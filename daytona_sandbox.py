@@ -5,15 +5,18 @@ author_url: https://adamsmith.as
 description: Coding agent tools (bash, read, write, edit) backed by per-user Daytona sandboxes with transparent lifecycle management.
 required_open_webui_version: 0.4.0
 requirements: httpx
-version: 0.1.1
+version: 0.2.0
 licence: MIT
 """
 
 import asyncio
+import base64
+import html as html_mod
 import io
 import time
 
 import httpx
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
 
@@ -55,6 +58,30 @@ def _get_email(user: dict) -> str:
     if not email:
         raise RuntimeError("No email found for user. Cannot provision sandbox.")
     return email
+
+
+def _highlight_code(code: str, path: str) -> str:
+    """Syntax-highlight code to HTML spans using Pygments. Falls back to escaped plaintext."""
+    try:
+        from pygments import highlight
+        from pygments.lexers import get_lexer_for_filename, TextLexer
+        from pygments.formatters import HtmlFormatter
+
+        try:
+            lexer = get_lexer_for_filename(path, stripall=False)
+        except Exception:
+            lexer = TextLexer()
+
+        # Catppuccin Mocha-inspired color scheme via Pygments style overrides
+        formatter = HtmlFormatter(
+            nowrap=True,       # no <div>/<pre> wrapper, just inline spans
+            noclasses=True,    # use inline styles so no external CSS needed
+            style="monokai",   # dark base theme
+        )
+        return highlight(code, lexer, formatter)
+    except ImportError:
+        # Pygments not available -- plain escaped text
+        return html_mod.escape(code)
 
 
 async def _wait_for_toolbox(valves, sandbox_id: str, emitter=None):
@@ -625,6 +652,181 @@ class Tools:
             replaced = count if replace_all else 1
             await _emit(__event_emitter__, "Edit complete", done=True)
             return f"Replaced {replaced} occurrence(s) in {path}"
+
+        except RuntimeError as e:
+            await _emit(__event_emitter__, f"Error: {e}", done=True)
+            return f"Error: {e}"
+        except httpx.HTTPStatusError as e:
+            await _emit(__event_emitter__, f"API error: HTTP {e.response.status_code}", done=True)
+            return f"API error: HTTP {e.response.status_code} — {e.response.text[:500]}"
+        except Exception as e:
+            await _emit(__event_emitter__, f"Error: {e}", done=True)
+            return f"Error: {e}"
+
+    async def attach(
+        self,
+        path: str,
+        __user__: dict = {},
+        __event_emitter__=None,
+    ) -> HTMLResponse:
+        """
+        Attach a file from the sandbox for the user to view inline.
+        The file content is rendered visually for the human but is NOT returned
+        to the model. Use read() if you need to see file contents yourself.
+        :param path: Absolute path or relative to /home/daytona (e.g. workspace/main.py).
+        """
+        try:
+            email = _get_email(__user__)
+            sandbox_id = await _ensure_sandbox(self.valves, email, __event_emitter__)
+
+            await _emit(__event_emitter__, f"Attaching {path}...")
+
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                resp = await client.get(
+                    _toolbox(self.valves, sandbox_id, "/files/download"),
+                    params={"path": path},
+                    headers=_headers(self.valves),
+                )
+
+                if resp.status_code == 404:
+                    await _emit(__event_emitter__, "File not found", done=True)
+                    return f"Error: File not found: {path}"
+
+                resp.raise_for_status()
+                content = resp.text
+
+            n_bytes = len(content.encode("utf-8"))
+            n_lines = content.count("\n") + (0 if content.endswith("\n") else 1)
+
+            filename = path.rsplit("/", 1)[-1] if "/" in path else path
+
+            # Server-side syntax highlighting with Pygments
+            highlighted = _highlight_code(content, path)
+
+            # Base64-encode raw content for copy/download without JS escaping issues
+            raw_b64 = base64.b64encode(content.encode("utf-8")).decode("ascii")
+
+            html_content = f"""<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+  body {{
+    font-family: 'SF Mono', 'Cascadia Code', 'Fira Code', Consolas, monospace;
+    font-size: 13px;
+    background: #1e1e2e;
+    color: #cdd6f4;
+  }}
+  .header {{
+    background: #313244;
+    padding: 8px 12px;
+    font-size: 12px;
+    color: #a6adc8;
+    border-bottom: 1px solid #45475a;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }}
+  .header .filename {{ color: #89b4fa; font-weight: 600; }}
+  .header .meta {{ color: #585b70; margin-left: auto; }}
+  .header .actions {{ display: flex; gap: 4px; }}
+  .header button {{
+    background: transparent;
+    border: 1px solid #45475a;
+    color: #a6adc8;
+    border-radius: 4px;
+    padding: 2px 8px;
+    font-size: 11px;
+    cursor: pointer;
+    font-family: inherit;
+  }}
+  .header button:hover {{ background: #45475a; color: #cdd6f4; }}
+  .header button.ok {{ color: #a6e3a1; border-color: #a6e3a1; }}
+  .code-wrap {{
+    display: flex;
+    overflow-x: auto;
+  }}
+  .gutter {{
+    padding: 12px 0;
+    text-align: right;
+    color: #585b70;
+    user-select: none;
+    flex-shrink: 0;
+    border-right: 1px solid #313244;
+  }}
+  .gutter div {{
+    padding: 0 12px;
+    line-height: 1.45;
+  }}
+  pre {{
+    margin: 0;
+    flex: 1;
+    overflow-x: auto;
+  }}
+  pre code {{
+    display: block;
+    padding: 12px;
+    line-height: 1.45;
+    tab-size: 4;
+  }}
+</style>
+</head>
+<body>
+  <div class="header">
+    <span class="filename">{html_mod.escape(filename)}</span>
+    <span class="meta">{n_lines} lines &middot; {n_bytes:,} bytes</span>
+    <span class="actions">
+      <button id="copy-btn" onclick="copyFile()">Copy</button>
+      <button onclick="saveFile()">Save</button>
+    </span>
+  </div>
+  <div class="code-wrap">
+    <div class="gutter">{"".join(f"<div>{i}</div>" for i in range(1, n_lines + 1))}</div>
+    <pre><code>{highlighted}</code></pre>
+  </div>
+  <script>
+    var _raw = atob("{raw_b64}");
+    var _fname = "{html_mod.escape(filename)}";
+    function copyFile() {{
+      var btn = document.getElementById('copy-btn');
+      var ta = document.createElement('textarea');
+      ta.value = _raw;
+      ta.style.position = 'fixed';
+      ta.style.opacity = '0';
+      document.body.appendChild(ta);
+      ta.select();
+      var ok = false;
+      try {{ ok = document.execCommand('copy'); }} catch(e) {{}}
+      document.body.removeChild(ta);
+      if (ok) {{
+        btn.textContent = 'Copied!';
+        btn.classList.add('ok');
+        setTimeout(function() {{ btn.textContent = 'Copy'; btn.classList.remove('ok'); }}, 1500);
+      }} else {{
+        btn.textContent = 'Failed';
+        setTimeout(function() {{ btn.textContent = 'Copy'; }}, 1500);
+      }}
+    }}
+    function saveFile() {{
+      var blob = new Blob([_raw], {{type: 'text/plain'}});
+      var a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = _fname;
+      a.click();
+      URL.revokeObjectURL(a.href);
+    }}
+    function reportHeight() {{
+      parent.postMessage({{ type: 'iframe:height', height: document.documentElement.scrollHeight }}, '*');
+    }}
+    window.addEventListener('load', reportHeight);
+    new ResizeObserver(reportHeight).observe(document.body);
+  </script>
+</body>
+</html>"""
+
+            await _emit(__event_emitter__, f"Attached {filename} ({n_bytes:,} bytes)", done=True)
+            return HTMLResponse(content=html_content, headers={"Content-Disposition": "inline"})
 
         except RuntimeError as e:
             await _emit(__event_emitter__, f"Error: {e}", done=True)

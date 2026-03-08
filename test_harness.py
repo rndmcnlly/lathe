@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """
 Test harness for daytona_sandbox.py toolkit.
-Exercises all four tools against the live Daytona API.
+Exercises all six tools against the live Daytona API.
 
 Usage:
     uv run --script test_harness.py
 """
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["httpx", "pydantic", "python-dotenv"]
+# dependencies = ["httpx", "pydantic", "python-dotenv", "fastapi", "pygments"]
 # ///
 
 import asyncio
@@ -244,6 +244,65 @@ async def run_tests():
     )
     check("nested file readable", "nested content" in result, result[:200])
 
+    # ── Test 7: attach ───────────────────────────────────────────
+    from fastapi.responses import HTMLResponse
+
+    print("\n── attach: Python file ──")
+    py_content = 'def greet(name):\n    return f"Hello, {name}!"\n\nprint(greet("world"))\n'
+    await tools.write(
+        "workspace/attach_test.py", py_content,
+        __user__=user, __event_emitter__=mock_emitter,
+    )
+    result = await tools.attach(
+        "workspace/attach_test.py",
+        __user__=user, __event_emitter__=mock_emitter,
+    )
+    check("returns HTMLResponse", isinstance(result, HTMLResponse), type(result).__name__)
+    body = result.body.decode("utf-8")
+    check("has Content-Disposition inline", result.headers.get("content-disposition") == "inline", result.headers.get("content-disposition", ""))
+    check("contains filename in header", "attach_test.py" in body, "")
+    check("contains line count", "4 lines" in body, "")
+    check("contains byte count", str(len(py_content.encode("utf-8"))) in body, "")
+    check("contains height reporting script", "iframe:height" in body, "")
+    check("contains copy button", "Copy" in body and "copyFile" in body, "")
+    check("contains save button", "Save" in body and "saveFile" in body, "")
+
+    print("\n── attach: syntax highlighting ──")
+    # Pygments should produce <span style= tokens for Python
+    check("has Pygments highlighting spans", 'style="' in body and "<span" in body, "no inline styles found")
+    check("contains the function content", "greet" in body, "")
+
+    print("\n── attach: plain text file ──")
+    await tools.write(
+        "workspace/attach_test.txt", "just plain text\nno highlighting\n",
+        __user__=user, __event_emitter__=mock_emitter,
+    )
+    result = await tools.attach(
+        "workspace/attach_test.txt",
+        __user__=user, __event_emitter__=mock_emitter,
+    )
+    check("txt returns HTMLResponse", isinstance(result, HTMLResponse), type(result).__name__)
+    body_txt = result.body.decode("utf-8")
+    check("txt contains content", "just plain text" in body_txt, "")
+    check("txt contains filename", "attach_test.txt" in body_txt, "")
+
+    print("\n── attach: file not found ──")
+    result = await tools.attach(
+        "workspace/nonexistent_file.xyz",
+        __user__=user, __event_emitter__=mock_emitter,
+    )
+    check("missing file returns error string", isinstance(result, str) and "Error" in result, str(result)[:200])
+
+    print("\n── attach: base64 round-trip ──")
+    import base64
+    # Verify the base64 payload in the HTML decodes to the original content
+    import re
+    b64_match = re.search(r'atob\("([A-Za-z0-9+/=]+)"\)', body)
+    check("base64 payload present", b64_match is not None, "no atob() found")
+    if b64_match:
+        decoded = base64.b64decode(b64_match.group(1)).decode("utf-8")
+        check("base64 decodes to original content", decoded == py_content, f"got {decoded[:80]}...")
+
     # ── Test 6: onboard ──────────────────────────────────────────
     # Clean slate for onboard tests (paths relative to /home/daytona, matching write() paths)
     await tools.bash("rm -rf /home/daytona/workspace/test_project /home/daytona/workspace/empty_project", __user__=user, __event_emitter__=mock_emitter)
@@ -284,9 +343,27 @@ async def run_tests():
     check("includes SKILL.md path", "SKILL.md" in result, result[:500])
     check("does NOT include skill body", "Detailed instructions here" not in result, result[:500])
 
+    # ── Test 8: _highlight_code helper ──────────────────────────
+    from daytona_sandbox import _highlight_code
+    import html as html_mod
+
+    print("\n── _highlight_code: Python ──")
+    hl = _highlight_code('def foo():\n    return 42\n', "test.py")
+    check("highlight produces spans", "<span" in hl, hl[:100])
+    check("highlight has inline styles", 'style="' in hl, hl[:100])
+    check("highlight preserves content", "foo" in hl and "42" in hl, hl[:100])
+
+    print("\n── _highlight_code: unknown extension ──")
+    hl_unk = _highlight_code("just text", "file.unknownext")
+    check("unknown ext still produces output", "just text" in hl_unk, hl_unk[:100])
+
+    print("\n── _highlight_code: no extension ──")
+    hl_none = _highlight_code("raw content", "Makefile")
+    check("no-ext file produces output", "raw content" in hl_none or "content" in hl_none, hl_none[:100])
+
     # ── Cleanup ──────────────────────────────────────────────────
     print("\n── cleanup ──")
-    await tools.bash("rm -rf workspace/test_file.txt workspace/dup_test.txt workspace/deep workspace/test_project", __user__=user, __event_emitter__=mock_emitter)
+    await tools.bash("rm -rf workspace/test_file.txt workspace/dup_test.txt workspace/deep workspace/test_project workspace/attach_test.py workspace/attach_test.txt", __user__=user, __event_emitter__=mock_emitter)
 
     # Stop the sandbox to conserve resources
     import httpx

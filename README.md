@@ -1,6 +1,6 @@
 # daytona-owui-agent-harness
 
-An Open WebUI toolkit that gives any OWUI-compatible model a coding agent's tool surface — `bash`, `read`, `write`, `edit`, `onboard` — executing against per-user [Daytona](https://daytona.io/) sandboxes with transparent lifecycle management.
+An Open WebUI toolkit that gives any OWUI-compatible model a coding agent's tool surface — `bash`, `read`, `write`, `edit`, `attach`, `onboard` — executing against per-user [Daytona](https://daytona.io/) sandboxes with transparent lifecycle management.
 
 ## Design
 
@@ -40,6 +40,7 @@ After the control plane reports `state=started`, a readiness probe (`echo ready`
 | `read(path, offset, limit)` | Read file with line numbers | `GET /files/download`, client-side line slicing |
 | `write(path, content)` | Write/create file | `mkdir -p` parent via exec, then `POST /files/upload` |
 | `edit(path, old_string, new_string, replace_all)` | Exact string replacement | Download, string replace, re-upload. Rejects ambiguous matches unless `replace_all=True`. |
+| `attach(path)` | Show file to user without consuming model context | Returns `HTMLResponse` with syntax-highlighted code viewer rendered as an inline iframe. See [Rich attachments](#rich-attachments) below. |
 
 ### Key implementation details
 
@@ -58,6 +59,25 @@ The `onboard` tool follows the [Agent Skills](https://agentskills.io/) progressi
 3. **Tier 3 (resources)**: Model uses `read()` or `bash()` to access `scripts/`, `references/`, etc.
 
 Skills are discovered at `{project_path}/.agents/skills/*/SKILL.md`.
+
+### Rich attachments
+
+The `attach` tool solves a fundamental problem with chat-based coding agents: the model shouldn't have to burn context tokens just to show the user a file. When the model calls `attach(path)`, the tool:
+
+1. Fetches the file from the sandbox
+2. Renders it as a self-contained HTML page with Pygments syntax highlighting, line numbers, and Copy/Save buttons
+3. Returns an OWUI `HTMLResponse` with `Content-Disposition: inline`, which OWUI renders as an inline iframe at the tool call site
+
+**What the model sees**: A short JSON confirmation (`"status": "success", "code": "ui_component"`). The file content never enters the context window. The model can use `read()` separately if it needs to inspect the content itself.
+
+**What the user sees**: A dark-themed code viewer (Catppuccin Mocha palette) with:
+- Syntax highlighting (server-side via Pygments — no CDN fetches from the sandboxed iframe)
+- Numbered lines
+- **Copy** button (copies raw file to clipboard)
+- **Save** button (triggers browser download with original filename)
+- Auto-sizing iframe height via `postMessage`
+
+This uses OWUI's [Rich UI Embedding](https://docs.openwebui.com/features/extensibility/plugin/development/rich-ui) feature and works in Native function calling mode.
 
 ### Valves (admin configuration)
 
@@ -96,4 +116,4 @@ Deploy as tool ID `daytona_sandbox` on any Open WebUI instance:
 uv run --script test_harness.py
 ```
 
-Requires `DAYTONA_API_KEY` in a `.env` file or exported as an environment variable. Creates a sandbox labeled `test-harness`, runs 40 tests across all 5 tools, stops the sandbox on completion.
+Requires `DAYTONA_API_KEY` in a `.env` file or exported as an environment variable. Creates a sandbox labeled `test-harness`, runs 61 tests across all 6 tools, stops the sandbox on completion.
