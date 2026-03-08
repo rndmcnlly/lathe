@@ -13,6 +13,7 @@ import asyncio
 import base64
 import html as html_mod
 import io
+import json
 import time
 
 import httpx
@@ -1080,6 +1081,310 @@ class Tools:
 
             await _emit(__event_emitter__, f"Attached {filename} ({n_bytes:,} bytes)", done=True)
             return HTMLResponse(content=html_content, headers={"Content-Disposition": "inline"})
+
+        except RuntimeError as e:
+            await _emit(__event_emitter__, f"Error: {e}", done=True)
+            return f"Error: {e}"
+        except httpx.HTTPStatusError as e:
+            await _emit(__event_emitter__, f"API error: HTTP {e.response.status_code}", done=True)
+            return f"API error: HTTP {e.response.status_code} — {e.response.text[:500]}"
+        except Exception as e:
+            await _emit(__event_emitter__, f"Error: {e}", done=True)
+            return f"Error: {e}"
+
+    async def ingest(
+        self,
+        prompt: str = "",
+        __user__: dict = {},
+        __event_emitter__=None,
+        __event_call__=None,
+    ) -> str:
+        """
+        Ask the user to upload a file from their local machine into the sandbox.
+        The file goes directly to the sandbox filesystem — it does not enter the
+        conversation context or the OWUI database. Use read() afterward if you
+        need to inspect the file contents yourself.
+        :param prompt: Optional message shown to the user explaining what file is needed, e.g. "Upload your CSV dataset".
+        """
+        try:
+            email = _get_email(__user__)
+            sandbox_id = await _ensure_sandbox(self.valves, email, __event_emitter__)
+
+            if not __event_call__:
+                return "Error: ingest requires browser-side execution (__event_call__). Ensure the toolkit is used in Native function calling mode."
+
+            # Build the prompt text for the modal
+            prompt_text = prompt if prompt else "The assistant is asking for a file."
+            prompt_js = json.dumps(prompt_text)
+
+            # Max file size (25 MB)
+            max_bytes = 25 * 1024 * 1024
+
+            # The JS picks a file, uploads it to OWUI's Files API from the
+            # browser (normal HTTP POST with XHR for progress), and returns
+            # only the small file ID + metadata through __event_call__.
+            js = f"""
+const promptText = {prompt_js};
+const maxBytes = {max_bytes};
+
+return await new Promise((resolve) => {{
+    const container = document.createElement("div");
+    container.style.cssText =
+        "position:fixed;top:0;left:0;width:100%;height:100%;" +
+        "display:flex;align-items:center;justify-content:center;" +
+        "background:rgba(0,0,0,0.45);z-index:99999";
+
+    const card = document.createElement("div");
+    card.style.cssText =
+        "background:#1e1e2e;border-radius:12px;padding:32px 40px;" +
+        "text-align:center;box-shadow:0 8px 32px rgba(0,0,0,0.5);" +
+        "font-family:system-ui,sans-serif;color:#cdd6f4;max-width:420px";
+
+    const title = document.createElement("h3");
+    title.textContent = "Upload File to Sandbox";
+    title.style.cssText = "margin:0 0 8px;font-size:18px;color:#f5e0dc";
+
+    const desc = document.createElement("p");
+    desc.textContent = promptText;
+    desc.style.cssText = "margin:0 0 20px;font-size:14px;opacity:0.8";
+
+    const fileInfo = document.createElement("p");
+    fileInfo.style.cssText = "margin:0 0 16px;font-size:13px;color:#89b4fa;min-height:20px";
+
+    // Progress bar (hidden until upload starts)
+    const progressWrap = document.createElement("div");
+    progressWrap.style.cssText =
+        "display:none;margin:0 0 16px;background:#45475a;border-radius:4px;" +
+        "height:6px;overflow:hidden";
+    const progressBar = document.createElement("div");
+    progressBar.style.cssText =
+        "height:100%;width:0%;background:#89b4fa;border-radius:4px;" +
+        "transition:width 0.2s ease";
+    progressWrap.appendChild(progressBar);
+
+    const input = document.createElement("input");
+    input.type = "file";
+    input.style.display = "none";
+
+    const chooseBtn = document.createElement("button");
+    chooseBtn.textContent = "Choose File\\u2026";
+    chooseBtn.style.cssText =
+        "padding:10px 28px;font-size:15px;border:none;border-radius:8px;" +
+        "background:#89b4fa;color:#1e1e2e;cursor:pointer;font-weight:600";
+
+    const uploadBtn = document.createElement("button");
+    uploadBtn.textContent = "Upload";
+    uploadBtn.style.cssText =
+        "padding:10px 28px;font-size:15px;border:none;border-radius:8px;" +
+        "background:#a6e3a1;color:#1e1e2e;cursor:pointer;font-weight:600;" +
+        "margin-left:12px;display:none";
+
+    const cancel = document.createElement("button");
+    cancel.textContent = "Cancel";
+    cancel.style.cssText =
+        "padding:10px 28px;font-size:14px;border:1px solid #585b70;" +
+        "border-radius:8px;background:transparent;color:#a6adc8;" +
+        "cursor:pointer;margin-left:12px";
+
+    let selectedFile = null;
+
+    function humanSize(n) {{
+        if (n < 1024) return n + " B";
+        if (n < 1024 * 1024) return (n / 1024).toFixed(1) + " KB";
+        return (n / 1024 / 1024).toFixed(1) + " MB";
+    }}
+
+    input.onchange = () => {{
+        if (input.files && input.files.length > 0) {{
+            selectedFile = input.files[0];
+            if (selectedFile.size > maxBytes) {{
+                fileInfo.textContent = selectedFile.name + " (" + humanSize(selectedFile.size) + ") \\u2014 too large (max 25 MB)";
+                fileInfo.style.color = "#f38ba8";
+                uploadBtn.style.display = "none";
+            }} else {{
+                fileInfo.textContent = selectedFile.name + " (" + humanSize(selectedFile.size) + ")";
+                fileInfo.style.color = "#a6e3a1";
+                uploadBtn.style.display = "inline-block";
+            }}
+        }}
+    }};
+
+    chooseBtn.onclick = () => input.click();
+
+    uploadBtn.onclick = () => {{
+        if (!selectedFile) return;
+        uploadBtn.style.display = "none";
+        chooseBtn.style.display = "none";
+        cancel.style.display = "none";
+        progressWrap.style.display = "block";
+        fileInfo.textContent = "Uploading\\u2026 0%";
+        fileInfo.style.color = "#89b4fa";
+
+        const token = localStorage.getItem("token");
+        const formData = new FormData();
+        formData.append("file", selectedFile);
+
+        const xhr = new XMLHttpRequest();
+
+        xhr.upload.onprogress = (e) => {{
+            if (e.lengthComputable) {{
+                const pct = Math.round(e.loaded / e.total * 100);
+                progressBar.style.width = pct + "%";
+                fileInfo.textContent = "Uploading\\u2026 " + pct + "% (" + humanSize(e.loaded) + " / " + humanSize(e.total) + ")";
+            }}
+        }};
+
+        xhr.upload.onload = () => {{
+            progressBar.style.width = "100%";
+            progressBar.style.background = "#a6e3a1";
+            fileInfo.textContent = "Processing\\u2026";
+            fileInfo.style.color = "#a6e3a1";
+        }};
+
+        xhr.onload = () => {{
+            if (xhr.status >= 200 && xhr.status < 300) {{
+                try {{
+                    const result = JSON.parse(xhr.responseText);
+                    container.remove();
+                    resolve(JSON.stringify({{
+                        ok: true,
+                        name: selectedFile.name,
+                        size: selectedFile.size,
+                        file_id: result.id,
+                    }}));
+                }} catch (e) {{
+                    container.remove();
+                    resolve(JSON.stringify({{ ok: false, error: "Bad response: " + xhr.responseText.slice(0, 200) }}));
+                }}
+            }} else {{
+                container.remove();
+                resolve(JSON.stringify({{ ok: false, error: "Upload failed: HTTP " + xhr.status + " " + xhr.responseText.slice(0, 200) }}));
+            }}
+        }};
+
+        xhr.onerror = () => {{
+            container.remove();
+            resolve(JSON.stringify({{ ok: false, error: "Network error during upload" }}));
+        }};
+
+        xhr.open("POST", "/api/v1/files/");
+        xhr.setRequestHeader("Authorization", "Bearer " + token);
+        xhr.send(formData);
+    }};
+
+    cancel.onclick = () => {{
+        container.remove();
+        resolve(JSON.stringify({{ ok: false, error: "User cancelled" }}));
+    }};
+
+    const btnRow = document.createElement("div");
+    btnRow.style.cssText = "display:flex;align-items:center;justify-content:center";
+    btnRow.appendChild(chooseBtn);
+    btnRow.appendChild(uploadBtn);
+    btnRow.appendChild(cancel);
+    card.appendChild(title);
+    card.appendChild(desc);
+    card.appendChild(fileInfo);
+    card.appendChild(progressWrap);
+    card.appendChild(input);
+    card.appendChild(btnRow);
+    container.appendChild(card);
+    document.body.appendChild(container);
+}});
+"""
+
+            await _emit(__event_emitter__, "Waiting for file selection...")
+
+            raw = await __event_call__({"type": "execute", "data": {"code": js}})
+
+            # Normalise response
+            if isinstance(raw, str):
+                try:
+                    result = json.loads(raw)
+                except json.JSONDecodeError:
+                    result = {"ok": False, "error": f"Unexpected response: {raw[:200]}"}
+            elif isinstance(raw, dict):
+                result = raw
+            else:
+                result = {"ok": False, "error": f"Unexpected response type: {type(raw)}"}
+
+            if not result.get("ok"):
+                err = result.get("error", "Unknown error")
+                await _emit(__event_emitter__, f"File not uploaded: {err}", done=True)
+                return f"File not uploaded: {err}"
+
+            filename = result.get("name", "unknown")
+            file_size = result.get("size", 0)
+            file_id = result.get("file_id", "")
+
+            if not file_id:
+                await _emit(__event_emitter__, "No file ID received", done=True)
+                return "Error: Browser upload succeeded but no file ID returned."
+
+            # Read file directly from OWUI's storage layer. The toolkit runs
+            # in-process, so we import the models and storage provider rather
+            # than making an HTTP call to ourselves.
+            await _emit(__event_emitter__, f"Transferring {filename} to sandbox...")
+
+            try:
+                from open_webui.models.files import Files as OWUIFiles
+                from open_webui.storage.provider import Storage
+
+                file_record = OWUIFiles.get_file_by_id(file_id)
+                if not file_record:
+                    await _emit(__event_emitter__, "File not found in OWUI", done=True)
+                    return f"Error: File {file_id} not found in OWUI database."
+
+                local_path = Storage.get_file(file_record.path)
+                with open(local_path, "rb") as f:
+                    file_bytes = f.read()
+            except ImportError as e:
+                await _emit(__event_emitter__, "Internal error accessing OWUI storage", done=True)
+                return f"Error: Could not import OWUI storage layer: {e}"
+
+            dest_path = f"/home/daytona/workspace/{filename}"
+
+            # Ensure workspace directory exists
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                await client.post(
+                    _toolbox(self.valves, sandbox_id, "/process/execute"),
+                    headers=_headers(self.valves),
+                    json={
+                        "command": 'bash -c "mkdir -p /home/daytona/workspace"',
+                        "timeout": 5000,
+                    },
+                )
+
+            # Upload to Daytona sandbox
+            async with httpx.AsyncClient(timeout=120.0) as client:
+                resp = await client.post(
+                    _toolbox(self.valves, sandbox_id, "/files/upload"),
+                    params={"path": dest_path},
+                    headers={
+                        "Authorization": f"Bearer {self.valves.daytona_api_key}",
+                    },
+                    files={"file": ("file", io.BytesIO(file_bytes), "application/octet-stream")},
+                )
+                resp.raise_for_status()
+
+            # Delete the transient file from OWUI storage
+            try:
+                from open_webui.models.files import Files as OWUIFiles
+                OWUIFiles.delete_file_by_id(file_id)
+            except Exception:
+                pass  # cleanup failure is non-fatal
+
+            def _human_size(n: int) -> str:
+                b = float(n)
+                for unit in ("B", "KB", "MB"):
+                    if b < 1024:
+                        return f"{b:,.0f} {unit}" if unit == "B" else f"{b:,.1f} {unit}"
+                    b /= 1024
+                return f"{b:,.1f} GB"
+
+            size_str = _human_size(file_size)
+            await _emit(__event_emitter__, f"Uploaded {filename} ({size_str})", done=True)
+            return f"Uploaded {filename} ({size_str}) to {dest_path}"
 
         except RuntimeError as e:
             await _emit(__event_emitter__, f"Error: {e}", done=True)
