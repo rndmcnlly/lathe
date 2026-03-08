@@ -5,12 +5,13 @@ author_url: https://adamsmith.as
 description: Coding agent tools (bash, read, write, edit) backed by per-user Daytona sandboxes with transparent lifecycle management.
 required_open_webui_version: 0.4.0
 requirements: httpx
-version: 0.2.0
+version: 0.3.0
 licence: MIT
 """
 
 import asyncio
 import base64
+import hashlib
 import html as html_mod
 import io
 import json
@@ -59,6 +60,68 @@ def _get_email(user: dict) -> str:
     if not email:
         raise RuntimeError("No email found for user. Cannot provision sandbox.")
     return email
+
+
+# ── output truncation (tail-biased, mirrors Pi's design) ────────────
+
+_MAX_LINES = 2000
+_MAX_BYTES = 50 * 1024  # 50 KB
+
+
+def _truncate_tail(text: str) -> tuple[str, bool, dict]:
+    """Truncate output keeping the *tail* (where errors and results live).
+
+    Returns (output, was_truncated, metadata).
+    Metadata keys when truncated:
+      total_lines, total_bytes, shown_start_line, shown_end_line, truncated_by
+    """
+    total_bytes = len(text.encode("utf-8"))
+    lines = text.split("\n")
+    total_lines = len(lines)
+
+    if total_lines <= _MAX_LINES and total_bytes <= _MAX_BYTES:
+        return text, False, {}
+
+    # Walk backwards, collecting complete lines within both limits
+    kept: list[str] = []
+    kept_bytes = 0
+    truncated_by = "lines"
+
+    for i in range(total_lines - 1, -1, -1):
+        line = lines[i]
+        line_bytes = len(line.encode("utf-8")) + (1 if kept else 0)  # +1 for \n joiner
+        if kept_bytes + line_bytes > _MAX_BYTES:
+            truncated_by = "bytes"
+            break
+        kept.append(line)
+        kept_bytes += line_bytes
+        if len(kept) >= _MAX_LINES:
+            truncated_by = "lines"
+            break
+
+    kept.reverse()
+    output = "\n".join(kept)
+    shown_lines = len(kept)
+    start_line = total_lines - shown_lines + 1
+
+    meta = {
+        "total_lines": total_lines,
+        "total_bytes": total_bytes,
+        "shown_start_line": start_line,
+        "shown_end_line": total_lines,
+        "truncated_by": truncated_by,
+    }
+    return output, True, meta
+
+
+def _human_size(n: int) -> str:
+    """Format byte count as human-readable string."""
+    b = float(n)
+    for unit in ("B", "KB", "MB", "GB"):
+        if b < 1024:
+            return f"{b:,.0f} {unit}" if unit == "B" else f"{b:,.1f} {unit}"
+        b /= 1024
+    return f"{b:,.1f} TB"
 
 
 def _highlight_code(code: str, path: str) -> str:
@@ -637,6 +700,9 @@ class Tools:
         Supports pipes, redirects, &&, ||, and all standard bash syntax.
         Commands must be non-interactive (no prompts for input). Use -y flags where needed.
         Default working directory is /home/daytona/workspace.
+        Output is truncated to the last 2000 lines or 50 KB (whichever limit is hit first).
+        If truncated, the full output is saved to a file in /tmp/ and the path is shown.
+        Use read() or another bash command to inspect specific parts of that file.
         :param command: The bash command to execute.
         :param workdir: Working directory for the command (default: /home/daytona/workspace).
         """
@@ -688,12 +754,57 @@ class Tools:
             exit_code = data.get("exitCode", -1)
             result = data.get("result", "")
 
+            # ── Truncation + spill-to-file ──────────────────────────
+            output, was_truncated, meta = _truncate_tail(result)
+            spill_path = None
+
+            if was_truncated:
+                # Write the full output to a unique temp file in the sandbox
+                # so the model can retrieve slices without re-running.
+                tag = hashlib.sha1(result[:256].encode("utf-8", errors="replace")).hexdigest()[:8]
+                spill_path = f"/tmp/_bash_output_{tag}.log"
+                async with httpx.AsyncClient(timeout=120.0) as client:
+                    await client.post(
+                        _toolbox(self.valves, sandbox_id, "/files/upload"),
+                        params={"path": spill_path},
+                        headers={"Authorization": f"Bearer {self.valves.daytona_api_key}"},
+                        files={
+                            "file": (
+                                "file",
+                                io.BytesIO(result.encode("utf-8")),
+                                "application/octet-stream",
+                            )
+                        },
+                    )
+
             await _emit(__event_emitter__, "Command complete", done=True)
 
-            if exit_code == 0:
-                return result if result else "(no output)"
-            else:
-                return f"Exit code: {exit_code}\n{result}"
+            # ── Format the return value ─────────────────────────────
+            if exit_code != 0:
+                output = f"Exit code: {exit_code}\n{output}"
+
+            if not output.strip():
+                output = "(no output)"
+
+            if was_truncated and spill_path:
+                start = meta["shown_start_line"]
+                end = meta["shown_end_line"]
+                total = meta["total_lines"]
+                total_size = _human_size(meta["total_bytes"])
+                if meta["truncated_by"] == "lines":
+                    notice = (
+                        f"\n\n[Showing lines {start}-{end} of {total}. "
+                        f"Full output ({total_size}): {spill_path}]"
+                    )
+                else:
+                    notice = (
+                        f"\n\n[Showing lines {start}-{end} of {total} "
+                        f"({_human_size(_MAX_BYTES)} limit, full output is {total_size}). "
+                        f"Full output: {spill_path}]"
+                    )
+                output += notice
+
+            return output
 
         except RuntimeError as e:
             await _emit(__event_emitter__, f"Error: {e}", done=True)

@@ -515,9 +515,79 @@ async def run_tests():
     hl_none = _highlight_code("raw content", "Makefile")
     check("no-ext file produces output", "raw content" in hl_none or "content" in hl_none, hl_none[:100])
 
+    # ── Test 14: _truncate_tail unit tests ──────────────────────────
+    from daytona_sandbox import _truncate_tail, _MAX_LINES, _MAX_BYTES
+
+    print("\n── _truncate_tail: no truncation needed ──")
+    short = "line 1\nline 2\nline 3"
+    out, trunc, meta = _truncate_tail(short)
+    check("short text not truncated", not trunc, f"truncated={trunc}")
+    check("short text unchanged", out == short, out[:80])
+
+    print("\n── _truncate_tail: line limit ──")
+    many_lines = "\n".join(f"line {i}" for i in range(5000))
+    out, trunc, meta = _truncate_tail(many_lines)
+    check("many lines truncated", trunc, f"truncated={trunc}")
+    check("truncated by lines", meta["truncated_by"] == "lines", meta.get("truncated_by"))
+    check("keeps last N lines", out.endswith("line 4999"), out[-30:])
+    check("total_lines correct", meta["total_lines"] == 5000, meta.get("total_lines"))
+    out_line_count = out.count("\n") + 1
+    check(f"output has <= {_MAX_LINES} lines", out_line_count <= _MAX_LINES, f"got {out_line_count}")
+
+    print("\n── _truncate_tail: byte limit ──")
+    # Create output that's under line limit but over byte limit
+    # Each line is ~100 bytes, 600 lines = ~60KB > 50KB limit
+    fat_lines = "\n".join(f"{'x' * 99}" for _ in range(600))
+    out, trunc, meta = _truncate_tail(fat_lines)
+    check("fat lines truncated", trunc, f"truncated={trunc}")
+    check("truncated by bytes", meta["truncated_by"] == "bytes", meta.get("truncated_by"))
+    out_bytes = len(out.encode("utf-8"))
+    check(f"output <= {_MAX_BYTES} bytes", out_bytes <= _MAX_BYTES, f"got {out_bytes}")
+
+    print("\n── _truncate_tail: empty string ──")
+    out, trunc, meta = _truncate_tail("")
+    check("empty string not truncated", not trunc, f"truncated={trunc}")
+
+    # ── Test 15: bash output truncation (integration) ────────────
+    print("\n── bash: output truncation with spill file ──")
+    # Generate 3000 lines of output — should trigger truncation
+    result = await tools.bash(
+        "for i in $(seq 1 3000); do echo \"output line $i\"; done",
+        __user__=user, __event_emitter__=mock_emitter,
+    )
+    check("truncated output has notice", "[Showing lines" in result, result[-200:])
+    check("notice mentions full output file", "/tmp/_bash_output_" in result, result[-200:])
+    check("last line present in output", "output line 3000" in result, result[-200:])
+    check("first line NOT in truncated output", "output line 1\n" not in result, "line 1 should be truncated away")
+
+    # Verify the spill file exists and contains everything
+    import re
+    spill_match = re.search(r"/tmp/_bash_output_\w+\.log", result)
+    if spill_match:
+        spill_path = spill_match.group(0)
+        # Check the file is accessible and has the full content
+        verify = await tools.bash(
+            f"wc -l < {spill_path}",
+            __user__=user, __event_emitter__=mock_emitter,
+        )
+        check("spill file has all 3000 lines", "3000" in verify, verify.strip())
+
+        # Check we can read a specific slice from it
+        head_result = await tools.bash(
+            f"head -n 3 {spill_path}",
+            __user__=user, __event_emitter__=mock_emitter,
+        )
+        check("can retrieve early lines from spill file", "output line 1" in head_result, head_result[:100])
+    else:
+        check("spill file path found in notice", False, "no path match found")
+
+    print("\n── bash: small output NOT truncated ──")
+    result = await tools.bash("echo hello", __user__=user, __event_emitter__=mock_emitter)
+    check("small output has no truncation notice", "[Showing lines" not in result, result[:200])
+
     # ── Cleanup ──────────────────────────────────────────────────
     print("\n── cleanup ──")
-    await tools.bash("rm -rf workspace/test_file.txt workspace/dup_test.txt workspace/deep workspace/test_project workspace/attach_test.py workspace/attach_test.txt workspace/test_image.png workspace/test_image.svg workspace/test_archive.zip workspace/test_binary.dat", __user__=user, __event_emitter__=mock_emitter)
+    await tools.bash("rm -rf workspace/test_file.txt workspace/dup_test.txt workspace/deep workspace/test_project workspace/attach_test.py workspace/attach_test.txt workspace/test_image.png workspace/test_image.svg workspace/test_archive.zip workspace/test_binary.dat /tmp/_bash_output_*.log", __user__=user, __event_emitter__=mock_emitter)
 
     # Stop the sandbox to conserve resources
     import httpx

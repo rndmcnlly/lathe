@@ -6,7 +6,7 @@ An Open WebUI toolkit that gives any OWUI-compatible model a coding agent's tool
 
 ### Core idea
 
-The model calls tools that look like a local coding agent (inspired by Pi / Claude Code). Under the hood, every call executes against a Daytona sandbox VM. The sandbox lifecycle is fully hidden from the model: the first tool call lazily creates, unarchives, or restarts the sandbox as needed. Nothing about the VM is scoped to the chat session — files persist across conversations for the same user.
+The model calls tools that look like a local coding agent (inspired by [Pi](https://github.com/badlogic/pi-mono/tree/main/packages/coding-agent) by Mario Zechner, aka [shittycodingagent.ai](https://shittycodingagent.ai)). Under the hood, every call executes against a Daytona sandbox VM. The sandbox lifecycle is fully hidden from the model: the first tool call lazily creates, unarchives, or restarts the sandbox as needed. Nothing about the VM is scoped to the chat session — files persist across conversations for the same user.
 
 ### Sandbox identity
 
@@ -36,7 +36,7 @@ After the control plane reports `state=started`, a readiness probe (`echo ready`
 | Tool | Purpose | Implementation |
 |------|---------|----------------|
 | `onboard(path)` | Load project context (AGENTS.md + skill catalog) | Uploads+executes a shell script that reads AGENTS.md and parses SKILL.md YAML frontmatter from `.agents/skills/` |
-| `bash(command, workdir)` | Execute shell commands | Uploads command as a temp script and runs `bash /tmp/_cmd.sh` with `set -e -o pipefail` and non-interactive env vars. 2-min timeout. |
+| `bash(command, workdir)` | Execute shell commands | Uploads command as a temp script and runs `bash /tmp/_cmd.sh` with `set -e -o pipefail` and non-interactive env vars. 2-min timeout. Output truncated to last 2000 lines / 50 KB; full output spilled to sandbox temp file if truncated. |
 | `read(path, offset, limit)` | Read file with line numbers | `GET /files/download`, client-side line slicing |
 | `write(path, content)` | Write/create file | `mkdir -p` parent via exec, then `POST /files/upload` |
 | `edit(path, old_string, new_string, replace_all)` | Exact string replacement | Download, string replace, re-upload. Rejects ambiguous matches unless `replace_all=True`. |
@@ -46,6 +46,7 @@ After the control plane reports `state=started`, a readiness probe (`echo ready`
 ### Key implementation details
 
 - **Command execution**: Daytona's `/process/execute` does argv splitting, not shell invocation. To avoid quoting/escaping issues, the `bash` tool writes the command verbatim to a temp script (`/tmp/_cmd.sh`) and executes `bash /tmp/_cmd.sh`. The model's command reaches bash with zero transformations.
+- **Output truncation**: Inspired by [Pi](https://github.com/badlogic/pi-mono/tree/main/packages/coding-agent)'s bash tool design. Output is truncated to the **last** 2000 lines or 50 KB (whichever limit is hit first), keeping the tail where errors and final results live. If truncated, the full output is uploaded to a temp file in the sandbox (`/tmp/_bash_output_{hash}.log`) and the model sees a notice like `[Showing lines 1842-2000 of 5400. Full output: /tmp/_bash_output_abc12345.log]`. The model can then use `read()` or `bash("head -n 100 /tmp/...")` to inspect earlier parts without re-running the command. This prevents verbose commands like `pip install` or `find /` from flooding the context window.
 - **Error handling**: Scripts run with `set -e -o pipefail` so failures abort immediately and pipe errors propagate. Models can override with `|| true` when intentional.
 - **Non-interactive environment**: Every bash command runs with `DEBIAN_FRONTEND=noninteractive GIT_TERMINAL_PROMPT=0 PIP_NO_INPUT=1 NPM_CONFIG_YES=true CI=true` exported to prevent blocking on interactive prompts.
 - **Helper visibility**: OWUI exposes all non-`__dunder__` methods on `class Tools` as callable tools. All helpers are module-level functions to stay invisible to tool discovery.
