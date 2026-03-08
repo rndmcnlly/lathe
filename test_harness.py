@@ -76,21 +76,36 @@ async def test_unit_parse_env_vars(R: Results):
     R.check("value with spaces preserved", ("OTHER", "has spaces") in pairs, str(pairs))
     R.check("value with quote preserved", ("QUOTE", "it's") in pairs, str(pairs))
 
-    print("\n── _parse_env_vars: invalid keys skipped ──")
-    pairs = _parse_env_vars('{"GOOD":"yes","123bad":"no","also-bad":"no","_ok":"yes"}')
-    keys = [k for k, v in pairs]
-    R.check("GOOD accepted", "GOOD" in keys, str(keys))
-    R.check("_ok accepted", "_ok" in keys, str(keys))
-    R.check("123bad rejected", "123bad" not in keys, str(keys))
-    R.check("also-bad rejected", "also-bad" not in keys, str(keys))
+    print("\n── _parse_env_vars: invalid keys raise ──")
+    try:
+        _parse_env_vars('{"GOOD":"yes","123bad":"no","also-bad":"no","_ok":"yes"}')
+        R.check("invalid keys raise ValueError", False, "no exception raised")
+    except ValueError as e:
+        R.check("invalid keys raise ValueError", True)
+        R.check("error mentions bad key", "123bad" in str(e) or "also-bad" in str(e), str(e))
 
-    print("\n── _parse_env_vars: non-string values skipped ──")
-    pairs = _parse_env_vars('{"A":"ok","B":123,"C":true}')
-    R.check("only string values kept", len(pairs) == 1 and pairs[0] == ("A", "ok"), str(pairs))
+    print("\n── _parse_env_vars: non-string values raise ──")
+    try:
+        _parse_env_vars('{"A":"ok","B":123,"C":true}')
+        R.check("non-string values raise ValueError", False, "no exception raised")
+    except ValueError as e:
+        R.check("non-string values raise ValueError", True)
+        R.check("error mentions bad key", "'B'" in str(e) or "'C'" in str(e), str(e))
 
-    print("\n── _parse_env_vars: invalid JSON returns [] ──")
-    R.check("garbage returns []", _parse_env_vars("not json") == [], "")
-    R.check("array returns []", _parse_env_vars('["a","b"]') == [], "")
+    print("\n── _parse_env_vars: invalid JSON raises ──")
+    try:
+        _parse_env_vars("not json")
+        R.check("garbage raises ValueError", False, "no exception raised")
+    except ValueError as e:
+        R.check("garbage raises ValueError", True)
+        R.check("garbage error mentions JSON", "JSON" in str(e), str(e))
+
+    try:
+        _parse_env_vars('["a","b"]')
+        R.check("array raises ValueError", False, "no exception raised")
+    except ValueError as e:
+        R.check("array raises ValueError", True)
+        R.check("array error mentions object", "object" in str(e), str(e))
 
 
 async def test_unit_classify_file(R: Results):

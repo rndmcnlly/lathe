@@ -60,8 +60,9 @@ def _parse_env_vars(env_vars: str) -> list[tuple[str, str]]:
 
     Expects a JSON object mapping string keys to string values,
     e.g. '{"MY_TOKEN":"abc123","FOO":"bar"}'.
-    Keys must match [A-Za-z_][A-Za-z0-9_]*; invalid keys are skipped.
-    Returns [] on empty input or parse error.
+    Keys must match [A-Za-z_][A-Za-z0-9_]*; invalid keys are skipped with a warning.
+    Returns [] on empty input (not an error).
+    Raises ValueError on malformed input so the caller can surface it to the agent.
     """
     import re
     s = env_vars.strip()
@@ -69,17 +70,32 @@ def _parse_env_vars(env_vars: str) -> list[tuple[str, str]]:
         return []
     try:
         mapping = json.loads(s)
-    except (json.JSONDecodeError, ValueError):
-        return []
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise ValueError(
+            f"UserValves env_vars is not valid JSON: {exc}. "
+            f"Fix the env_vars field in your tool settings (it should look like "
+            f'{{\"MY_TOKEN\":\"abc123\"}}) and retry.'
+        ) from exc
     if not isinstance(mapping, dict):
-        return []
+        raise ValueError(
+            f"UserValves env_vars must be a JSON object, got {type(mapping).__name__}. "
+            f'Expected something like {{\"MY_TOKEN\":\"abc123\"}}.'
+        )
     pairs: list[tuple[str, str]] = []
+    skipped: list[str] = []
     for key, value in mapping.items():
         if not isinstance(key, str) or not isinstance(value, str):
+            skipped.append(repr(key))
             continue
         if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key):
+            skipped.append(repr(key))
             continue
         pairs.append((key, value))
+    if skipped:
+        raise ValueError(
+            f"UserValves env_vars contains invalid keys or non-string values: "
+            f"{', '.join(skipped)}. Keys must match [A-Za-z_][A-Za-z0-9_]*."
+        )
     return pairs
 
 
@@ -863,6 +879,7 @@ class Tools:
             # splitting — the command reaches bash with zero transformations.
 
             # Collect user-supplied env vars from UserValves (never logged).
+            # Raises ValueError (caught below) if env_vars is malformed.
             user_valves = __user__.get("valves")
             user_env_lines = ""
             if user_valves:
