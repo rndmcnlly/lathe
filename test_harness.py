@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Test harness for daytona_sandbox.py toolkit.
-Exercises all six tools against the live Daytona API.
+Test harness for lathe.py toolkit.
+Exercises all seven tools against the live sandbox provider API.
 
 Usage:
     uv run --script test_harness.py
@@ -21,7 +21,7 @@ load_dotenv()
 
 # Import the toolkit
 sys.path.insert(0, os.path.dirname(__file__))
-from daytona_sandbox import Tools
+from lathe import Tools
 
 API_KEY = os.environ.get("DAYTONA_API_KEY")
 if not API_KEY:
@@ -431,7 +431,7 @@ async def run_tests():
     check("non-UTF8 has Save button", "saveFile" in dat_body, "small binary should be downloadable")
 
     # ── Test 10: _classify_file unit tests ───────────────────────
-    from daytona_sandbox import _classify_file
+    from lathe import _classify_file
 
     print("\n── _classify_file: image extensions ──")
     for ext in ["png", "jpg", "jpeg", "gif", "svg", "webp", "bmp", "ico", "avif"]:
@@ -455,7 +455,7 @@ async def run_tests():
     check(".exe classified by extension", _classify_file("file.exe", b"hello\x00world") == "binary", "")
 
     # ── Test 11: _render_image_html unit tests ───────────────────
-    from daytona_sandbox import _render_image_html, _render_binary_html
+    from lathe import _render_image_html, _render_binary_html
 
     print("\n── _render_image_html: structure ──")
     img_html = _render_image_html(b"\x89PNG fake", "photo.png", "dir/photo.png")
@@ -477,7 +477,7 @@ async def run_tests():
     check("binary html has resize observer", "ResizeObserver" in bin_html, "")
 
     print("\n── _render_binary_html: large file (over 10MB) ──")
-    from daytona_sandbox import _EMBED_SIZE_CAP
+    from lathe import _EMBED_SIZE_CAP
     # Don't actually allocate 10MB — just mock by testing the threshold logic
     # We'll create a bytes object just over the cap
     fake_large = b"\x00" * (_EMBED_SIZE_CAP + 1)
@@ -498,7 +498,7 @@ async def run_tests():
     check("2MB shows as MB", "MB" in html_1mb, "")
 
     # ── Test 13: _highlight_code helper ──────────────────────────
-    from daytona_sandbox import _highlight_code
+    from lathe import _highlight_code
     import html as html_mod
 
     print("\n── _highlight_code: Python ──")
@@ -516,7 +516,7 @@ async def run_tests():
     check("no-ext file produces output", "raw content" in hl_none or "content" in hl_none, hl_none[:100])
 
     # ── Test 14: _truncate_tail unit tests ──────────────────────────
-    from daytona_sandbox import _truncate_tail, _MAX_LINES, _MAX_BYTES
+    from lathe import _truncate_tail, _MAX_LINES, _MAX_BYTES
 
     print("\n── _truncate_tail: no truncation needed ──")
     short = "line 1\nline 2\nline 3"
@@ -591,7 +591,7 @@ async def run_tests():
 
     # Stop the sandbox to conserve resources
     import httpx
-    from daytona_sandbox import _headers
+    from lathe import _headers
     async with httpx.AsyncClient(timeout=30.0) as client:
         sandboxes_resp = await client.get(
             f"{tools.valves.daytona_api_url}/sandbox",

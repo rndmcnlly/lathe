@@ -1,11 +1,11 @@
 """
-title: Daytona Sandbox
+title: Lathe
 author: Adam Smith
 author_url: https://adamsmith.as
-description: Coding agent tools (bash, read, write, edit) backed by per-user Daytona sandboxes with transparent lifecycle management.
+description: Coding agent tools (bash, read, write, edit, attach, ingest, onboard) backed by per-user sandbox VMs with transparent lifecycle management.
 required_open_webui_version: 0.4.0
 requirements: httpx
-version: 0.3.0
+version: 0.4.0
 licence: MIT
 """
 

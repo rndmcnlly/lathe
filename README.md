@@ -1,18 +1,18 @@
-# daytona-owui-agent-harness
+# Lathe
 
-An Open WebUI toolkit that gives any OWUI-compatible model a coding agent's tool surface — `bash`, `read`, `write`, `edit`, `attach`, `ingest`, `onboard` — executing against per-user [Daytona](https://daytona.io/) sandboxes with transparent lifecycle management.
+An Open WebUI toolkit that gives any OWUI-compatible model a coding agent's tool surface — `bash`, `read`, `write`, `edit`, `attach`, `ingest`, `onboard` — executing against per-user sandbox VMs with transparent lifecycle management.
 
 ## Design
 
 ### Core idea
 
-The model calls tools that look like a local coding agent (inspired by [Pi](https://github.com/badlogic/pi-mono/tree/main/packages/coding-agent) by Mario Zechner, aka [shittycodingagent.ai](https://shittycodingagent.ai)). Under the hood, every call executes against a Daytona sandbox VM. The sandbox lifecycle is fully hidden from the model: the first tool call lazily creates, unarchives, or restarts the sandbox as needed. Nothing about the VM is scoped to the chat session — files persist across conversations for the same user.
+The model calls tools that look like a local coding agent (inspired by [Pi](https://github.com/badlogic/pi-mono/tree/main/packages/coding-agent) by Mario Zechner, aka [shittycodingagent.ai](https://shittycodingagent.ai)). Under the hood, every call executes against a sandbox VM. The sandbox lifecycle is fully hidden from the model: the first tool call lazily creates, unarchives, or restarts the sandbox as needed. Nothing about the VM is scoped to the chat session — files persist across conversations for the same user.
 
 ### Sandbox identity
 
 - **One sandbox per OWUI user**, identified by email address.
 - **Label**: `{deployment_label}:{email}` (e.g. `chat.example.com:user@example.com`) for API lookup via `GET /sandbox?label=...`.
-- **Name**: `{deployment_label}/{email}` for human readability on the Daytona dashboard.
+- **Name**: `{deployment_label}/{email}` for human readability on the provider dashboard.
 - Sandboxes are never deleted (`autoDeleteInterval: -1`). They stop after idle (default 15 min) and archive after stop (default 60 min).
 
 ### Lifecycle: `_ensure_sandbox()`
@@ -45,7 +45,7 @@ After the control plane reports `state=started`, a readiness probe (`echo ready`
 
 ### Key implementation details
 
-- **Command execution**: Daytona's `/process/execute` does argv splitting, not shell invocation. To avoid quoting/escaping issues, the `bash` tool writes the command verbatim to a temp script (`/tmp/_cmd.sh`) and executes `bash /tmp/_cmd.sh`. The model's command reaches bash with zero transformations.
+- **Command execution**: The sandbox provider's `/process/execute` does argv splitting, not shell invocation. To avoid quoting/escaping issues, the `bash` tool writes the command verbatim to a temp script (`/tmp/_cmd.sh`) and executes `bash /tmp/_cmd.sh`. The model's command reaches bash with zero transformations.
 - **Output truncation**: Inspired by [Pi](https://github.com/badlogic/pi-mono/tree/main/packages/coding-agent)'s bash tool design. Output is truncated to the **last** 2000 lines or 50 KB (whichever limit is hit first), keeping the tail where errors and final results live. If truncated, the full output is uploaded to a temp file in the sandbox (`/tmp/_bash_output_{hash}.log`) and the model sees a notice like `[Showing lines 1842-2000 of 5400. Full output: /tmp/_bash_output_abc12345.log]`. The model can then use `read()` or `bash("head -n 100 /tmp/...")` to inspect earlier parts without re-running the command. This prevents verbose commands like `pip install` or `find /` from flooding the context window.
 - **Error handling**: Scripts run with `set -e -o pipefail` so failures abort immediately and pipe errors propagate. Models can override with `|| true` when intentional.
 - **Non-interactive environment**: Every bash command runs with `DEBIAN_FRONTEND=noninteractive GIT_TERMINAL_PROMPT=0 PIP_NO_INPUT=1 NPM_CONFIG_YES=true CI=true` exported to prevent blocking on interactive prompts.
@@ -86,7 +86,7 @@ This uses OWUI's [Rich UI Embedding](https://docs.openwebui.com/features/extensi
 
 ### Ingest
 
-The `ingest` tool is the inverse of `attach`: instead of pushing a file from the sandbox to the user, it pulls a file from the user's local machine into the sandbox. The file bytes never enter the model's context window. They transit through OWUI's file storage for a few seconds (as a relay) before being pushed to the Daytona sandbox and deleted from OWUI.
+The `ingest` tool is the inverse of `attach`: instead of pushing a file from the sandbox to the user, it pulls a file from the user's local machine into the sandbox. The file bytes never enter the model's context window. They transit through OWUI's file storage for a few seconds (as a relay) before being pushed to the sandbox and deleted from OWUI.
 
 When the model calls `ingest(prompt)`, the tool:
 
@@ -94,7 +94,7 @@ When the model calls `ingest(prompt)`, the tool:
 2. Injects JavaScript via `__event_call__` that renders a Catppuccin Mocha-themed file picker modal with a progress bar
 3. The user picks a local file via `<input type="file">` (works in all browsers, no File System Access API dependency)
 4. JavaScript uploads the file to OWUI's Files API (`POST /api/v1/files/`) using XHR (for upload progress), then returns just the file ID through `__event_call__`
-5. Python reads the file from OWUI's storage layer (direct in-process import, no HTTP self-call), uploads to Daytona at `/home/daytona/workspace/{filename}`, and deletes the transient file from OWUI
+5. Python reads the file from OWUI's storage layer (direct in-process import, no HTTP self-call), uploads to the sandbox at `/home/daytona/workspace/{filename}`, and deletes the transient file from OWUI
 
 **Why the OWUI relay?** OWUI's `__event_call__` bridge has a message size limit that prevents returning large payloads (like base64-encoded files) from JavaScript to Python. The workaround routes the bytes through a normal HTTP upload to OWUI's Files API (which has no such limit), then reads them from disk in-process. The file is deleted immediately after transfer.
 
@@ -113,7 +113,7 @@ When the model calls `ingest(prompt)`, the tool:
 
 | Valve | Default | Purpose |
 |-------|---------|---------|
-| `daytona_api_key` | (empty, password field) | Daytona API key |
+| `daytona_api_key` | (empty, password field) | Sandbox provider API key |
 | `daytona_api_url` | `https://app.daytona.io/api` | Control plane URL |
 | `daytona_proxy_url` | `https://proxy.app.daytona.io/toolbox` | Toolbox proxy URL |
 | `deployment_label` | (empty, must configure) | Label key for sandbox tagging (e.g. `chat.example.com`) |
@@ -121,23 +121,23 @@ When the model calls `ingest(prompt)`, the tool:
 | `auto_archive_minutes` | `60` | Minutes after stop before archive |
 | `sandbox_language` | `python` | Default runtime |
 
-### Daytona API surface used
+### Sandbox provider API surface used
 
 - **Control plane** (`app.daytona.io/api`): `GET /sandbox`, `POST /sandbox`, `POST /sandbox/{id}/start`, `POST /sandbox/{id}/stop`, `POST /sandbox/{id}/recover`
 - **Toolbox** (`proxy.app.daytona.io/toolbox/{id}`): `POST /process/execute`, `GET /files/download`, `POST /files/upload`
 
 ## Files
 
-- `daytona_sandbox.py` — The OWUI toolkit (single file, deployed via OWUI admin API)
-- `test_harness.py` — Integration test suite against live Daytona API (`uv run --script test_harness.py`)
+- `lathe.py` — The OWUI toolkit (single file, deployed via OWUI admin API)
+- `test_harness.py` — Integration test suite against live sandbox provider API (`uv run --script test_harness.py`)
 
 ## Deployment
 
-Deploy as tool ID `daytona_sandbox` on any Open WebUI instance:
+Deploy as tool ID `lathe` on any Open WebUI instance:
 
 ```python
-# Read source, POST to /api/v1/tools/id/daytona_sandbox/update
-# Then POST valves to /api/v1/tools/id/daytona_sandbox/valves/update
+# Read source, POST to /api/v1/tools/id/lathe/update
+# Then POST valves to /api/v1/tools/id/lathe/valves/update
 ```
 
 ## Testing
