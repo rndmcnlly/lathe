@@ -1361,7 +1361,7 @@ return await new Promise((resolve) => {{
     card.style.cssText =
         "background:#1e1e2e;border-radius:12px;padding:32px 40px;" +
         "text-align:center;box-shadow:0 8px 32px rgba(0,0,0,0.5);" +
-        "font-family:system-ui,sans-serif;color:#cdd6f4;max-width:420px";
+        "font-family:system-ui,sans-serif;color:#cdd6f4;max-width:480px";
 
     const title = document.createElement("h3");
     title.textContent = "Upload File to Sandbox";
@@ -1393,21 +1393,22 @@ return await new Promise((resolve) => {{
     chooseBtn.textContent = "Choose File\\u2026";
     chooseBtn.style.cssText =
         "padding:10px 28px;font-size:15px;border:none;border-radius:8px;" +
-        "background:#89b4fa;color:#1e1e2e;cursor:pointer;font-weight:600";
+        "background:#89b4fa;color:#1e1e2e;cursor:pointer;font-weight:600;" +
+        "white-space:nowrap";
 
     const uploadBtn = document.createElement("button");
     uploadBtn.textContent = "Upload";
     uploadBtn.style.cssText =
         "padding:10px 28px;font-size:15px;border:none;border-radius:8px;" +
         "background:#a6e3a1;color:#1e1e2e;cursor:pointer;font-weight:600;" +
-        "margin-left:12px;display:none";
+        "white-space:nowrap;display:none";
 
     const cancel = document.createElement("button");
     cancel.textContent = "Cancel";
     cancel.style.cssText =
         "padding:10px 28px;font-size:14px;border:1px solid #585b70;" +
         "border-radius:8px;background:transparent;color:#a6adc8;" +
-        "cursor:pointer;margin-left:12px";
+        "cursor:pointer;white-space:nowrap";
 
     let selectedFile = null;
 
@@ -1417,20 +1418,54 @@ return await new Promise((resolve) => {{
         return (n / 1024 / 1024).toFixed(1) + " MB";
     }}
 
-    input.onchange = () => {{
-        if (input.files && input.files.length > 0) {{
-            selectedFile = input.files[0];
-            if (selectedFile.size > maxBytes) {{
-                fileInfo.textContent = selectedFile.name + " (" + humanSize(selectedFile.size) + ") \\u2014 too large (max 25 MB)";
-                fileInfo.style.color = "#f38ba8";
-                uploadBtn.style.display = "none";
-            }} else {{
-                fileInfo.textContent = selectedFile.name + " (" + humanSize(selectedFile.size) + ")";
-                fileInfo.style.color = "#a6e3a1";
-                uploadBtn.style.display = "inline-block";
-            }}
+    function selectFile(file) {{
+        selectedFile = file;
+        if (selectedFile.size > maxBytes) {{
+            fileInfo.textContent = selectedFile.name + " (" + humanSize(selectedFile.size) + ") \\u2014 too large (max 25 MB)";
+            fileInfo.style.color = "#f38ba8";
+            uploadBtn.style.display = "none";
+        }} else {{
+            fileInfo.textContent = selectedFile.name + " (" + humanSize(selectedFile.size) + ")";
+            fileInfo.style.color = "#a6e3a1";
+            uploadBtn.style.display = "inline-block";
         }}
+    }}
+
+    input.onchange = () => {{
+        if (input.files && input.files.length > 0) selectFile(input.files[0]);
     }};
+
+    // Drag-and-drop: make the whole card a drop target
+    let dragCounter = 0;
+    const defaultBorder = "none";
+    const activeBorder = "2px dashed #89b4fa";
+    card.style.border = defaultBorder;
+    card.addEventListener("dragenter", (e) => {{
+        e.preventDefault();
+        dragCounter++;
+        card.style.border = activeBorder;
+    }});
+    card.addEventListener("dragleave", (e) => {{
+        e.preventDefault();
+        dragCounter--;
+        if (dragCounter <= 0) {{ dragCounter = 0; card.style.border = defaultBorder; }}
+    }});
+    card.addEventListener("dragover", (e) => {{
+        e.preventDefault();
+        e.dataTransfer.dropEffect = "copy";
+    }});
+    card.addEventListener("drop", (e) => {{
+        e.preventDefault();
+        dragCounter = 0;
+        card.style.border = defaultBorder;
+        if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {{
+            selectFile(e.dataTransfer.files[0]);
+        }}
+    }});
+
+    const dropHint = document.createElement("p");
+    dropHint.textContent = "or drop a file onto this dialog";
+    dropHint.style.cssText = "margin:14px 0 0;font-size:12px;color:#585b70;font-style:italic";
 
     chooseBtn.onclick = () => input.click();
 
@@ -1439,6 +1474,7 @@ return await new Promise((resolve) => {{
         uploadBtn.style.display = "none";
         chooseBtn.style.display = "none";
         cancel.style.display = "none";
+        dropHint.style.display = "none";
         progressWrap.style.display = "block";
         fileInfo.textContent = "Uploading\\u2026 0%";
         fileInfo.style.color = "#89b4fa";
@@ -1501,16 +1537,18 @@ return await new Promise((resolve) => {{
     }};
 
     const btnRow = document.createElement("div");
-    btnRow.style.cssText = "display:flex;align-items:center;justify-content:center";
+    btnRow.style.cssText = "display:flex;align-items:center;justify-content:center;gap:12px";
     btnRow.appendChild(chooseBtn);
     btnRow.appendChild(uploadBtn);
     btnRow.appendChild(cancel);
+
     card.appendChild(title);
     card.appendChild(desc);
     card.appendChild(fileInfo);
     card.appendChild(progressWrap);
     card.appendChild(input);
     card.appendChild(btnRow);
+    card.appendChild(dropHint);
     container.appendChild(card);
     document.body.appendChild(container);
 }});
