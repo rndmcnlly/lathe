@@ -15,6 +15,7 @@ import hashlib
 import html as html_mod
 import io
 import json
+import textwrap
 import time
 
 import httpx
@@ -48,6 +49,21 @@ async def _emit(emitter, description: str, done: bool = False):
                 "data": {"description": description, "done": done},
             }
         )
+
+
+async def _tool_guard(emitter, coro):
+    """Run *coro*, catch standard tool exceptions, and return an error string."""
+    try:
+        return await coro
+    except RuntimeError as e:
+        await _emit(emitter, f"Error: {e}", done=True)
+        return f"Error: {e}"
+    except httpx.HTTPStatusError as e:
+        await _emit(emitter, f"API error: HTTP {e.response.status_code}", done=True)
+        return f"API error: HTTP {e.response.status_code} — {e.response.text[:500]}"
+    except Exception as e:
+        await _emit(emitter, f"Error: {e}", done=True)
+        return f"Error: {e}"
 
 
 def _shell_quote(s: str) -> str:
@@ -192,6 +208,48 @@ def _highlight_code(code: str, path: str) -> str:
         return html_mod.escape(code)
 
 
+# ── shared HTML/CSS/JS constants ─────────────────────────────────────
+
+_BASE_CSS = """\
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: 'SF Mono', 'Cascadia Code', 'Fira Code', Consolas, monospace;
+    font-size: 13px;
+    background: #1e1e2e;
+    color: #cdd6f4;
+  }
+  .header {
+    background: #313244;
+    padding: 8px 12px;
+    font-size: 12px;
+    color: #a6adc8;
+    border-bottom: 1px solid #45475a;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .header .filename { color: #89b4fa; font-weight: 600; }
+  .header .meta { color: #585b70; margin-left: auto; }
+  .header .actions { display: flex; gap: 4px; }
+  .header button {
+    background: transparent;
+    border: 1px solid #45475a;
+    color: #a6adc8;
+    border-radius: 4px;
+    padding: 2px 8px;
+    font-size: 11px;
+    cursor: pointer;
+    font-family: inherit;
+  }
+  .header button:hover { background: #45475a; color: #cdd6f4; }"""
+
+_REPORT_HEIGHT_JS = """\
+    function reportHeight() {
+      parent.postMessage({ type: 'iframe:height', height: document.documentElement.scrollHeight }, '*');
+    }
+    window.addEventListener('load', reportHeight);
+    new ResizeObserver(reportHeight).observe(document.body);"""
+
 # ── file classification for attach ───────────────────────────────────
 
 _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", ".bmp", ".ico", ".avif"}
@@ -243,37 +301,7 @@ def _render_image_html(raw: bytes, filename: str, path: str) -> str:
 <head>
 <meta charset="utf-8">
 <style>
-  * {{ margin: 0; padding: 0; box-sizing: border-box; }}
-  body {{
-    font-family: 'SF Mono', 'Cascadia Code', 'Fira Code', Consolas, monospace;
-    font-size: 13px;
-    background: #1e1e2e;
-    color: #cdd6f4;
-  }}
-  .header {{
-    background: #313244;
-    padding: 8px 12px;
-    font-size: 12px;
-    color: #a6adc8;
-    border-bottom: 1px solid #45475a;
-    display: flex;
-    align-items: center;
-    gap: 8px;
-  }}
-  .header .filename {{ color: #89b4fa; font-weight: 600; }}
-  .header .meta {{ color: #585b70; margin-left: auto; }}
-  .header .actions {{ display: flex; gap: 4px; }}
-  .header button {{
-    background: transparent;
-    border: 1px solid #45475a;
-    color: #a6adc8;
-    border-radius: 4px;
-    padding: 2px 8px;
-    font-size: 11px;
-    cursor: pointer;
-    font-family: inherit;
-  }}
-  .header button:hover {{ background: #45475a; color: #cdd6f4; }}
+{_BASE_CSS}
   .img-wrap {{
     padding: 16px;
     display: flex;
@@ -313,11 +341,7 @@ def _render_image_html(raw: bytes, filename: str, path: str) -> str:
       a.click();
       URL.revokeObjectURL(a.href);
     }}
-    function reportHeight() {{
-      parent.postMessage({{ type: 'iframe:height', height: document.documentElement.scrollHeight }}, '*');
-    }}
-    window.addEventListener('load', reportHeight);
-    new ResizeObserver(reportHeight).observe(document.body);
+{_REPORT_HEIGHT_JS}
   </script>
 </body>
 </html>"""
@@ -328,14 +352,6 @@ def _render_binary_html(raw: bytes, filename: str, path: str) -> str:
     ext = ("." + path.rsplit(".", 1)[-1]).lower() if "." in path.rsplit("/", 1)[-1] else ""
     n_bytes = len(raw)
     can_embed = n_bytes <= _EMBED_SIZE_CAP
-
-    def _human_size(n: int) -> str:
-        b = float(n)
-        for unit in ("B", "KB", "MB", "GB"):
-            if b < 1024:
-                return f"{b:,.0f} {unit}" if unit == "B" else f"{b:,.1f} {unit}"
-            b /= 1024
-        return f"{b:,.1f} TB"
 
     save_button = ""
     save_script = ""
@@ -429,11 +445,7 @@ def _render_binary_html(raw: bytes, filename: str, path: str) -> str:
   </div>
   <script>
     {save_script}
-    function reportHeight() {{
-      parent.postMessage({{ type: 'iframe:height', height: document.documentElement.scrollHeight }}, '*');
-    }}
-    window.addEventListener('load', reportHeight);
-    new ResizeObserver(reportHeight).observe(document.body);
+{_REPORT_HEIGHT_JS}
   </script>
 </body>
 </html>"""
@@ -743,55 +755,55 @@ class Tools:
         Fails if the path contains neither an AGENTS.md file nor a .agents/skills/ directory.
         :param path: Absolute path to the project root (e.g. /home/daytona/workspace/myproject).
         """
-        try:
+        async def _run():
             email = _get_email(__user__)
             sandbox_id = await _ensure_sandbox(self.valves, email, __event_emitter__)
 
             await _emit(__event_emitter__, "Loading project context...")
 
             p = path.rstrip("/")
-            script = (
-                'P=' + _shell_quote(p) + '\n'
-                'found=0\n'
-                'if [ -f "$P/AGENTS.md" ]; then\n'
-                '  echo "# AGENTS.md"\n'
-                '  echo ""\n'
-                '  cat "$P/AGENTS.md"\n'
-                '  found=1\n'
-                'fi\n'
-                'if [ -d "$P/.agents/skills" ]; then\n'
-                '  skills=""\n'
-                '  for d in "$P"/.agents/skills/*/SKILL.md; do\n'
-                '    [ -f "$d" ] || continue\n'
-                '    found=1\n'
-                '    dir_name=$(basename "$(dirname "$d")")\n'
-                '    fm_name="$dir_name"\n'
-                '    fm_desc=""\n'
-                '    in_fm=0\n'
-                '    while IFS= read -r line; do\n'
-                '      case "$in_fm" in\n'
-                '        0) [ "$line" = "---" ] && in_fm=1 ;;\n'
-                '        1) [ "$line" = "---" ] && break\n'
-                '           case "$line" in\n'
-                '             name:*) fm_name="${line#name:}"; fm_name="${fm_name# }" ;;\n'
-                '             description:*) fm_desc="${line#description:}"; fm_desc="${fm_desc# }" ;;\n'
-                '           esac ;;\n'
-                '      esac\n'
-                '    done < "$d"\n'
-                '    skills="${skills}- **${fm_name}**: ${fm_desc}\\n  \\`${d}\\`\\n"\n'
-                '  done\n'
-                '  if [ -n "$skills" ]; then\n'
-                '    [ -f "$P/AGENTS.md" ] && echo -e "\\n---\\n"\n'
-                '    echo "# Available Skills"\n'
-                '    echo ""\n'
-                '    echo "Load a skill'"'"'s full instructions with read(path) when the task matches its description."\n'
-                '    echo ""\n'
-                '    echo -e "$skills"\n'
-                '  fi\n'
-                'fi\n'
-                '[ "$found" -eq 0 ] && echo "ERROR_NO_CONTEXT" && exit 1\n'
-                'exit 0\n'
-            )
+            script = textwrap.dedent("""\
+                P=__PATH__
+                found=0
+                if [ -f "$P/AGENTS.md" ]; then
+                  echo "# AGENTS.md"
+                  echo ""
+                  cat "$P/AGENTS.md"
+                  found=1
+                fi
+                if [ -d "$P/.agents/skills" ]; then
+                  skills=""
+                  for d in "$P"/.agents/skills/*/SKILL.md; do
+                    [ -f "$d" ] || continue
+                    found=1
+                    dir_name=$(basename "$(dirname "$d")")
+                    fm_name="$dir_name"
+                    fm_desc=""
+                    in_fm=0
+                    while IFS= read -r line; do
+                      case "$in_fm" in
+                        0) [ "$line" = "---" ] && in_fm=1 ;;
+                        1) [ "$line" = "---" ] && break
+                           case "$line" in
+                             name:*) fm_name="${line#name:}"; fm_name="${fm_name# }" ;;
+                             description:*) fm_desc="${line#description:}"; fm_desc="${fm_desc# }" ;;
+                           esac ;;
+                      esac
+                    done < "$d"
+                    skills="${skills}- **${fm_name}**: ${fm_desc}\\n  \\`${d}\\`\\n"
+                  done
+                  if [ -n "$skills" ]; then
+                    [ -f "$P/AGENTS.md" ] && echo -e "\\n---\\n"
+                    echo "# Available Skills"
+                    echo ""
+                    echo "Load a skill's full instructions with read(path) when the task matches its description."
+                    echo ""
+                    echo -e "$skills"
+                  fi
+                fi
+                [ "$found" -eq 0 ] && echo "ERROR_NO_CONTEXT" && exit 1
+                exit 0
+            """).replace("__PATH__", _shell_quote(p))
 
             # Write script to temp file and execute it (avoids all quoting issues)
             script_tag = hashlib.sha1(
@@ -836,15 +848,7 @@ class Tools:
             await _emit(__event_emitter__, "Project context loaded", done=True)
             return result if result else "(empty project context)"
 
-        except RuntimeError as e:
-            await _emit(__event_emitter__, f"Error: {e}", done=True)
-            return f"Error: {e}"
-        except httpx.HTTPStatusError as e:
-            await _emit(__event_emitter__, f"API error: HTTP {e.response.status_code}", done=True)
-            return f"API error: HTTP {e.response.status_code} — {e.response.text[:500]}"
-        except Exception as e:
-            await _emit(__event_emitter__, f"Error: {e}", done=True)
-            return f"Error: {e}"
+        return await _tool_guard(__event_emitter__, _run())
 
     async def bash(
         self,
@@ -867,7 +871,7 @@ class Tools:
         :param command: The bash command to execute.
         :param workdir: Working directory for the command (default: /home/daytona/workspace).
         """
-        try:
+        async def _run():
             email = _get_email(__user__)
             sandbox_id = await _ensure_sandbox(self.valves, email, __event_emitter__)
 
@@ -988,15 +992,7 @@ class Tools:
 
             return output
 
-        except RuntimeError as e:
-            await _emit(__event_emitter__, f"Error: {e}", done=True)
-            return f"Error: {e}"
-        except httpx.HTTPStatusError as e:
-            await _emit(__event_emitter__, f"API error: HTTP {e.response.status_code}", done=True)
-            return f"API error: HTTP {e.response.status_code} — {e.response.text[:500]}"
-        except Exception as e:
-            await _emit(__event_emitter__, f"Error: {e}", done=True)
-            return f"Error: {e}"
+        return await _tool_guard(__event_emitter__, _run())
 
     async def read(
         self,
@@ -1013,7 +1009,7 @@ class Tools:
         :param offset: Line number to start from (1-indexed, default 1).
         :param limit: Maximum number of lines to return (default 2000).
         """
-        try:
+        async def _run():
             email = _get_email(__user__)
             sandbox_id = await _ensure_sandbox(self.valves, email, __event_emitter__)
 
@@ -1054,15 +1050,7 @@ class Tools:
                 header += f", showing lines {start_idx + 1}-{min(end_idx, total_lines)}"
             return f"{header}\n{numbered}"
 
-        except RuntimeError as e:
-            await _emit(__event_emitter__, f"Error: {e}", done=True)
-            return f"Error: {e}"
-        except httpx.HTTPStatusError as e:
-            await _emit(__event_emitter__, f"API error: HTTP {e.response.status_code}", done=True)
-            return f"API error: HTTP {e.response.status_code} — {e.response.text[:500]}"
-        except Exception as e:
-            await _emit(__event_emitter__, f"Error: {e}", done=True)
-            return f"Error: {e}"
+        return await _tool_guard(__event_emitter__, _run())
 
     async def write(
         self,
@@ -1077,7 +1065,7 @@ class Tools:
         :param path: Absolute path or relative to /home/daytona (e.g. workspace/main.py).
         :param content: The full file content to write.
         """
-        try:
+        async def _run():
             email = _get_email(__user__)
             sandbox_id = await _ensure_sandbox(self.valves, email, __event_emitter__)
 
@@ -1112,15 +1100,7 @@ class Tools:
             await _emit(__event_emitter__, "Write complete", done=True)
             return f"Wrote {n_bytes} bytes ({n_lines} lines) to {path}"
 
-        except RuntimeError as e:
-            await _emit(__event_emitter__, f"Error: {e}", done=True)
-            return f"Error: {e}"
-        except httpx.HTTPStatusError as e:
-            await _emit(__event_emitter__, f"API error: HTTP {e.response.status_code}", done=True)
-            return f"API error: HTTP {e.response.status_code} — {e.response.text[:500]}"
-        except Exception as e:
-            await _emit(__event_emitter__, f"Error: {e}", done=True)
-            return f"Error: {e}"
+        return await _tool_guard(__event_emitter__, _run())
 
     async def edit(
         self,
@@ -1139,7 +1119,7 @@ class Tools:
         :param new_string: The replacement text.
         :param replace_all: If true, replace all occurrences. If false (default), fail if multiple matches found.
         """
-        try:
+        async def _run():
             email = _get_email(__user__)
             sandbox_id = await _ensure_sandbox(self.valves, email, __event_emitter__)
 
@@ -1194,15 +1174,7 @@ class Tools:
             await _emit(__event_emitter__, "Edit complete", done=True)
             return f"Replaced {replaced} occurrence(s) in {path}"
 
-        except RuntimeError as e:
-            await _emit(__event_emitter__, f"Error: {e}", done=True)
-            return f"Error: {e}"
-        except httpx.HTTPStatusError as e:
-            await _emit(__event_emitter__, f"API error: HTTP {e.response.status_code}", done=True)
-            return f"API error: HTTP {e.response.status_code} — {e.response.text[:500]}"
-        except Exception as e:
-            await _emit(__event_emitter__, f"Error: {e}", done=True)
-            return f"Error: {e}"
+        return await _tool_guard(__event_emitter__, _run())
 
     async def attach(
         self,
@@ -1218,7 +1190,7 @@ class Tools:
         and binary files (download card with Save button for files under 10 MB).
         :param path: Absolute path or relative to /home/daytona (e.g. workspace/main.py).
         """
-        try:
+        async def _run():
             email = _get_email(__user__)
             sandbox_id = await _ensure_sandbox(self.valves, email, __event_emitter__)
 
@@ -1258,37 +1230,7 @@ class Tools:
 <head>
 <meta charset="utf-8">
 <style>
-  * {{ margin: 0; padding: 0; box-sizing: border-box; }}
-  body {{
-    font-family: 'SF Mono', 'Cascadia Code', 'Fira Code', Consolas, monospace;
-    font-size: 13px;
-    background: #1e1e2e;
-    color: #cdd6f4;
-  }}
-  .header {{
-    background: #313244;
-    padding: 8px 12px;
-    font-size: 12px;
-    color: #a6adc8;
-    border-bottom: 1px solid #45475a;
-    display: flex;
-    align-items: center;
-    gap: 8px;
-  }}
-  .header .filename {{ color: #89b4fa; font-weight: 600; }}
-  .header .meta {{ color: #585b70; margin-left: auto; }}
-  .header .actions {{ display: flex; gap: 4px; }}
-  .header button {{
-    background: transparent;
-    border: 1px solid #45475a;
-    color: #a6adc8;
-    border-radius: 4px;
-    padding: 2px 8px;
-    font-size: 11px;
-    cursor: pointer;
-    font-family: inherit;
-  }}
-  .header button:hover {{ background: #45475a; color: #cdd6f4; }}
+{_BASE_CSS}
   .header button.ok {{ color: #a6e3a1; border-color: #a6e3a1; }}
   .code-wrap {{
     display: flex;
@@ -1363,11 +1305,7 @@ class Tools:
       a.click();
       URL.revokeObjectURL(a.href);
     }}
-    function reportHeight() {{
-      parent.postMessage({{ type: 'iframe:height', height: document.documentElement.scrollHeight }}, '*');
-    }}
-    window.addEventListener('load', reportHeight);
-    new ResizeObserver(reportHeight).observe(document.body);
+{_REPORT_HEIGHT_JS}
   </script>
 </body>
 </html>"""
@@ -1375,15 +1313,7 @@ class Tools:
             await _emit(__event_emitter__, f"Attached {filename} ({n_bytes:,} bytes)", done=True)
             return HTMLResponse(content=html_content, headers={"Content-Disposition": "inline"})
 
-        except RuntimeError as e:
-            await _emit(__event_emitter__, f"Error: {e}", done=True)
-            return f"Error: {e}"
-        except httpx.HTTPStatusError as e:
-            await _emit(__event_emitter__, f"API error: HTTP {e.response.status_code}", done=True)
-            return f"API error: HTTP {e.response.status_code} — {e.response.text[:500]}"
-        except Exception as e:
-            await _emit(__event_emitter__, f"Error: {e}", done=True)
-            return f"Error: {e}"
+        return await _tool_guard(__event_emitter__, _run())
 
     async def ingest(
         self,
@@ -1399,7 +1329,7 @@ class Tools:
         need to inspect the file contents yourself.
         :param prompt: Optional message shown to the user explaining what file is needed, e.g. "Upload your CSV dataset".
         """
-        try:
+        async def _run():
             email = _get_email(__user__)
             sandbox_id = await _ensure_sandbox(self.valves, email, __event_emitter__)
 
@@ -1667,24 +1597,8 @@ return await new Promise((resolve) => {{
             except Exception:
                 pass  # cleanup failure is non-fatal
 
-            def _human_size(n: int) -> str:
-                b = float(n)
-                for unit in ("B", "KB", "MB"):
-                    if b < 1024:
-                        return f"{b:,.0f} {unit}" if unit == "B" else f"{b:,.1f} {unit}"
-                    b /= 1024
-                return f"{b:,.1f} GB"
-
             size_str = _human_size(file_size)
             await _emit(__event_emitter__, f"Uploaded {filename} ({size_str})", done=True)
             return f"Uploaded {filename} ({size_str}) to {dest_path}"
 
-        except RuntimeError as e:
-            await _emit(__event_emitter__, f"Error: {e}", done=True)
-            return f"Error: {e}"
-        except httpx.HTTPStatusError as e:
-            await _emit(__event_emitter__, f"API error: HTTP {e.response.status_code}", done=True)
-            return f"API error: HTTP {e.response.status_code} — {e.response.text[:500]}"
-        except Exception as e:
-            await _emit(__event_emitter__, f"Error: {e}", done=True)
-            return f"Error: {e}"
+        return await _tool_guard(__event_emitter__, _run())
