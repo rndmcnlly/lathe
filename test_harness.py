@@ -8,6 +8,16 @@ Usage:
     uv run --script test_harness.py unit           # unit tests only (no sandbox)
     uv run --script test_harness.py bash edit      # specific groups only
     uv run --script test_harness.py --list         # list available groups
+
+TODO: The tool docstrings are executable promptware — they are the interface
+contract between the toolkit and the model. A misleading docstring is a bug
+that no amount of integration testing catches, because these tests call the
+Python methods directly with correct arguments. What's needed is an eval
+harness where an agent that has *not* read the source code is given only the
+tool schemas (names, docstrings, param descriptions) and asked to accomplish
+tasks (e.g. "start a web server and give me a preview link"). Score on: does
+it background the server, does it pick the right port, does it avoid known
+pitfalls. This tests the docstrings as prompts, not the code as code.
 """
 # /// script
 # requires-python = ">=3.11"

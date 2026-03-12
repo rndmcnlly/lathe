@@ -862,6 +862,7 @@ class Tools:
         The sandbox and its filesystem persist across conversations for this user.
         Supports pipes, redirects, &&, ||, and all standard bash syntax.
         Commands must be non-interactive (no prompts for input). Use -y flags where needed.
+        For long-running servers, background them: nohup cmd > /tmp/out.log 2>&1 & echo $!
         Default working directory is /home/daytona/workspace.
         Output is truncated to the last 2000 lines or 50 KB (whichever limit is hit first).
         If truncated, the full output is saved to a file in /tmp/ and the path is shown.
@@ -1649,13 +1650,8 @@ return await new Promise((resolve) => {{
     ) -> str:
         """
         Generate a preview URL for a service running in the sandbox.
-        Returns a signed URL that the user can open directly in a new browser tab
-        (no extra headers needed). The URL is valid for about 1 hour.
-        IMPORTANT: The server must be started in the background first, or bash()
-        will block forever waiting for it to exit. Use this pattern:
-          nohup python3 -m http.server 3000 > /tmp/server.log 2>&1 & echo $!
-        Then call preview(3000). The echoed PID can be used later: kill <PID>
-        You know the app's routes — suggest relevant paths for the user to visit.
+        The server must already be running in the background (see bash docs).
+        Returns a signed URL the user can open in a new browser tab.
         :param port: The port the sandbox service is listening on (3000–9999). Defaults to 3000.
         """
         async def _run():
@@ -1684,7 +1680,10 @@ return await new Promise((resolve) => {{
             return (
                 f"Preview URL (valid ~1 hour): {url}\n\n"
                 f"The user can open this in a new browser tab. "
-                f"They may see a Daytona security warning on first visit — they can click through it."
+                f"They may see a Daytona security warning on first visit — they can click through it.\n\n"
+                f"Note: the sandbox auto-stops after ~15 min of inactivity regardless of "
+                f"running background processes, killing the server. If the user reports "
+                f"the preview stopped working, restart the server and call preview() again."
             )
 
         return await _tool_guard(__event_emitter__, _run())
