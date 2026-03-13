@@ -17,6 +17,7 @@ import io
 import json
 import textwrap
 import time
+import urllib.parse
 
 import httpx
 from fastapi.responses import HTMLResponse
@@ -451,6 +452,71 @@ def _render_binary_html(raw: bytes, filename: str, path: str) -> str:
 </html>"""
 
 
+VOLUME_MOUNT_PATH = "/home/daytona/volume"
+
+
+async def _ensure_volume(valves, volume_name: str, client: httpx.AsyncClient) -> str:
+    """Get or create a Daytona volume by name. Polls until ready. Returns the volume ID."""
+    encoded_name = urllib.parse.quote(volume_name, safe="")
+    get_url = _api(valves, f"/volumes/by-name/{encoded_name}")
+
+    # Try to fetch existing volume (treat deleting volumes as absent)
+    resp = await client.get(get_url, headers=_headers(valves))
+    need_create = (
+        resp.status_code != 200
+        or resp.json().get("state") in ("pending_delete", "deleting")
+    )
+    if need_create:
+        # Create the volume.  Retry loop handles the race where a
+        # recently-deleted volume name hasn't fully freed up yet.
+        for attempt in range(30):
+            resp = await client.post(
+                _api(valves, "/volumes"),
+                headers=_headers(valves),
+                json={"name": volume_name},
+            )
+            if resp.status_code == 400 and "already exists" in resp.text:
+                # Deletion still propagating — wait and retry.
+                await asyncio.sleep(2)
+                resp = await client.get(get_url, headers=_headers(valves))
+                if resp.status_code == 200:
+                    state = resp.json().get("state")
+                    if state not in ("pending_delete", "deleting"):
+                        break
+                continue
+            resp.raise_for_status()
+            break
+        else:
+            raise RuntimeError(
+                f"Could not create volume '{volume_name}' — "
+                f"name still reserved by a deleting volume after 60s of retries"
+            )
+
+    vol = resp.json()
+    vol_id = vol["id"]
+
+    # Poll until the volume is ready (creation involves S3 provisioning).
+    # Tolerate transient 404s — the by-name index may lag behind creation.
+    if vol.get("state") == "ready":
+        return vol_id
+
+    deadline = time.time() + 60
+    poll_interval = 1.0
+    while time.time() < deadline:
+        await asyncio.sleep(poll_interval)
+        resp = await client.get(get_url, headers=_headers(valves))
+        if resp.status_code == 404:
+            poll_interval = min(poll_interval * 1.2, 5.0)
+            continue
+        resp.raise_for_status()
+        vol = resp.json()
+        if vol.get("state") == "ready":
+            return vol_id
+        poll_interval = min(poll_interval * 1.2, 5.0)
+
+    raise RuntimeError(f"Volume '{volume_name}' did not reach ready state within 60s (state: {vol.get('state')})")
+
+
 async def _wait_for_toolbox(valves, sandbox_id: str, emitter=None):
     """Poll the toolbox API until it responds, then ensure workspace dir exists."""
     async with httpx.AsyncClient(timeout=10.0) as client:
@@ -519,7 +585,11 @@ async def _ensure_sandbox(valves, email: str, emitter=None) -> str:
         sandbox = matches[0] if matches else None
 
         if sandbox is None:
-            # 2. Create new sandbox
+            # 2. Get or create a persistent volume for this user
+            volume_name = f"{label_key}/{email}"
+            volume_id = await _ensure_volume(valves, volume_name, client)
+
+            # 3. Create new sandbox with volume mounted
             await _emit(emitter, "Creating sandbox...")
             resp = await client.post(
                 _api(valves, "/sandbox"),
@@ -531,6 +601,12 @@ async def _ensure_sandbox(valves, email: str, emitter=None) -> str:
                     "autoStopInterval": valves.auto_stop_minutes,
                     "autoArchiveInterval": valves.auto_archive_minutes,
                     "autoDeleteInterval": -1,
+                    "volumes": [
+                        {
+                            "volumeId": volume_id,
+                            "mountPath": VOLUME_MOUNT_PATH,
+                        }
+                    ],
                 },
             )
             resp.raise_for_status()
@@ -656,6 +732,7 @@ class Tools:
     async def destroy(
         self,
         confirm: bool = False,
+        wipe_volume: bool = False,
         __user__: dict = {},
         __event_emitter__=None,
     ) -> str:
@@ -664,7 +741,11 @@ class Tools:
         A fresh sandbox will be created automatically on your next tool call.
         Only use this if your sandbox is in an unrecoverable state.
         You must set confirm=true to proceed. Without it, no action is taken.
+        By default, the user's persistent volume (/home/daytona/volume) is kept intact
+        and will be re-mounted on the next sandbox. Set wipe_volume=true to also
+        delete the volume for a completely clean slate.
         :param confirm: Must be set to true to confirm destruction. Defaults to false as a safety measure.
+        :param wipe_volume: Also delete the persistent volume. Defaults to false (volume survives).
         """
         if not confirm:
             return (
@@ -729,11 +810,41 @@ class Tools:
                     if not remaining:
                         break
 
+                # Optionally wipe the persistent volume
+                volume_msg = ""
+                if wipe_volume:
+                    volume_name = f"{label_key}/{email}"
+                    encoded_vol = urllib.parse.quote(volume_name, safe="")
+                    await _emit(__event_emitter__, "Deleting persistent volume...")
+                    try:
+                        resp = await client.get(
+                            _api(valves, f"/volumes/by-name/{encoded_vol}"),
+                            headers=_headers(valves),
+                        )
+                        if resp.status_code == 200:
+                            vol_id = resp.json()["id"]
+                            resp = await client.delete(
+                                _api(valves, f"/volumes/{vol_id}"),
+                                headers=_headers(valves),
+                            )
+                            resp.raise_for_status()
+                            volume_msg = " Persistent volume also deleted."
+                        else:
+                            volume_msg = " No persistent volume found to delete."
+                    except Exception as vol_exc:
+                        volume_msg = f" Warning: failed to delete volume: {vol_exc}"
+                else:
+                    volume_msg = (
+                        f" Your persistent files in {VOLUME_MOUNT_PATH} are intact"
+                        f" and will reappear in your next sandbox."
+                    )
+
                 await _emit(__event_emitter__, "Sandbox destroyed", done=True)
                 ids = ", ".join(d[:12] for d in deleted)
                 return (
-                    f"Destroyed {len(deleted)} sandbox(es) ({ids}). "
-                    f"A fresh sandbox will be created on the next tool call."
+                    f"Destroyed {len(deleted)} sandbox(es) ({ids})."
+                    f"{volume_msg}"
+                    f" A fresh sandbox will be created on the next tool call."
                 )
 
         except Exception as exc:
@@ -860,6 +971,7 @@ class Tools:
         """
         Execute a bash command in a persistent Linux sandbox.
         The sandbox and its filesystem persist across conversations for this user.
+        /home/daytona/volume is S3/FUSE-backed persistent storage that survives sandbox destruction.
         Supports pipes, redirects, &&, ||, and all standard bash syntax.
         Commands must be non-interactive (no prompts for input). Use -y flags where needed.
         For long-running servers, background them: nohup cmd > /tmp/out.log 2>&1 & echo $!

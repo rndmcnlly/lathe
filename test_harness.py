@@ -693,6 +693,29 @@ async def test_int_ensure_sandbox(R: Results, tools: Tools, user: dict):
         sandbox_id_3 = await _ensure_sandbox(tools.valves, TEST_EMAIL, emitter=mock_emitter)
         R.check("back to normal after dup cleanup", sandbox_id_3 == sandbox_id, f"{sandbox_id_3[:12]} != {sandbox_id[:12]}")
 
+        print("\n── _ensure_sandbox: volume is mounted ──")
+        from lathe import VOLUME_MOUNT_PATH, _toolbox
+        resp = await client.post(
+            _toolbox(tools.valves, sandbox_id, "/process/execute"),
+            headers=_headers(tools.valves),
+            json={"command": f"bash -c \"grep '{VOLUME_MOUNT_PATH}' /proc/mounts && echo MOUNTED\"", "timeout": 5000},
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        R.check("volume is mounted", data.get("exitCode") == 0 and "MOUNTED" in data.get("result", ""),
+                 f"exitCode={data.get('exitCode')}, result={data.get('result', '')[:200]}")
+
+        # Verify volume is writable
+        resp = await client.post(
+            _toolbox(tools.valves, sandbox_id, "/process/execute"),
+            headers=_headers(tools.valves),
+            json={"command": f"echo vol_test > {VOLUME_MOUNT_PATH}/_ensure_sandbox_test.txt && cat {VOLUME_MOUNT_PATH}/_ensure_sandbox_test.txt", "timeout": 5000},
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        R.check("volume is writable", data.get("exitCode") == 0 and "vol_test" in data.get("result", ""),
+                 f"exitCode={data.get('exitCode')}, result={data.get('result', '')[:200]}")
+
 
 async def test_int_ssh(R: Results, tools: Tools, user: dict):
 
@@ -753,6 +776,7 @@ async def test_int_preview(R: Results, tools: Tools, user: dict):
 
 
 async def test_int_destroy(R: Results, tools: Tools, user: dict):
+    from lathe import _headers, VOLUME_MOUNT_PATH
 
     print("\n── destroy: safety guard (confirm=false) ──")
     result = await tools.destroy(__user__=user, __event_emitter__=mock_emitter)
@@ -766,12 +790,19 @@ async def test_int_destroy(R: Results, tools: Tools, user: dict):
     result = await tools.bash("echo still_alive", __user__=user, __event_emitter__=mock_emitter)
     R.check("sandbox survives abort", "still_alive" in result, result[:200])
 
-    print("\n── destroy: wipes sandbox (confirm=true) ──")
+    print("\n── destroy: wipes sandbox but preserves volume ──")
+    # Write a marker file to the volume before destroying
+    result = await tools.bash(
+        f"echo destroy_test > {VOLUME_MOUNT_PATH}/destroy_test.txt",
+        __user__=user, __event_emitter__=mock_emitter,
+    )
+    R.check("write marker to volume", "Error" not in result, result[:200])
+
     result = await tools.destroy(confirm=True, __user__=user, __event_emitter__=mock_emitter)
     R.check("destroy reports success", "Destroyed" in result and "1 sandbox" in result, result[:200])
+    R.check("destroy mentions volume intact", "intact" in result.lower(), result[:200])
 
     import httpx, json as _json
-    from lathe import _headers
     async with httpx.AsyncClient(timeout=30.0) as client:
         resp = await client.get(
             f"{tools.valves.daytona_api_url}/sandbox",
@@ -784,7 +815,38 @@ async def test_int_destroy(R: Results, tools: Tools, user: dict):
         ]
         R.check("sandbox gone after destroy", len(remaining) == 0, f"got {len(remaining)}")
 
+    print("\n── destroy: volume data survives sandbox destruction ──")
+    # bash() creates a fresh sandbox (with volume re-mounted)
+    result = await tools.bash(
+        f"cat {VOLUME_MOUNT_PATH}/destroy_test.txt",
+        __user__=user, __event_emitter__=mock_emitter,
+    )
+    R.check("volume data survives destroy", "destroy_test" in result, result[:200])
+
+    print("\n── destroy: wipe_volume deletes volume and data ──")
+    # Write another marker to the volume
+    result = await tools.bash(
+        f"echo wipe_test > {VOLUME_MOUNT_PATH}/wipe_test.txt",
+        __user__=user, __event_emitter__=mock_emitter,
+    )
+    result = await tools.destroy(
+        confirm=True, wipe_volume=True,
+        __user__=user, __event_emitter__=mock_emitter,
+    )
+    R.check("wipe_volume destroy succeeds", "Destroyed" in result, result[:200])
+    R.check("wipe_volume mentions volume deleted", "volume also deleted" in result.lower(), result[:200])
+
+    # Next tool call should create a fresh volume + sandbox; old data should be gone
+    result = await tools.bash(
+        f"cat {VOLUME_MOUNT_PATH}/wipe_test.txt 2>&1 || true",
+        __user__=user, __event_emitter__=mock_emitter,
+    )
+    R.check("volume data gone after wipe", "No such file" in result, result[:200])
+
     print("\n── destroy: no sandbox to destroy ──")
+    result = await tools.destroy(confirm=True, __user__=user, __event_emitter__=mock_emitter)
+    # First destroy the sandbox that was just created
+    # Then try again with nothing left
     result = await tools.destroy(confirm=True, __user__=user, __event_emitter__=mock_emitter)
     R.check("destroy with nothing reports no sandbox", "No sandbox found" in result, result[:200])
 
@@ -793,7 +855,10 @@ async def test_int_destroy(R: Results, tools: Tools, user: dict):
     R.check("fresh sandbox works", "reborn" in result, result[:200])
 
     print("\n── final cleanup: destroy reborn sandbox ──")
-    result = await tools.destroy(confirm=True, __user__=user, __event_emitter__=mock_emitter)
+    result = await tools.destroy(
+        confirm=True, wipe_volume=True,
+        __user__=user, __event_emitter__=mock_emitter,
+    )
     R.check("final destroy succeeds", "Destroyed" in result, result[:200])
 
 
