@@ -542,7 +542,7 @@ def _render_binary_html(raw: bytes, filename: str, path: str) -> str:
       URL.revokeObjectURL(a.href);
     }}"""
     else:
-        save_button = '<span class="too-large">Too large to download from viewer</span>'
+        save_button = '<span class="too-large">Too large to embed &mdash; ask the agent to serve it via preview()</span>'
 
     return f"""<!DOCTYPE html>
 <html>
@@ -1469,6 +1469,8 @@ class Tools:
         to the model. Use read() if you need to see file contents yourself.
         Works with text files (syntax-highlighted), images (rendered inline),
         and binary files (download card with Save button for files under 10 MB).
+        For larger files (video, datasets, model weights), serve them with a
+        background HTTP server and use preview() to give the user a direct link.
         :param path: Absolute path or relative to /home/daytona (e.g. workspace/main.py).
         """
         async def _run():
@@ -1593,7 +1595,16 @@ class Tools:
 </body>
 </html>"""
 
-            await _emit(__event_emitter__, f"Attached {filename} ({n_bytes:,} bytes)", done=True)
+            if n_bytes > _EMBED_SIZE_CAP and file_type in ("binary", "media"):
+                await _emit(
+                    __event_emitter__,
+                    f"Attached {filename} ({n_bytes:,} bytes) — too large to embed; "
+                    "serve it with a background HTTP server and use preview() to give "
+                    "the user a direct download link",
+                    done=True,
+                )
+            else:
+                await _emit(__event_emitter__, f"Attached {filename} ({n_bytes:,} bytes)", done=True)
             return HTMLResponse(content=html_content, headers={"Content-Disposition": "inline"})
 
         return await _tool_guard(__event_emitter__, _run())
