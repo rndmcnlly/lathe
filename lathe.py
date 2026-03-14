@@ -269,8 +269,10 @@ _IMAGE_MIME = {
     ".gif": "image/gif", ".svg": "image/svg+xml", ".webp": "image/webp",
     ".bmp": "image/bmp", ".ico": "image/x-icon", ".avif": "image/avif",
 }
-# Max bytes to embed in HTML for binary download (10 MB)
-_EMBED_SIZE_CAP = 10 * 1024 * 1024
+# Max bytes to embed in HTML for binary download.  Binary and media files are
+# now always offloaded to OWUI file storage, so this cap only guards the
+# (unlikely) inline-fallback path when the upload fails.
+_EMBED_SIZE_CAP = 100 * 1024 * 1024
 
 
 def _sniff_media_mime(raw: bytes) -> str | None:
@@ -614,6 +616,244 @@ def _render_binary_html(raw: bytes, filename: str, path: str) -> str:
   </div>
   <script>
     {save_script}
+{_REPORT_HEIGHT_JS}
+  </script>
+</body>
+</html>"""
+
+
+def _upload_to_owui_storage(raw: bytes, filename: str, user_id: str, content_type: str = "application/octet-stream") -> str:
+    """Upload raw bytes to OWUI's file storage layer in-process.
+
+    Returns the OWUI file ID.  The file is owned by *user_id* so the user's
+    own JWT can read it back via ``GET /api/v1/files/{id}/content``.
+    """
+    import uuid as _uuid
+
+    from open_webui.models.files import FileForm, Files as OWUIFiles
+    from open_webui.storage.provider import Storage
+
+    file_id = str(_uuid.uuid4())
+    storage_filename = f"{file_id}_{filename}"
+
+    contents, file_path = Storage.upload_file(
+        io.BytesIO(raw),
+        storage_filename,
+        {
+            "OpenWebUI-User-Id": user_id,
+            "OpenWebUI-File-Id": file_id,
+        },
+    )
+
+    OWUIFiles.insert_new_file(
+        user_id,
+        FileForm(
+            id=file_id,
+            filename=filename,
+            path=file_path,
+            data={},
+            meta={
+                "name": filename,
+                "content_type": content_type,
+                "size": len(raw),
+                "data": {"source": "lathe-attach"},
+            },
+        ),
+    )
+    return file_id
+
+
+def _render_offloaded_html(
+    file_id: str,
+    filename: str,
+    file_type: str,
+    mime: str,
+    n_bytes: int,
+) -> str:
+    """Render a thin viewer shell (~2 KB) that fetches file content on-demand.
+
+    The iframe shares the parent origin when OWUI's sandbox policy includes
+    ``allow-same-origin``, so it can read the JWT from ``localStorage``.
+    Without that flag the fetch will 401 and the viewer shows a fallback.
+    """
+    esc_fname = html_mod.escape(filename)
+    ext = ("." + filename.rsplit(".", 1)[-1]).lower() if "." in filename else ""
+    ext_label = ext.lstrip(".").upper() or "BIN"
+    size_str = _human_size(n_bytes)
+    api_url = f"/api/v1/files/{file_id}/content"
+
+    # Build type-specific rendering JS (runs after the fetch resolves)
+    if file_type == "image":
+        render_js = f"""
+      var img = document.createElement('img');
+      img.alt = "{esc_fname}";
+      img.style.maxWidth = '100%';
+      img.style.height = 'auto';
+      img.style.borderRadius = '4px';
+      img.src = URL.createObjectURL(blob);
+      var wrap = document.getElementById('content');
+      wrap.style.padding = '16px';
+      wrap.style.display = 'flex';
+      wrap.style.justifyContent = 'center';
+      wrap.style.background = '#181825';
+      wrap.appendChild(img);"""
+    elif file_type == "media":
+        is_video = mime.startswith("video/")
+        tag = "video" if is_video else "audio"
+        extra_style = (
+            "el.style.maxWidth='100%';el.style.maxHeight='480px';el.style.borderRadius='4px';"
+            if is_video
+            else "el.style.width='100%';"
+        )
+        render_js = f"""
+      var el = document.createElement('{tag}');
+      el.controls = true;
+      el.preload = 'metadata';
+      {extra_style}
+      el.src = URL.createObjectURL(blob);
+      var wrap = document.getElementById('content');
+      wrap.style.padding = '16px';
+      wrap.style.display = 'flex';
+      wrap.style.justifyContent = 'center';
+      wrap.style.background = '#181825';
+      wrap.appendChild(el);"""
+    elif file_type == "text":
+        render_js = f"""
+      var text = await blob.text();
+      var pre = document.createElement('pre');
+      var code = document.createElement('code');
+      code.textContent = text;
+      code.style.display = 'block';
+      code.style.padding = '12px';
+      code.style.lineHeight = '1.45';
+      code.style.tabSize = '4';
+      code.style.whiteSpace = 'pre';
+      code.style.overflowX = 'auto';
+      pre.style.margin = '0';
+      pre.appendChild(code);
+      var wrap = document.getElementById('content');
+      wrap.appendChild(pre);
+      // Also enable Copy button
+      document.getElementById('copy-btn').style.display = 'inline-block';
+      window._textContent = text;"""
+    else:
+        # binary — just show the download card, no inline render
+        render_js = f"""
+      var wrap = document.getElementById('content');
+      var card = document.createElement('div');
+      card.style.padding = '20px 16px';
+      card.style.display = 'flex';
+      card.style.alignItems = 'center';
+      card.style.gap = '16px';
+      card.innerHTML = '<div style="font-size:32px;flex-shrink:0;width:48px;height:48px;background:#45475a;border-radius:8px;display:flex;align-items:center;justify-content:center;">&#128230;</div>'
+        + '<div style="flex:1;"><div style="color:#89b4fa;font-weight:600;font-size:14px;">{esc_fname}</div>'
+        + '<div style="color:#585b70;font-size:12px;margin-top:4px;">{size_str} &middot; {ext_label} file</div></div>';
+      wrap.appendChild(card);"""
+
+    copy_button = '<button id="copy-btn" style="display:none;" onclick="copyFile()">Copy</button>' if file_type == "text" else ""
+
+    return f"""<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+{_BASE_CSS}
+  #status {{
+    padding: 16px;
+    color: #a6adc8;
+    font-size: 12px;
+  }}
+  #status.error {{
+    color: #f38ba8;
+  }}
+</style>
+</head>
+<body>
+  <div class="header">
+    <span class="filename">{esc_fname}</span>
+    <span class="meta">{size_str}</span>
+    <span class="actions">
+      {copy_button}
+      <button id="save-btn" onclick="saveFile()" disabled>Save</button>
+    </span>
+  </div>
+  <div id="content"></div>
+  <div id="status">Loading\u2026</div>
+  <script>
+    var _blob = null;
+    var _fname = "{esc_fname}";
+
+    (async function() {{
+      var status = document.getElementById('status');
+      var token;
+      try {{
+        token = localStorage.getItem('token');
+      }} catch(e) {{
+        // allow-same-origin not set — localStorage is inaccessible
+        status.className = 'error';
+        status.textContent = 'Cannot load file: iframe sandbox is missing allow-same-origin. '
+          + 'Enable it in Settings \\u2192 Interface \\u2192 \"Allow iframes to access parent context\", then reload.';
+        reportHeight();
+        return;
+      }}
+      if (!token) {{
+        status.className = 'error';
+        status.textContent = 'No auth token found in localStorage.';
+        reportHeight();
+        return;
+      }}
+
+      try {{
+        var resp = await fetch("{api_url}", {{
+          headers: {{ "Authorization": "Bearer " + token }}
+        }});
+        if (!resp.ok) {{
+          throw new Error('HTTP ' + resp.status + ': ' + (await resp.text()));
+        }}
+        var blob = await resp.blob();
+        _blob = blob;
+
+        {render_js}
+
+        document.getElementById('save-btn').disabled = false;
+        status.style.display = 'none';
+      }} catch(e) {{
+        status.className = 'error';
+        status.textContent = 'Failed to load file: ' + e.message;
+      }}
+      reportHeight();
+    }})();
+
+    function saveFile() {{
+      if (!_blob) return;
+      var a = document.createElement('a');
+      a.href = URL.createObjectURL(_blob);
+      a.download = _fname;
+      a.click();
+      URL.revokeObjectURL(a.href);
+    }}
+
+    function copyFile() {{
+      if (!window._textContent) return;
+      var btn = document.getElementById('copy-btn');
+      var ta = document.createElement('textarea');
+      ta.value = window._textContent;
+      ta.style.position = 'fixed';
+      ta.style.opacity = '0';
+      document.body.appendChild(ta);
+      ta.select();
+      var ok = false;
+      try {{ ok = document.execCommand('copy'); }} catch(e) {{}}
+      document.body.removeChild(ta);
+      if (ok) {{
+        btn.textContent = 'Copied!';
+        setTimeout(function() {{ btn.textContent = 'Copy'; }}, 1500);
+      }} else {{
+        btn.textContent = 'Failed';
+        setTimeout(function() {{ btn.textContent = 'Copy'; }}, 1500);
+      }}
+    }}
+
 {_REPORT_HEIGHT_JS}
   </script>
 </body>
@@ -1467,14 +1707,14 @@ class Tools:
         Attach a file from the sandbox for the user to view inline.
         The file content is rendered visually for the human but is NOT returned
         to the model. Use read() if you need to see file contents yourself.
-        Works with text files (syntax-highlighted), images (rendered inline),
-        and binary files (download card with Save button for files under 10 MB).
-        For larger files (video, datasets, model weights), serve them with a
-        background HTTP server and use preview() to give the user a direct link.
+        Text files (syntax-highlighted) and images are always inlined.
+        Audio, video, and binary files are offloaded to OWUI file storage so
+        only a thin viewer shell lands in the chat DB.
         :param path: Absolute path or relative to /home/daytona (e.g. workspace/main.py).
         """
         async def _run():
             email = _get_email(__user__)
+            user_id = __user__.get("id", "")
             sandbox_id = await _ensure_sandbox(self.valves, email, __event_emitter__)
 
             await _emit(__event_emitter__, f"Attaching {path}...")
@@ -1497,6 +1737,31 @@ class Tools:
             filename = path.rsplit("/", 1)[-1] if "/" in path else path
             file_type = _classify_file(path, raw)
 
+            # ── offloaded path: media & binary go to OWUI storage ────
+            #   Text and images are always inlined (fast, self-contained).
+            #   Media and binary are always offloaded so the chat DB stays
+            #   small regardless of file size.
+            if file_type in ("media", "binary") and user_id:
+                ext = ("." + path.rsplit(".", 1)[-1]).lower() if "." in path.rsplit("/", 1)[-1] else ""
+                ct = (_media_mime(path, raw) or "application/octet-stream") if file_type == "media" else "application/octet-stream"
+
+                try:
+                    await _emit(__event_emitter__, f"Uploading {filename} to file storage...")
+                    file_id = _upload_to_owui_storage(raw, filename, user_id, ct)
+                    html_content = _render_offloaded_html(
+                        file_id, filename, file_type, ct, n_bytes,
+                    )
+                    await _emit(
+                        __event_emitter__,
+                        f"Attached {filename} ({_human_size(n_bytes)}, offloaded to file storage)",
+                        done=True,
+                    )
+                    return HTMLResponse(content=html_content, headers={"Content-Disposition": "inline"})
+                except Exception as e:
+                    # Fall through to inline path on upload failure
+                    await _emit(__event_emitter__, f"Offload failed ({e}), falling back to inline embed...")
+
+            # ── inline path: text, images, or offload fallback ───────
             if file_type == "image":
                 html_content = _render_image_html(raw, filename, path)
             elif file_type == "media":
