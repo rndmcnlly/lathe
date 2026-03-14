@@ -263,7 +263,6 @@ _BINARY_EXTS = {
     ".wasm",
     ".o", ".obj",
     ".ttf", ".otf", ".woff", ".woff2",
-    ".mp3", ".mp4", ".wav", ".ogg", ".flac", ".avi", ".mkv", ".mov", ".webm",
 }
 _IMAGE_MIME = {
     ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
@@ -274,13 +273,106 @@ _IMAGE_MIME = {
 _EMBED_SIZE_CAP = 10 * 1024 * 1024
 
 
+def _sniff_media_mime(raw: bytes) -> str | None:
+    """Detect audio/video MIME type from file magic bytes (no dependencies).
+
+    Returns a MIME string like 'video/mp4' or 'audio/mpeg', or None if the
+    bytes do not match any known media signature.  Only the first 12 bytes
+    are inspected so this is safe to call on arbitrarily large buffers.
+    """
+    if len(raw) < 4:
+        return None
+
+    head = raw[:12]
+
+    # RIFF container: WAV or AVI (bytes 0-3 = "RIFF", 8-11 = format)
+    if head[:4] == b"RIFF" and len(head) >= 12:
+        fmt = head[8:12]
+        if fmt == b"WAVE":
+            return "audio/wav"
+        if fmt == b"AVI ":
+            return "video/x-msvideo"
+
+    # Ogg container (Vorbis, Opus, Theora, etc.)
+    if head[:4] == b"OggS":
+        return "audio/ogg"
+
+    # FLAC
+    if head[:4] == b"fLaC":
+        return "audio/flac"
+
+    # MP3 — ID3v2 tag header
+    if head[:3] == b"ID3":
+        return "audio/mpeg"
+
+    # MP3 — raw MPEG sync word (frame header starts with 11 set bits)
+    if len(raw) >= 2 and (raw[0] == 0xFF) and (raw[1] & 0xE0) == 0xE0:
+        return "audio/mpeg"
+
+    # MPEG-4 / QuickTime family: bytes 4-8 = "ftyp"
+    if len(raw) >= 8 and head[4:8] == b"ftyp":
+        # Subtype at bytes 8-12 distinguishes mp4 vs m4a vs mov etc.
+        # but the browser handles all of them with <video>/<audio> via
+        # the generic MIME; we refine where we can.
+        if len(raw) >= 12:
+            brand = raw[8:12]
+            # M4A is audio-only MP4
+            if brand == b"M4A ":
+                return "audio/mp4"
+            # Common QuickTime brands
+            if brand in (b"qt  ", b"mqt "):
+                return "video/quicktime"
+        return "video/mp4"
+
+    # Matroska / WebM: EBML header 0x1A45DFA3
+    if head[:4] == b"\x1a\x45\xdf\xa3":
+        # WebM is a Matroska subset.  To distinguish them we would need
+        # to parse the EBML DocType element.  Sniff for the string "webm"
+        # in the first 64 bytes as a cheap heuristic.
+        probe = raw[:64] if len(raw) >= 64 else raw
+        if b"webm" in probe:
+            return "video/webm"
+        return "video/x-matroska"
+
+    return None
+
+
+def _media_mime(path: str, raw: bytes) -> str | None:
+    """Return an audio/* or video/* MIME type, or None if not a media file.
+
+    Tries magic-byte sniffing first (content-authoritative), then falls
+    back to stdlib mimetypes for extension-based guessing.
+    """
+    import mimetypes
+
+    # 1. Content sniff
+    mime = _sniff_media_mime(raw)
+    if mime:
+        return mime
+
+    # 2. Extension fallback via stdlib
+    guessed, _ = mimetypes.guess_type(path, strict=False)
+    if guessed and (guessed.startswith("audio/") or guessed.startswith("video/")):
+        return guessed
+
+    return None
+
+
 def _classify_file(path: str, raw: bytes) -> str:
-    """Classify a file as 'image', 'binary', or 'text' based on extension and content."""
+    """Classify a file as 'image', 'media', 'binary', or 'text'.
+
+    Uses extension sets for images and known-binary formats, magic-byte
+    sniffing for audio/video, and a UTF-8 decode heuristic as the final
+    fallback.
+    """
     ext = ("." + path.rsplit(".", 1)[-1]).lower() if "." in path.rsplit("/", 1)[-1] else ""
     if ext in _IMAGE_EXTS:
         return "image"
     if ext in _BINARY_EXTS:
         return "binary"
+    # Media detection: magic bytes first, extension fallback
+    if _media_mime(path, raw) is not None:
+        return "media"
     # Heuristic: try UTF-8 decode; if it fails, it's binary
     try:
         raw.decode("utf-8")
@@ -326,6 +418,82 @@ def _render_image_html(raw: bytes, filename: str, path: str) -> str:
   </div>
   <div class="img-wrap">
     <img src="data:{mime};base64,{raw_b64}" alt="{html_mod.escape(filename)}">
+  </div>
+  <script>
+    var _b64 = "{raw_b64}";
+    var _mime = "{mime}";
+    var _fname = "{html_mod.escape(filename)}";
+    function saveFile() {{
+      var bin = atob(_b64);
+      var arr = new Uint8Array(bin.length);
+      for (var i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
+      var blob = new Blob([arr], {{type: _mime}});
+      var a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = _fname;
+      a.click();
+      URL.revokeObjectURL(a.href);
+    }}
+{_REPORT_HEIGHT_JS}
+  </script>
+</body>
+</html>"""
+
+
+def _render_media_html(raw: bytes, filename: str, path: str) -> str:
+    """Render an audio/video file with inline <audio>/<video> controls and Save button.
+
+    Falls back to the binary download card for files over _EMBED_SIZE_CAP
+    (base64 encoding would blow up the iframe).
+    """
+    n_bytes = len(raw)
+    if n_bytes > _EMBED_SIZE_CAP:
+        return _render_binary_html(raw, filename, path)
+
+    mime = _media_mime(path, raw) or "application/octet-stream"
+    is_video = mime.startswith("video/")
+    tag = "video" if is_video else "audio"
+    raw_b64 = base64.b64encode(raw).decode("ascii")
+
+    if is_video:
+        media_css = """
+  .media-wrap video {
+    max-width: 100%;
+    max-height: 480px;
+    border-radius: 4px;
+  }"""
+    else:
+        media_css = """
+  .media-wrap audio {
+    width: 100%;
+  }"""
+
+    return f"""<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+{_BASE_CSS}
+  .media-wrap {{
+    padding: 16px;
+    display: flex;
+    justify-content: center;
+    background: #181825;
+  }}{media_css}
+</style>
+</head>
+<body>
+  <div class="header">
+    <span class="filename">{html_mod.escape(filename)}</span>
+    <span class="meta">{_human_size(n_bytes)}</span>
+    <span class="actions">
+      <button onclick="saveFile()">Save</button>
+    </span>
+  </div>
+  <div class="media-wrap">
+    <{tag} controls preload="metadata" src="data:{mime};base64,{raw_b64}">
+      Your browser does not support the {tag} element.
+    </{tag}>
   </div>
   <script>
     var _b64 = "{raw_b64}";
@@ -1329,6 +1497,8 @@ class Tools:
 
             if file_type == "image":
                 html_content = _render_image_html(raw, filename, path)
+            elif file_type == "media":
+                html_content = _render_media_html(raw, filename, path)
             elif file_type == "binary":
                 html_content = _render_binary_html(raw, filename, path)
             else:

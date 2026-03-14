@@ -126,8 +126,26 @@ async def test_unit_classify_file(R: Results):
         R.check(f".{ext} classified as image", _classify_file(f"file.{ext}", b"") == "image", f"got {_classify_file(f'file.{ext}', b'')}")
 
     print("\n── _classify_file: binary extensions ──")
-    for ext in ["zip", "tar", "gz", "pdf", "exe", "whl", "sqlite", "mp3", "mp4", "woff2"]:
+    for ext in ["zip", "tar", "gz", "pdf", "exe", "whl", "sqlite", "woff2"]:
         R.check(f".{ext} classified as binary", _classify_file(f"file.{ext}", b"") == "binary", f"got {_classify_file(f'file.{ext}', b'')}")
+
+    print("\n── _classify_file: media by extension (no magic bytes) ──")
+    # Files with media extensions but empty content — extension fallback via mimetypes
+    for ext, expected in [("mp3", "media"), ("mp4", "media"), ("wav", "media"),
+                          ("ogg", "media"), ("flac", "media"), ("webm", "media"),
+                          ("mkv", "media"), ("mov", "media"), ("avi", "media"),
+                          ("m4a", "media"), ("aac", "media"), ("opus", "media")]:
+        R.check(f".{ext} classified as media", _classify_file(f"file.{ext}", b"") == expected, f"got {_classify_file(f'file.{ext}', b'')}")
+
+    print("\n── _classify_file: media by magic bytes (wrong/no extension) ──")
+    # Real media content with misleading extensions — magic bytes should win
+    R.check("RIFF/WAVE magic → media", _classify_file("file.dat", b"RIFF\x00\x00\x00\x00WAVE") == "media", "")
+    R.check("RIFF/AVI magic → media", _classify_file("file.bin", b"RIFF\x00\x00\x00\x00AVI ") == "media", "")
+    R.check("ID3 magic → media", _classify_file("file.bin", b"ID3\x03\x00") == "media", "")
+    R.check("fLaC magic → media", _classify_file("file.bin", b"fLaC\x00\x00") == "media", "")
+    R.check("OggS magic → media", _classify_file("file.bin", b"OggS\x00\x00") == "media", "")
+    R.check("ftyp magic → media", _classify_file("file.bin", b"\x00\x00\x00\x1cftypisom") == "media", "")
+    R.check("EBML magic → media", _classify_file("file.bin", b"\x1a\x45\xdf\xa3") == "media", "")
 
     print("\n── _classify_file: text by content ──")
     R.check("valid UTF-8 is text", _classify_file("file.unknown", b"hello world") == "text", "")
@@ -138,6 +156,92 @@ async def test_unit_classify_file(R: Results):
     R.check("invalid UTF-8 is binary", _classify_file("file.dat", b"\x80\x81\x82") == "binary", "")
     R.check("null bytes are valid UTF-8 (text)", _classify_file("file.bin", b"hello\x00world") == "text", "")
     R.check(".exe classified by extension", _classify_file("file.exe", b"hello\x00world") == "binary", "")
+
+
+async def test_unit_sniff_media(R: Results):
+    from lathe import _sniff_media_mime
+
+    print("\n── _sniff_media_mime: WAV ──")
+    R.check("WAV detected", _sniff_media_mime(b"RIFF\x00\x00\x00\x00WAVE") == "audio/wav", "")
+
+    print("\n── _sniff_media_mime: AVI ──")
+    R.check("AVI detected", _sniff_media_mime(b"RIFF\x00\x00\x00\x00AVI ") == "video/x-msvideo", "")
+
+    print("\n── _sniff_media_mime: MP3 (ID3) ──")
+    R.check("MP3 ID3 detected", _sniff_media_mime(b"ID3\x03\x00\x00\x00") == "audio/mpeg", "")
+
+    print("\n── _sniff_media_mime: MP3 (sync word) ──")
+    R.check("MP3 sync detected", _sniff_media_mime(b"\xff\xfb\x90\x00") == "audio/mpeg", "")
+
+    print("\n── _sniff_media_mime: FLAC ──")
+    R.check("FLAC detected", _sniff_media_mime(b"fLaC\x00\x00\x00\x22") == "audio/flac", "")
+
+    print("\n── _sniff_media_mime: Ogg ──")
+    R.check("Ogg detected", _sniff_media_mime(b"OggS\x00\x02\x00\x00") == "audio/ogg", "")
+
+    print("\n── _sniff_media_mime: MP4 (isom) ──")
+    R.check("MP4 isom detected", _sniff_media_mime(b"\x00\x00\x00\x1cftypisom") == "video/mp4", "")
+
+    print("\n── _sniff_media_mime: M4A ──")
+    R.check("M4A detected", _sniff_media_mime(b"\x00\x00\x00\x1cftypM4A ") == "audio/mp4", "")
+
+    print("\n── _sniff_media_mime: QuickTime ──")
+    R.check("MOV detected", _sniff_media_mime(b"\x00\x00\x00\x14ftypqt  ") == "video/quicktime", "")
+
+    print("\n── _sniff_media_mime: WebM ──")
+    webm_header = b"\x1a\x45\xdf\xa3" + b"\x00" * 20 + b"webm" + b"\x00" * 36
+    R.check("WebM detected", _sniff_media_mime(webm_header) == "video/webm", "")
+
+    print("\n── _sniff_media_mime: MKV ──")
+    R.check("MKV detected", _sniff_media_mime(b"\x1a\x45\xdf\xa3\x01\x00\x00") == "video/x-matroska", "")
+
+    print("\n── _sniff_media_mime: non-media ──")
+    R.check("empty returns None", _sniff_media_mime(b"") is None, "")
+    R.check("short returns None", _sniff_media_mime(b"\x00\x01") is None, "")
+    R.check("text returns None", _sniff_media_mime(b"hello world") is None, "")
+    R.check("PNG returns None", _sniff_media_mime(b"\x89PNG\r\n\x1a\n") is None, "")
+    R.check("ZIP returns None", _sniff_media_mime(b"PK\x03\x04") is None, "")
+
+
+async def test_unit_render_media_html(R: Results):
+    from lathe import _render_media_html, _media_mime, _EMBED_SIZE_CAP
+
+    # Build minimal real-ish media bytes for tests
+    wav_bytes = b"RIFF\x00\x00\x00\x00WAVEfmt "
+    mp4_bytes = b"\x00\x00\x00\x1cftypisom\x00\x00\x02\x00"
+    mp3_bytes = b"ID3\x03\x00\x00\x00\x00\x00\x00"
+
+    print("\n── _render_media_html: video (mp4) ──")
+    html = _render_media_html(mp4_bytes, "clip.mp4", "/tmp/clip.mp4")
+    R.check("mp4 has <video> tag", "<video controls" in html, "")
+    R.check("mp4 has video/mp4 mime", "video/mp4" in html, "")
+    R.check("mp4 has Save button", "saveFile" in html, "")
+    R.check("mp4 has resize observer", "ResizeObserver" in html, "")
+    R.check("mp4 has no <audio>", "<audio" not in html, "")
+
+    print("\n── _render_media_html: audio (wav) ──")
+    html = _render_media_html(wav_bytes, "beep.wav", "/tmp/beep.wav")
+    R.check("wav has <audio> tag", "<audio controls" in html, "")
+    R.check("wav has audio/wav mime", "audio/wav" in html, "")
+    R.check("wav has no <video>", "<video" not in html, "")
+
+    print("\n── _render_media_html: audio (mp3) ──")
+    html = _render_media_html(mp3_bytes, "song.mp3", "/tmp/song.mp3")
+    R.check("mp3 has <audio> tag", "<audio controls" in html, "")
+    R.check("mp3 has audio/mpeg mime", "audio/mpeg" in html, "")
+
+    print("\n── _render_media_html: oversized falls back to binary card ──")
+    big = b"RIFF" + (b"\x00" * (_EMBED_SIZE_CAP + 1))
+    html = _render_media_html(big, "huge.wav", "/tmp/huge.wav")
+    R.check("oversized has no <audio>", "<audio" not in html, "")
+    R.check("oversized has no <video>", "<video" not in html, "")
+    R.check("oversized shows too-large", "Too large" in html, "")
+    del big
+
+    print("\n── _render_media_html: magic-detected file with wrong extension ──")
+    html = _render_media_html(wav_bytes, "mystery.bin", "/tmp/mystery.bin")
+    R.check("magic sniff finds WAV in .bin", "<audio controls" in html, "")
+    R.check("magic sniff uses audio/wav", "audio/wav" in html, "")
 
 
 async def test_unit_render_html(R: Results):
@@ -867,6 +971,8 @@ async def test_int_destroy(R: Results, tools: Tools, user: dict):
 UNIT_GROUPS = {
     "parse_env_vars": test_unit_parse_env_vars,
     "classify_file": test_unit_classify_file,
+    "sniff_media": test_unit_sniff_media,
+    "render_media_html": test_unit_render_media_html,
     "render_html": test_unit_render_html,
     "highlight": test_unit_highlight,
     "truncate": test_unit_truncate,
