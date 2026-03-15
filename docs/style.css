@@ -83,7 +83,14 @@ code {
 
 .hero {
     text-align: center;
-    padding: 5rem 0 2.5rem 0;
+    padding: 4rem 0 2.5rem 0;
+}
+
+.hero-logo {
+    display: block;
+    width: 240px;
+    height: auto;
+    margin: 0 auto 0.75rem auto;
 }
 
 .hero-name {
@@ -92,10 +99,6 @@ code {
     letter-spacing: -0.03em;
     color: var(--text);
     margin-bottom: 0.25rem;
-}
-
-.hero-name span {
-    color: var(--peach);
 }
 
 .hero-tagline {
@@ -354,6 +357,10 @@ code {
 /* ── Responsive ───────────────────────────────────── */
 
 @media (max-width: 520px) {
+    .hero-logo {
+        width: 200px;
+    }
+
     .hero-name {
         font-size: 2.25rem;
     }

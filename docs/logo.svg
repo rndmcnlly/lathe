@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 460">
+  <!-- Lathe — side view of the machine -->
+  <!-- Bed / ways -->
+  <rect x="80" y="400" width="840" height="40" rx="4" fill="#9399b2"/>
+  <!-- Headstock -->
+  <rect x="80" y="200" width="200" height="200" rx="8" fill="#cdd6f4"/>
+  <!-- Chuck face -->
+  <circle cx="280" cy="300" r="70" fill="#9399b2"/>
+  <circle cx="280" cy="300" r="30" fill="#cdd6f4"/>
+  <!-- Workpiece -->
+  <rect x="280" y="275" width="440" height="50" rx="25" fill="#fab387"/>
+  <!-- Tailstock -->
+  <rect x="720" y="260" width="160" height="140" rx="8" fill="#cdd6f4"/>
+  <!-- Tailstock point -->
+  <polygon points="720,300 700,290 700,310" fill="#cdd6f4"/>
+  <!-- Tool post -->
+  <rect x="440" y="340" width="80" height="60" rx="4" fill="#cdd6f4"/>
+  <!-- Cutting tool -->
+  <rect x="450" y="325" width="60" height="20" rx="2" fill="#a6adc8"/>
+</svg>
