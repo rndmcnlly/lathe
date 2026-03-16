@@ -1585,15 +1585,16 @@ class Tools:
             )
 
             # Execute it
+            _BASH_PROCESS_TIMEOUT_MS = 120_000
             resp = await client.post(
                 _toolbox(self.valves, sandbox_id, "/process/execute"),
                 headers=_headers(self.valves),
                 json={
                     "command": f"bash {script_path}",
                     "cwd": workdir,
-                    "timeout": 120000,
+                    "timeout": _BASH_PROCESS_TIMEOUT_MS,
                 },
-                timeout=300.0,
+                timeout=_BASH_PROCESS_TIMEOUT_MS / 1000 + 30,  # process ceiling + buffer
             )
             resp.raise_for_status()
             data = resp.json()
@@ -1880,7 +1881,7 @@ class Tools:
 
                 try:
                     await _emit(__event_emitter__, f"Uploading {filename} to file storage...")
-                    file_id = _upload_to_owui_storage(raw, filename, user_id, ct)
+                    file_id = await asyncio.to_thread(_upload_to_owui_storage, raw, filename, user_id, ct)
                     html_content = _render_offloaded_html(
                         file_id, filename, file_type, ct, n_bytes,
                     )
@@ -2374,8 +2375,7 @@ return await new Promise((resolve) => {{
                     return f"Error: File {file_id} not found in OWUI database."
 
                 local_path = Storage.get_file(file_record.path)
-                with open(local_path, "rb") as f:
-                    file_bytes = f.read()
+                file_bytes = await asyncio.to_thread(lambda: open(local_path, "rb").read())
             except ImportError as e:
                 await _emit(__event_emitter__, "Internal error accessing OWUI storage", done=True)
                 return f"Error: Could not import OWUI storage layer: {e}"
