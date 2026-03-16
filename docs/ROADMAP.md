@@ -32,8 +32,7 @@ theme, no build step, no JS. Hotlinks the self-demo video from issue #11.
 - **og:image.** No social card yet. Needed for link previews on Twitter, Discord,
   Slack.
 - **Anchor links on section headings.** For sharing deep links to specific sections.
-- **Responsive polish.** The architecture ASCII diagram overflows on narrow screens.
-  Consider a simplified mobile version or an SVG replacement.
+- **~~Responsive polish.~~** ✅ Architecture diagram uses `clamp()` font sizing.
 - **Dark/light toggle.** The Catppuccin Mocha theme is dark-only. A Latte variant
   toggle would be nice but is low priority (the audience skews dark-mode).
 
@@ -57,8 +56,7 @@ theme, no build step, no JS. Hotlinks the self-demo video from issue #11.
   useful.
 - **Analytics.** Something minimal and privacy-respecting (Plausible, Umami, or
   just GitHub Pages traffic stats).
-- **Custom domain.** `lathe.adamsmith.as` or similar, if the project warrants its
-  own subdomain.
+- **~~Custom domain.~~** ✅ Live at [lathe.tools](https://lathe.tools).
 
 ## Long-term / aspirational
 
