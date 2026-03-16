@@ -1026,26 +1026,6 @@ async def test_int_destroy(R: Results, tools: Tools, user: dict):
     )
     R.check("volume data survives destroy", "destroy_test" in result, result[:200])
 
-    print("\n── destroy: wipe_volume deletes volume and data ──")
-    # Write another marker to the volume
-    result = await tools.bash(
-        f"echo wipe_test > {VOLUME_MOUNT_PATH}/wipe_test.txt",
-        __user__=user, __event_emitter__=mock_emitter,
-    )
-    result = await tools.destroy(
-        confirm=True, wipe_volume=True,
-        __user__=user, __event_emitter__=mock_emitter,
-    )
-    R.check("wipe_volume destroy succeeds", "Destroyed" in result, result[:200])
-    R.check("wipe_volume mentions volume deleted", "volume also deleted" in result.lower(), result[:200])
-
-    # Next tool call should create a fresh volume + sandbox; old data should be gone
-    result = await tools.bash(
-        f"cat {VOLUME_MOUNT_PATH}/wipe_test.txt 2>&1 || true",
-        __user__=user, __event_emitter__=mock_emitter,
-    )
-    R.check("volume data gone after wipe", "No such file" in result, result[:200])
-
     print("\n── destroy: no sandbox to destroy ──")
     result = await tools.destroy(confirm=True, __user__=user, __event_emitter__=mock_emitter)
     # First destroy the sandbox that was just created
@@ -1059,7 +1039,7 @@ async def test_int_destroy(R: Results, tools: Tools, user: dict):
 
     print("\n── final cleanup: destroy reborn sandbox ──")
     result = await tools.destroy(
-        confirm=True, wipe_volume=True,
+        confirm=True,
         __user__=user, __event_emitter__=mock_emitter,
     )
     R.check("final destroy succeeds", "Destroyed" in result, result[:200])

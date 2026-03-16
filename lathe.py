@@ -1210,7 +1210,7 @@ class Tools:
               stops, and recovers automatically — you never manage lifecycle.
             - The default working directory is /home/daytona/workspace.
             - /home/daytona/volume is S3/FUSE-backed persistent storage that
-              survives even sandbox destruction (unless wipe_volume=true).
+              survives sandbox destruction.
             - The sandbox auto-stops after a configurable idle timeout and
               auto-archives after a further interval. Any tool call transparently
               restarts it.
@@ -1318,15 +1318,13 @@ class Tools:
     async def destroy(
         self,
         confirm: bool = False,
-        wipe_volume: bool = False,
         __user__: dict = {},
         __event_emitter__=None,
     ) -> str:
         """
-        Permanently destroy the sandbox. Irreversible. Set confirm=true to proceed.
-        Volume is preserved by default; set wipe_volume=true for a clean slate.
+        Permanently destroy the sandbox VM. Irreversible. Set confirm=true to proceed.
+        Persistent volume data is preserved and will reappear in the next sandbox.
         :param confirm: Must be true to confirm destruction.
-        :param wipe_volume: Also delete the persistent volume (default: false).
         """
         if not confirm:
             return (
@@ -1394,42 +1392,12 @@ class Tools:
                     if not remaining:
                         break
 
-                # Optionally wipe the persistent volume
-                volume_msg = ""
-                if wipe_volume:
-                    volume_name = f"{label_key}/{email}"
-                    encoded_vol = urllib.parse.quote(volume_name, safe="")
-                    await _emit(__event_emitter__, "Deleting persistent volume...")
-                    try:
-                        resp = await client.get(
-                            _api(valves, f"/volumes/by-name/{encoded_vol}"),
-                            headers=_headers(valves),
-                            timeout=30.0,
-                        )
-                        if resp.status_code == 200:
-                            vol_id = resp.json()["id"]
-                            resp = await client.delete(
-                                _api(valves, f"/volumes/{vol_id}"),
-                                headers=_headers(valves),
-                                timeout=30.0,
-                            )
-                            resp.raise_for_status()
-                            volume_msg = " Persistent volume also deleted."
-                        else:
-                            volume_msg = " No persistent volume found to delete."
-                    except Exception as vol_exc:
-                        volume_msg = f" Warning: failed to delete volume: {vol_exc}"
-                else:
-                    volume_msg = (
-                        f" Your persistent files in {VOLUME_MOUNT_PATH} are intact"
-                        f" and will reappear in your next sandbox."
-                    )
-
                 await _emit(__event_emitter__, "Sandbox destroyed", done=True)
                 ids = ", ".join(d[:12] for d in deleted)
                 return (
                     f"Destroyed {len(deleted)} sandbox(es) ({ids})."
-                    f"{volume_msg}"
+                    f" Your persistent files in {VOLUME_MOUNT_PATH} are intact"
+                    f" and will reappear in your next sandbox."
                     f" A fresh sandbox will be created on the next tool call."
                 )
 
