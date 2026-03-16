@@ -729,7 +729,6 @@ async def test_int_bash_sessions(R: Results, tools: Tools, user: dict):
     R.check("background descriptor has CMD=", "CMD=" in bg_result, bg_result[:300])
     R.check("background descriptor has Peek hint", "Peek:" in bg_result, bg_result[:300])
     R.check("background descriptor has Poll hint", "Poll:" in bg_result, bg_result[:300])
-    R.check("background descriptor has Wait hint", "foreground_seconds=" in bg_result, bg_result[:500])
 
     # Extract CMD dir from background descriptor
     cmd_match = re.search(r"CMD=(/tmp/cmd/[0-9a-f-]+)", bg_result)
@@ -806,10 +805,11 @@ async def test_int_ensure_sandbox(R: Results, tools: Tools, user: dict):
 
     async with httpx.AsyncClient(timeout=30.0) as client:
         print("\n── _ensure_sandbox: identity ──")
-        sandbox_id = await _ensure_sandbox(tools.valves, TEST_EMAIL, client, emitter=mock_emitter)
+        sandbox_id, _warning = await _ensure_sandbox(tools.valves, TEST_EMAIL, client, emitter=mock_emitter)
         R.check("returns a sandbox id", sandbox_id and isinstance(sandbox_id, str), repr(sandbox_id))
-        sandbox_id_2 = await _ensure_sandbox(tools.valves, TEST_EMAIL, client, emitter=mock_emitter)
+        sandbox_id_2, warning_2 = await _ensure_sandbox(tools.valves, TEST_EMAIL, client, emitter=mock_emitter)
         R.check("same sandbox on repeat call", sandbox_id == sandbox_id_2, f"{sandbox_id[:12]} != {sandbox_id_2[:12]}")
+        R.check("no warning when already running", warning_2 is None, repr(warning_2))
 
         print("\n── _ensure_sandbox: isolation ──")
         resp = await client.get(
@@ -893,7 +893,7 @@ async def test_int_ensure_sandbox(R: Results, tools: Tools, user: dict):
                 break
         print(f"  Deleted ({len(remaining)} sandbox(es) remain).")
 
-        sandbox_id_3 = await _ensure_sandbox(tools.valves, TEST_EMAIL, client, emitter=mock_emitter)
+        sandbox_id_3, _ = await _ensure_sandbox(tools.valves, TEST_EMAIL, client, emitter=mock_emitter)
         R.check("back to normal after dup cleanup", sandbox_id_3 == sandbox_id, f"{sandbox_id_3[:12]} != {sandbox_id[:12]}")
 
         print("\n── _ensure_sandbox: volume is mounted ──")

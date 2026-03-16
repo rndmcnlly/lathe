@@ -99,6 +99,11 @@ async def _tool_context(emitter, fn):
         return f"Error: {e}"
 
 
+def _prepend_warning(result: str, warning: str | None) -> str:
+    """Prepend a sandbox lifecycle warning to a tool result if present."""
+    return f"{warning}\n{result}" if warning else result
+
+
 def _shell_quote(s: str) -> str:
     """Single-quote a string for safe use in shell scripts."""
     return "'" + s.replace("'", "'\\''") + "'"
@@ -959,8 +964,12 @@ async def _wait_for_toolbox(valves, sandbox_id: str, client: httpx.AsyncClient, 
     raise RuntimeError("Sandbox started but toolbox daemon did not become responsive (30s)")
 
 
-async def _ensure_sandbox(valves, email: str, client: httpx.AsyncClient, emitter=None) -> str:
-    """Find or create a running sandbox for this user. Returns sandbox_id."""
+async def _ensure_sandbox(valves, email: str, client: httpx.AsyncClient, emitter=None) -> tuple[str, str | None]:
+    """Find or create a running sandbox for this user.
+
+    Returns (sandbox_id, warning) where warning is None if the sandbox was
+    already running, or a short message describing what recovery was needed.
+    """
     if not valves.daytona_api_key:
         raise RuntimeError(
             "Daytona API key not configured. Ask an admin to set it in Tool settings."
@@ -995,6 +1004,7 @@ async def _ensure_sandbox(valves, email: str, client: httpx.AsyncClient, emitter
         )
 
     sandbox = matches[0] if matches else None
+    warning: str | None = None
 
     if sandbox is None:
         # 2. Get or create a persistent volume for this user
@@ -1002,7 +1012,7 @@ async def _ensure_sandbox(valves, email: str, client: httpx.AsyncClient, emitter
         volume_id = await _ensure_volume(valves, volume_name, client)
 
         # 3. Create new sandbox with volume mounted
-        await _emit(emitter, "Creating sandbox...")
+        await _emit(emitter, "Preparing sandbox...")
         resp = await client.post(
             _api(valves, "/sandbox"),
             headers=_headers(valves),
@@ -1024,6 +1034,7 @@ async def _ensure_sandbox(valves, email: str, client: httpx.AsyncClient, emitter
         )
         resp.raise_for_status()
         sandbox = resp.json()
+        warning = "[Sandbox was created — this is a fresh environment with no prior files]"
 
     sandbox_id = sandbox["id"]
     state = sandbox.get("state", "unknown")
@@ -1032,20 +1043,25 @@ async def _ensure_sandbox(valves, email: str, client: httpx.AsyncClient, emitter
     if state == "started":
         await _wait_for_toolbox(valves, sandbox_id, client, emitter)
         await _emit(emitter, "Sandbox ready", done=True)
-        return sandbox_id
+        return sandbox_id, warning
 
     if state in ("stopped", "archived"):
-        label = "Restoring sandbox..." if state == "archived" else "Starting sandbox..."
-        await _emit(emitter, label)
+        await _emit(emitter, "Preparing sandbox...")
         resp = await client.post(
             _api(valves, f"/sandbox/{sandbox_id}/start"),
             headers=_headers(valves),
             timeout=30.0,
         )
         resp.raise_for_status()
+        if not warning:
+            warning = (
+                "[Sandbox was restarted from archived state — installed packages may need reinstalling]"
+                if state == "archived" else
+                "[Sandbox was restarted — running processes were lost]"
+            )
 
     elif state == "error" and sandbox.get("recoverable"):
-        await _emit(emitter, "Recovering sandbox...")
+        await _emit(emitter, "Preparing sandbox...")
         resp = await client.post(
             _api(valves, f"/sandbox/{sandbox_id}/recover"),
             headers=_headers(valves),
@@ -1058,9 +1074,11 @@ async def _ensure_sandbox(valves, email: str, client: httpx.AsyncClient, emitter
             timeout=30.0,
         )
         resp.raise_for_status()
+        if not warning:
+            warning = "[Sandbox was recovered from error — check that expected files and processes still exist]"
 
     elif state in ("starting", "stopping", "archiving"):
-        await _emit(emitter, f"Sandbox is {state}, waiting...")
+        await _emit(emitter, "Preparing sandbox...")
     else:
         if state == "error":
             raise RuntimeError(
@@ -1084,7 +1102,7 @@ async def _ensure_sandbox(valves, email: str, client: httpx.AsyncClient, emitter
         if state == "started":
             await _wait_for_toolbox(valves, sandbox_id, client, emitter)
             await _emit(emitter, "Sandbox ready", done=True)
-            return sandbox_id
+            return sandbox_id, warning
 
         if state == "error":
             raise RuntimeError(
@@ -1432,7 +1450,7 @@ class Tools:
         """
         async def _run(client):
             email = _get_email(__user__)
-            sandbox_id = await _ensure_sandbox(self.valves, email, client, __event_emitter__)
+            sandbox_id, _sb_warning = await _ensure_sandbox(self.valves, email, client, __event_emitter__)
 
             await _emit(__event_emitter__, "Loading project context...")
 
@@ -1519,7 +1537,7 @@ class Tools:
                 return f"Error: onboard script failed (exit {exit_code}): {result[:500]}"
 
             await _emit(__event_emitter__, "Project context loaded", done=True)
-            return result if result else "(empty project context)"
+            return _prepend_warning(result if result else "(empty project context)", _sb_warning)
 
         return await _tool_context(__event_emitter__, _run)
 
@@ -1543,7 +1561,7 @@ class Tools:
         """
         async def _run(client):
             email = _get_email(__user__)
-            sandbox_id = await _ensure_sandbox(self.valves, email, client, __event_emitter__)
+            sandbox_id, _sb_warning = await _ensure_sandbox(self.valves, email, client, __event_emitter__)
 
             await _emit(__event_emitter__, "Running command...")
 
@@ -1705,13 +1723,11 @@ class Tools:
                     f"\n\n[Backgrounded after {elapsed}s — command is still running]\n"
                     f"  CMD={cmd_dir}\n"
                     f"  Peek: tail $CMD/log\n"
-                    f"  Poll: test -f $CMD/exit && cat $CMD/exit || echo RUNNING\n"
-                    f"  Wait: bash(\"while [ ! -f {cmd_dir}/exit ]; do sleep 2; done; "
-                    f"cat {cmd_dir}/exit; tail {cmd_dir}/log\", foreground_seconds=120)\n"
-                    f"Tell the user the command is running. Don't check until they ask or "
+                    f"  Poll: for i in 1 2 3 4 5; do test -f $CMD/exit && {{ cat $CMD/exit; break; }} || sleep 2; done; test -f $CMD/exit || echo RUNNING\n"
+                    f"Tell the user the command is running. Don't poll until they ask or "
                     f"you have a concrete reason to expect completion."
                 )
-                return output + bg_notice
+                return _prepend_warning(output + bg_notice, _sb_warning)
 
             # ── Command finished within foreground window ────────────
             output, was_truncated, meta = _truncate_tail(result)
@@ -1749,7 +1765,7 @@ class Tools:
                     )
                 output += notice
 
-            return output
+            return _prepend_warning(output, _sb_warning)
 
         return await _tool_context(__event_emitter__, _run)
 
@@ -1769,7 +1785,7 @@ class Tools:
         """
         async def _run(client):
             email = _get_email(__user__)
-            sandbox_id = await _ensure_sandbox(self.valves, email, client, __event_emitter__)
+            sandbox_id, _sb_warning = await _ensure_sandbox(self.valves, email, client, __event_emitter__)
 
             await _emit(__event_emitter__, f"Reading {path}...")
 
@@ -1806,7 +1822,7 @@ class Tools:
             header = f"File: {path} ({total_lines} lines total)"
             if start_idx > 0 or end_idx < total_lines:
                 header += f", showing lines {start_idx + 1}-{min(end_idx, total_lines)}"
-            return f"{header}\n{numbered}"
+            return _prepend_warning(f"{header}\n{numbered}", _sb_warning)
 
         return await _tool_context(__event_emitter__, _run)
 
@@ -1824,7 +1840,7 @@ class Tools:
         """
         async def _run(client):
             email = _get_email(__user__)
-            sandbox_id = await _ensure_sandbox(self.valves, email, client, __event_emitter__)
+            sandbox_id, _sb_warning = await _ensure_sandbox(self.valves, email, client, __event_emitter__)
 
             await _emit(__event_emitter__, f"Writing {path}...")
 
@@ -1852,7 +1868,7 @@ class Tools:
             n_bytes = len(content_bytes)
             n_lines = content.count("\n") + (0 if content.endswith("\n") else 1)
             await _emit(__event_emitter__, "Write complete", done=True)
-            return f"Wrote {n_bytes} bytes ({n_lines} lines) to {path}"
+            return _prepend_warning(f"Wrote {n_bytes} bytes ({n_lines} lines) to {path}", _sb_warning)
 
         return await _tool_context(__event_emitter__, _run)
 
@@ -1874,7 +1890,7 @@ class Tools:
         """
         async def _run(client):
             email = _get_email(__user__)
-            sandbox_id = await _ensure_sandbox(self.valves, email, client, __event_emitter__)
+            sandbox_id, _sb_warning = await _ensure_sandbox(self.valves, email, client, __event_emitter__)
 
             await _emit(__event_emitter__, f"Editing {path}...")
 
@@ -1925,7 +1941,7 @@ class Tools:
 
             replaced = count if replace_all else 1
             await _emit(__event_emitter__, "Edit complete", done=True)
-            return f"Replaced {replaced} occurrence(s) in {path}"
+            return _prepend_warning(f"Replaced {replaced} occurrence(s) in {path}", _sb_warning)
 
         return await _tool_context(__event_emitter__, _run)
 
@@ -1943,7 +1959,7 @@ class Tools:
         async def _run(client):
             email = _get_email(__user__)
             user_id = __user__.get("id", "")
-            sandbox_id = await _ensure_sandbox(self.valves, email, client, __event_emitter__)
+            sandbox_id, _sb_warning = await _ensure_sandbox(self.valves, email, client, __event_emitter__)
 
             await _emit(__event_emitter__, f"Attaching {path}...")
 
@@ -2107,7 +2123,7 @@ class Tools:
         """
         async def _run(client):
             email = _get_email(__user__)
-            sandbox_id = await _ensure_sandbox(self.valves, email, client, __event_emitter__)
+            sandbox_id, _sb_warning = await _ensure_sandbox(self.valves, email, client, __event_emitter__)
 
             if not __event_call__:
                 return "Error: ingest requires browser-side execution (__event_call__). Ensure the toolkit is used in Native function calling mode."
@@ -2508,7 +2524,7 @@ return await new Promise((resolve) => {{
 
             size_str = _human_size(file_size)
             await _emit(__event_emitter__, f"Uploaded {filename} ({size_str})", done=True)
-            return f"Uploaded {filename} ({size_str}) to {dest_path}"
+            return _prepend_warning(f"Uploaded {filename} ({size_str}) to {dest_path}", _sb_warning)
 
         return await _tool_context(__event_emitter__, _run)
 
@@ -2527,7 +2543,7 @@ return await new Promise((resolve) => {{
                 return "Error: port must be an integer between 3000 and 9999."
 
             email = _get_email(__user__)
-            sandbox_id = await _ensure_sandbox(self.valves, email, client, __event_emitter__)
+            sandbox_id, _sb_warning = await _ensure_sandbox(self.valves, email, client, __event_emitter__)
 
             await _emit(__event_emitter__, f"Generating preview URL for port {port}...")
 
@@ -2545,13 +2561,14 @@ return await new Promise((resolve) => {{
                 return "Error: Daytona returned an empty preview URL."
 
             await _emit(__event_emitter__, f"Preview URL ready (port {port})", done=True)
-            return (
+            return _prepend_warning(
                 f"Preview URL (valid ~1 hour): {url}\n\n"
                 f"The user can open this in a new browser tab. "
                 f"They may see a Daytona security warning on first visit — they can click through it.\n\n"
                 f"Note: the sandbox auto-stops after ~15 min of inactivity regardless of "
                 f"running background processes, killing the server. If the user reports "
-                f"the preview stopped working, restart the server and call preview() again."
+                f"the preview stopped working, restart the server and call preview() again.",
+                _sb_warning,
             )
 
         return await _tool_context(__event_emitter__, _run)
@@ -2571,7 +2588,7 @@ return await new Promise((resolve) => {{
                 return "Error: expires_in_minutes must be an integer between 1 and 1440 (24 hours)."
 
             email = _get_email(__user__)
-            sandbox_id = await _ensure_sandbox(self.valves, email, client, __event_emitter__)
+            sandbox_id, _sb_warning = await _ensure_sandbox(self.valves, email, client, __event_emitter__)
 
             await _emit(__event_emitter__, "Creating SSH access token...")
 
@@ -2593,13 +2610,14 @@ return await new Promise((resolve) => {{
                 ssh_command = f"ssh {token}@ssh.app.daytona.io"
 
             await _emit(__event_emitter__, "SSH access ready", done=True)
-            return (
+            return _prepend_warning(
                 f"SSH command (valid {expires_in_minutes} min):\n\n"
                 f"```\n{ssh_command}\n```\n\n"
                 f"The user can paste this into their terminal, VS Code Remote SSH, "
                 f"or JetBrains Gateway.\n\n"
                 f"Note: the sandbox auto-stops after ~{self.valves.auto_stop_minutes} min of inactivity. "
-                f"Active SSH sessions keep the sandbox alive."
+                f"Active SSH sessions keep the sandbox alive.",
+                _sb_warning,
             )
 
         return await _tool_context(__event_emitter__, _run)
