@@ -10,7 +10,9 @@ Lathe registers ten tools that models can call in [Native function calling mode]
 
 1. **Outbound API calls to Daytona** — Lathe creates, starts, or resumes a cloud sandbox VM via the Daytona control plane and toolbox APIs. All sandbox operations go outbound from your OWUI server.
 2. **`__event_call__` JS injection** — The `ingest` tool uses OWUI's `__event_call__` mechanism to render a file-upload modal in the user's browser tab. This is the same pattern used by other OWUI toolkits (e.g. [picker-agent](https://github.com/rndmcnlly/picker-agent)).
-3. **Transient OWUI file storage** — `ingest` briefly relays uploaded files through OWUI's Files API (to work around `__event_call__` size limits), then deletes them after transfer to the sandbox.
+3. **OWUI file storage** — Two tools use OWUI's file storage layer:
+   - `ingest` briefly relays uploaded files through the Files API (to work around `__event_call__` size limits), then deletes them after transfer to the sandbox.
+   - `attach` permanently stores media and binary files (audio, video, archives, etc.) in OWUI file storage so large payloads don't bloat the chat database. These files are owned by the user and persist until manually removed. Text and image files are inlined directly and do not touch file storage.
 
 No other OWUI internals are touched. The toolkit does not modify models, prompts, users, or other configuration.
 
