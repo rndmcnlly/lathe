@@ -204,7 +204,7 @@ async def test_unit_sniff_media(R: Results):
 
 
 async def test_unit_render_media_html(R: Results):
-    from lathe import _render_media_html, _media_mime, _EMBED_SIZE_CAP
+    from lathe import _render_media_html, _media_mime
 
     # Build minimal real-ish media bytes for tests
     wav_bytes = b"RIFF\x00\x00\x00\x00WAVEfmt "
@@ -230,13 +230,8 @@ async def test_unit_render_media_html(R: Results):
     R.check("mp3 has <audio> tag", "<audio controls" in html, "")
     R.check("mp3 has audio/mpeg mime", "audio/mpeg" in html, "")
 
-    print("\n── _render_media_html: oversized falls back to binary card ──")
-    big = b"RIFF" + (b"\x00" * (_EMBED_SIZE_CAP + 1))
-    html = _render_media_html(big, "huge.wav", "/tmp/huge.wav")
-    R.check("oversized has no <audio>", "<audio" not in html, "")
-    R.check("oversized has no <video>", "<video" not in html, "")
-    R.check("oversized shows too-large", "Too large" in html, "")
-    del big
+    # Note: oversized-fallback test removed — media is always offloaded to OWUI
+    # storage before reaching _render_media_html; this function always embeds.
 
     print("\n── _render_media_html: magic-detected file with wrong extension ──")
     html = _render_media_html(wav_bytes, "mystery.bin", "/tmp/mystery.bin")
@@ -245,7 +240,7 @@ async def test_unit_render_media_html(R: Results):
 
 
 async def test_unit_render_html(R: Results):
-    from lathe import _render_image_html, _render_binary_html, _EMBED_SIZE_CAP
+    from lathe import _render_image_html, _render_binary_html
 
     print("\n── _render_image_html: structure ──")
     img_html = _render_image_html(b"\x89PNG fake", "photo.png", "dir/photo.png")
@@ -257,22 +252,17 @@ async def test_unit_render_html(R: Results):
     R.check("image html has save function", "saveFile" in img_html, "")
     R.check("image html has resize observer", "ResizeObserver" in img_html, "")
 
-    print("\n── _render_binary_html: small file ──")
+    print("\n── _render_binary_html: structure ──")
     bin_html = _render_binary_html(b"\x00" * 100, "data.zip", "path/data.zip")
     R.check("binary html has doctype", "<!DOCTYPE html>" in bin_html, "")
     R.check("binary html has filename", "data.zip" in bin_html, "")
     R.check("binary html shows ZIP type", "ZIP" in bin_html, "")
-    R.check("binary html has save for small file", "saveFile" in bin_html, "")
+    R.check("binary html always has saveFile", "saveFile" in bin_html, "")
     R.check("binary html has resize observer", "ResizeObserver" in bin_html, "")
 
-    print("\n── _render_binary_html: large file (over 10MB) ──")
-    fake_large = b"\x00" * (_EMBED_SIZE_CAP + 1)
-    big_html = _render_binary_html(fake_large, "huge.tar.gz", "huge.tar.gz")
-    R.check("large binary has no saveFile", "saveFile" not in big_html, "should not embed >10MB")
-    R.check("large binary shows too-large message", "Too large" in big_html, "")
-    R.check("large binary still has filename", "huge.tar.gz" in big_html, "")
-    R.check("large binary still has resize observer", "ResizeObserver" in big_html, "")
-    del fake_large
+    # Note: large-file / too-large-to-embed test removed — binary files are always
+    # offloaded to OWUI storage before reaching _render_binary_html; this function
+    # always embeds content for the Save button.
 
     print("\n── _render_binary_html: human-readable sizes ──")
     html_1b = _render_binary_html(b"\x00", "f.bin", "f.bin")
@@ -707,9 +697,9 @@ async def test_int_ensure_sandbox(R: Results, tools: Tools, user: dict):
 
     async with httpx.AsyncClient(timeout=30.0) as client:
         print("\n── _ensure_sandbox: identity ──")
-        sandbox_id = await _ensure_sandbox(tools.valves, TEST_EMAIL, emitter=mock_emitter)
+        sandbox_id = await _ensure_sandbox(tools.valves, TEST_EMAIL, client, emitter=mock_emitter)
         R.check("returns a sandbox id", sandbox_id and isinstance(sandbox_id, str), repr(sandbox_id))
-        sandbox_id_2 = await _ensure_sandbox(tools.valves, TEST_EMAIL, emitter=mock_emitter)
+        sandbox_id_2 = await _ensure_sandbox(tools.valves, TEST_EMAIL, client, emitter=mock_emitter)
         R.check("same sandbox on repeat call", sandbox_id == sandbox_id_2, f"{sandbox_id[:12]} != {sandbox_id_2[:12]}")
 
         print("\n── _ensure_sandbox: isolation ──")
@@ -739,7 +729,7 @@ async def test_int_ensure_sandbox(R: Results, tools: Tools, user: dict):
         saved_label = tools.valves.deployment_label
         tools.valves.deployment_label = ""
         try:
-            await _ensure_sandbox(tools.valves, TEST_EMAIL, emitter=mock_emitter)
+            await _ensure_sandbox(tools.valves, TEST_EMAIL, client, emitter=mock_emitter)
             R.check("empty label raises RuntimeError", False, "no exception raised")
         except RuntimeError as e:
             R.check("empty label raises RuntimeError", "Deployment label" in str(e), str(e))
@@ -764,7 +754,7 @@ async def test_int_ensure_sandbox(R: Results, tools: Tools, user: dict):
         print(f"  Created duplicate sandbox {duplicate_id[:12]}...")
 
         try:
-            await _ensure_sandbox(tools.valves, TEST_EMAIL, emitter=mock_emitter)
+            await _ensure_sandbox(tools.valves, TEST_EMAIL, client, emitter=mock_emitter)
             R.check("duplicate raises RuntimeError", False, "no exception raised")
         except RuntimeError as e:
             msg = str(e)
@@ -794,7 +784,7 @@ async def test_int_ensure_sandbox(R: Results, tools: Tools, user: dict):
                 break
         print(f"  Deleted ({len(remaining)} sandbox(es) remain).")
 
-        sandbox_id_3 = await _ensure_sandbox(tools.valves, TEST_EMAIL, emitter=mock_emitter)
+        sandbox_id_3 = await _ensure_sandbox(tools.valves, TEST_EMAIL, client, emitter=mock_emitter)
         R.check("back to normal after dup cleanup", sandbox_id_3 == sandbox_id, f"{sandbox_id_3[:12]} != {sandbox_id[:12]}")
 
         print("\n── _ensure_sandbox: volume is mounted ──")
@@ -1065,9 +1055,11 @@ async def run_tests():
         user = {"email": TEST_EMAIL, "id": "test-id", "name": "Test User"}
 
         # Pre-warm: create/start sandbox once before fanning out
+        import httpx as _httpx
         from lathe import _ensure_sandbox
         print("\n── pre-warm: ensuring sandbox is ready ──")
-        await _ensure_sandbox(tools.valves, TEST_EMAIL, emitter=mock_emitter)
+        async with _httpx.AsyncClient() as _prewarm_client:
+            await _ensure_sandbox(tools.valves, TEST_EMAIL, _prewarm_client, emitter=mock_emitter)
 
         # Integration tests that are independent can run concurrently,
         # but destroy must run last and ensure_sandbox has side effects.

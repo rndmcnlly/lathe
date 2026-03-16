@@ -83,10 +83,11 @@ async def _emit(emitter, description: str, done: bool = False):
         )
 
 
-async def _tool_guard(emitter, coro):
-    """Run *coro*, catch standard tool exceptions, and return an error string."""
+async def _tool_context(emitter, fn):
+    """Open a shared HTTP client, call fn(client), catch standard tool exceptions."""
     try:
-        return await coro
+        async with httpx.AsyncClient() as client:
+            return await fn(client)
     except RuntimeError as e:
         await _emit(emitter, f"Error: {e}", done=True)
         return f"Error: {e}"
@@ -870,7 +871,7 @@ async def _ensure_volume(valves, volume_name: str, client: httpx.AsyncClient) ->
     get_url = _api(valves, f"/volumes/by-name/{encoded_name}")
 
     # Try to fetch existing volume (treat deleting volumes as absent)
-    resp = await client.get(get_url, headers=_headers(valves))
+    resp = await client.get(get_url, headers=_headers(valves), timeout=30.0)
     need_create = (
         resp.status_code != 200
         or resp.json().get("state") in ("pending_delete", "deleting")
@@ -883,11 +884,12 @@ async def _ensure_volume(valves, volume_name: str, client: httpx.AsyncClient) ->
                 _api(valves, "/volumes"),
                 headers=_headers(valves),
                 json={"name": volume_name},
+                timeout=30.0,
             )
             if resp.status_code == 400 and "already exists" in resp.text:
                 # Deletion still propagating — wait and retry.
                 await asyncio.sleep(2)
-                resp = await client.get(get_url, headers=_headers(valves))
+                resp = await client.get(get_url, headers=_headers(valves), timeout=30.0)
                 if resp.status_code == 200:
                     state = resp.json().get("state")
                     if state not in ("pending_delete", "deleting"):
@@ -913,7 +915,7 @@ async def _ensure_volume(valves, volume_name: str, client: httpx.AsyncClient) ->
     poll_interval = 1.0
     while time.time() < deadline:
         await asyncio.sleep(poll_interval)
-        resp = await client.get(get_url, headers=_headers(valves))
+        resp = await client.get(get_url, headers=_headers(valves), timeout=30.0)
         if resp.status_code == 404:
             poll_interval = min(poll_interval * 1.2, 5.0)
             continue
@@ -926,37 +928,38 @@ async def _ensure_volume(valves, volume_name: str, client: httpx.AsyncClient) ->
     raise RuntimeError(f"Volume '{volume_name}' did not reach ready state within 60s (state: {vol.get('state')})")
 
 
-async def _wait_for_toolbox(valves, sandbox_id: str, emitter=None):
+async def _wait_for_toolbox(valves, sandbox_id: str, client: httpx.AsyncClient, emitter=None):
     """Poll the toolbox API until it responds, then ensure workspace dir exists."""
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        for attempt in range(30):
-            try:
-                resp = await client.post(
-                    _toolbox(valves, sandbox_id, "/process/execute"),
-                    headers=_headers(valves),
-                    json={"command": "echo ready", "timeout": 5000},
-                )
-                if resp.status_code == 200:
-                    data = resp.json()
-                    if data.get("exitCode") == 0 and "ready" in data.get("result", ""):
-                        await client.post(
-                            _toolbox(valves, sandbox_id, "/process/execute"),
-                            headers=_headers(valves),
-                            json={
-                                "command": "bash -c 'mkdir -p /home/daytona/workspace'",
-                                "timeout": 5000,
-                            },
-                        )
-                        return
-            except (httpx.HTTPError, httpx.TimeoutException):
-                pass
-            await asyncio.sleep(1)
-            if attempt == 2:
-                await _emit(emitter, "Waiting for sandbox to become ready...")
+    for attempt in range(30):
+        try:
+            resp = await client.post(
+                _toolbox(valves, sandbox_id, "/process/execute"),
+                headers=_headers(valves),
+                json={"command": "echo ready", "timeout": 5000},
+                timeout=10.0,
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                if data.get("exitCode") == 0 and "ready" in data.get("result", ""):
+                    await client.post(
+                        _toolbox(valves, sandbox_id, "/process/execute"),
+                        headers=_headers(valves),
+                        json={
+                            "command": "bash -c 'mkdir -p /home/daytona/workspace'",
+                            "timeout": 5000,
+                        },
+                        timeout=10.0,
+                    )
+                    return
+        except (httpx.HTTPError, httpx.TimeoutException):
+            pass
+        await asyncio.sleep(1)
+        if attempt == 2:
+            await _emit(emitter, "Waiting for sandbox to become ready...")
     raise RuntimeError("Sandbox started but toolbox daemon did not become responsive (30s)")
 
 
-async def _ensure_sandbox(valves, email: str, emitter=None) -> str:
+async def _ensure_sandbox(valves, email: str, client: httpx.AsyncClient, emitter=None) -> str:
     """Find or create a running sandbox for this user. Returns sandbox_id."""
     if not valves.daytona_api_key:
         raise RuntimeError(
@@ -971,121 +974,126 @@ async def _ensure_sandbox(valves, email: str, emitter=None) -> str:
     label_key = valves.deployment_label
     labels_filter = json.dumps({label_key: email})
 
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        # 1. Look up existing sandbox by label
-        resp = await client.get(
+    # 1. Look up existing sandbox by label
+    resp = await client.get(
+        _api(valves, "/sandbox"),
+        params={"labels": labels_filter},
+        headers=_headers(valves),
+        timeout=30.0,
+    )
+    resp.raise_for_status()
+    sandboxes = resp.json() or []
+
+    matches = [s for s in sandboxes if s.get("labels", {}).get(label_key) == email]
+
+    if len(matches) > 1:
+        ids = ", ".join(s["id"] for s in matches)
+        raise RuntimeError(
+            f"Found {len(matches)} sandboxes labelled {label_key}={email} ({ids}). "
+            f"Expected at most 1. Please delete the extras in the Daytona dashboard "
+            f"and try again."
+        )
+
+    sandbox = matches[0] if matches else None
+
+    if sandbox is None:
+        # 2. Get or create a persistent volume for this user
+        volume_name = f"{label_key}/{email}"
+        volume_id = await _ensure_volume(valves, volume_name, client)
+
+        # 3. Create new sandbox with volume mounted
+        await _emit(emitter, "Creating sandbox...")
+        resp = await client.post(
             _api(valves, "/sandbox"),
-            params={"labels": labels_filter},
             headers=_headers(valves),
+            json={
+                "language": valves.sandbox_language,
+                "name": f"{label_key}/{email}",
+                "labels": {label_key: email},
+                "autoStopInterval": valves.auto_stop_minutes,
+                "autoArchiveInterval": valves.auto_archive_minutes,
+                "autoDeleteInterval": -1,
+                "volumes": [
+                    {
+                        "volumeId": volume_id,
+                        "mountPath": VOLUME_MOUNT_PATH,
+                    }
+                ],
+            },
+            timeout=30.0,
         )
         resp.raise_for_status()
-        sandboxes = resp.json() or []
+        sandbox = resp.json()
 
-        matches = [s for s in sandboxes if s.get("labels", {}).get(label_key) == email]
+    sandbox_id = sandbox["id"]
+    state = sandbox.get("state", "unknown")
 
-        if len(matches) > 1:
-            ids = ", ".join(s["id"] for s in matches)
+    # 3. Ensure it's running
+    if state == "started":
+        await _wait_for_toolbox(valves, sandbox_id, client, emitter)
+        await _emit(emitter, "Sandbox ready", done=True)
+        return sandbox_id
+
+    if state in ("stopped", "archived"):
+        label = "Restoring sandbox..." if state == "archived" else "Starting sandbox..."
+        await _emit(emitter, label)
+        resp = await client.post(
+            _api(valves, f"/sandbox/{sandbox_id}/start"),
+            headers=_headers(valves),
+            timeout=30.0,
+        )
+        resp.raise_for_status()
+
+    elif state == "error" and sandbox.get("recoverable"):
+        await _emit(emitter, "Recovering sandbox...")
+        resp = await client.post(
+            _api(valves, f"/sandbox/{sandbox_id}/recover"),
+            headers=_headers(valves),
+            timeout=30.0,
+        )
+        resp.raise_for_status()
+        resp = await client.post(
+            _api(valves, f"/sandbox/{sandbox_id}/start"),
+            headers=_headers(valves),
+            timeout=30.0,
+        )
+        resp.raise_for_status()
+
+    elif state in ("starting", "stopping", "archiving"):
+        await _emit(emitter, f"Sandbox is {state}, waiting...")
+    else:
+        if state == "error":
             raise RuntimeError(
-                f"Found {len(matches)} sandboxes labelled {label_key}={email} ({ids}). "
-                f"Expected at most 1. Please delete the extras in the Daytona dashboard "
-                f"and try again."
+                f"Sandbox is in non-recoverable error state: {sandbox.get('errorReason', 'unknown')}"
             )
 
-        sandbox = matches[0] if matches else None
+    # 4. Poll until started
+    deadline = time.time() + 120
+    poll_interval = 1.0
+    while time.time() < deadline:
+        await asyncio.sleep(poll_interval)
+        resp = await client.get(
+            _api(valves, f"/sandbox/{sandbox_id}"),
+            headers=_headers(valves),
+            timeout=30.0,
+        )
+        resp.raise_for_status()
+        info = resp.json()
+        state = info.get("state", "unknown")
 
-        if sandbox is None:
-            # 2. Get or create a persistent volume for this user
-            volume_name = f"{label_key}/{email}"
-            volume_id = await _ensure_volume(valves, volume_name, client)
-
-            # 3. Create new sandbox with volume mounted
-            await _emit(emitter, "Creating sandbox...")
-            resp = await client.post(
-                _api(valves, "/sandbox"),
-                headers=_headers(valves),
-                json={
-                    "language": valves.sandbox_language,
-                    "name": f"{label_key}/{email}",
-                    "labels": {label_key: email},
-                    "autoStopInterval": valves.auto_stop_minutes,
-                    "autoArchiveInterval": valves.auto_archive_minutes,
-                    "autoDeleteInterval": -1,
-                    "volumes": [
-                        {
-                            "volumeId": volume_id,
-                            "mountPath": VOLUME_MOUNT_PATH,
-                        }
-                    ],
-                },
-            )
-            resp.raise_for_status()
-            sandbox = resp.json()
-
-        sandbox_id = sandbox["id"]
-        state = sandbox.get("state", "unknown")
-
-        # 3. Ensure it's running
         if state == "started":
-            await _wait_for_toolbox(valves, sandbox_id, emitter)
+            await _wait_for_toolbox(valves, sandbox_id, client, emitter)
             await _emit(emitter, "Sandbox ready", done=True)
             return sandbox_id
 
-        if state in ("stopped", "archived"):
-            label = "Restoring sandbox..." if state == "archived" else "Starting sandbox..."
-            await _emit(emitter, label)
-            resp = await client.post(
-                _api(valves, f"/sandbox/{sandbox_id}/start"),
-                headers=_headers(valves),
+        if state == "error":
+            raise RuntimeError(
+                f"Sandbox entered error state: {info.get('errorReason', 'unknown')}"
             )
-            resp.raise_for_status()
 
-        elif state == "error" and sandbox.get("recoverable"):
-            await _emit(emitter, "Recovering sandbox...")
-            resp = await client.post(
-                _api(valves, f"/sandbox/{sandbox_id}/recover"),
-                headers=_headers(valves),
-            )
-            resp.raise_for_status()
-            resp = await client.post(
-                _api(valves, f"/sandbox/{sandbox_id}/start"),
-                headers=_headers(valves),
-            )
-            resp.raise_for_status()
+        poll_interval = min(poll_interval * 1.2, 5.0)
 
-        elif state in ("starting", "stopping", "archiving"):
-            await _emit(emitter, f"Sandbox is {state}, waiting...")
-        else:
-            if state == "error":
-                raise RuntimeError(
-                    f"Sandbox is in non-recoverable error state: {sandbox.get('errorReason', 'unknown')}"
-                )
-
-        # 4. Poll until started
-        deadline = time.time() + 120
-        poll_interval = 1.0
-        while time.time() < deadline:
-            await asyncio.sleep(poll_interval)
-            resp = await client.get(
-                _api(valves, f"/sandbox/{sandbox_id}"),
-                headers=_headers(valves),
-            )
-            resp.raise_for_status()
-            info = resp.json()
-            state = info.get("state", "unknown")
-
-            if state == "started":
-                await _wait_for_toolbox(valves, sandbox_id, emitter)
-                await _emit(emitter, "Sandbox ready", done=True)
-                return sandbox_id
-
-            if state == "error":
-                raise RuntimeError(
-                    f"Sandbox entered error state: {info.get('errorReason', 'unknown')}"
-                )
-
-            poll_interval = min(poll_interval * 1.2, 5.0)
-
-        raise RuntimeError("Timed out waiting for sandbox to start (120s)")
+    raise RuntimeError("Timed out waiting for sandbox to start (120s)")
 
 
 # ── Tools class (only public methods are visible to OWUI) ───────────
@@ -1311,11 +1319,12 @@ class Tools:
 
             await _emit(__event_emitter__, "Looking up sandbox...")
 
-            async with httpx.AsyncClient(timeout=30.0) as client:
+            async with httpx.AsyncClient() as client:
                 resp = await client.get(
                     _api(valves, "/sandbox"),
                     params={"labels": labels_filter},
                     headers=_headers(valves),
+                    timeout=30.0,
                 )
                 resp.raise_for_status()
                 sandboxes = resp.json() or []
@@ -1336,6 +1345,7 @@ class Tools:
                         _api(valves, f"/sandbox/{sid}"),
                         headers=_headers(valves),
                         params={"force": "true"},
+                        timeout=30.0,
                     )
                     resp.raise_for_status()
                     deleted.append(sid)
@@ -1347,6 +1357,7 @@ class Tools:
                         _api(valves, "/sandbox"),
                         params={"labels": labels_filter},
                         headers=_headers(valves),
+                        timeout=30.0,
                     )
                     remaining = [
                         s for s in (resp.json() or [])
@@ -1365,12 +1376,14 @@ class Tools:
                         resp = await client.get(
                             _api(valves, f"/volumes/by-name/{encoded_vol}"),
                             headers=_headers(valves),
+                            timeout=30.0,
                         )
                         if resp.status_code == 200:
                             vol_id = resp.json()["id"]
                             resp = await client.delete(
                                 _api(valves, f"/volumes/{vol_id}"),
                                 headers=_headers(valves),
+                                timeout=30.0,
                             )
                             resp.raise_for_status()
                             volume_msg = " Persistent volume also deleted."
@@ -1407,9 +1420,9 @@ class Tools:
         Use read() on a skill's SKILL.md path to load its full instructions later.
         :param path: Absolute path to the project root (e.g. /home/daytona/workspace/myproject).
         """
-        async def _run():
+        async def _run(client):
             email = _get_email(__user__)
-            sandbox_id = await _ensure_sandbox(self.valves, email, __event_emitter__)
+            sandbox_id = await _ensure_sandbox(self.valves, email, client, __event_emitter__)
 
             await _emit(__event_emitter__, "Loading project context...")
 
@@ -1463,25 +1476,26 @@ class Tools:
             ).hexdigest()[:12]
             script_path = f"/tmp/_onboard_{script_tag}.sh"
             content_bytes = script.encode("utf-8")
-            async with httpx.AsyncClient(timeout=60.0) as client:
-                await client.post(
-                    _toolbox(self.valves, sandbox_id, "/files/upload"),
-                    params={"path": script_path},
-                    headers={"Authorization": f"Bearer {self.valves.daytona_api_key}"},
-                    files={"file": ("file", io.BytesIO(content_bytes), "application/octet-stream")},
-                )
+            await client.post(
+                _toolbox(self.valves, sandbox_id, "/files/upload"),
+                params={"path": script_path},
+                headers={"Authorization": f"Bearer {self.valves.daytona_api_key}"},
+                files={"file": ("file", io.BytesIO(content_bytes), "application/octet-stream")},
+                timeout=60.0,
+            )
 
-                resp = await client.post(
-                    _toolbox(self.valves, sandbox_id, "/process/execute"),
-                    headers=_headers(self.valves),
-                    json={
-                        "command": f"bash {script_path}",
-                        "cwd": p,
-                        "timeout": 30000,
-                    },
-                )
-                resp.raise_for_status()
-                data = resp.json()
+            resp = await client.post(
+                _toolbox(self.valves, sandbox_id, "/process/execute"),
+                headers=_headers(self.valves),
+                json={
+                    "command": f"bash {script_path}",
+                    "cwd": p,
+                    "timeout": 30000,
+                },
+                timeout=60.0,
+            )
+            resp.raise_for_status()
+            data = resp.json()
 
             result = data.get("result", "")
             exit_code = data.get("exitCode", -1)
@@ -1500,7 +1514,7 @@ class Tools:
             await _emit(__event_emitter__, "Project context loaded", done=True)
             return result if result else "(empty project context)"
 
-        return await _tool_guard(__event_emitter__, _run())
+        return await _tool_context(__event_emitter__, _run)
 
     async def bash(
         self,
@@ -1516,9 +1530,9 @@ class Tools:
         :param command: The bash command to execute.
         :param workdir: Working directory (default: /home/daytona/workspace).
         """
-        async def _run():
+        async def _run(client):
             email = _get_email(__user__)
-            sandbox_id = await _ensure_sandbox(self.valves, email, __event_emitter__)
+            sandbox_id = await _ensure_sandbox(self.valves, email, client, __event_emitter__)
 
             await _emit(__event_emitter__, "Running command...")
 
@@ -1560,27 +1574,29 @@ class Tools:
                 (command + str(time.time())).encode("utf-8", errors="replace")
             ).hexdigest()[:12]
             script_path = f"/tmp/_cmd_{script_tag}.sh"
-            async with httpx.AsyncClient(timeout=300.0) as client:
-                # Upload the script
-                await client.post(
-                    _toolbox(self.valves, sandbox_id, "/files/upload"),
-                    params={"path": script_path},
-                    headers={"Authorization": f"Bearer {self.valves.daytona_api_key}"},
-                    files={"file": ("file", io.BytesIO(script.encode("utf-8")), "application/octet-stream")},
-                )
 
-                # Execute it
-                resp = await client.post(
-                    _toolbox(self.valves, sandbox_id, "/process/execute"),
-                    headers=_headers(self.valves),
-                    json={
-                        "command": f"bash {script_path}",
-                        "cwd": workdir,
-                        "timeout": 120000,
-                    },
-                )
-                resp.raise_for_status()
-                data = resp.json()
+            # Upload the script
+            await client.post(
+                _toolbox(self.valves, sandbox_id, "/files/upload"),
+                params={"path": script_path},
+                headers={"Authorization": f"Bearer {self.valves.daytona_api_key}"},
+                files={"file": ("file", io.BytesIO(script.encode("utf-8")), "application/octet-stream")},
+                timeout=60.0,
+            )
+
+            # Execute it
+            resp = await client.post(
+                _toolbox(self.valves, sandbox_id, "/process/execute"),
+                headers=_headers(self.valves),
+                json={
+                    "command": f"bash {script_path}",
+                    "cwd": workdir,
+                    "timeout": 120000,
+                },
+                timeout=300.0,
+            )
+            resp.raise_for_status()
+            data = resp.json()
 
             exit_code = data.get("exitCode", -1)
             result = data.get("result", "")
@@ -1594,19 +1610,19 @@ class Tools:
                 # so the model can retrieve slices without re-running.
                 tag = hashlib.sha1(result[:256].encode("utf-8", errors="replace")).hexdigest()[:8]
                 spill_path = f"/tmp/_bash_output_{tag}.log"
-                async with httpx.AsyncClient(timeout=120.0) as client:
-                    await client.post(
-                        _toolbox(self.valves, sandbox_id, "/files/upload"),
-                        params={"path": spill_path},
-                        headers={"Authorization": f"Bearer {self.valves.daytona_api_key}"},
-                        files={
-                            "file": (
-                                "file",
-                                io.BytesIO(result.encode("utf-8")),
-                                "application/octet-stream",
-                            )
-                        },
-                    )
+                await client.post(
+                    _toolbox(self.valves, sandbox_id, "/files/upload"),
+                    params={"path": spill_path},
+                    headers={"Authorization": f"Bearer {self.valves.daytona_api_key}"},
+                    files={
+                        "file": (
+                            "file",
+                            io.BytesIO(result.encode("utf-8")),
+                            "application/octet-stream",
+                        )
+                    },
+                    timeout=120.0,
+                )
 
             await _emit(__event_emitter__, "Command complete", done=True)
 
@@ -1637,7 +1653,7 @@ class Tools:
 
             return output
 
-        return await _tool_guard(__event_emitter__, _run())
+        return await _tool_context(__event_emitter__, _run)
 
     async def read(
         self,
@@ -1653,25 +1669,25 @@ class Tools:
         :param offset: Starting line number (1-indexed, default: 1).
         :param limit: Max lines to return (default: 2000).
         """
-        async def _run():
+        async def _run(client):
             email = _get_email(__user__)
-            sandbox_id = await _ensure_sandbox(self.valves, email, __event_emitter__)
+            sandbox_id = await _ensure_sandbox(self.valves, email, client, __event_emitter__)
 
             await _emit(__event_emitter__, f"Reading {path}...")
 
-            async with httpx.AsyncClient(timeout=60.0) as client:
-                resp = await client.get(
-                    _toolbox(self.valves, sandbox_id, "/files/download"),
-                    params={"path": path},
-                    headers=_headers(self.valves),
-                )
+            resp = await client.get(
+                _toolbox(self.valves, sandbox_id, "/files/download"),
+                params={"path": path},
+                headers=_headers(self.valves),
+                timeout=60.0,
+            )
 
-                if resp.status_code == 404:
-                    await _emit(__event_emitter__, "File not found", done=True)
-                    return f"Error: File not found: {path}"
+            if resp.status_code == 404:
+                await _emit(__event_emitter__, "File not found", done=True)
+                return f"Error: File not found: {path}"
 
-                resp.raise_for_status()
-                content = resp.text
+            resp.raise_for_status()
+            content = resp.text
 
             lines = content.split("\n")
             if lines and lines[-1] == "":
@@ -1694,7 +1710,7 @@ class Tools:
                 header += f", showing lines {start_idx + 1}-{min(end_idx, total_lines)}"
             return f"{header}\n{numbered}"
 
-        return await _tool_guard(__event_emitter__, _run())
+        return await _tool_context(__event_emitter__, _run)
 
     async def write(
         self,
@@ -1708,42 +1724,42 @@ class Tools:
         :param path: Absolute path or relative to /home/daytona (e.g. workspace/main.py).
         :param content: The full file content to write.
         """
-        async def _run():
+        async def _run(client):
             email = _get_email(__user__)
-            sandbox_id = await _ensure_sandbox(self.valves, email, __event_emitter__)
+            sandbox_id = await _ensure_sandbox(self.valves, email, client, __event_emitter__)
 
             await _emit(__event_emitter__, f"Writing {path}...")
 
             parent = "/".join(path.rstrip("/").split("/")[:-1])
             if parent:
-                async with httpx.AsyncClient(timeout=30.0) as client:
-                    await client.post(
-                        _toolbox(self.valves, sandbox_id, "/process/execute"),
-                        headers=_headers(self.valves),
-                        json={
-                            "command": f'bash -c "mkdir -p {parent}"',
-                            "timeout": 5000,
-                        },
-                    )
+                await client.post(
+                    _toolbox(self.valves, sandbox_id, "/process/execute"),
+                    headers=_headers(self.valves),
+                    json={
+                        "command": f'bash -c "mkdir -p {parent}"',
+                        "timeout": 5000,
+                    },
+                    timeout=30.0,
+                )
 
             content_bytes = content.encode("utf-8")
-            async with httpx.AsyncClient(timeout=60.0) as client:
-                resp = await client.post(
-                    _toolbox(self.valves, sandbox_id, "/files/upload"),
-                    params={"path": path},
-                    headers={
-                        "Authorization": f"Bearer {self.valves.daytona_api_key}",
-                    },
-                    files={"file": ("file", io.BytesIO(content_bytes), "application/octet-stream")},
-                )
-                resp.raise_for_status()
+            resp = await client.post(
+                _toolbox(self.valves, sandbox_id, "/files/upload"),
+                params={"path": path},
+                headers={
+                    "Authorization": f"Bearer {self.valves.daytona_api_key}",
+                },
+                files={"file": ("file", io.BytesIO(content_bytes), "application/octet-stream")},
+                timeout=60.0,
+            )
+            resp.raise_for_status()
 
             n_bytes = len(content_bytes)
             n_lines = content.count("\n") + (0 if content.endswith("\n") else 1)
             await _emit(__event_emitter__, "Write complete", done=True)
             return f"Wrote {n_bytes} bytes ({n_lines} lines) to {path}"
 
-        return await _tool_guard(__event_emitter__, _run())
+        return await _tool_context(__event_emitter__, _run)
 
     async def edit(
         self,
@@ -1761,25 +1777,25 @@ class Tools:
         :param new_string: The replacement text.
         :param replace_all: Replace all occurrences (default: false).
         """
-        async def _run():
+        async def _run(client):
             email = _get_email(__user__)
-            sandbox_id = await _ensure_sandbox(self.valves, email, __event_emitter__)
+            sandbox_id = await _ensure_sandbox(self.valves, email, client, __event_emitter__)
 
             await _emit(__event_emitter__, f"Editing {path}...")
 
-            async with httpx.AsyncClient(timeout=60.0) as client:
-                resp = await client.get(
-                    _toolbox(self.valves, sandbox_id, "/files/download"),
-                    params={"path": path},
-                    headers=_headers(self.valves),
-                )
+            resp = await client.get(
+                _toolbox(self.valves, sandbox_id, "/files/download"),
+                params={"path": path},
+                headers=_headers(self.valves),
+                timeout=60.0,
+            )
 
-                if resp.status_code == 404:
-                    await _emit(__event_emitter__, "File not found", done=True)
-                    return f"Error: File not found: {path}"
+            if resp.status_code == 404:
+                await _emit(__event_emitter__, "File not found", done=True)
+                return f"Error: File not found: {path}"
 
-                resp.raise_for_status()
-                content = resp.text
+            resp.raise_for_status()
+            content = resp.text
 
             count = content.count(old_string)
 
@@ -1801,22 +1817,22 @@ class Tools:
                 new_content = content.replace(old_string, new_string, 1)
 
             content_bytes = new_content.encode("utf-8")
-            async with httpx.AsyncClient(timeout=60.0) as client:
-                resp = await client.post(
-                    _toolbox(self.valves, sandbox_id, "/files/upload"),
-                    params={"path": path},
-                    headers={
-                        "Authorization": f"Bearer {self.valves.daytona_api_key}",
-                    },
-                    files={"file": ("file", io.BytesIO(content_bytes), "application/octet-stream")},
-                )
-                resp.raise_for_status()
+            resp = await client.post(
+                _toolbox(self.valves, sandbox_id, "/files/upload"),
+                params={"path": path},
+                headers={
+                    "Authorization": f"Bearer {self.valves.daytona_api_key}",
+                },
+                files={"file": ("file", io.BytesIO(content_bytes), "application/octet-stream")},
+                timeout=60.0,
+            )
+            resp.raise_for_status()
 
             replaced = count if replace_all else 1
             await _emit(__event_emitter__, "Edit complete", done=True)
             return f"Replaced {replaced} occurrence(s) in {path}"
 
-        return await _tool_guard(__event_emitter__, _run())
+        return await _tool_context(__event_emitter__, _run)
 
     async def attach(
         self,
@@ -1829,26 +1845,26 @@ class Tools:
         Use read() if you need to see the contents yourself.
         :param path: Absolute path or relative to /home/daytona (e.g. workspace/main.py).
         """
-        async def _run():
+        async def _run(client):
             email = _get_email(__user__)
             user_id = __user__.get("id", "")
-            sandbox_id = await _ensure_sandbox(self.valves, email, __event_emitter__)
+            sandbox_id = await _ensure_sandbox(self.valves, email, client, __event_emitter__)
 
             await _emit(__event_emitter__, f"Attaching {path}...")
 
-            async with httpx.AsyncClient(timeout=60.0) as client:
-                resp = await client.get(
-                    _toolbox(self.valves, sandbox_id, "/files/download"),
-                    params={"path": path},
-                    headers=_headers(self.valves),
-                )
+            resp = await client.get(
+                _toolbox(self.valves, sandbox_id, "/files/download"),
+                params={"path": path},
+                headers=_headers(self.valves),
+                timeout=60.0,
+            )
 
-                if resp.status_code == 404:
-                    await _emit(__event_emitter__, "File not found", done=True)
-                    return f"Error: File not found: {path}"
+            if resp.status_code == 404:
+                await _emit(__event_emitter__, "File not found", done=True)
+                return f"Error: File not found: {path}"
 
-                resp.raise_for_status()
-                raw = resp.content  # bytes, not text — safe for binary
+            resp.raise_for_status()
+            raw = resp.content  # bytes, not text — safe for binary
 
             n_bytes = len(raw)
             filename = path.rsplit("/", 1)[-1] if "/" in path else path
@@ -1979,7 +1995,7 @@ class Tools:
             await _emit(__event_emitter__, f"Attached {filename} ({n_bytes:,} bytes)", done=True)
             return HTMLResponse(content=html_content, headers={"Content-Disposition": "inline"})
 
-        return await _tool_guard(__event_emitter__, _run())
+        return await _tool_context(__event_emitter__, _run)
 
     async def ingest(
         self,
@@ -1994,9 +2010,9 @@ class Tools:
         to inspect.
         :param prompt: Message shown to the user (e.g. "Upload your CSV dataset").
         """
-        async def _run():
+        async def _run(client):
             email = _get_email(__user__)
-            sandbox_id = await _ensure_sandbox(self.valves, email, __event_emitter__)
+            sandbox_id = await _ensure_sandbox(self.valves, email, client, __event_emitter__)
 
             if not __event_call__:
                 return "Error: ingest requires browser-side execution (__event_call__). Ensure the toolkit is used in Native function calling mode."
@@ -2367,27 +2383,27 @@ return await new Promise((resolve) => {{
             dest_path = f"/home/daytona/workspace/{filename}"
 
             # Ensure workspace directory exists
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                await client.post(
-                    _toolbox(self.valves, sandbox_id, "/process/execute"),
-                    headers=_headers(self.valves),
-                    json={
-                        "command": 'bash -c "mkdir -p /home/daytona/workspace"',
-                        "timeout": 5000,
-                    },
-                )
+            await client.post(
+                _toolbox(self.valves, sandbox_id, "/process/execute"),
+                headers=_headers(self.valves),
+                json={
+                    "command": 'bash -c "mkdir -p /home/daytona/workspace"',
+                    "timeout": 5000,
+                },
+                timeout=30.0,
+            )
 
             # Upload to Daytona sandbox
-            async with httpx.AsyncClient(timeout=120.0) as client:
-                resp = await client.post(
-                    _toolbox(self.valves, sandbox_id, "/files/upload"),
-                    params={"path": dest_path},
-                    headers={
-                        "Authorization": f"Bearer {self.valves.daytona_api_key}",
-                    },
-                    files={"file": ("file", io.BytesIO(file_bytes), "application/octet-stream")},
-                )
-                resp.raise_for_status()
+            resp = await client.post(
+                _toolbox(self.valves, sandbox_id, "/files/upload"),
+                params={"path": dest_path},
+                headers={
+                    "Authorization": f"Bearer {self.valves.daytona_api_key}",
+                },
+                files={"file": ("file", io.BytesIO(file_bytes), "application/octet-stream")},
+                timeout=120.0,
+            )
+            resp.raise_for_status()
 
             # Delete the transient file from OWUI storage
             try:
@@ -2400,7 +2416,7 @@ return await new Promise((resolve) => {{
             await _emit(__event_emitter__, f"Uploaded {filename} ({size_str})", done=True)
             return f"Uploaded {filename} ({size_str}) to {dest_path}"
 
-        return await _tool_guard(__event_emitter__, _run())
+        return await _tool_context(__event_emitter__, _run)
 
     async def preview(
         self,
@@ -2412,23 +2428,23 @@ return await new Promise((resolve) => {{
         Generate a signed preview URL for a service running in the sandbox.
         :param port: Port the service listens on (3000–9999, default: 3000).
         """
-        async def _run():
+        async def _run(client):
             if not isinstance(port, int) or port < 3000 or port > 9999:
                 return "Error: port must be an integer between 3000 and 9999."
 
             email = _get_email(__user__)
-            sandbox_id = await _ensure_sandbox(self.valves, email, __event_emitter__)
+            sandbox_id = await _ensure_sandbox(self.valves, email, client, __event_emitter__)
 
             await _emit(__event_emitter__, f"Generating preview URL for port {port}...")
 
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                resp = await client.get(
-                    _api(self.valves, f"/sandbox/{sandbox_id}/ports/{port}/signed-preview-url"),
-                    params={"expiresInSeconds": 3600},
-                    headers=_headers(self.valves),
-                )
-                resp.raise_for_status()
-                data = resp.json()
+            resp = await client.get(
+                _api(self.valves, f"/sandbox/{sandbox_id}/ports/{port}/signed-preview-url"),
+                params={"expiresInSeconds": 3600},
+                headers=_headers(self.valves),
+                timeout=30.0,
+            )
+            resp.raise_for_status()
+            data = resp.json()
 
             url = data.get("url", "")
             if not url:
@@ -2444,7 +2460,7 @@ return await new Promise((resolve) => {{
                 f"the preview stopped working, restart the server and call preview() again."
             )
 
-        return await _tool_guard(__event_emitter__, _run())
+        return await _tool_context(__event_emitter__, _run)
 
     async def ssh(
         self,
@@ -2456,23 +2472,23 @@ return await new Promise((resolve) => {{
         Generate a time-limited SSH command for the user to connect interactively.
         :param expires_in_minutes: Token validity in minutes (1–1440, default: 60).
         """
-        async def _run():
+        async def _run(client):
             if not isinstance(expires_in_minutes, int) or expires_in_minutes < 1 or expires_in_minutes > 1440:
                 return "Error: expires_in_minutes must be an integer between 1 and 1440 (24 hours)."
 
             email = _get_email(__user__)
-            sandbox_id = await _ensure_sandbox(self.valves, email, __event_emitter__)
+            sandbox_id = await _ensure_sandbox(self.valves, email, client, __event_emitter__)
 
             await _emit(__event_emitter__, "Creating SSH access token...")
 
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                resp = await client.post(
-                    _api(self.valves, f"/sandbox/{sandbox_id}/ssh-access"),
-                    params={"expiresInMinutes": expires_in_minutes},
-                    headers=_headers(self.valves),
-                )
-                resp.raise_for_status()
-                data = resp.json()
+            resp = await client.post(
+                _api(self.valves, f"/sandbox/{sandbox_id}/ssh-access"),
+                params={"expiresInMinutes": expires_in_minutes},
+                headers=_headers(self.valves),
+                timeout=30.0,
+            )
+            resp.raise_for_status()
+            data = resp.json()
 
             ssh_command = data.get("sshCommand", "")
             if not ssh_command:
@@ -2492,4 +2508,4 @@ return await new Promise((resolve) => {{
                 f"Active SSH sessions keep the sandbox alive."
             )
 
-        return await _tool_guard(__event_emitter__, _run())
+        return await _tool_context(__event_emitter__, _run)
