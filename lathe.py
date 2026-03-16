@@ -1536,39 +1536,33 @@ class Tools:
 
             await _emit(__event_emitter__, "Running command...")
 
-            # Build a script that sets non-interactive env vars then runs the
-            # command exactly as provided.  Writing to a temp file avoids all
-            # quoting/escaping issues with the Daytona execute API's argv
-            # splitting — the command reaches bash with zero transformations.
-
-            # Collect user-supplied env vars from UserValves (never logged).
-            # Raises ValueError (caught below) if env_vars is malformed.
-            user_valves = __user__.get("valves")
-            user_env_lines = ""
-            if user_valves:
-                raw_env = getattr(user_valves, "env_vars", "") or ""
-                pairs = _parse_env_vars(raw_env)
-                if pairs:
-                    user_env_lines = (
-                        "# user env vars\n"
-                        + "".join(
-                            f"export {k}={_shell_quote(v)}\n"
-                            for k, v in pairs
-                        )
-                    )
-
+            # Build a script that runs the command exactly as provided.
+            # Writing to a temp file avoids all quoting/escaping issues with
+            # the Daytona execute API's argv splitting — the command reaches
+            # bash with zero transformations.
             script = (
                 "#!/usr/bin/env bash\n"
                 "set -e -o pipefail\n"
-                "export DEBIAN_FRONTEND=noninteractive "
-                "GIT_TERMINAL_PROMPT=0 "
-                "PIP_NO_INPUT=1 "
-                "NPM_CONFIG_YES=true "
-                "CI=true\n"
-                + user_env_lines
                 + command
                 + "\n"
             )
+
+            # Collect user-supplied env vars from UserValves (never logged).
+            # Raises ValueError (caught below) if env_vars is malformed.
+            # Non-interactive defaults are passed via the API env dict so they
+            # are scoped to the execution and never written to disk.
+            user_valves = __user__.get("valves")
+            exec_env: dict[str, str] = {
+                "DEBIAN_FRONTEND": "noninteractive",
+                "GIT_TERMINAL_PROMPT": "0",
+                "PIP_NO_INPUT": "1",
+                "NPM_CONFIG_YES": "true",
+                "CI": "true",
+            }
+            if user_valves:
+                raw_env = getattr(user_valves, "env_vars", "") or ""
+                pairs = _parse_env_vars(raw_env)
+                exec_env.update(pairs)
 
             script_tag = hashlib.sha1(
                 (command + str(time.time())).encode("utf-8", errors="replace")
@@ -1593,6 +1587,7 @@ class Tools:
                     "command": f"bash {script_path}",
                     "cwd": workdir,
                     "timeout": _BASH_PROCESS_TIMEOUT_MS,
+                    "env": exec_env,
                 },
                 timeout=_BASH_PROCESS_TIMEOUT_MS / 1000 + 30,  # process ceiling + buffer
             )
@@ -1734,12 +1729,9 @@ class Tools:
             parent = "/".join(path.rstrip("/").split("/")[:-1])
             if parent:
                 await client.post(
-                    _toolbox(self.valves, sandbox_id, "/process/execute"),
+                    _toolbox(self.valves, sandbox_id, "/files/folder"),
                     headers=_headers(self.valves),
-                    json={
-                        "command": f'bash -c "mkdir -p {parent}"',
-                        "timeout": 5000,
-                    },
+                    json={"path": parent, "mode": "755"},
                     timeout=30.0,
                 )
 
