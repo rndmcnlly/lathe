@@ -300,10 +300,7 @@ _IMAGE_MIME = {
     ".gif": "image/gif", ".svg": "image/svg+xml", ".webp": "image/webp",
     ".bmp": "image/bmp", ".ico": "image/x-icon", ".avif": "image/avif",
 }
-# Max bytes to embed in HTML for binary download.  Binary and media files are
-# now always offloaded to OWUI file storage, so this cap only guards the
-# (unlikely) inline-fallback path when the upload fails.
-_EMBED_SIZE_CAP = 100 * 1024 * 1024
+
 
 
 def _sniff_media_mime(raw: bytes) -> str | None:
@@ -474,15 +471,8 @@ def _render_image_html(raw: bytes, filename: str, path: str) -> str:
 
 
 def _render_media_html(raw: bytes, filename: str, path: str) -> str:
-    """Render an audio/video file with inline <audio>/<video> controls and Save button.
-
-    Falls back to the binary download card for files over _EMBED_SIZE_CAP
-    (base64 encoding would blow up the iframe).
-    """
+    """Render an audio/video file with inline <audio>/<video> controls and Save button."""
     n_bytes = len(raw)
-    if n_bytes > _EMBED_SIZE_CAP:
-        return _render_binary_html(raw, filename, path)
-
     mime = _media_mime(path, raw) or "application/octet-stream"
     is_video = mime.startswith("video/")
     tag = "video" if is_video else "audio"
@@ -550,17 +540,12 @@ def _render_media_html(raw: bytes, filename: str, path: str) -> str:
 
 
 def _render_binary_html(raw: bytes, filename: str, path: str) -> str:
-    """Render a binary file as a download card. Embeds content for Save if under size cap."""
+    """Render a binary file as a download card with an embedded Save button."""
     ext = ("." + path.rsplit(".", 1)[-1]).lower() if "." in path.rsplit("/", 1)[-1] else ""
     n_bytes = len(raw)
-    can_embed = n_bytes <= _EMBED_SIZE_CAP
-
-    save_button = ""
-    save_script = ""
-    if can_embed:
-        raw_b64 = base64.b64encode(raw).decode("ascii")
-        save_button = '<button onclick="saveFile()">Save</button>'
-        save_script = f"""
+    raw_b64 = base64.b64encode(raw).decode("ascii")
+    save_button = '<button onclick="saveFile()">Save</button>'
+    save_script = f"""
     var _b64 = "{raw_b64}";
     var _fname = "{html_mod.escape(filename)}";
     function saveFile() {{
@@ -574,8 +559,6 @@ def _render_binary_html(raw: bytes, filename: str, path: str) -> str:
       a.click();
       URL.revokeObjectURL(a.href);
     }}"""
-    else:
-        save_button = '<span class="too-large">Too large to embed &mdash; ask the agent to serve it via preview()</span>'
 
     return f"""<!DOCTYPE html>
 <html>
@@ -1905,8 +1888,7 @@ class Tools:
                     )
                     return HTMLResponse(content=html_content, headers={"Content-Disposition": "inline"})
                 except Exception as e:
-                    # Fall through to inline path on upload failure
-                    await _emit(__event_emitter__, f"Offload failed ({e}), falling back to inline embed...")
+                    raise RuntimeError(f"OWUI storage offload failed for {filename}: {e}") from e
 
             # ── inline path: text, images, or offload fallback ───────
             if file_type == "image":
@@ -2007,16 +1989,7 @@ class Tools:
 </body>
 </html>"""
 
-            if n_bytes > _EMBED_SIZE_CAP and file_type in ("binary", "media"):
-                await _emit(
-                    __event_emitter__,
-                    f"Attached {filename} ({n_bytes:,} bytes) — too large to embed; "
-                    "serve it with a background HTTP server and use preview() to give "
-                    "the user a direct download link",
-                    done=True,
-                )
-            else:
-                await _emit(__event_emitter__, f"Attached {filename} ({n_bytes:,} bytes)", done=True)
+            await _emit(__event_emitter__, f"Attached {filename} ({n_bytes:,} bytes)", done=True)
             return HTMLResponse(content=html_content, headers={"Content-Disposition": "inline"})
 
         return await _tool_guard(__event_emitter__, _run())
