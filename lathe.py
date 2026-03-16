@@ -1196,6 +1196,71 @@ class Tools:
     #   breadcrumbs like 'see lathe(manpage="bash") for details'.
 
     _MANPAGES: dict[str, str] = {
+        "background": textwrap.dedent("""\
+            # Lathe — Background Jobs
+
+            When bash() auto-backgrounds a command, it returns a descriptor with
+            two paths:
+
+              CMD=/tmp/cmd/<id>   — the job's sidecar directory
+              PID=/tmp/cmd/<id>/pid — process ID file
+
+            ## Sidecar files
+
+            Where CMD=/tmp/cmd/<id>:
+
+              CMD/sh    — the full wrapper script that was executed
+              CMD/pid   — PID of the bash process (written before exec)
+              CMD/log   — stdout+stderr, written live via tee
+              CMD/exit  — exit code; present only when the process ends
+
+            Absence of CMD/exit means the process is still running *or* the
+            sandbox was restarted (in which case the PID is stale). To
+            distinguish the two, check whether the PID is still alive.
+
+            ## Recipes
+
+            **Peek at live output:**
+            ```
+            tail $CMD/log
+            ```
+
+            **Poll until done (bounded):**
+            ```
+            for i in 1 2 3 4 5; do
+              test -f $CMD/exit && {{ cat $CMD/exit; break; }} || sleep 2
+            done
+            test -f $CMD/exit || echo STILL_RUNNING
+            ```
+
+            **Check if process is alive:**
+            ```
+            kill -0 $(cat $CMD/pid) 2>/dev/null && echo ALIVE || echo DEAD_OR_GONE
+            ```
+
+            **Kill the job:**
+            ```
+            kill $(cat $CMD/pid)
+            ```
+            This stops the wrapper process. Note: child processes the job spawned
+            will have already reparented to init and will keep running. If the job
+            launched named services (e.g. a dev server), kill them by name:
+            ```
+            pkill -f my_server_name
+            ```
+
+            **Kill and confirm wrapper is gone:**
+            ```
+            kill $(cat $CMD/pid); sleep 1; kill -0 $(cat $CMD/pid) 2>/dev/null && echo STILL_UP || echo GONE
+            ```
+
+            ## Caution
+
+            After a sandbox restart, CMD/pid contains a stale PID. A new process
+            may have been assigned that ID. Do not kill without first verifying
+            the process is the one you launched (e.g. check CMD/log for expected
+            output before killing).
+            """),
         "overview": textwrap.dedent("""\
             # Lathe Toolkit — Overview
 
@@ -1249,11 +1314,11 @@ class Tools:
               -y or equivalent flags. For interactive work, give the user an ssh()
               token.
             - bash() auto-backgrounds commands that exceed ~30 seconds. When this
-              happens, it returns a background descriptor with a /tmp/cmd/<id>/
-              state directory (log, exit, sh). Use foreground_seconds= to extend
-              the wait (e.g. foreground_seconds=120 for known-slow commands or
-              when waiting for a backgrounded command to finish). The command
-              keeps running even after backgrounding.
+              happens, it returns a background descriptor with CMD and PID paths.
+              Use foreground_seconds= to extend the wait (e.g. foreground_seconds=120
+              for known-slow commands or when waiting for a backgrounded command to
+              finish). The command keeps running even after backgrounding.
+              See lathe(manpage="background") for peek/poll/kill recipes.
             - bash() output is truncated to the last 2000 lines / 50 KB. If
               truncated, the full output is available in the log file at
               /tmp/cmd/<id>/log — use read() to inspect specific sections.
@@ -1284,6 +1349,7 @@ class Tools:
     # lookups and useful for the model to decide which page to request).
     _MANPAGE_INDEX: dict[str, str] = {
         "overview": "Big-picture orientation: sandbox model, tool catalog, key workflows, gotchas.",
+        "background": "Background job sidecar files, and peek/poll/kill recipes.",
     }
 
     async def lathe(
@@ -1544,12 +1610,14 @@ class Tools:
             # ── Build wrapper script ────────────────────────────────
             #
             # Each command gets a /proc-style directory under /tmp/cmd/:
-            #   /tmp/cmd/<uuid>/sh    — the script
+            #   /tmp/cmd/<uuid>/sh    — the wrapper script
+            #   /tmp/cmd/<uuid>/pid   — wrapper process ID (written before exec; kill to stop the job)
             #   /tmp/cmd/<uuid>/log   — stdout+stderr (tee'd live)
             #   /tmp/cmd/<uuid>/exit  — exit code (written on completion)
             cmd_id = str(uuid.uuid4())
             cmd_dir = f"/tmp/cmd/{cmd_id}"
             log_path = f"{cmd_dir}/log"
+            pid_path = f"{cmd_dir}/pid"
             exit_path = f"{cmd_dir}/exit"
             script_path = f"{cmd_dir}/sh"
 
@@ -1565,6 +1633,7 @@ class Tools:
                 "NPM_CONFIG_YES=true "
                 "CI=true\n"
                 + user_env_lines
+                + f"echo $BASHPID > {_shell_quote(pid_path)}\n"
                 + f"exec > >(tee {_shell_quote(log_path)}) 2>&1\n"
                 + command
                 + "\n"
@@ -1689,9 +1758,9 @@ class Tools:
 
                 bg_notice = (
                     f"\n\n[Backgrounded after {elapsed}s — command is still running]\n"
-                    f"  CMD={cmd_dir}\n"
-                    f"  Peek: tail $CMD/log\n"
-                    f"  Poll: for i in 1 2 3 4 5; do test -f $CMD/exit && {{ cat $CMD/exit; break; }} || sleep 2; done; test -f $CMD/exit || echo RUNNING\n"
+                    f"CMD={cmd_id}\n"
+                    f"Ref /tmp/cmd/$CMD/{{sh,pid,log,exit}}\n"
+                    f"See lathe(manpage=\"background\") for peek/poll/kill recipes.\n"
                     f"Tell the user the command is running. Don't poll until they ask or "
                     f"you have a concrete reason to expect completion."
                 )

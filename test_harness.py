@@ -567,6 +567,8 @@ async def test_int_attach(R: Results, tools: Tools, user: dict):
         print("\n── attach: ZIP binary file ──")
         result = await tools.attach("workspace/test_archive.zip", __user__=user, __event_emitter__=mock_emitter)
         R.check("zip returns HTMLResponse", isinstance(result, HTMLResponse), type(result).__name__)
+        if not isinstance(result, HTMLResponse):
+            return
         zip_body = result.body.decode("utf-8")
         R.check("zip shows filename", "test_archive.zip" in zip_body, "")
         R.check("zip shows file type", "ZIP" in zip_body, "")
@@ -679,6 +681,7 @@ async def test_int_bash_sessions(R: Results, tools: Tools, user: dict):
         R.check("state dir has log file", "log" in dir_result, dir_result[:200])
         R.check("state dir has exit file", "exit" in dir_result, dir_result[:200])
         R.check("state dir has sh file", "sh" in dir_result, dir_result[:200])
+        R.check("state dir has pid file", "pid" in dir_result, dir_result[:200])
 
         exit_result = await tools.bash(
             f"cat {sentinel_dir}/exit", __user__=user, __event_emitter__=mock_emitter,
@@ -727,13 +730,13 @@ async def test_int_bash_sessions(R: Results, tools: Tools, user: dict):
     )
     R.check("short timeout triggers backgrounding", "Backgrounded" in bg_result, bg_result[:300])
     R.check("background descriptor has CMD=", "CMD=" in bg_result, bg_result[:300])
-    R.check("background descriptor has Peek hint", "Peek:" in bg_result, bg_result[:300])
-    R.check("background descriptor has Poll hint", "Poll:" in bg_result, bg_result[:300])
+    R.check("background descriptor has Ref line", "Ref /tmp/cmd/$CMD/" in bg_result, bg_result[:300])
+    R.check("background descriptor has manpage pointer", 'manpage="background"' in bg_result, bg_result[:300])
 
-    # Extract CMD dir from background descriptor
-    cmd_match = re.search(r"CMD=(/tmp/cmd/[0-9a-f-]+)", bg_result)
+    # Extract CMD uuid from background descriptor and reconstruct full path
+    cmd_match = re.search(r"CMD=([0-9a-f-]{36})", bg_result)
     if cmd_match:
-        bg_cmd_dir = cmd_match.group(1)
+        bg_cmd_dir = f"/tmp/cmd/{cmd_match.group(1)}"
 
         # Wait for the backgrounded command to finish using the suggested pattern
         wait_result = await tools.bash(
