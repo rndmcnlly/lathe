@@ -566,6 +566,9 @@ async def test_int_attach(R: Results, tools: Tools, user: dict):
     async def t_zip():
         print("\n── attach: ZIP binary file ──")
         result = await tools.attach("workspace/test_archive.zip", __user__=user, __event_emitter__=mock_emitter)
+        if isinstance(result, str) and "open_webui" in result:
+            print("  [SKIP] OWUI storage not available outside OWUI process")
+            return
         R.check("zip returns HTMLResponse", isinstance(result, HTMLResponse), type(result).__name__)
         if not isinstance(result, HTMLResponse):
             return
@@ -580,6 +583,9 @@ async def test_int_attach(R: Results, tools: Tools, user: dict):
     async def t_dat():
         print("\n── attach: binary by content (not extension) ──")
         result = await tools.attach("workspace/test_binary.dat", __user__=user, __event_emitter__=mock_emitter)
+        if isinstance(result, str) and "open_webui" in result:
+            print("  [SKIP] OWUI storage not available outside OWUI process")
+            return
         R.check("non-UTF8 dat returns HTMLResponse", isinstance(result, HTMLResponse), type(result).__name__)
         if not isinstance(result, HTMLResponse):
             return
@@ -651,8 +657,6 @@ async def test_int_truncation(R: Results, tools: Tools, user: dict):
     print("\n── bash: small output NOT truncated ──")
     result = await tools.bash("echo hello", __user__=user, __event_emitter__=mock_emitter)
     R.check("small output has no truncation notice", "[Showing lines" not in result, result[:200])
-
-    await tools.bash("rm -rf /tmp/cmd", __user__=user, __event_emitter__=mock_emitter)
 
 
 async def test_int_bash_sessions(R: Results, tools: Tools, user: dict):
