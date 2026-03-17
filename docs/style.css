@@ -136,6 +136,26 @@ code {
     flex-shrink: 0;
 }
 
+/* ── Download button ──────────────────────────────── */
+
+.hero-links .download-btn {
+    color: var(--base);
+    background: var(--peach);
+    padding: 0.3rem 0.9rem;
+    border-radius: 999px;
+    font-weight: 600;
+    transition: background 0.15s, color 0.15s;
+}
+
+.hero-links .download-btn:hover {
+    background: var(--yellow);
+    color: var(--base);
+}
+
+.hero-links .download-btn svg {
+    color: var(--base);
+}
+
 /* ── Demo video ───────────────────────────────────── */
 
 .demo-video {
