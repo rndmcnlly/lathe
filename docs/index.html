@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <link rel="stylesheet" href="style.css">
     <title>Lathe — a coding agent surface for Open WebUI</title>
-    <meta name="description" content="Lathe gives any Open WebUI model a full coding agent toolkit: bash, file editing, live preview, SSH access, and more — all running in persistent cloud sandboxes.">
+    <meta name="description" content="Lathe gives any Open WebUI model a full coding agent toolkit: bash, file editing, web services, SSH access, and more — all running in persistent cloud sandboxes.">
     <meta property="og:title" content="Lathe">
     <meta property="og:type" content="website">
     <meta property="og:description" content="A coding agent surface for Open WebUI. Persistent sandboxes, real tools, zero setup for users.">
@@ -38,7 +38,7 @@
 <div class="callout">
     <strong>Lathe</strong> is an <a href="https://docs.openwebui.com/">Open WebUI</a> toolkit — a single Python file
     your admin installs once. After that, every model on the server can
-    run shell commands, edit code, preview web apps, transfer files, and SSH into
+    run shell commands, edit code, expose web services, and SSH into
     a persistent cloud sandbox. One sandbox per user, survives across conversations.
 </div>
 
@@ -60,7 +60,7 @@
     <p>
         You talk to a model in Open WebUI. The model calls Lathe's tools —
         <code>bash</code>, <code>write</code>, <code>edit</code>, <code>read</code>,
-        <code>preview</code>, and more. Every tool call executes in a cloud VM
+        <code>expose</code>, and more. Every tool call executes in a cloud VM
         that belongs to you, managed by <a href="https://www.daytona.io/">Daytona</a>.
     </p>
     <div class="arch-diagram"><span class="dim">┌─────────────┐  tool calls  ┌─────────────┐   API   ┌──────────────┐</span>
@@ -102,20 +102,8 @@
             <p>Exact string replacement in files. Safer than rewriting the whole file.</p>
         </div>
         <div class="tool-card">
-            <h3>attach</h3>
-            <p>Show a file to you without burning the model's context. Syntax highlighting, image preview, or download card.</p>
-        </div>
-        <div class="tool-card">
-            <h3>ingest</h3>
-            <p>Upload a file from your machine or paste text directly into the sandbox.</p>
-        </div>
-        <div class="tool-card">
-            <h3>preview</h3>
-            <p>Get a live URL for a web server running in your sandbox. See your app in the browser.</p>
-        </div>
-        <div class="tool-card">
-            <h3>ssh</h3>
-            <p>Get a time-limited SSH command for direct terminal access. Works with VS Code Remote too.</p>
+            <h3>expose</h3>
+            <p>Give the user a public URL for any sandbox service — web apps, file browsers (<a href="https://github.com/sigoden/dufs">dufs</a>), IDEs (<a href="https://github.com/coder/code-server">code-server</a>) — or a time-limited SSH command.</p>
         </div>
         <div class="tool-card">
             <h3>fetch</h3>
@@ -143,11 +131,11 @@
     <ul class="recipe-list">
         <li>
             <span class="recipe-label">Build a web app</span>
-            <span class="recipe-desc">"Build me a simple todo app with FastAPI and HTMX, then preview it."</span>
+            <span class="recipe-desc">"Build me a simple todo app with FastAPI and HTMX, then expose it so I can try it."</span>
         </li>
         <li>
-            <span class="recipe-label">Analyze data</span>
-            <span class="recipe-desc">Use <code>ingest</code> to upload a CSV, then ask the model to analyze it with pandas and attach a chart.</span>
+            <span class="recipe-label">Browse &amp; transfer files</span>
+            <span class="recipe-desc">"Set up a file browser" — the model runs <a href="https://github.com/sigoden/dufs">dufs</a> and gives you a URL with drag-and-drop upload/download, no size limit.</span>
         </li>
         <li>
             <span class="recipe-label">Work on a repo</span>
@@ -162,8 +150,8 @@
             <span class="recipe-desc">"Give me SSH access" — get a command you can paste into your terminal or VS Code.</span>
         </li>
         <li>
-            <span class="recipe-label">Share a file</span>
-            <span class="recipe-desc">"Attach the generated report" — see the file inline without it entering the conversation context.</span>
+            <span class="recipe-label">Full IDE in the browser</span>
+            <span class="recipe-desc">"Set up code-server" — the model installs <a href="https://github.com/coder/code-server">code-server</a> and gives you VS Code in a browser tab, editing files in your sandbox.</span>
         </li>
     </ul>
 </div>

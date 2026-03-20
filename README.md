@@ -1,20 +1,17 @@
 # Lathe
 
-A single-file Open WebUI toolkit that gives any model a coding agent's tool surface — `bash`, `read`, `write`, `edit`, `attach`, `ingest`, `onboard`, `ssh`, `preview`, `destroy` — executing against per-user cloud sandboxes via [Daytona](https://www.daytona.io/).
+A single-file Open WebUI toolkit that gives any model a coding agent's tool surface — `bash`, `read`, `write`, `edit`, `onboard`, `expose`, `fetch`, `destroy` — executing against per-user cloud sandboxes via [Daytona](https://www.daytona.io/).
 
 **For users**: See [lathe.tools](https://lathe.tools) for what Lathe can do, how to use it, and example workflows.
 
 ## What it does to your instance
 
-Lathe registers ten tools that models can call in [Native function calling mode](https://docs.openwebui.com/features/extensibility/plugin/tools/). When a user's model calls a tool:
+Lathe registers nine tools that models can call in [Native function calling mode](https://docs.openwebui.com/features/extensibility/plugin/tools/). When a user's model calls a tool:
 
 1. **Outbound API calls to Daytona** — Lathe creates, starts, or resumes a cloud sandbox VM via the Daytona control plane and toolbox APIs. All sandbox operations go outbound from your OWUI server.
-2. **`__event_call__` JS injection** — The `ingest` tool uses OWUI's `__event_call__` mechanism to render a file-upload modal in the user's browser tab. This is the same pattern used by other OWUI toolkits (e.g. [picker-agent](https://github.com/rndmcnlly/picker-agent)).
-3. **OWUI file storage** — Two tools use OWUI's file storage layer:
-   - `ingest` briefly relays uploaded files through the Files API (to work around `__event_call__` size limits), then deletes them after transfer to the sandbox.
-   - `attach` permanently stores media and binary files (audio, video, archives, etc.) in OWUI file storage so large payloads don't bloat the chat database. These files are owned by the user and persist until manually removed. Text and image files are inlined directly and do not touch file storage.
+2. **Outbound HTTP from `fetch`** — The `fetch` tool makes HTTP requests from the OWUI server on the model's behalf, bypassing sandbox egress restrictions. Request/response bodies are transferred as sandbox files; only HTTP metadata enters the conversation.
 
-No other OWUI internals are touched. The toolkit does not modify models, prompts, users, or other configuration.
+No OWUI internals are touched. The toolkit does not import `open_webui.*`, does not use OWUI file storage, and does not modify models, prompts, users, or other configuration. Its only runtime dependency is `httpx`.
 
 ## Security and trust model
 
@@ -72,15 +69,14 @@ To update an existing installation, use the `/api/v1/tools/id/lathe/update` endp
 
 | Tool | Purpose |
 |------|---------|
+| `lathe(manpage)` | Agent-facing manual system — orientation, recipes, troubleshooting |
 | `onboard(path)` | Load project context (AGENTS.md + skill catalog) |
-| `bash(command, workdir)` | Execute shell commands (2-min timeout, output truncated to last 2000 lines / 50 KB) |
+| `bash(command, workdir)` | Execute shell commands (auto-backgrounds after ~30s, output truncated to last 2000 lines / 50 KB) |
 | `read(path, offset, limit)` | Read file with line numbers |
 | `write(path, content)` | Write/create file (auto-creates parent dirs) |
 | `edit(path, old_string, new_string, replace_all)` | Exact string replacement |
-| `attach(path)` | Show file to user without consuming model context |
-| `ingest(prompt)` | Get a file or pasted text from the user into the sandbox |
-| `ssh(expires_in_minutes)` | Generate a time-limited SSH access command |
-| `preview(port)` | Get a live URL for a running web server in the sandbox |
+| `expose(port, ssh)` | Give the user a public HTTPS URL for a sandbox service, or a time-limited SSH command |
+| `fetch(url, method, headers, body, output)` | Make HTTP requests from the OWUI server, bypassing sandbox egress restrictions |
 | `destroy(confirm)` | Permanently delete the sandbox (requires `confirm=true`) |
 
 ## Testing

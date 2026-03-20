@@ -13,12 +13,12 @@ theme, no build step, no JS. Hotlinks the self-demo video from issue #11.
 
 - **Screenshots / GIFs of real sessions.** The tool grid is text-only right now.
   Each tool card could show a brief inline clip or screenshot of it in action
-  (e.g. the attach viewer rendering syntax-highlighted code, the ingest modal,
-  the SSH command output).
+  (e.g. a dufs file browser exposed via `expose`, SSH command output, a
+  code-server IDE session).
 - **A proper hero demo.** The self-demo video is a stress-test artifact, not a
-  polished product demo. A screen recording of a real user session — upload CSV,
-  get analysis, preview a chart — would be more compelling than the Manim-style
-  narrated slides.
+  polished product demo. A screen recording of a real user session — clone a
+  repo, fix tests, expose the result — would be more compelling than the
+  Manim-style narrated slides.
 - **Recipes as expandable sections.** The current recipe list is flat text.
   Clicking a recipe could expand to show a transcript or annotated screenshot
   of the interaction.
