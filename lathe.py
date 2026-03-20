@@ -569,6 +569,14 @@ class Tools:
     #   tool docstrings can then be further scrunched by adding
     #   breadcrumbs like 'see lathe(manpage="bash") for details'.
 
+    # WARNING: Manpage strings are NOT passed through str.format()
+    # unconditionally.  Only pages containing the literal placeholder
+    # "{tool_catalog}" are formatted (see the lathe() method).  This
+    # means shell snippets with curly braces (${VAR}, {sh,pid,log,exit},
+    # {"key":"value"}, etc.) are safe in all other pages.  If you add a
+    # new dynamic placeholder, gate the .format() call on its presence
+    # rather than calling .format() on every page — otherwise any page
+    # with literal braces will blow up with a KeyError at runtime.
     _MANPAGES: dict[str, str] = {
         "fetch": textwrap.dedent("""\
             # Lathe — fetch() egress bypass
@@ -950,7 +958,9 @@ class Tools:
             return f"Lathe toolkit version: {ver}"
 
         if manpage in self._MANPAGES:
-            content = self._MANPAGES[manpage].format(tool_catalog=tool_catalog)
+            content = self._MANPAGES[manpage]
+            if "{tool_catalog}" in content:
+                content = content.format(tool_catalog=tool_catalog)
             await _emit(__event_emitter__, f"Manual page: {manpage}", done=True)
             return content
 

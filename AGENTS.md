@@ -1,6 +1,6 @@
 # Agent Instructions — lathe
 
-This repo is a single-file Open WebUI toolkit (`lathe.py`) with a test harness (`test_harness.py`). Read both before making changes.
+This repo is a single-file Open WebUI toolkit (`lathe.py`) with a test harness (`test_harness.py`). Read both files **in full** into your context before making any changes or discussing the code. The codebase is small enough that this is always feasible — do not delegate exploration to a subagent that only reports a summary. You need the actual code in context to reason about interactions, not a lossy precis of it.
 
 ## Three audiences, three homes
 
