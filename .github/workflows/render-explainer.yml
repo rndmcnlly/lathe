@@ -4,7 +4,7 @@ on:
   push:
     paths:
       - 'explainer-video/**'
-      - '.github/workflows/render-video.yml'
+      - '.github/workflows/render-explainer.yml'
   workflow_dispatch:
 
 permissions:
