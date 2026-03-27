@@ -25,6 +25,13 @@ jobs:
         working-directory: video
         run: npm ci
 
+      - name: Cache TTS audio
+        uses: actions/cache@v4
+        with:
+          path: video/public/audio
+          key: tts-${{ hashFiles('video/src/data/script.tsx') }}
+          restore-keys: tts-
+
       - name: Render TTS audio + MP4
         working-directory: video
         env:

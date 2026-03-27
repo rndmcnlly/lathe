@@ -4,8 +4,9 @@
   "private": true,
   "scripts": {
     "start": "npx remotion studio",
-    "prepare-audio": "npx tsx prepare.ts",
-    "build": "npx tsx prepare.ts && npx remotion render LatheExplainer out/lathe-explainer.mp4 --codec h264"
+    "build": "npx tsx build.ts",
+    "build:tts": "npx tsx build.ts --tts-only",
+    "build:force": "npx tsx build.ts --force-tts"
   },
   "dependencies": {
     "@remotion/cli": "^4.0.0",

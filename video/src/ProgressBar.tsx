@@ -3,77 +3,11 @@
 
 import React from "react";
 import { useCurrentFrame, useVideoConfig, interpolate, Easing } from "remotion";
-import { COLORS, FONTS, PART_THEMES, TIMING } from "./design";
-import { SCRIPT, type Part, type Slide } from "./data/script";
+import { COLORS, FONTS, PART_THEMES } from "./design";
+import { script, extractTimeline } from "./data/script";
 import manifestData from "./data/manifest.json";
 
-type ManifestEntry = { file: string; durationMs: number };
-const manifest = manifestData as Record<string, ManifestEntry>;
-
-function getSlideFrames(slide: Slide, fps: number): number {
-  if (manifest[slide.id]) {
-    return Math.ceil((manifest[slide.id].durationMs / 1000) * fps);
-  }
-  const words = slide.narration.split(/\s+/).length;
-  return Math.ceil(((words / 150) * 60) * fps);
-}
-
-// Pre-compute the full timeline structure
-type SlideSpan = {
-  slideId: string;
-  partIndex: number;
-  slideIndex: number;
-  globalStart: number;
-  duration: number;
-};
-
-type PartSpan = {
-  partId: string;
-  label: string;
-  globalStart: number;
-  duration: number;
-  slides: SlideSpan[];
-};
-
-function buildTimeline(fps: number): { parts: PartSpan[]; totalFrames: number } {
-  const parts: PartSpan[] = [];
-  let globalFrame = 0;
-
-  for (let pi = 0; pi < SCRIPT.length; pi++) {
-    const part = SCRIPT[pi];
-    const partStart = globalFrame;
-    const slides: SlideSpan[] = [];
-
-    for (let si = 0; si < part.slides.length; si++) {
-      const slide = part.slides[si];
-      const isSection = slide.sectionStart && si > 0;
-      const leadIn = isSection ? TIMING.SECTION_LEAD_IN : TIMING.SLIDE_LEAD_IN;
-      const tail = isSection ? TIMING.SECTION_TAIL : TIMING.SLIDE_TAIL;
-      const audioDuration = getSlideFrames(slide, fps);
-      const totalDuration = leadIn + audioDuration + tail;
-
-      slides.push({
-        slideId: slide.id,
-        partIndex: pi,
-        slideIndex: si,
-        globalStart: globalFrame,
-        duration: totalDuration,
-      });
-
-      globalFrame += totalDuration;
-    }
-
-    parts.push({
-      partId: part.id,
-      label: PART_THEMES[part.id as keyof typeof PART_THEMES].label,
-      globalStart: partStart,
-      duration: globalFrame - partStart,
-      slides,
-    });
-  }
-
-  return { parts, totalFrames: globalFrame };
-}
+const manifest = manifestData as Record<string, { file: string; durationMs: number }>;
 
 // ── Component ─────────────────────────────────────────────────────
 
@@ -92,7 +26,7 @@ export const ProgressBar: React.FC = () => {
   // Don't render in stills
   if (durationInFrames === 1) return null;
 
-  const { parts, totalFrames } = buildTimeline(fps);
+  const { parts, totalFrames } = extractTimeline(script, manifest, fps);
   const barWidth = width - BAR_MARGIN_X * 2;
 
   // Fade in over first second, stay visible
@@ -207,7 +141,7 @@ export const ProgressBar: React.FC = () => {
 
                   return (
                     <div
-                      key={slide.slideId}
+                      key={slide.id}
                       style={{
                         width: slideWidth,
                         height: BAR_HEIGHT,
