@@ -1,6 +1,6 @@
 # Agent Instructions — lathe
 
-This repo is a single-file Open WebUI toolkit (`lathe.py`) with a test harness (`test_harness.py`). Read both files **in full** into your context before making any changes or discussing the code. The codebase is small enough that this is always feasible — do not delegate exploration to a subagent that only reports a summary. You need the actual code in context to reason about interactions, not a lossy precis of it.
+This repo is a single-file Open WebUI toolkit (`lathe.py`) with a three-tier test suite. Read `lathe.py` **in full** into your context before making any changes or discussing the code, plus whichever test file is relevant. The codebase is small enough that this is always feasible — do not delegate exploration to a subagent that only reports a summary. You need the actual code in context to reason about interactions, not a lossy precis of it.
 
 ## Three audiences, three homes
 
@@ -16,19 +16,34 @@ When writing or reorganizing documentation, route content to the right home. Imp
 
 Deployment credentials live in `.env` (gitignored). It contains:
 
-- `DAYTONA_API_KEY` — used by the test harness for integration tests against the live sandbox API.
-- `CHAT_ADAMSMITH_AS_OWUI_TOKEN` — admin JWT for `https://chat.adamsmith.as`, the primary deployment. Use this to install or update the tool via the OWUI admin API.
+- `DAYTONA_API_KEY` — used by integration tests against the live sandbox API.
+- `CHAT_ADAMSMITH_AS_OWUI_TOKEN` — admin JWT for `https://chat.adamsmith.as`, the primary deployment. Used by deployment tests and to install/update the tool via the OWUI admin API.
+- `EMAIL` / `PASS` — login credentials used by the demo video capture script.
 
 To run unit tests (no sandbox needed):
 
 ```
-uv run --script test_harness.py unit
+uv run --script test_unit.py
 ```
 
-To run all integration tests (requires `DAYTONA_API_KEY` in `.env`):
+To run integration tests (requires `DAYTONA_API_KEY` in `.env`):
 
 ```
-uv run --script test_harness.py
+uv run --script test_integration.py
+```
+
+To run deployment tests against the live OWUI instance (requires `CHAT_ADAMSMITH_AS_OWUI_TOKEN`):
+
+```
+uv run --script test_deployment.py              # all deployment tests
+uv run --script test_deployment.py --verbose    # show all socket.io events
+```
+
+The dispatcher `test_harness.py` runs unit + integration by default (backwards compat):
+
+```
+uv run --script test_harness.py              # unit + integration
+uv run --script test_harness.py all          # unit + integration + deployment
 ```
 
 ## Keep tests in sync with the implementation
