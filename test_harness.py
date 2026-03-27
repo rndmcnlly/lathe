@@ -118,6 +118,30 @@ async def test_unit_parse_env_vars(R: Results):
         R.check("array error mentions object", "object" in str(e), str(e))
 
 
+async def test_unit_onboard_script(R: Results):
+    from lathe import _build_onboard_script
+
+    print("\n── _build_onboard_script: generates valid Python ──")
+    script = _build_onboard_script("/home/daytona/workspace/myproject")
+    try:
+        compile(script, "<onboard>", "exec")
+        R.check("script compiles", True)
+    except SyntaxError as e:
+        R.check("script compiles", False, str(e))
+
+    R.check("script has PROJECT assignment", "PROJECT = '/home/daytona/workspace/myproject'" in script, script[:200])
+    R.check("script references ~/.agents", "~/.agents" in script, "missing global path")
+    R.check("script has ERROR_NO_CONTEXT sentinel", "ERROR_NO_CONTEXT" in script, "missing sentinel")
+
+    print("\n── _build_onboard_script: handles tricky paths ──")
+    script = _build_onboard_script("/home/daytona/workspace/it's a \"test\"")
+    try:
+        compile(script, "<onboard>", "exec")
+        R.check("tricky path compiles", True)
+    except SyntaxError as e:
+        R.check("tricky path compiles", False, str(e))
+
+
 async def test_unit_truncate(R: Results):
     from lathe import _truncate_tail, _MAX_LINES, _MAX_BYTES
 
@@ -299,19 +323,22 @@ async def test_int_write_read_edit(R: Results, tools: Tools, user: dict):
 async def test_int_onboard(R: Results, tools: Tools, user: dict):
     ctx = dict(__user__=user, __event_emitter__=mock_emitter)
 
-    await tools.bash("rm -rf /home/daytona/workspace/test_project /home/daytona/workspace/empty_project", **ctx)
+    # Clean up any prior state (project dirs + global ~/.agents)
+    await tools.bash("rm -rf /home/daytona/workspace/test_project /home/daytona/workspace/empty_project /home/daytona/.agents", **ctx)
 
-    print("\n── onboard: missing context ──")
+    print("\n── onboard: missing context (no project, no global) ──")
     r = await tools.onboard("/home/daytona/workspace/empty_project", **ctx)
-    R.check("fails without AGENTS.md or .agents/", "Error" in r, r[:200])
+    R.check("fails without any context", "Error" in r, r[:300])
+    R.check("error mentions ~/.agents/", "~/.agents/" in r, r[:300])
 
-    print("\n── onboard: AGENTS.md only ──")
+    print("\n── onboard: project AGENTS.md only ──")
     await tools.write("/home/daytona/workspace/test_project/AGENTS.md", "# Test Agent\nYou are a helpful test agent.\n", **ctx)
     r = await tools.onboard("/home/daytona/workspace/test_project", **ctx)
     R.check("returns AGENTS.md content", "helpful test agent" in r, r[:300])
+    R.check("labeled as project context", "Project Agent Instructions" in r, r[:300])
     R.check("no skills section when none exist", "Available Skills" not in r, r[:300])
 
-    print("\n── onboard: with skills ──")
+    print("\n── onboard: with project skills ──")
     await tools.write(
         "/home/daytona/workspace/test_project/.agents/skills/test-skill/SKILL.md",
         "---\nname: test-skill\ndescription: A skill for testing things.\n---\n\n# Test Skill\nDetailed instructions here.\n",
@@ -324,7 +351,50 @@ async def test_int_onboard(R: Results, tools: Tools, user: dict):
     R.check("includes SKILL.md path", "SKILL.md" in r, r[:500])
     R.check("does NOT include skill body", "Detailed instructions here" not in r, r[:500])
 
-    await tools.bash("rm -rf /home/daytona/workspace/test_project /home/daytona/workspace/empty_project", **ctx)
+    print("\n── onboard: global AGENTS.md only (no project context) ──")
+    await tools.write("/home/daytona/.agents/AGENTS.md", "# Global Agent\nGlobal preferences and conventions.\n", **ctx)
+    r = await tools.onboard("/home/daytona/workspace/empty_project", **ctx)
+    R.check("returns global AGENTS.md", "Global preferences" in r, r[:500])
+    R.check("labeled as global context", "Global Agent Instructions" in r, r[:300])
+
+    print("\n── onboard: global + project AGENTS.md together ──")
+    r = await tools.onboard("/home/daytona/workspace/test_project", **ctx)
+    R.check("contains global context", "Global preferences" in r, r[:500])
+    R.check("contains project context", "helpful test agent" in r, r[:500])
+    R.check("global labeled", "Global Agent Instructions" in r, r[:500])
+    R.check("project labeled", "Project Agent Instructions" in r, r[:500])
+
+    print("\n── onboard: global skills ──")
+    await tools.write(
+        "/home/daytona/.agents/skills/global-skill/SKILL.md",
+        "---\nname: global-skill\ndescription: A global reusable skill.\n---\n\n# Global Skill\nGlobal skill body.\n",
+        **ctx,
+    )
+    r = await tools.onboard("/home/daytona/workspace/test_project", **ctx)
+    R.check("lists global skill", "global-skill" in r, r[:800])
+    R.check("lists project skill", "test-skill" in r, r[:800])
+    R.check("global skill description shown", "global reusable skill" in r, r[:800])
+
+    print("\n── onboard: project skill overrides global on name collision ──")
+    await tools.write(
+        "/home/daytona/.agents/skills/test-skill/SKILL.md",
+        "---\nname: test-skill\ndescription: Global version of test-skill (should be overridden).\n---\n\nGlobal body.\n",
+        **ctx,
+    )
+    r = await tools.onboard("/home/daytona/workspace/test_project", **ctx)
+    R.check("project skill wins on collision", "A skill for testing things" in r, r[:800])
+    R.check("global version overridden", "should be overridden" not in r, r[:800])
+    # The path should point to the project-local skill, not the global one
+    R.check("collision path is project-local", "/home/daytona/workspace/test_project/" in r, r[:800])
+
+    print("\n── onboard: global skills only (no project) ──")
+    r = await tools.onboard("/home/daytona/workspace/empty_project", **ctx)
+    R.check("global-only has skills section", "Available Skills" in r, r[:800])
+    R.check("global-only lists global-skill", "global-skill" in r, r[:800])
+    R.check("global-only lists test-skill from global", "test-skill" in r, r[:800])
+
+    # Clean up
+    await tools.bash("rm -rf /home/daytona/workspace/test_project /home/daytona/workspace/empty_project /home/daytona/.agents", **ctx)
 
 
 async def test_int_truncation(R: Results, tools: Tools, user: dict):
@@ -739,6 +809,7 @@ async def test_int_destroy(R: Results, tools: Tools, user: dict):
 
 UNIT_GROUPS = {
     "parse_env_vars": test_unit_parse_env_vars,
+    "onboard_script": test_unit_onboard_script,
     "truncate": test_unit_truncate,
 }
 

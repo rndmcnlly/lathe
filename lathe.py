@@ -229,6 +229,104 @@ def _human_size(n: int) -> str:
     return f"{b:,.1f} TB"
 
 
+def _build_onboard_script(project_path: str) -> str:
+    """Build a Python script that collects agent context from a sandbox.
+
+    Searches two locations:
+      1. ~/.agents/          — global agent instructions and skills
+      2. <project_path>/     — project-local instructions and skills
+
+    Skills are merged into a single catalog.  On name collision, the
+    project-level entry wins (more specific scope takes precedence).
+    """
+    # The script is a self-contained Python program executed on the sandbox.
+    # project_path is injected via repr() so it's safely quoted as a
+    # Python string literal.  The rest of the script uses no interpolation.
+    return "import os, glob\n\nPROJECT = " + repr(project_path) + "\n" + textwrap.dedent("""\
+        GLOBAL  = os.path.expanduser("~/.agents")
+
+        sections = []
+        found = False
+
+        # ── Collect AGENTS.md files ──────────────────────────────────
+
+        def read_agents_md(base, heading):
+            p = os.path.join(base, "AGENTS.md")
+            if not os.path.isfile(p):
+                return None
+            with open(p) as f:
+                return f"# {heading} ({p})\\n\\n{f.read()}"
+
+        global_md = read_agents_md(GLOBAL, "Global Agent Instructions")
+        if global_md:
+            sections.append(global_md)
+            found = True
+
+        project_md = read_agents_md(PROJECT, "Project Agent Instructions")
+        if project_md:
+            sections.append(project_md)
+            found = True
+
+        # ── Collect and merge skills ─────────────────────────────────
+
+        def collect_skills(base):
+            skills_dir = os.path.join(base, "skills")
+            if not os.path.isdir(skills_dir):
+                return
+            for skill_md in sorted(glob.glob(os.path.join(skills_dir, "*/SKILL.md"))):
+                dir_name = os.path.basename(os.path.dirname(skill_md))
+                name = dir_name
+                desc = ""
+                try:
+                    with open(skill_md) as f:
+                        lines = f.readlines()
+                except OSError:
+                    continue
+                # Parse YAML frontmatter (minimal, no deps)
+                if lines and lines[0].strip() == "---":
+                    for line in lines[1:]:
+                        if line.strip() == "---":
+                            break
+                        if line.startswith("name:"):
+                            name = line[len("name:"):].strip()
+                        elif line.startswith("description:"):
+                            desc = line[len("description:"):].strip()
+                yield name, desc, skill_md
+
+        # Global first, then project overrides on collision
+        skills = {}   # name -> (desc, path)
+        order  = []   # first-seen order
+        for name, desc, path in collect_skills(GLOBAL):
+            if name not in skills:
+                order.append(name)
+            skills[name] = (desc, path)
+        for name, desc, path in collect_skills(os.path.join(PROJECT, ".agents")):
+            if name not in skills:
+                order.append(name)
+            skills[name] = (desc, path)
+
+        if order:
+            found = True
+            lines = [
+                "# Available Skills",
+                "",
+                "Load a skill's full instructions with read(path) when the task matches its description.",
+                "",
+            ]
+            for name in order:
+                desc, path = skills[name]
+                lines.append(f"- **{name}**: {desc}")
+                lines.append("  `" + path + "`")
+            sections.append("\\n".join(lines))
+
+        # ── Output ───────────────────────────────────────────────────
+
+        if not found:
+            print("ERROR_NO_CONTEXT")
+            raise SystemExit(1)
+
+        print("\\n\\n---\\n\\n".join(sections))
+    """)
 
 
 
@@ -793,7 +891,8 @@ class Tools:
 
             **Project context:**
             Call onboard() at the start of a conversation to load AGENTS.md and
-            discover available skills for the project.
+            discover available skills. Searches both the project directory and
+            ~/.agents/ for global agent instructions and skills.
 
             **Network requests:**
             Use bash("curl ...") or bash("wget ...") for HTTP requests. The
@@ -980,6 +1079,7 @@ class Tools:
     ) -> str:
         """
         Load project context (AGENTS.md + skill catalog) at the start of a conversation.
+        Searches both the project directory and ~/.agents/ for global context.
         Use read() on a skill's SKILL.md path to load its full instructions later.
         :param path: Absolute path to the project root (e.g. /home/daytona/workspace/myproject).
         """
@@ -990,51 +1090,10 @@ class Tools:
             await _emit(__event_emitter__, "Loading project context...")
 
             p = path.rstrip("/")
-            script = textwrap.dedent("""\
-                P=__PATH__
-                found=0
-                if [ -f "$P/AGENTS.md" ]; then
-                  echo "# AGENTS.md"
-                  echo ""
-                  cat "$P/AGENTS.md"
-                  found=1
-                fi
-                if [ -d "$P/.agents/skills" ]; then
-                  skills=""
-                  for d in "$P"/.agents/skills/*/SKILL.md; do
-                    [ -f "$d" ] || continue
-                    found=1
-                    dir_name=$(basename "$(dirname "$d")")
-                    fm_name="$dir_name"
-                    fm_desc=""
-                    in_fm=0
-                    while IFS= read -r line; do
-                      case "$in_fm" in
-                        0) [ "$line" = "---" ] && in_fm=1 ;;
-                        1) [ "$line" = "---" ] && break
-                           case "$line" in
-                             name:*) fm_name="${line#name:}"; fm_name="${fm_name# }" ;;
-                             description:*) fm_desc="${line#description:}"; fm_desc="${fm_desc# }" ;;
-                           esac ;;
-                      esac
-                    done < "$d"
-                    skills="${skills}- **${fm_name}**: ${fm_desc}\\n  \\`${d}\\`\\n"
-                  done
-                  if [ -n "$skills" ]; then
-                    [ -f "$P/AGENTS.md" ] && echo -e "\\n---\\n"
-                    echo "# Available Skills"
-                    echo ""
-                    echo "Load a skill's full instructions with read(path) when the task matches its description."
-                    echo ""
-                    echo -e "$skills"
-                  fi
-                fi
-                [ "$found" -eq 0 ] && echo "ERROR_NO_CONTEXT" && exit 1
-                exit 0
-            """).replace("__PATH__", _shell_quote(p))
+            script = _build_onboard_script(p)
 
-            # Write script to temp file and execute it (avoids all quoting issues)
-            script_path = f"/tmp/_onboard_{uuid.uuid4()}.sh"
+            # Write script to temp file and execute it
+            script_path = f"/tmp/_onboard_{uuid.uuid4()}.py"
             content_bytes = script.encode("utf-8")
             await client.post(
                 _toolbox(self.valves, sandbox_id, "/files/upload"),
@@ -1048,8 +1107,7 @@ class Tools:
                 _toolbox(self.valves, sandbox_id, "/process/execute"),
                 headers=_headers(self.valves),
                 json={
-                    "command": f"bash {script_path}",
-                    "cwd": p,
+                    "command": f"python3 {script_path}",
                     "timeout": 30000,
                 },
                 timeout=60.0,
@@ -1063,8 +1121,12 @@ class Tools:
             if "ERROR_NO_CONTEXT" in result:
                 await _emit(__event_emitter__, "No project context found", done=True)
                 return (
-                    f"Error: No AGENTS.md or .agents/skills/ directory found at {path}. "
-                    f"This path must contain at least one of these to use onboard."
+                    f"Error: No agent context found. Searched:\n"
+                    f"  - {path}/AGENTS.md\n"
+                    f"  - {path}/.agents/skills/\n"
+                    f"  - ~/.agents/AGENTS.md\n"
+                    f"  - ~/.agents/skills/\n"
+                    f"At least one of these must exist to use onboard."
                 )
 
             if exit_code != 0:
