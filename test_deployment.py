@@ -5,8 +5,8 @@ against a live Open WebUI instance via Socket.IO.
 
 Connects to the OWUI Socket.IO endpoint, sends chat completions with
 tool_ids=["lathe"], and verifies that tool calls are executed server-side
-and produce expected results.  Each test gets a fresh chat_id that is
-deleted on completion — no persistent state is left in the OWUI database.
+and produce expected results.  Each test uses a local: prefixed chat_id
+so OWUI treats it as a temporary chat — nothing is persisted to the database.
 
 Usage:
     uv run --script test_deployment.py                  # run all tests
@@ -151,12 +151,11 @@ class OWUIClient:
           content  — the assistant's final HTML content string
           output   — the structured output array (function_call, function_call_output, message)
           events   — all raw Socket.IO events received during this turn
-          chat_id  — the chat ID (for cleanup via delete_chat)
         """
         if not self.session_id:
             raise RuntimeError("Not connected — call connect() first")
 
-        chat_id = str(uuid.uuid4())
+        chat_id = f"local:{uuid.uuid4()}"
         message_id = str(uuid.uuid4())
 
         self._events.clear()
@@ -217,20 +216,7 @@ class OWUIClient:
             "content": content,
             "output": output,
             "events": list(self._events),
-            "chat_id": chat_id,
         }
-
-    async def delete_chat(self, chat_id: str):
-        """Delete a chat to clean up after tests."""
-        try:
-            async with httpx.AsyncClient() as client:
-                await client.delete(
-                    f"{self.base_url}/api/v1/chats/{chat_id}",
-                    headers={"Authorization": f"Bearer {self.token}"},
-                    timeout=10.0,
-                )
-        except Exception:
-            pass  # best-effort cleanup
 
 
 # ── Helpers for inspecting output arrays ─────────────────────────────
@@ -321,7 +307,6 @@ async def test_bash_execution(R: Results, owui: OWUIClient):
     R.check("assistant responded after tool call", len(msgs) > 0, f"got {len(msgs)} messages")
 
     R.flush_diagnostics(before)
-    await owui.delete_chat(result["chat_id"])
 
 
 async def test_lathe_manual(R: Results, owui: OWUIClient):
@@ -347,7 +332,6 @@ async def test_lathe_manual(R: Results, owui: OWUIClient):
         R.check("version in output", "version" in text.lower(), text[:200])
 
     R.flush_diagnostics(before)
-    await owui.delete_chat(result["chat_id"])
 
 
 async def test_write_read_roundtrip(R: Results, owui: OWUIClient):
@@ -386,8 +370,6 @@ async def test_write_read_roundtrip(R: Results, owui: OWUIClient):
         R.check("marker in read output", marker in text, text[:200])
 
     R.flush_diagnostics(before)
-    await owui.delete_chat(result1["chat_id"])
-    await owui.delete_chat(result2["chat_id"])
 
 
 # ── Test registry and runner ─────────────────────────────────────────
