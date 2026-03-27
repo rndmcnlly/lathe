@@ -70,6 +70,23 @@ The `lathe(manpage="recipes")` manpage is the authoritative source for tested bo
 - **Install to /tmp.** Binaries in `/tmp` survive sandbox stop/restart but not `destroy()`. This is the right tradeoff — the recipes page tells the model to re-run the install script if the binary is missing.
 - **Architecture.** Daytona sandboxes are x86_64 Linux. Use `x86_64-unknown-linux-musl` (static) builds where available.
 
+## Video pipelines
+
+The repo contains two CI-rendered video pipelines, both triggered on push or manual dispatch and uploaded to GitHub Releases:
+
+| Directory | Workflow | Output | Release tag |
+|-----------|----------|--------|-------------|
+| `explainer-video/` | `render-explainer.yml` | Narrated Remotion explainer (MP4 + VTT) | `explainer-video-latest` |
+| `demo-video/` | `render-demo.yml` | Playwright capture of a live session (WebM) | `demo-video-latest` |
+
+Both are embedded on the docs site (`docs/index.html`) via release asset URLs.
+
+**Explainer video** is a Remotion project with TTS narration (requires `DEEPINFRA_TOKEN` secret). Edit `explainer-video/src/data/script.tsx` to change content.
+
+**Demo video** is a headless Playwright script (`demo-video/capture.mjs`) that logs into `chat.adamsmith.as`, enables Lathe, and drives a real multi-turn conversation. Requires `DEMO_EMAIL` and `DEMO_PASS` secrets. The capture is non-deterministic — model responses vary between runs. The script asks the model to use markdown links for exposed URLs so that raw proxy URLs never appear as visible text in the video.
+
+Changes to `lathe.py` can break the demo video if they affect user-visible behavior (e.g. tool output format, expose URL structure, sandbox lifecycle). The demo workflow is a reasonable smoke test for the live deployment but should not block merges — it depends on external services (OWUI, Daytona, model inference) that can fail independently.
+
 ## Architecture notes
 
 - **Single file** — everything lives in `lathe.py`. Resist splitting it.
