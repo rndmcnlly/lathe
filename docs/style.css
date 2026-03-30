@@ -1,5 +1,19 @@
 /* Lathe docs — warm dark palette */
 
+:root {
+    --bg:           #0a0908;
+    --bg-raised:    #110f0c;
+    --bg-inset:     #1a1714;
+    --border:       #2a2520;
+    --border-hover: #3a3530;
+    --muted:        #4a4035;
+    --dim:          #6a5e4a;
+    --subtle:       #7a6e5a;
+    --fg-soft:      #9a8e7a;
+    --text:         #c4b59a;
+    --heading:      #d4c4a8;
+}
+
 * {
     box-sizing: border-box;
     margin: 0;
@@ -13,9 +27,9 @@ html {
 }
 
 body {
-    color: #c4b59a;
+    color: var(--text);
     font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
-    background-color: #0a0908;
+    background-color: var(--bg);
     line-height: 1.6;
     min-height: 100vh;
     overflow-x: hidden;
@@ -51,7 +65,7 @@ body {
     font-weight: 900;
     letter-spacing: 0.14em;
     text-transform: uppercase;
-    color: #d4c4a8;
+    color: var(--heading);
     text-shadow: 0 0 80px rgba(10,9,8,0.95), 0 2px 40px rgba(10,9,8,0.9);
     margin-bottom: 0.3rem;
 }
@@ -60,7 +74,7 @@ body {
     font-size: 0.9rem;
     letter-spacing: 0.1em;
     text-transform: uppercase;
-    color: #7a6e5a;
+    color: var(--subtle);
     text-shadow: 0 0 30px rgba(10,9,8,0.95);
 }
 
@@ -74,7 +88,7 @@ body {
 }
 
 .hero-links a {
-    color: #7a6e5a;
+    color: var(--subtle);
     display: inline-flex;
     align-items: center;
     gap: 0.4rem;
@@ -87,8 +101,8 @@ body {
 }
 
 .hero-links a:hover {
-    color: #d4c4a8;
-    border-bottom-color: #4a4035;
+    color: var(--heading);
+    border-bottom-color: var(--muted);
 }
 
 .hero-links svg {
@@ -109,15 +123,15 @@ body {
 /* ── Links ────────────────────────────────────────── */
 
 a {
-    color: #c4b59a;
+    color: var(--text);
     text-decoration: none;
-    border-bottom: 1px solid #3a3530;
+    border-bottom: 1px solid var(--border-hover);
     transition: color 0.15s, border-color 0.15s;
 }
 
 a:hover {
-    color: #d4c4a8;
-    border-bottom-color: #7a6e5a;
+    color: var(--heading);
+    border-bottom-color: var(--subtle);
 }
 
 /* ── Code ─────────────────────────────────────────── */
@@ -125,32 +139,32 @@ a:hover {
 code {
     font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
     font-size: 0.85em;
-    background: #1a1714;
-    border: 1px solid #2a2520;
+    background: var(--bg-inset);
+    border: 1px solid var(--border);
     border-radius: 3px;
     padding: 0.1em 0.35em;
-    color: #d4c4a8;
+    color: var(--heading);
 }
 
 /* ── Callout box ──────────────────────────────────── */
 
 .callout {
-    border-top: 1px solid #2a2520;
+    border-top: 1px solid var(--border);
     padding: 2rem 0;
     font-size: 1.05rem;
-    color: #a89880;
+    color: var(--fg-soft);
     line-height: 1.7;
 }
 
 .callout strong {
-    color: #d4c4a8;
+    color: var(--heading);
 }
 
 /* ── Sections ─────────────────────────────────────── */
 
 .section {
     padding: 2.5rem 0;
-    border-top: 1px solid #2a2520;
+    border-top: 1px solid var(--border);
 }
 
 .section-label {
@@ -158,20 +172,20 @@ code {
     font-weight: 700;
     text-transform: uppercase;
     letter-spacing: 0.12em;
-    color: #6a5e4a;
+    color: var(--dim);
     margin-bottom: 0.5rem;
 }
 
 .section-title {
     font-size: 1.3rem;
     font-weight: 800;
-    color: #d4c4a8;
+    color: var(--heading);
     margin-bottom: 1rem;
     letter-spacing: -0.01em;
 }
 
 .section p {
-    color: #9a8e7a;
+    color: var(--fg-soft);
     margin-bottom: 1rem;
     line-height: 1.65;
 }
@@ -189,25 +203,29 @@ code {
 .video-block video {
     width: 100%;
     border-radius: 3px;
-    border: 1px solid #2a2520;
+    border: 1px solid var(--border);
     display: block;
+    /* Warm-tint white-background videos to reduce clash with dark palette. */
+    filter: sepia(0.06);
 }
+
+
 
 .video-caption {
     text-align: center;
     font-size: 0.75rem;
-    color: #6a5e4a;
+    color: var(--dim);
     margin-top: 0.5rem;
     letter-spacing: 0.03em;
 }
 
 .video-caption a {
-    color: #7a6e5a;
+    color: var(--subtle);
     border-bottom-color: transparent;
 }
 
 .video-caption a:hover {
-    color: #c4b59a;
+    color: var(--text);
 }
 
 /* ── Tool grid ────────────────────────────────────── */
@@ -220,39 +238,39 @@ code {
 }
 
 .tool-card {
-    background: #110f0c;
-    border: 1px solid #2a2520;
+    background: var(--bg-raised);
+    border: 1px solid var(--border);
     border-radius: 3px;
     padding: 0.9rem 1rem;
     transition: border-color 0.15s;
 }
 
 .tool-card:hover {
-    border-color: #3a3530;
+    border-color: var(--border-hover);
 }
 
 .tool-card h3 {
     font-size: 0.85rem;
     font-weight: 700;
-    color: #d4c4a8;
+    color: var(--heading);
     margin-bottom: 0.25rem;
     font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
 }
 
 .tool-card p {
     font-size: 0.8rem;
-    color: #7a6e5a;
+    color: var(--subtle);
     margin: 0;
     line-height: 1.45;
 }
 
 .tool-card a {
-    color: #9a8e7a;
-    border-bottom-color: #3a3530;
+    color: var(--fg-soft);
+    border-bottom-color: var(--border-hover);
 }
 
 .tool-card a:hover {
-    color: #c4b59a;
+    color: var(--text);
 }
 
 /* ── Recipe list ──────────────────────────────────── */
@@ -265,7 +283,7 @@ code {
 
 .recipe-list li {
     padding: 0.6rem 0;
-    border-bottom: 1px solid #1a1714;
+    border-bottom: 1px solid var(--bg-inset);
     display: flex;
     align-items: baseline;
     gap: 0.75rem;
@@ -277,25 +295,25 @@ code {
 }
 
 .recipe-label {
-    color: #c4b59a;
+    color: var(--text);
     font-weight: 600;
     white-space: nowrap;
 }
 
 .recipe-desc {
-    color: #7a6e5a;
+    color: var(--subtle);
 }
 
 /* ── Terminal box ─────────────────────────────────── */
 
 .terminal-box {
-    background: #110f0c;
-    border: 1px solid #2a2520;
+    background: var(--bg-raised);
+    border: 1px solid var(--border);
     border-radius: 3px;
     padding: 0.75rem 1.25rem;
     font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
     font-size: 0.8rem;
-    color: #c4b59a;
+    color: var(--text);
     margin: 1.25rem 0;
     overflow-x: auto;
     white-space: pre;
@@ -303,7 +321,7 @@ code {
 }
 
 .terminal-box .comment {
-    color: #4a4035;
+    color: var(--muted);
 }
 
 /* ── Footer ───────────────────────────────────────── */
@@ -311,18 +329,18 @@ code {
 .footer {
     text-align: center;
     padding: 2.5rem 0;
-    border-top: 1px solid #2a2520;
+    border-top: 1px solid var(--border);
     font-size: 0.8rem;
-    color: #4a4035;
+    color: var(--muted);
 }
 
 .footer a {
-    color: #6a5e4a;
+    color: var(--dim);
     border-bottom: none;
 }
 
 .footer a:hover {
-    color: #c4b59a;
+    color: var(--text);
 }
 
 /* ── Responsive ───────────────────────────────────── */
