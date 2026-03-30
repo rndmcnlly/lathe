@@ -3,7 +3,7 @@
  * Playwright video capture of a real Lathe session on an Open WebUI instance.
  *
  * Captures: login → enable Lathe → clone a repo → ask for VS Code on
- * a random port → model installs code-server + exposes it → open the
+ * port 3000 → model installs code-server + exposes it → open the
  * live IDE URL → return to chat → ask model to stop the server.
  *
  * Usage:  node capture.mjs
@@ -36,9 +36,7 @@ if (!OWUI_URL || !EMAIL || !PASS) { console.error("Set DEMO_OWUI_URL, DEMO_EMAIL
 
 const VIEWPORT = { width: 1280, height: 720 };
 
-// Random port for the VS Code prompt (makes each capture unique, shows
-// the model respects the user's port choice)
-const RANDOM_PORT = 3000 + Math.floor(Math.random() * 6999);
+const PORT = 3000;
 
 // ── Structured logging ──────────────────────────────────────────────
 
@@ -184,13 +182,23 @@ async function findExposeUrl(page) {
 // ── Chat interaction helpers ────────────────────────────────────────
 
 async function typeMessage(page, text) {
-  await page.evaluate((msg) => {
+  await page.evaluate(() => {
     const input = document.getElementById("chat-input");
     if (!input) return;
     input.focus();
-    input.innerHTML = `<p>${msg}</p>`;
+    input.innerHTML = "<p></p>";
     input.dispatchEvent(new Event("input", { bubbles: true }));
-  }, text);
+  });
+  for (const ch of text) {
+    await page.evaluate((c) => {
+      const input = document.getElementById("chat-input");
+      if (!input) return;
+      const p = input.querySelector("p") || input;
+      p.textContent += c;
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+    }, ch);
+    await page.waitForTimeout(10);
+  }
 }
 
 async function sendMessage(page) {
@@ -279,22 +287,6 @@ async function scrollChat(page, deltaY, smooth = true) {
   }, { dy: deltaY, smooth });
 }
 
-/** Scroll from top to bottom to reveal the full response. */
-async function scrollReveal(page, { stepPx = 250, stepMs = 1200 } = {}) {
-  await scrollChat(page, -99999, false);
-  await page.waitForTimeout(800);
-  const totalScroll = await page.evaluate(() => {
-    const c = document.querySelector("[data-capture-scroll]");
-    return c ? c.scrollHeight - c.clientHeight : 0;
-  });
-  if (totalScroll <= 0) return;
-  const steps = Math.ceil(totalScroll / stepPx);
-  for (let i = 0; i < steps; i++) {
-    await scrollChat(page, stepPx, true);
-    await page.waitForTimeout(stepMs);
-  }
-}
-
 /** Scroll to the bottom of the chat (to see latest content). */
 async function scrollToBottom(page) {
   await scrollChat(page, 99999, false);
@@ -309,62 +301,60 @@ const VIDEO_TMP = "/tmp/capture-video";
 mkdirSync(VIDEO_TMP, { recursive: true });
 
 const browser = await chromium.launch({ headless: true });
+
+// ── Login in an unrecorded context ──────────────────────────────
+// Auth is independent of Lathe — no reason to show it in the video.
+log("login", `Navigating to ${OWUI_URL}...`);
+const loginContext = await browser.newContext({ viewport: VIEWPORT });
+const loginPage = await loginContext.newPage();
+await loginPage.goto(`${OWUI_URL}/auth`);
+await loginPage.waitForLoadState("networkidle").catch(() => {});
+await loginPage.waitForTimeout(500);
+
+if (loginPage.url().includes("/auth")) {
+  log("login", "Signing in...");
+  const emailInput = 'input[placeholder="Enter Your Email"]';
+  const passInput = 'input[placeholder="Enter Your Password"]';
+  await loginPage.fill(emailInput, EMAIL);
+  await loginPage.fill(passInput, PASS);
+  await loginPage.click('button[type="submit"]');
+  await loginPage.waitForTimeout(500);
+
+  // Dismiss "What's New" modal if present
+  await loginPage.evaluate(() => {
+    for (const b of document.querySelectorAll("button"))
+      if (b.textContent.trim() === "Okay, Let's Go!") b.click();
+  });
+  await loginPage.waitForTimeout(500);
+  log("login", "Logged in");
+} else {
+  log("login", "Already logged in (cookies persisted)");
+}
+
+// Extract auth token from localStorage (OWUI stores JWT there, not in cookies)
+const token = await loginPage.evaluate(() => localStorage.getItem("token"));
+const cookies = await loginContext.cookies();
+log("login", `Token: ${token ? token.slice(0, 20) + "..." : "null"}`);
+await loginContext.close();
+
+// ── Recorded context starts here ────────────────────────────────
 const context = await browser.newContext({
   viewport: VIEWPORT,
   recordVideo: { dir: VIDEO_TMP, size: VIEWPORT },
 });
+await context.addCookies(cookies);
 const page = await context.newPage();
+
+// Inject the JWT into localStorage before navigating
+await page.goto(`${OWUI_URL}/auth`);
+await page.evaluate((t) => { if (t) localStorage.setItem("token", t); }, token);
 
 // Track the chat URL so we can return to the same conversation
 let chatUrl = null;
 
 try {
-  // ── Login ──────────────────────────────────────────────────────
-  log("login", `Navigating to ${OWUI_URL}...`);
-  await page.goto(`${OWUI_URL}/auth`);
+  await page.goto(`${OWUI_URL}/`);
   await page.waitForLoadState("networkidle").catch(() => {});
-  await page.waitForTimeout(1500);
-
-  if (page.url().includes("/auth")) {
-    await injectCursor(page);
-
-    // Type email in two beats: username, then domain
-    log("login", "Typing email...");
-    const emailInput = 'input[placeholder="Enter Your Email"]';
-    await highlight(page, emailInput, 800);
-    await cursorClick(page, emailInput);
-    const [emailUser, emailDomain] = EMAIL.split("@");
-    await page.fill(emailInput, emailUser);
-    await page.waitForTimeout(600);
-    await page.fill(emailInput, `${emailUser}@${emailDomain}`);
-    await page.waitForTimeout(500);
-
-    // Password
-    log("login", "Typing password...");
-    const passInput = 'input[placeholder="Enter Your Password"]';
-    await cursorClick(page, passInput);
-    await page.fill(passInput, PASS);
-    await page.waitForTimeout(500);
-
-    // Highlight sign-in button, then click
-    log("login", "Signing in...");
-    await highlight(page, 'button[type="submit"]', 1000);
-    await cursorClick(page, 'button[type="submit"]');
-    await page.click('button[type="submit"]');
-    await cursorHide(page);
-    await page.waitForTimeout(3000);
-
-    // Dismiss "What's New" modal if present
-    await page.evaluate(() => {
-      for (const b of document.querySelectorAll("button"))
-        if (b.textContent.trim() === "Okay, Let's Go!") b.click();
-    });
-    await page.waitForTimeout(800);
-    log("login", "Logged in");
-  } else {
-    log("login", "Already logged in (cookies persisted)");
-  }
-
   await suppressTooltips(page);
   await injectCursor(page);
 
@@ -374,9 +364,30 @@ try {
 
   // ── Beat 2: Enable Lathe ───────────────────────────────────────
   log("beat2", "Enabling Lathe...");
-  await highlight(page, "#integration-menu-button", 1000);
-  await cursorClick(page, "#integration-menu-button");
-  await page.click("#integration-menu-button");
+  // The integrations button ID varies across OWUI versions
+  const intBtn = await page.evaluate(() => {
+    const candidates = ["#integration-menu-button", "#tools-menu-button"];
+    for (const sel of candidates) {
+      if (document.querySelector(sel)) return sel;
+    }
+    // Fallback: find by aria-label or nearby text
+    for (const b of document.querySelectorAll("button")) {
+      const label = (b.getAttribute("aria-label") || "").toLowerCase();
+      if (label.includes("tool") || label.includes("integration")) return `#${b.id}`;
+    }
+    return null;
+  });
+  log("beat2", `Integration button: ${intBtn}`);
+  if (!intBtn) {
+    // Dump available button IDs for debugging
+    const ids = await page.evaluate(() =>
+      [...document.querySelectorAll("button[id]")].map(b => `${b.id}: ${b.textContent.trim().slice(0, 30)}`).join(", ")
+    );
+    log("beat2", `Available buttons: ${ids}`);
+    throw new Error("Could not find integration menu button");
+  }
+  await cursorClick(page, intBtn);
+  await page.click(intBtn);
   await page.waitForTimeout(500);
 
   // Click "Tools NN" row
@@ -392,22 +403,24 @@ try {
   });
   await page.waitForTimeout(500);
 
-  // Highlight the Lathe row, then toggle it on
+  // Highlight the Lathe row, then toggle it on with animated cursor
   await page.evaluate(() => {
     for (const b of document.querySelectorAll("button")) {
-      if (b.textContent.trim() === "Lathe" && b.getBoundingClientRect().y > 0) {
+      if (b.textContent.trim().endsWith("Lathe") && b.getBoundingClientRect().y > 0) {
         b.setAttribute("data-capture-lathe-row", "1");
         break;
       }
     }
   });
-  await highlight(page, "[data-capture-lathe-row]", 1200);
+  // The toggle is a button[role="switch"] inside the Lathe row.
+  // Clicking the row itself triggers the toggle logic in OWUI.
+  await cursorClick(page, "[data-capture-lathe-row]");
+  await page.click("[data-capture-lathe-row]");
   const toggled = await page.evaluate(() => {
-    const b = document.querySelector("[data-capture-lathe-row]");
-    if (!b) return false;
-    const divs = b.querySelectorAll("div");
-    if (divs.length >= 7) { divs[6].click(); return true; }
-    return false;
+    const row = document.querySelector("[data-capture-lathe-row]");
+    if (!row) return false;
+    const sw = row.querySelector('button[role="switch"]');
+    return sw ? sw.getAttribute("aria-checked") === "true" : false;
   });
   log("beat2", `Toggled: ${toggled}`);
   await page.waitForTimeout(800);
@@ -417,10 +430,9 @@ try {
 
   // ── Beat 3: First prompt — clone repo ──────────────────────────
   log("beat3", "Typing first prompt...");
-  await highlight(page, "#chat-input", 800);
   await cursorClick(page, "#chat-input");
   await typeMessage(page, "Clone https://github.com/rndmcnlly/lathe and give me a friendly one-paragraph description of what it does.");
-  await page.waitForTimeout(1500);
+  await page.waitForTimeout(500);
 
   // ── Beat 4: Send and wait ──────────────────────────────────────
   log("beat4", "Sending first prompt...");
@@ -432,14 +444,13 @@ try {
   // Capture the chat URL so we can return to this conversation later
   chatUrl = page.url();
   log("beat4", `Chat URL: ${chatUrl}`);
-  await page.waitForTimeout(1500);
+  await page.waitForTimeout(500);
 
-  // ── Beat 5: Second prompt — VS Code on a random port ────────────
-  log("beat5", `Typing second prompt (port ${RANDOM_PORT})...`);
-  await highlight(page, "#chat-input", 800);
+  // ── Beat 5: Second prompt — VS Code on port 3000 ────────────────
+  log("beat5", "Typing second prompt...");
   await cursorClick(page, "#chat-input");
-  await typeMessage(page, `Give me a VS Code editor for this repo on port ${RANDOM_PORT}. When you share the link, use a markdown link with a friendly label instead of showing the raw URL.`);
-  await page.waitForTimeout(1500);
+  await typeMessage(page, `Give me a VS Code editor for this repo on port ${PORT}. When you share the link, use a markdown link with a friendly label instead of showing the raw URL.`);
+  await page.waitForTimeout(500);
 
   // ── Beat 6: Send and wait for code-server install + expose ─────
   log("beat6", "Sending second prompt...");
@@ -447,7 +458,7 @@ try {
   await sendMessage(page);
   await cursorHide(page);
   await waitForResponse(page, { timeoutMs: 180000, stableMs: 5000 });
-  await page.waitForTimeout(1500);
+  await page.waitForTimeout(500);
 
   // ── Beat 7: Highlight and open the VS Code URL ─────────────────
   // The model was asked to use a markdown link, so the raw URL is only
@@ -458,76 +469,73 @@ try {
   if (exposeUrl) {
     log("beat7", `Found URL: ${exposeUrl}`);
 
-    // Highlight the link in the chat before navigating
-    const highlighted = await page.evaluate((url) => {
+    // Tag the link so the cursor can target it, then scroll it into view
+    await page.evaluate((url) => {
       const host = url.split("//")[1]?.split("/")[0];
-      if (!host) return false;
+      if (!host) return;
       for (const a of document.querySelectorAll("a[href]")) {
         if ((a.getAttribute("href") || "").includes(host)) {
+          a.setAttribute("data-capture-expose-link", "1");
           a.scrollIntoView({ behavior: "smooth", block: "center" });
-          a.style.outline = "3px solid rgba(59, 130, 246, 0.85)";
-          a.style.outlineOffset = "3px";
-          a.style.borderRadius = "4px";
-          return true;
+          break;
         }
       }
-      return false;
     }, exposeUrl);
-    if (highlighted) await page.waitForTimeout(2000);
+    await page.waitForTimeout(800);
+    await cursorClick(page, "[data-capture-expose-link]");
+    await page.waitForTimeout(500);
 
     await page.goto(exposeUrl);
-    await page.waitForTimeout(2500);
-
-    // Click through Daytona security interstitial if present
-    const clicked = await page.evaluate(() => {
-      for (const b of document.querySelectorAll("button, a")) {
-        const t = b.textContent.trim().toLowerCase();
-        if (t.includes("continue") || t.includes("proceed") || t.includes("open") || t.includes("i understand")) {
-          b.click(); return true;
-        }
-      }
-      return false;
-    });
-    if (clicked) {
-      log("beat7", "Clicked through security interstitial");
-      await page.waitForTimeout(4000);
-    }
-
-    // Let VS Code load
     await page.waitForTimeout(6000);
     log("beat7", "VS Code visible");
   } else {
     log("beat7", "No expose URL found — skipping VS Code navigation");
-    await page.waitForTimeout(2000);
+    await page.waitForTimeout(1000);
   }
 
   // ── Beat 8: Return to chat ──────────────────────────────────────
   log("beat8", "Returning to chat...");
   await page.goto(chatUrl || `${OWUI_URL}/`);
   await page.waitForLoadState("networkidle").catch(() => {});
-  await page.waitForTimeout(2000);
+  await page.waitForTimeout(1000);
   await suppressTooltips(page);
   await injectCursor(page);
   await scrollToBottom(page);
 
   // ── Beat 9: Ask model to stop the server ───────────────────────
   log("beat9", "Typing stop-server prompt...");
-  await highlight(page, "#chat-input", 800);
   await cursorClick(page, "#chat-input");
   await typeMessage(page, "Thanks! Please stop the code-server now, I'm done with it.");
-  await page.waitForTimeout(1200);
+  await page.waitForTimeout(500);
 
   log("beat9", "Sending stop-server prompt...");
   await cursorClick(page, "#send-message-button");
   await sendMessage(page);
   await cursorHide(page);
   await waitForResponse(page, { timeoutMs: 60000, stableMs: 5000 });
-  await page.waitForTimeout(1000);
+  await page.waitForTimeout(500);
 
   // ── Beat 10: Let the cleanup response sit visibly ──────────────
   log("beat10", "Showing cleanup response...");
   await scrollToBottom(page);
-  await page.waitForTimeout(3000);
+  await page.waitForTimeout(500);
+
+  // ── Beat 11: Gimmick — run whatever's in DEMO_GIMMICK.md ──────
+  log("beat11", "Typing gimmick prompt...");
+  await cursorClick(page, "#chat-input");
+  await typeMessage(page, "Do the thing in /home/daytona/workspace/DEMO_GIMMICK.md");
+  await page.waitForTimeout(500);
+
+  log("beat11", "Sending gimmick prompt...");
+  await cursorClick(page, "#send-message-button");
+  await sendMessage(page);
+  await cursorHide(page);
+  await waitForResponse(page, { timeoutMs: 120000, stableMs: 5000 });
+  await page.waitForTimeout(500);
+
+  log("beat12", "Showing gimmick response...");
+  await scrollToBottom(page);
+  await page.waitForTimeout(500);
 
   log("done", "Capture complete");
   await page.waitForTimeout(1000);
