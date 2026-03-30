@@ -460,16 +460,20 @@ async def test_int_expose(R: Results, tools: Tools, user: dict):
     ctx = dict(__user__=user, __event_emitter__=mock_emitter)
 
     print("\n── expose: invalid port (too low) ──")
-    r = await tools.expose(port=80, **ctx)
+    r = await tools.expose(target="http:80", **ctx)
     R.check("port 80 rejected", "Error" in r and "3000" in r, r[:200])
 
     print("\n── expose: invalid port (too high) ──")
-    r = await tools.expose(port=10000, **ctx)
+    r = await tools.expose(target="http:10000", **ctx)
     R.check("port 10000 rejected", "Error" in r and "9999" in r, r[:200])
 
-    print("\n── expose: no port and no ssh ──")
-    r = await tools.expose(**ctx)
-    R.check("default args rejected", "Error" in r, r[:200])
+    print("\n── expose: bare port number rejected ──")
+    r = await tools.expose(target="3000", **ctx)
+    R.check("bare port rejected", "Error" in r and "http:" in r.lower(), r[:200])
+
+    print("\n── expose: nonsense target ──")
+    r = await tools.expose(target="ftp", **ctx)
+    R.check("nonsense target rejected", "Error" in r, r[:200])
 
     print("\n── expose: start a server then get URL ──")
     await tools.bash(
@@ -479,7 +483,7 @@ async def test_int_expose(R: Results, tools: Tools, user: dict):
     import asyncio as _asyncio
     await _asyncio.sleep(1)
 
-    r = await tools.expose(port=8080, **ctx)
+    r = await tools.expose(target="http:8080", **ctx)
     R.check("expose returns URL", "Public URL" in r, r[:300])
     R.check("URL contains https://", "https://" in r, r[:300])
     R.check("mentions 1 hour validity", "1 hour" in r, r[:300])
@@ -489,7 +493,7 @@ async def test_int_expose(R: Results, tools: Tools, user: dict):
     await tools.bash("pkill -f 'http.server 8080' || true", **ctx)
 
     print("\n── expose: SSH access ──")
-    r = await tools.expose(ssh=True, **ctx)
+    r = await tools.expose(target="ssh", **ctx)
     R.check("ssh returns command", "ssh" in r.lower(), r[:300])
     R.check("mentions validity", "60 min" in r, r[:300])
     R.check("contains ssh command block", "```" in r, r[:300])

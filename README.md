@@ -72,7 +72,7 @@ To update an existing installation, use the `/api/v1/tools/id/lathe/update` endp
 | `read(path, offset, limit)` | Read file with line numbers |
 | `write(path, content)` | Write/create file (auto-creates parent dirs) |
 | `edit(path, old_string, new_string, replace_all)` | Exact string replacement |
-| `expose(port, ssh)` | Give the user a public HTTPS URL for a sandbox service, or a time-limited SSH command |
+| `expose(target)` | Expose a sandbox service — `"http:3000"` for a public HTTPS URL, `"ssh"` for a time-limited SSH command |
 | `destroy(confirm)` | Permanently delete the sandbox (requires `confirm=true`) |
 
 ## Testing

@@ -810,7 +810,7 @@ class Tools:
             ```
             nohup /tmp/dufs /home/daytona --port 3000 --allow-all &
             ```
-            Then call expose(port=3000). Give the user the URL and tell them:
+            Then call expose(target="http:3000"). Give the user the URL and tell them:
             - Drag and drop to upload
             - Click files to download
             - Navigate folders to browse
@@ -839,7 +839,7 @@ class Tools:
             ```
             nohup /tmp/code-server/bin/code-server --bind-addr 0.0.0.0:8080 --auth none /home/daytona/workspace &
             ```
-            Then call expose(port=8080). The user gets VS Code in their browser
+            Then call expose(target="http:8080"). The user gets VS Code in their browser
             with full terminal, extensions, and file editing.
             """),
         "overview": textwrap.dedent("""\
@@ -877,7 +877,7 @@ class Tools:
 
             **Running services and exposing them:**
             The sandbox is a server. Background a web server with nohup, then
-            call expose(port=N) to get a public HTTPS URL the user can open.
+            call expose(target="http:N") to get a public HTTPS URL the user can open.
             The sandbox auto-stops on idle, which kills background processes —
             restart the server and call expose() again if needed.
 
@@ -888,7 +888,7 @@ class Tools:
             See lathe(manpage="recipes") for install and usage scripts.
 
             **Interactive shell:**
-            For interactive work, call expose(ssh=true) to give the user a
+            For interactive work, call expose(target="ssh") to give the user a
             time-limited SSH command they can paste into their terminal, VS Code
             Remote SSH, or JetBrains Gateway.
 
@@ -909,7 +909,7 @@ class Tools:
 
             - Commands are non-interactive. No stdin prompts, no curses UIs. Use
               -y or equivalent flags. For interactive work, give the user an
-              expose(ssh=true) token.
+              expose(target="ssh") token.
             - bash() auto-backgrounds commands that exceed ~30 seconds. When this
               happens, it returns a background descriptor with CMD and PID paths.
               Use foreground_seconds= to extend the wait (e.g. foreground_seconds=120
@@ -922,7 +922,7 @@ class Tools:
             - edit() requires an exact string match (including whitespace). If
               the match is ambiguous, provide more surrounding context or use
               replace_all=true.
-            - expose() URLs expire after ~1 hour. The sandbox itself stops on
+            - expose() URLs expire after ~1 hour (call expose again for a fresh URL). The sandbox itself stops on
               idle (~15 min default), killing servers.
             - destroy() is irreversible. The volume is preserved.
             - **Network egress may be restricted.** Depending on the admin's
@@ -1560,27 +1560,46 @@ class Tools:
 
     async def expose(
         self,
-        port: int = 0,
-        ssh: bool = False,
+        target: str,
         __user__: dict = {},
         __event_emitter__=None,
     ) -> str:
         """
-        Expose a sandbox service to the user. Use port= for web servers,
-        ssh=true for interactive shell access.
+        Expose a sandbox service to the user. Pass "http:<port>" for web
+        servers or "ssh" for interactive shell access.
         Common patterns: dufs for file upload/download, code-server for a full
         IDE, or any web app. See lathe(manpage="recipes") for install scripts.
-        :param port: Port the service listens on (3000–9999). Returns a public HTTPS URL valid ~1 hour.
-        :param ssh: If true, returns a time-limited SSH command (ignores port).
+        :param target: What to expose — "ssh" for a shell, or "http:<port>" (e.g. "http:3000", port range 3000–9999) for an HTTP service.
         """
         async def _run(client):
-            if not ssh and (not isinstance(port, int) or port < 3000 or port > 9999):
-                return "Error: port must be an integer between 3000 and 9999, or set ssh=true for shell access."
+            # Parse target: "ssh" or "http:<port>"
+            target_stripped = target.strip().lower()
+            is_ssh = target_stripped == "ssh"
+            port = 0
+
+            if not is_ssh:
+                if not target_stripped.startswith("http:"):
+                    return (
+                        f"Error: target must be \"ssh\" or \"http:<port>\" "
+                        f"(e.g. \"http:3000\"). Got: \"{target}\""
+                    )
+                port_str = target_stripped[len("http:"):]
+                try:
+                    port = int(port_str)
+                except (ValueError, TypeError):
+                    return (
+                        f"Error: port in \"http:<port>\" must be a number. "
+                        f"Got: \"{target}\""
+                    )
+                if port < 3000 or port > 9999:
+                    return (
+                        f"Error: port must be between 3000 and 9999. Got: {port}"
+                    )
 
             email = _get_email(__user__)
             sandbox_id, _sb_warning = await _ensure_sandbox(self.valves, email, client, __event_emitter__)
 
-            if ssh:
+            if is_ssh:
                 await _emit(__event_emitter__, "Creating SSH access token...")
                 resp = await client.post(
                     _api(self.valves, f"/sandbox/{sandbox_id}/ssh-access"),
