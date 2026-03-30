@@ -850,6 +850,9 @@ class Tools:
             cross-conversation filesystem. The sandbox is created transparently
             on first tool use and survives across conversations for the same user.
 
+            - Documentation: https://lathe.tools
+            - Source: https://github.com/rndmcnlly/lathe
+
             Read this page fully before your first tool call. It covers the
             sandbox model, available workflows, and common mistakes.
 
