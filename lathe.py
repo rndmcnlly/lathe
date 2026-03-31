@@ -808,21 +808,23 @@ class Tools:
 
             **Start and expose:**
             ```
-            nohup /tmp/dufs /home/daytona --port 3000 --allow-all &
+            nohup /tmp/dufs /home/daytona/workspace --allow-all &
             ```
-            Then call expose(target="http:3000"). Give the user the URL and tell them:
+            Then call expose(target="http:5000"). Give the user the URL and tell them:
             - Drag and drop to upload
             - Click files to download
             - Navigate folders to browse
 
+            dufs defaults to port 5000.
+
             **Serve a specific directory:**
             ```
-            nohup /tmp/dufs /home/daytona/workspace/output --port 3000 --allow-all &
+            nohup /tmp/dufs /home/daytona/workspace/output --allow-all &
             ```
 
             **Read-only (download only, no upload):**
             ```
-            nohup /tmp/dufs /home/daytona/workspace --port 3000 &
+            nohup /tmp/dufs /home/daytona/workspace &
             ```
 
             ## Full IDE — code-server
