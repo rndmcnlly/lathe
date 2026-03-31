@@ -150,8 +150,8 @@ $ bash("npm test")
       <Slide id="expose-moment" section>
         <ToolCall
           tool="expose"
-          args="port=8080"
-          result={`Public URL (valid ~1 hour):
+          args='target="code-server"'
+          result={`IDE URL (valid ~1 hour):
 https://8080-sandbox-abc123.proxy.daytona.io/
   ?token=eyJ...
 
@@ -161,8 +161,8 @@ extensions, file editing.`}
         />
         Now here's where it gets interesting. The agent calls expose —
         and the user gets a public URL to whatever's running in the
-        sandbox. A web app. A file browser. A full VS Code instance. The
-        interaction breaks out of the chat window.
+        sandbox. A web app. A file browser. A full VS Code instance. One
+        tool call installs, starts, and signs the URL.
       </Slide>
 
       <Slide id="beyond-chat">

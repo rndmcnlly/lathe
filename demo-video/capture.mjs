@@ -2,9 +2,9 @@
 /**
  * Playwright video capture of a real Lathe session on an Open WebUI instance.
  *
- * Captures: login → enable Lathe → clone a repo → ask for VS Code on
- * port 3000 → model installs code-server + exposes it → open the
- * live IDE URL → return to chat → ask model to stop the server.
+ * Captures: login → enable Lathe → clone a repo → ask for VS Code →
+ * model calls expose(target="code-server") → open the live IDE URL →
+ * return to chat → ask model to stop the server.
  *
  * Usage:  node capture.mjs
  * Env:    DEMO_OWUI_URL, DEMO_EMAIL, DEMO_PASS (loaded from .env if present)
@@ -36,7 +36,6 @@ if (!OWUI_URL || !EMAIL || !PASS) { console.error("Set DEMO_OWUI_URL, DEMO_EMAIL
 
 const VIEWPORT = { width: 1280, height: 720 };
 
-const PORT = 3000;
 
 // ── Structured logging ──────────────────────────────────────────────
 
@@ -446,10 +445,10 @@ try {
   log("beat4", `Chat URL: ${chatUrl}`);
   await page.waitForTimeout(500);
 
-  // ── Beat 5: Second prompt — VS Code on port 3000 ────────────────
+  // ── Beat 5: Second prompt — VS Code ─────────────────────────────
   log("beat5", "Typing second prompt...");
   await cursorClick(page, "#chat-input");
-  await typeMessage(page, `Give me a VS Code editor for this repo on port ${PORT}. When you share the link, use a markdown link with a friendly label instead of showing the raw URL.`);
+  await typeMessage(page, `Give me a VS Code editor for this repo. When you share the link, use a markdown link with a friendly label instead of showing the raw URL.`);
   await page.waitForTimeout(500);
 
   // ── Beat 6: Send and wait for code-server install + expose ─────
