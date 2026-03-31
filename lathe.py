@@ -5,7 +5,7 @@ author_url: https://adamsmith.as
 description: Coding agent tools (lathe, bash, read, write, edit, onboard, expose, destroy) backed by per-user sandbox VMs with transparent lifecycle management.
 required_open_webui_version: 0.4.0
 requirements: httpx
-version: 0.10.0
+version: 0.11.0
 licence: MIT
 """
 
@@ -155,6 +155,13 @@ def _get_email(user: dict) -> str:
     if not email:
         raise RuntimeError("No email found for user. Cannot provision sandbox.")
     return email
+
+
+def _extract_pid(output: str) -> str:
+    """Extract PID=<number> from ensure-script output. Returns the number or '?'."""
+    import re
+    m = re.search(r"PID=(\d+)", output)
+    return m.group(1) if m else "?"
 
 
 def _require_abs_path(path: str, param_name: str = "path") -> str | None:
@@ -332,6 +339,50 @@ def _build_onboard_script(project_path: str) -> str:
 
 
 VOLUME_MOUNT_PATH = "/home/daytona/volume"
+
+# ── Service fast-path constants ──────────────────────────────────────
+
+_DUFS_BIN = "/tmp/dufs"
+_DUFS_PORT = 5000  # dufs default
+_DUFS_ROOT = "/home/daytona/workspace"
+
+# Single idempotent script: install if missing, start if not listening.
+# Exit 0 = ready (prints READY); non-zero = install or start failed.
+_DUFS_ENSURE_SCRIPT = (
+    f'set -e; '
+    f'if ! test -x {_DUFS_BIN}; then '
+    f'  TAG=$(curl -sf https://api.github.com/repos/sigoden/dufs/releases/latest '
+    f'    | python3 -c "import sys,json; print(json.load(sys.stdin)[\'tag_name\'])") '
+    f'  && curl -sL "https://github.com/sigoden/dufs/releases/download/${{TAG}}/'
+    f'dufs-${{TAG}}-x86_64-unknown-linux-musl.tar.gz" '
+    f'  | tar xz -C /tmp && chmod +x {_DUFS_BIN}; '
+    f'fi; '
+    f'if ! ss -tlnp | grep -q ":{_DUFS_PORT} "; then '
+    f'  nohup {_DUFS_BIN} {_DUFS_ROOT} --allow-all > /tmp/dufs.log 2>&1 & '
+    f'  sleep 0.5; '
+    f'fi; '
+    f'PID=$(ss -tlnp | grep ":{_DUFS_PORT} " | grep -o "pid=[0-9]*" | head -1 | cut -d= -f2); '
+    f'echo "READY PID=$PID"'
+)
+
+_CS_BIN = "/tmp/code-server/bin/code-server"
+_CS_PORT = 8080
+_CS_ROOT = "/home/daytona/workspace"
+
+_CS_ENSURE_SCRIPT = (
+    f'set -e; '
+    f'if ! test -x {_CS_BIN}; then '
+    f'  curl -fsSL https://code-server.dev/install.sh '
+    f'  | sh -s -- --method=standalone --prefix=/tmp/code-server; '
+    f'fi; '
+    f'if ! ss -tlnp | grep -q ":{_CS_PORT} "; then '
+    f'  nohup {_CS_BIN} --bind-addr 0.0.0.0:{_CS_PORT} --auth none {_CS_ROOT} '
+    f'  > /tmp/code-server.log 2>&1 & '
+    f'  sleep 1; '
+    f'fi; '
+    f'PID=$(ss -tlnp | grep ":{_CS_PORT} " | grep -o "pid=[0-9]*" | head -1 | cut -d= -f2); '
+    f'echo "READY PID=$PID"'
+)
 
 
 async def _ensure_volume(valves, volume_name: str, client: httpx.AsyncClient) -> str:
@@ -690,8 +741,8 @@ class Tools:
 
             **Common — user downloads and uploads via dufs:**
             Ask the user to download the file on their own machine, then
-            upload it to the sandbox through the dufs file browser. See
-            lathe(manpage="recipes") for dufs setup. This handles any file
+            upload it to the sandbox through the dufs file browser. Call
+            expose(target="dufs") to get the URL. This handles any file
             type and any host with no size constraints.
 
             **Rare — custom browser-side fetch service:**
@@ -795,54 +846,44 @@ class Tools:
             ## File browser — dufs
 
             When the user asks to upload files, download files, browse files,
-            or transfer files, the answer is dufs + expose(). Do NOT attempt
-            to relay file contents through the conversation — give the user a
-            URL they can use directly in their browser.
+            or transfer files, the answer is expose(target="dufs"). Do NOT
+            attempt to relay file contents through the conversation — give the
+            user a URL they can use directly in their browser.
 
-            **Install dufs (run once per sandbox):**
+            **One-step setup:**
             ```
-            TAG=$(curl -s https://api.github.com/repos/sigoden/dufs/releases/latest | python3 -c "import sys,json; print(json.load(sys.stdin)['tag_name'])")
-            curl -sL "https://github.com/sigoden/dufs/releases/download/${TAG}/dufs-${TAG}-x86_64-unknown-linux-musl.tar.gz" \
-              | tar xz -C /tmp && chmod +x /tmp/dufs && /tmp/dufs --version
+            expose(target="dufs")
             ```
+            This installs dufs if missing, starts it on port 5000 serving
+            /home/daytona/workspace with full upload/download, and returns a
+            signed URL. Idempotent — safe to call again after sandbox restart.
 
-            **Start and expose:**
-            ```
-            nohup /tmp/dufs /home/daytona/workspace --allow-all &
-            ```
-            Then call expose(target="http:5000"). Give the user the URL and tell them:
-            - Drag and drop to upload
-            - Click files to download
-            - Navigate folders to browse
-
-            dufs defaults to port 5000.
-
-            **Serve a specific directory:**
+            **Custom directory or read-only access:**
+            For non-default configurations, install and start dufs manually:
             ```
             nohup /tmp/dufs /home/daytona/workspace/output --allow-all &
             ```
-
-            **Read-only (download only, no upload):**
-            ```
-            nohup /tmp/dufs /home/daytona/workspace &
-            ```
+            Then call expose(target="http:5000").
 
             ## Full IDE — code-server
 
             When the user asks for an IDE, editor, or VS Code in the browser,
             use code-server.
 
-            **Install code-server (run once per sandbox):**
+            **One-step setup:**
             ```
-            curl -fsSL https://code-server.dev/install.sh | sh -s -- --method=standalone --prefix=/tmp/code-server
+            expose(target="code-server")
             ```
+            This installs code-server if missing, starts it on port 8080
+            serving /home/daytona/workspace with no auth, and returns a signed
+            URL. Idempotent — safe to call again after sandbox restart.
 
-            **Start and expose:**
+            **Custom configuration:**
+            For non-default settings, install and start code-server manually:
             ```
             nohup /tmp/code-server/bin/code-server --bind-addr 0.0.0.0:8080 --auth none /home/daytona/workspace &
             ```
-            Then call expose(target="http:8080"). The user gets VS Code in their browser
-            with full terminal, extensions, and file editing.
+            Then call expose(target="http:8080").
             """),
         "overview": textwrap.dedent("""\
             # Lathe Toolkit — Overview
@@ -884,10 +925,16 @@ class Tools:
             restart the server and call expose() again if needed.
 
             **File upload/download/browsing:**
-            When the user wants to upload, download, or browse files, run dufs
-            (a file server) in the sandbox and expose it. The user gets
-            drag-and-drop upload/download in their browser with no size limit.
-            See lathe(manpage="recipes") for install and usage scripts.
+            When the user wants to upload, download, or browse files, call
+            expose(target="dufs"). This installs and starts dufs automatically
+            and returns a URL with drag-and-drop upload/download — one tool call.
+            See lathe(manpage="recipes") for custom configurations.
+
+            **Browser IDE:**
+            When the user wants an IDE, call expose(target="code-server"). This
+            installs and starts code-server automatically and returns a URL —
+            VS Code in the browser with terminal, extensions, and file editing.
+            See lathe(manpage="recipes") for custom configurations.
 
             **Interactive shell:**
             For interactive work, call expose(target="ssh") to give the user a
@@ -1567,23 +1614,24 @@ class Tools:
         __event_emitter__=None,
     ) -> str:
         """
-        Expose a sandbox service to the user. Pass "http:<port>" for web
-        servers or "ssh" for interactive shell access.
-        Common patterns: dufs for file upload/download, code-server for a full
-        IDE, or any web app. See lathe(manpage="recipes") for install scripts.
-        :param target: What to expose — "ssh" for a shell, or "http:<port>" (e.g. "http:3000", port range 3000–9999) for an HTTP service.
+        Expose a sandbox service to the user. Pass "dufs" for a one-step file
+        browser, "code-server" for a one-step IDE, "http:<port>" for a web
+        server you already started, or "ssh" for interactive shell access.
+        :param target: What to expose — "dufs" for file upload/download, "code-server" for a browser IDE, "ssh" for a shell, or "http:<port>" (e.g. "http:5000", port range 3000–9999) for an HTTP service you started manually.
         """
         async def _run(client):
-            # Parse target: "ssh" or "http:<port>"
+            # Parse target: "ssh", "dufs", "code-server", or "http:<port>"
             target_stripped = target.strip().lower()
             is_ssh = target_stripped == "ssh"
+            is_dufs = target_stripped == "dufs"
+            is_code_server = target_stripped == "code-server"
             port = 0
 
-            if not is_ssh:
+            if not is_ssh and not is_dufs and not is_code_server:
                 if not target_stripped.startswith("http:"):
                     return (
-                        f"Error: target must be \"ssh\" or \"http:<port>\" "
-                        f"(e.g. \"http:3000\"). Got: \"{target}\""
+                        f"Error: target must be \"ssh\", \"dufs\", \"code-server\", or \"http:<port>\" "
+                        f"(e.g. \"http:5000\"). Got: \"{target}\""
                     )
                 port_str = target_stripped[len("http:"):]
                 try:
@@ -1627,6 +1675,106 @@ class Tools:
                     f"or JetBrains Gateway.\n\n"
                     f"Note: the sandbox auto-stops after ~{self.valves.auto_stop_minutes} min of inactivity. "
                     f"Active SSH sessions keep the sandbox alive.",
+                    _sb_warning,
+                )
+
+            # ── dufs fast path: install + start + sign URL ──────────
+            if is_dufs:
+                await _emit(__event_emitter__, "Preparing dufs file browser...")
+
+                # Single script: install if binary missing, start if port free.
+                resp = await client.post(
+                    _toolbox(self.valves, sandbox_id, "/process/execute"),
+                    headers=_headers(self.valves),
+                    json={"command": _DUFS_ENSURE_SCRIPT, "timeout": 30000},
+                    timeout=60.0,
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                result = data.get("result", "")
+                if data.get("exitCode", -1) != 0 or "READY" not in result:
+                    await _emit(__event_emitter__, "dufs setup failed", done=True)
+                    return (
+                        f"Error: dufs setup failed (exit {data.get('exitCode')}).\n"
+                        f"{result[:500]}\n\n"
+                        f"This usually means the sandbox cannot reach GitHub (egress filtering). "
+                        f"See lathe(manpage=\"egress\") for workarounds, or install dufs manually "
+                        f"and use expose(target=\"http:{_DUFS_PORT}\")."
+                    )
+
+                pid = _extract_pid(result)
+
+                # Sign the URL
+                await _emit(__event_emitter__, "Generating URL...")
+                resp = await client.get(
+                    _api(self.valves, f"/sandbox/{sandbox_id}/ports/{_DUFS_PORT}/signed-preview-url"),
+                    params={"expiresInSeconds": 3600},
+                    headers=_headers(self.valves),
+                    timeout=30.0,
+                )
+                resp.raise_for_status()
+                url = resp.json().get("url", "")
+                if not url:
+                    return "Error: Daytona returned an empty URL."
+
+                await _emit(__event_emitter__, "File browser ready", done=True)
+                return _prepend_warning(
+                    f"File browser URL (valid ~1 hour): {url}\n\n"
+                    f"Give this URL to the user. In their browser they can:\n"
+                    f"- **Upload**: drag and drop files onto the page\n"
+                    f"- **Download**: click any file\n"
+                    f"- **Browse**: navigate folders\n\n"
+                    f"dufs is serving {_DUFS_ROOT} on port {_DUFS_PORT} (PID {pid}).",
+                    _sb_warning,
+                )
+
+            # ── code-server fast path: install + start + sign URL ───
+            if is_code_server:
+                await _emit(__event_emitter__, "Preparing code-server IDE...")
+
+                # Single script: install if binary missing, start if port free.
+                resp = await client.post(
+                    _toolbox(self.valves, sandbox_id, "/process/execute"),
+                    headers=_headers(self.valves),
+                    json={"command": _CS_ENSURE_SCRIPT, "timeout": 60000},
+                    timeout=120.0,
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                result = data.get("result", "")
+                if data.get("exitCode", -1) != 0 or "READY" not in result:
+                    await _emit(__event_emitter__, "code-server setup failed", done=True)
+                    return (
+                        f"Error: code-server setup failed (exit {data.get('exitCode')}).\n"
+                        f"{result[:500]}\n\n"
+                        f"This usually means the sandbox cannot reach the install script host "
+                        f"(egress filtering). See lathe(manpage=\"egress\") for workarounds, or "
+                        f"install code-server manually and use expose(target=\"http:{_CS_PORT}\")."
+                    )
+
+                pid = _extract_pid(result)
+
+                # Sign the URL
+                await _emit(__event_emitter__, "Generating URL...")
+                resp = await client.get(
+                    _api(self.valves, f"/sandbox/{sandbox_id}/ports/{_CS_PORT}/signed-preview-url"),
+                    params={"expiresInSeconds": 3600},
+                    headers=_headers(self.valves),
+                    timeout=30.0,
+                )
+                resp.raise_for_status()
+                url = resp.json().get("url", "")
+                if not url:
+                    return "Error: Daytona returned an empty URL."
+
+                await _emit(__event_emitter__, "IDE ready", done=True)
+                return _prepend_warning(
+                    f"IDE URL (valid ~1 hour): {url}\n\n"
+                    f"Give this URL to the user. They get VS Code in the browser with:\n"
+                    f"- Full terminal access\n"
+                    f"- File editing and navigation\n"
+                    f"- Extension support\n\n"
+                    f"code-server is serving {_CS_ROOT} on port {_CS_PORT} (PID {pid}).",
                     _sb_warning,
                 )
 
