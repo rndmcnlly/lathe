@@ -2,7 +2,7 @@
 title: Lathe
 author: Adam Smith
 author_url: https://adamsmith.as
-description: Coding agent tools (lathe, bash, read, write, edit, onboard, expose, destroy) backed by per-user sandbox VMs with transparent lifecycle management.
+description: Coding agent tools (lathe, bash, read, write, edit, glob, onboard, expose, destroy) backed by per-user sandbox VMs with transparent lifecycle management.
 required_open_webui_version: 0.4.0
 requirements: httpx
 version: 0.11.0
@@ -234,6 +234,197 @@ def _human_size(n: int) -> str:
             return f"{b:,.0f} {unit}" if unit == "B" else f"{b:,.1f} {unit}"
         b /= 1024
     return f"{b:,.1f} TB"
+
+
+# ── hierarchical glob (runs on sandbox) ──────────────────────────────
+
+_GLOB_MAX_LINES = 100
+
+_GLOB_SCRIPT = r'''
+import os
+import sys
+from pathlib import Path
+
+
+def glob_hierarchy(base_dir, pattern, max_lines):
+    base = Path(base_dir).resolve()
+    if not base.is_dir():
+        return f"Error: not a directory: {base_dir}"
+
+    # ── Parse pattern: comma-separated, !prefix = exclude ────────
+    # Result = union(positive) - union(negative), order-independent.
+    # Commas inside {braces} are part of glob syntax, not delimiters.
+    terms, current, depth = [], [], 0
+    for ch in pattern:
+        if ch == "{": depth += 1
+        elif ch == "}": depth -= 1
+        elif ch == "," and depth == 0:
+            terms.append("".join(current).strip())
+            current = []
+            continue
+        current.append(ch)
+    terms.append("".join(current).strip())
+
+    positive, negative = [], []
+    for term in terms:
+        if not term:
+            continue
+        if term.startswith("!"):
+            negative.append(term[1:])
+        else:
+            positive.append(term)
+
+    if not positive:
+        return f"Error: pattern must include at least one positive glob (got {pattern!r})"
+
+    # ── Exhaustive glob ──────────────────────────────────────────
+    base_prefix = str(base) + os.sep
+
+    def _collect(globs):
+        result = set()
+        for g in globs:
+            for p in base.glob(g):
+                s = str(p.resolve())
+                if p.is_file() and s.startswith(base_prefix):
+                    result.add(s)
+        return result
+
+    included = _collect(positive)
+    if negative:
+        included -= _collect(negative)
+    matches = sorted(included)
+
+    if not matches:
+        return f"0 matches for {pattern!r} in {base}"
+
+    # ── Build trie ───────────────────────────────────────────────
+    root = {"children": {}, "files": [], "count": 0, "path": str(base)}
+
+    for filepath in matches:
+        rel = os.path.relpath(filepath, base)
+        parts = rel.split(os.sep)
+        node = root
+        node["count"] += 1
+        for part in parts[:-1]:
+            if part not in node["children"]:
+                node["children"][part] = {
+                    "children": {},
+                    "files": [],
+                    "count": 0,
+                    "path": os.path.join(node["path"], part),
+                }
+            node = node["children"][part]
+            node["count"] += 1
+        node["files"].append(filepath)
+
+    # ── Budget-driven expansion ──────────────────────────────────
+    expanded = {id(root)}
+    partial_limit = {}
+
+    def _ordered_children(node):
+        items = []
+        for name in sorted(node["children"],
+                           key=lambda n: node["children"][n]["count"],
+                           reverse=True):
+            items.append(("dir", node["children"][name]))
+        for f in sorted(node["files"]):
+            items.append(("file", f))
+        return items
+
+    def _count_lines(node):
+        if id(node) not in expanded:
+            return 1
+        limit = partial_limit.get(id(node))
+        if limit is not None:
+            items = _ordered_children(node)
+            if limit < len(items):
+                total = 1  # the "... and N more" line
+                for kind, item in items[:limit]:
+                    total += 1 if kind == "file" else _count_lines(item)
+                return total
+        total = len(node["files"])
+        for child in node["children"].values():
+            total += _count_lines(child)
+        return total
+
+    def _collapsible(node):
+        if id(node) not in expanded:
+            yield (node["count"], node)
+            return
+        for child in node["children"].values():
+            yield from _collapsible(child)
+
+    current_lines = _count_lines(root)
+
+    while current_lines < max_lines:
+        candidates = list(_collapsible(root))
+        if not candidates:
+            break
+
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        best_count, best_node = candidates[0]
+        n_children = len(best_node["files"]) + len(best_node["children"])
+
+        if n_children <= 1:
+            expanded.add(id(best_node))
+            current_lines = _count_lines(root)
+            continue
+
+        net_cost = n_children - 1
+        if current_lines + net_cost <= max_lines:
+            expanded.add(id(best_node))
+            current_lines = _count_lines(root)
+            continue
+
+        # Partial expansion
+        budget_for_children = max_lines - current_lines
+        if budget_for_children < 2:
+            break
+        expanded.add(id(best_node))
+        partial_limit[id(best_node)] = budget_for_children
+        current_lines = _count_lines(root)
+        break
+
+    # ── Render ───────────────────────────────────────────────────
+    output = []
+
+    def render(node):
+        if id(node) not in expanded:
+            output.append(f"{node['path']}/ ({node['count']} matches)")
+            return
+
+        items = _ordered_children(node)
+        limit = partial_limit.get(id(node))
+
+        if limit is not None and limit < len(items):
+            shown = items[:limit]
+            hidden_count = sum(
+                1 if k == "file" else item["count"]
+                for k, item in items[limit:]
+            )
+            for kind, item in shown:
+                if kind == "file":
+                    output.append(item)
+                else:
+                    render(item)
+            output.append(
+                f"{node['path']}/ ... and {hidden_count} more matches"
+            )
+        else:
+            for f in sorted(node["files"]):
+                output.append(f)
+            for name in sorted(node["children"]):
+                render(node["children"][name])
+
+    render(root)
+
+    header = f"{len(matches)} matches for {pattern!r} in {base}"
+    has_collapsed = bool(list(_collapsible(root))) or bool(partial_limit)
+    if has_collapsed:
+        header += f" (budget: {max_lines} lines, some directories collapsed)"
+
+    return header + "\n" + "\n".join(output)
+'''
 
 
 def _build_onboard_script(project_path: str) -> str:
@@ -1479,6 +1670,57 @@ class Tools:
             if start_idx > 0 or end_idx < total_lines:
                 header += f", showing lines {start_idx + 1}-{min(end_idx, total_lines)}"
             return _prepend_warning(f"{header}\n{numbered}", _sb_warning)
+
+        return await _tool_context(__event_emitter__, _run)
+
+    async def glob(
+        self,
+        pattern: str,
+        max_lines: int = _GLOB_MAX_LINES,
+        __user__: dict = {},
+        __event_emitter__=None,
+    ) -> str:
+        """
+        Search for files in the sandbox workspace by glob pattern.
+        Returns a hierarchical listing of matches with absolute paths.
+        Dense directories are collapsed with match counts; narrow the
+        pattern or increase max_lines to expand them.
+        :param pattern: Comma-separated glob patterns relative to /home/daytona/workspace. Prefix with ! to exclude. Examples: '**/*.py', 'src/**/*.ts,src/**/*.tsx', '**/*,!**/node_modules/**,!**/.git/**'.
+        :param max_lines: Maximum output lines (default: 100). Increase to see more detail.
+        """
+        async def _run(client):
+            email = _get_email(__user__)
+            sandbox_id, _sb_warning = await _ensure_sandbox(self.valves, email, client, __event_emitter__)
+
+            await _emit(__event_emitter__, f"Searching for {pattern}...")
+
+            clamped = max(1, min(500, max_lines))
+            base_dir = "/home/daytona/workspace"
+            script = (
+                _GLOB_SCRIPT
+                + f"\nprint(glob_hierarchy({base_dir!r}, {pattern!r}, {clamped!r}))"
+            )
+
+            resp = await client.post(
+                _toolbox(self.valves, sandbox_id, "/process/execute"),
+                headers=_headers(self.valves),
+                json={"command": f"python3 -c {_shell_quote(script)}", "timeout": 30000},
+                timeout=60.0,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            result = data.get("result", "")
+            exit_code = data.get("exitCode", -1)
+
+            if exit_code != 0:
+                await _emit(__event_emitter__, "Search failed", done=True)
+                return _prepend_warning(
+                    f"Error: glob script failed (exit {exit_code}).\n{result[:500]}",
+                    _sb_warning,
+                )
+
+            await _emit(__event_emitter__, "Search complete", done=True)
+            return _prepend_warning(result, _sb_warning)
 
         return await _tool_context(__event_emitter__, _run)
 

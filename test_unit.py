@@ -7,8 +7,10 @@ Usage:
 """
 
 import asyncio
+import subprocess
 import sys
 import os
+import tempfile
 import time
 
 sys.path.insert(0, os.path.dirname(__file__))
@@ -174,6 +176,246 @@ async def test_build_tool_catalog(R: Results):
     R.check("catalog is non-empty", len(catalog) > 0, "catalog should list at least one tool")
 
 
+async def test_glob_script(R: Results):
+    from lathe import _GLOB_SCRIPT
+
+    def run_glob(base_dir, pattern, max_lines):
+        """Exec the glob script via subprocess, return stdout."""
+        script = (
+            _GLOB_SCRIPT
+            + f"\nprint(glob_hierarchy({base_dir!r}, {pattern!r}, {max_lines!r}))"
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            capture_output=True, text=True,
+        )
+        if result.returncode != 0:
+            return f"SCRIPT ERROR: {result.stderr}"
+        return result.stdout.rstrip("\n")
+
+    def parse_header(output):
+        """Extract match count from header line."""
+        first_line = output.split("\n")[0]
+        return int(first_line.split(" ")[0])
+
+    def body_lines(output):
+        """All lines after the header."""
+        return output.split("\n")[1:]
+
+    # ── Build a known directory tree ─────────────────────────────
+    #
+    #   tmp/
+    #     a.py
+    #     b.py
+    #     c.txt
+    #     sub/
+    #       d.py
+    #       e.py
+    #       deep/
+    #         f.py
+    #         g.py
+    #         h.py
+    #     other/
+    #       i.py
+    #     empty/
+    #     chain/
+    #       only/
+    #         child/
+    #           leaf.py
+
+    with tempfile.TemporaryDirectory() as tmp:
+        # Create files
+        for name in ["a.py", "b.py", "c.txt"]:
+            open(os.path.join(tmp, name), "w").close()
+
+        os.makedirs(os.path.join(tmp, "sub", "deep"))
+        for name in ["d.py", "e.py"]:
+            open(os.path.join(tmp, "sub", name), "w").close()
+        for name in ["f.py", "g.py", "h.py"]:
+            open(os.path.join(tmp, "sub", "deep", name), "w").close()
+
+        os.makedirs(os.path.join(tmp, "other"))
+        open(os.path.join(tmp, "other", "i.py"), "w").close()
+
+        os.makedirs(os.path.join(tmp, "empty"))
+
+        os.makedirs(os.path.join(tmp, "chain", "only", "child"))
+        open(os.path.join(tmp, "chain", "only", "child", "leaf.py"), "w").close()
+
+        # ── Full expansion with generous budget ──────────────────
+        print("\n── glob_script: full expansion ──")
+        out = run_glob(tmp, "**/*.py", 100)
+        R.check("no script error", not out.startswith("SCRIPT ERROR"), out[:200])
+        R.check("header shows 9 matches", parse_header(out) == 9, out.split("\n")[0])
+        lines = body_lines(out)
+        R.check("9 file lines", len(lines) == 9, f"got {len(lines)}")
+        R.check("all paths absolute", all(l.startswith("/") for l in lines), lines[:3])
+        R.check("no collapsed dirs", not any("matches)" in l for l in lines), str(lines))
+        R.check("no budget note in header", "budget" not in out.split("\n")[0], out.split("\n")[0])
+
+        # ── Tight budget forces collapsing ───────────────────────
+        print("\n── glob_script: tight budget ──")
+        out = run_glob(tmp, "**/*.py", 5)
+        R.check("header still shows 9", parse_header(out) == 9, out.split("\n")[0])
+        lines = body_lines(out)
+        R.check("body within budget", len(lines) <= 5, f"got {len(lines)} lines")
+        R.check("budget note in header", "budget" in out.split("\n")[0], out.split("\n")[0])
+        # sub/ has the most matches (5) so it should be collapsed
+        collapsed = [l for l in lines if "matches)" in l]
+        R.check("at least one collapsed dir", len(collapsed) >= 1, str(lines))
+
+        # ── Match counts are conserved ───────────────────────────
+        print("\n── glob_script: count conservation ──")
+        out = run_glob(tmp, "**/*.py", 5)
+        total = parse_header(out)
+        lines = body_lines(out)
+        # Count: each plain file = 1, each "(N matches)" = N, each "... and N more" = N
+        accounted = 0
+        for l in lines:
+            if "... and " in l and " more matches" in l:
+                accounted += int(l.split("... and ")[1].split(" more")[0])
+            elif "matches)" in l:
+                accounted += int(l.split("(")[1].split(" ")[0])
+            else:
+                accounted += 1
+        R.check("counts conserved", accounted == total,
+                f"accounted {accounted} vs header {total}")
+
+        # ── Single-child chains expand for free ──────────────────
+        print("\n── glob_script: single-child chain ──")
+        out = run_glob(tmp, "chain/**/*.py", 5)
+        R.check("header shows 1 match", parse_header(out) == 1, out.split("\n")[0])
+        lines = body_lines(out)
+        R.check("leaf.py fully expanded", len(lines) == 1, f"got {len(lines)}")
+        R.check("shows absolute path to leaf",
+                lines[0].endswith("chain/only/child/leaf.py"), lines[0])
+
+        # ── Pattern filters correctly ────────────────────────────
+        print("\n── glob_script: pattern filtering ──")
+        out = run_glob(tmp, "*.txt", 100)
+        R.check("txt header shows 1", parse_header(out) == 1, out.split("\n")[0])
+        R.check("only c.txt", body_lines(out)[0].endswith("c.txt"), body_lines(out))
+
+        # ── No matches ───────────────────────────────────────────
+        print("\n── glob_script: no matches ──")
+        out = run_glob(tmp, "**/*.rs", 100)
+        R.check("reports 0 matches", out.startswith("0 matches"), out[:50])
+
+        # ── Bad directory ────────────────────────────────────────
+        print("\n── glob_script: bad directory ──")
+        out = run_glob("/nonexistent/path", "**/*", 100)
+        R.check("reports error", out.startswith("Error:"), out[:50])
+
+        # ── Partial expansion ────────────────────────────────────
+        print("\n── glob_script: partial expansion ──")
+        # sub/ has 5 matches (2 files + deep/ with 3). Expanding sub/
+        # costs 2 net lines (3 children - 1). Budget=7 means:
+        #   root: 2 files + 3 collapsed dirs = 5 lines
+        #   expand sub/ (+2): 2 files + deep/(collapsed) = 7 lines
+        #   expand deep/ (+2 net) would be 9 — over budget.
+        # But deep/ has 3 children and expanding costs 2 net lines.
+        # At budget=8, deep/ expansion fits (7+2=9 > 8) — nope.
+        # At budget=9, deep fits. So budget=8 should leave deep/ collapsed.
+        #
+        # For actual partial expansion we need a dir with many children.
+        # Make a wide/ dir with 10 files:
+        os.makedirs(os.path.join(tmp, "wide"))
+        for j in range(10):
+            open(os.path.join(tmp, "wide", f"w{j}.py"), "w").close()
+
+        # Now root has 2 files + 4 dirs = 6 lines.
+        # wide/ has 10 children; full expansion costs 9 net lines.
+        # Budget=10: 6 + 9 = 15 > 10, so wide/ gets partial expansion.
+        # Budget_for_children = 10 - 6 = 4 items shown + overflow line.
+        out = run_glob(tmp, "**/*.py", 10)
+        lines = body_lines(out)
+        R.check("body within budget", len(lines) <= 10, f"got {len(lines)}")
+        overflow = [l for l in lines if "... and " in l and " more matches" in l]
+        R.check("has overflow line", len(overflow) >= 1, str(lines))
+        # Verify conservation still holds
+        total = parse_header(out)
+        accounted = 0
+        for l in lines:
+            if "... and " in l and " more matches" in l:
+                accounted += int(l.split("... and ")[1].split(" more")[0])
+            elif "matches)" in l:
+                accounted += int(l.split("(")[1].split(" ")[0])
+            else:
+                accounted += 1
+        R.check("partial expansion counts conserved", accounted == total,
+                f"accounted {accounted} vs header {total}")
+
+        # ── Multi-pattern union ──────────────────────────────────
+        print("\n── glob_script: multi-pattern union ──")
+        out = run_glob(tmp, "**/*.py,**/*.txt", 100)
+        total = parse_header(out)
+        # 19 .py files (original 9 + 10 in wide/) + 1 .txt = 20
+        R.check("union includes both extensions", total == 20,
+                f"expected 20, got {total}")
+        lines = body_lines(out)
+        has_py = any(l.endswith(".py") for l in lines)
+        has_txt = any(l.endswith(".txt") for l in lines)
+        R.check("has .py files", has_py, str(lines[:3]))
+        R.check("has .txt files", has_txt, str(lines[:3]))
+
+        # ── Negation excludes matches ────────────────────────────
+        print("\n── glob_script: negation ──")
+        out = run_glob(tmp, "**/*.py,!**/deep/**", 100)
+        total = parse_header(out)
+        # 19 .py total minus 3 in deep/ = 16
+        R.check("negation removes deep/", total == 16,
+                f"expected 16, got {total}")
+        lines = body_lines(out)
+        has_deep = any("deep" in l for l in lines)
+        R.check("no deep/ files in output", not has_deep, str([l for l in lines if "deep" in l]))
+
+        # ── Negation is order-independent ────────────────────────
+        print("\n── glob_script: negation order-independent ──")
+        out_a = run_glob(tmp, "**/*.py,!**/wide/**", 100)
+        out_b = run_glob(tmp, "!**/wide/**,**/*.py", 100)
+        R.check("order does not matter",
+                parse_header(out_a) == parse_header(out_b),
+                f"{parse_header(out_a)} vs {parse_header(out_b)}")
+
+        # ── Braces not split ─────────────────────────────────────
+        print("\n── glob_script: braces preserved ──")
+        # {py,txt} brace expansion — if Python supports it, should
+        # match both; if not, 0 matches.  Either way, no crash.
+        out = run_glob(tmp, "*.{py,txt}", 100)
+        R.check("brace pattern no error",
+                not out.startswith("Error:") and not out.startswith("SCRIPT ERROR"),
+                out[:80])
+        # Verify braces + comma delimiter coexist:
+        # "*.{py,txt},!**/deep/**" should parse as two terms, not three.
+        out = run_glob(tmp, "**/*.{py,txt},!**/deep/**", 100)
+        total = parse_header(out)
+        lines = body_lines(out)
+        has_deep = any("deep" in l for l in lines)
+        R.check("brace+negation excludes deep/", not has_deep,
+                str([l for l in lines if "deep" in l]))
+
+        # ── No positive patterns is an error ─────────────────────
+        print("\n── glob_script: no positive patterns ──")
+        out = run_glob(tmp, "!**/*.py", 100)
+        R.check("rejects all-negative", out.startswith("Error:"), out[:80])
+
+        # ── Negation count conservation ──────────────────────────
+        print("\n── glob_script: negation count conservation ──")
+        out = run_glob(tmp, "**/*,!**/wide/**,!**/deep/**", 5)
+        total = parse_header(out)
+        lines = body_lines(out)
+        accounted = 0
+        for l in lines:
+            if "... and " in l and " more matches" in l:
+                accounted += int(l.split("... and ")[1].split(" more")[0])
+            elif "matches)" in l:
+                accounted += int(l.split("(")[1].split(" ")[0])
+            else:
+                accounted += 1
+        R.check("negation counts conserved", accounted == total,
+                f"accounted {accounted} vs header {total}")
+
+
 # ── Test registry and runner ─────────────────────────────────────────
 
 TESTS = {
@@ -183,6 +425,7 @@ TESTS = {
     "shell_quote": test_shell_quote,
     "require_abs_path": test_require_abs_path,
     "build_tool_catalog": test_build_tool_catalog,
+    "glob_script": test_glob_script,
 }
 
 
