@@ -416,6 +416,176 @@ async def test_glob_script(R: Results):
                 f"accounted {accounted} vs header {total}")
 
 
+async def test_grep_script(R: Results):
+    from lathe import _GREP_SCRIPT
+
+    def run_grep(base_dir, regex, files_pattern, max_lines):
+        """Exec the grep script via subprocess, return stdout."""
+        script = (
+            _GREP_SCRIPT
+            + f"\nprint(grep_hierarchy({base_dir!r}, {regex!r}, {files_pattern!r}, {max_lines!r}))"
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            capture_output=True, text=True,
+        )
+        if result.returncode != 0:
+            return f"SCRIPT ERROR: {result.stderr}"
+        return result.stdout.rstrip("\n")
+
+    def parse_header_matches(output):
+        """Extract total match count from header."""
+        return int(output.split("\n")[0].split(" ")[0])
+
+    def parse_header_files(output):
+        """Extract file count from header."""
+        first = output.split("\n")[0]
+        # "N matches across M files for ..."
+        return int(first.split(" across ")[1].split(" ")[0])
+
+    def body_lines(output):
+        return output.split("\n")[1:]
+
+    # ── Build a known directory tree with known content ──────────
+    #
+    #   tmp/
+    #     a.py          contains: "def foo():", "def bar():"
+    #     b.py          contains: "def baz():"
+    #     c.txt         contains: "def txt_func():"
+    #     sub/
+    #       d.py        contains: "def sub_one():", "def sub_two():", "def sub_three():"
+    #       e.py        contains: "class Helper:"
+    #     other/
+    #       f.py        contains: "def other_func():"
+
+    with tempfile.TemporaryDirectory() as tmp:
+        def writef(relpath, content):
+            full = os.path.join(tmp, relpath)
+            os.makedirs(os.path.dirname(full), exist_ok=True)
+            with open(full, "w") as f:
+                f.write(content)
+
+        writef("a.py", "def foo():\n    pass\ndef bar():\n    pass\n")
+        writef("b.py", "def baz():\n    pass\n")
+        writef("c.txt", "def txt_func():\n    pass\n")
+        writef("sub/d.py", "def sub_one():\n    pass\ndef sub_two():\n    pass\ndef sub_three():\n    pass\n")
+        writef("sub/e.py", "class Helper:\n    pass\n")
+        writef("other/f.py", "def other_func():\n    pass\n")
+
+        # ── Full expansion with generous budget ──────────────────
+        print("\n── grep_script: full expansion ──")
+        out = run_grep(tmp, "def ", "**/*.py", 100)
+        R.check("no script error", not out.startswith("SCRIPT ERROR"), out[:200])
+        total = parse_header_matches(out)
+        R.check("header shows 7 matches", total == 7, out.split("\n")[0])
+        n_files = parse_header_files(out)
+        R.check("header shows 4 files", n_files == 4, out.split("\n")[0])
+        lines = body_lines(out)
+        # All 7 matches should be expanded as file:line: text
+        match_lines = [l for l in lines if ":" in l and "matches)" not in l]
+        R.check("7 match lines", len(match_lines) == 7, f"got {len(match_lines)}")
+        R.check("no budget note", "budget" not in out.split("\n")[0], out.split("\n")[0])
+
+        # ── File scope filtering ─────────────────────────────────
+        print("\n── grep_script: file scope ──")
+        out = run_grep(tmp, "def ", "**/*.txt", 100)
+        total = parse_header_matches(out)
+        R.check("txt scope finds 1", total == 1, out.split("\n")[0])
+
+        # ── Tight budget collapses files ─────────────────────────
+        print("\n── grep_script: tight budget ──")
+        # 4 files with matches; budget=5 means d.py (3 matches) can
+        # expand (+2 net) for 6 total, which won't fit. So all stay
+        # collapsed except single-match files (free to expand).
+        out = run_grep(tmp, "def ", "**/*.py", 5)
+        lines = body_lines(out)
+        R.check("body within budget", len(lines) <= 5, f"got {len(lines)}")
+        R.check("budget note in header", "budget" in out.split("\n")[0], out.split("\n")[0])
+        collapsed = [l for l in lines if "matches)" in l and "... and" not in l]
+        R.check("at least one collapsed file", len(collapsed) >= 1, str(lines))
+
+        # ── Match count conservation ─────────────────────────────
+        print("\n── grep_script: count conservation ──")
+        out = run_grep(tmp, "def ", "**/*.py", 5)
+        total = parse_header_matches(out)
+        lines = body_lines(out)
+        accounted = 0
+        for l in lines:
+            if "... and " in l and " more match" in l:
+                accounted += int(l.split("... and ")[1].split(" more")[0])
+            elif "matches)" in l and "files)" not in l:
+                # "file (N matches)" — extract N
+                accounted += int(l.split("(")[1].split(" ")[0])
+            elif "matches in " in l:
+                # "dir/ (N matches in M files)" — extract N
+                accounted += int(l.split("(")[1].split(" ")[0])
+            else:
+                accounted += 1
+        R.check("counts conserved", accounted == total,
+                f"accounted {accounted} vs header {total}")
+
+        # ── Negation in file scope ───────────────────────────────
+        print("\n── grep_script: file negation ──")
+        out = run_grep(tmp, "def ", "**/*.py,!**/sub/**", 100)
+        total = parse_header_matches(out)
+        # a.py(2) + b.py(1) + other/f.py(1) = 4
+        R.check("negation removes sub/", total == 4,
+                f"expected 4, got {total}")
+        lines = body_lines(out)
+        has_sub = any("sub" in l for l in lines)
+        R.check("no sub/ in output", not has_sub, str([l for l in lines if "sub" in l]))
+
+        # ── No matches ───────────────────────────────────────────
+        print("\n── grep_script: no matches ──")
+        out = run_grep(tmp, "ZZZNOMATCH", "**/*.py", 100)
+        R.check("reports 0 matches", "0 matches" in out, out[:50])
+
+        # ── Bad regex ────────────────────────────────────────────
+        print("\n── grep_script: bad regex ──")
+        out = run_grep(tmp, "[invalid", "**/*.py", 100)
+        R.check("reports regex error", out.startswith("Error:"), out[:80])
+
+        # ── Bad directory ────────────────────────────────────────
+        print("\n── grep_script: bad directory ──")
+        out = run_grep("/nonexistent/path", "foo", "**/*", 100)
+        R.check("reports dir error", out.startswith("Error:"), out[:50])
+
+        # ── Single-match file expands for free ───────────────────
+        print("\n── grep_script: single match file ──")
+        out = run_grep(tmp, "class ", "**/*.py", 100)
+        total = parse_header_matches(out)
+        R.check("finds 1 class match", total == 1, out.split("\n")[0])
+        lines = body_lines(out)
+        R.check("match line has line number",
+                any(":1: class Helper:" in l for l in lines), str(lines))
+
+        # ── Partial file expansion ───────────────────────────────
+        print("\n── grep_script: partial file expansion ──")
+        # d.py has 3 matches. With budget=2 and 4 files:
+        # all collapsed = 4 lines > budget 2.
+        # Actually we need a scenario where files fit but match lines don't.
+        # Make a file with many matches:
+        writef("many.py", "\n".join(f"def func_{i}():" for i in range(20)))
+        out = run_grep(tmp, "def ", "many.py", 10)
+        total = parse_header_matches(out)
+        R.check("many.py has 20 matches", total == 20, out.split("\n")[0])
+        lines = body_lines(out)
+        R.check("body within budget", len(lines) <= 10, f"got {len(lines)}")
+        overflow = [l for l in lines if "... and " in l and " more match" in l]
+        R.check("has overflow line", len(overflow) == 1, str(lines))
+
+        # ── Line truncation ──────────────────────────────────────
+        print("\n── grep_script: line truncation ──")
+        writef("long.py", "def " + "x" * 300 + "():\n    pass\n")
+        out = run_grep(tmp, "def ", "long.py", 100)
+        lines = body_lines(out)
+        R.check("long line truncated", lines[0].endswith("..."), lines[0][-20:])
+        # 200 char max + file:line: prefix + "..."
+        content_part = lines[0].split(": ", 1)[1] if ": " in lines[0] else lines[0]
+        R.check("truncated within limit", len(content_part) <= 210,
+                f"got {len(content_part)}")
+
+
 # ── Test registry and runner ─────────────────────────────────────────
 
 TESTS = {
@@ -426,6 +596,7 @@ TESTS = {
     "require_abs_path": test_require_abs_path,
     "build_tool_catalog": test_build_tool_catalog,
     "glob_script": test_glob_script,
+    "grep_script": test_grep_script,
 }
 
 

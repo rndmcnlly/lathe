@@ -2,10 +2,10 @@
 title: Lathe
 author: Adam Smith
 author_url: https://adamsmith.as
-description: Coding agent tools (lathe, bash, read, write, edit, glob, onboard, expose, destroy) backed by per-user sandbox VMs with transparent lifecycle management.
+description: Coding agent tools (lathe, bash, read, write, edit, glob, grep, onboard, expose, destroy) backed by per-user sandbox VMs with transparent lifecycle management.
 required_open_webui_version: 0.4.0
 requirements: httpx
-version: 0.11.0
+version: 0.12.0
 licence: MIT
 """
 
@@ -422,6 +422,267 @@ def glob_hierarchy(base_dir, pattern, max_lines):
     has_collapsed = bool(list(_collapsible(root))) or bool(partial_limit)
     if has_collapsed:
         header += f" (budget: {max_lines} lines, some directories collapsed)"
+
+    return header + "\n" + "\n".join(output)
+'''
+
+
+# ── hierarchical grep (runs on sandbox) ──────────────────────────────
+
+_GREP_MAX_LINES = 100
+
+_GREP_SCRIPT = r'''
+import os
+import re
+import sys
+from pathlib import Path
+
+_MAX_LINE_WIDTH = 200
+
+
+def grep_hierarchy(base_dir, regex, files_pattern, max_lines):
+    base = Path(base_dir).resolve()
+    if not base.is_dir():
+        return f"Error: not a directory: {base_dir}"
+
+    # ── Compile regex ────────────────────────────────────────────
+    try:
+        pat = re.compile(regex)
+    except re.error as e:
+        return f"Error: invalid regex {regex!r}: {e}"
+
+    # ── Parse file scope: comma-separated, !prefix = exclude ────
+    terms, current, depth = [], [], 0
+    for ch in files_pattern:
+        if ch == "{": depth += 1
+        elif ch == "}": depth -= 1
+        elif ch == "," and depth == 0:
+            terms.append("".join(current).strip())
+            current = []
+            continue
+        current.append(ch)
+    terms.append("".join(current).strip())
+
+    positive, negative = [], []
+    for term in terms:
+        if not term:
+            continue
+        if term.startswith("!"):
+            negative.append(term[1:])
+        else:
+            positive.append(term)
+
+    if not positive:
+        return f"Error: files pattern must include at least one positive glob (got {files_pattern!r})"
+
+    # ── Collect files ────────────────────────────────────────────
+    base_prefix = str(base) + os.sep
+
+    def _collect(globs):
+        result = set()
+        for g in globs:
+            for p in base.glob(g):
+                s = str(p.resolve())
+                if p.is_file() and s.startswith(base_prefix):
+                    result.add(s)
+        return result
+
+    included = _collect(positive)
+    if negative:
+        included -= _collect(negative)
+    files = sorted(included)
+
+    if not files:
+        return f"0 files match {files_pattern!r} in {base}"
+
+    # ── Scan files for matches ───────────────────────────────────
+    file_matches = {}
+    total_matches = 0
+
+    for filepath in files:
+        try:
+            with open(filepath, "r", errors="replace") as f:
+                hits = []
+                for i, line in enumerate(f, 1):
+                    if pat.search(line):
+                        text = line.rstrip("\n\r")
+                        if len(text) > _MAX_LINE_WIDTH:
+                            text = text[:_MAX_LINE_WIDTH] + "..."
+                        hits.append((i, text))
+                if hits:
+                    file_matches[filepath] = hits
+                    total_matches += len(hits)
+        except (OSError, UnicodeDecodeError):
+            continue
+
+    if not file_matches:
+        return f"0 matches for {regex!r} in {len(files)} files"
+
+    # ── Build trie of files with matches ─────────────────────────
+    root = {
+        "children": {}, "files": {}, "path": str(base),
+        "n_files": 0, "n_matches": 0,
+    }
+
+    for filepath, hits in sorted(file_matches.items()):
+        rel = os.path.relpath(filepath, base)
+        parts = rel.split(os.sep)
+        node = root
+        node["n_files"] += 1
+        node["n_matches"] += len(hits)
+
+        for part in parts[:-1]:
+            if part not in node["children"]:
+                node["children"][part] = {
+                    "children": {}, "files": {}, "n_files": 0, "n_matches": 0,
+                    "path": os.path.join(node["path"], part),
+                }
+            node = node["children"][part]
+            node["n_files"] += 1
+            node["n_matches"] += len(hits)
+
+        node["files"][filepath] = hits
+
+    # ── Two-level budget-driven expansion ────────────────────────
+    dir_expanded = {id(root)}
+    file_expanded = set()
+    file_partial = {}
+
+    def _count_lines(node):
+        if id(node) not in dir_expanded:
+            return 1
+        total = 0
+        for fp, hits in node["files"].items():
+            if fp in file_expanded:
+                limit = file_partial.get(fp)
+                if limit is not None and limit < len(hits):
+                    total += limit + 1
+                else:
+                    total += len(hits)
+            else:
+                total += 1
+        for child in node["children"].values():
+            total += _count_lines(child)
+        return total
+
+    def _dir_candidates(node):
+        if id(node) not in dir_expanded:
+            yield (node["n_matches"], "dir", node)
+            return
+        for child in node["children"].values():
+            yield from _dir_candidates(child)
+
+    def _file_candidates(node):
+        if id(node) not in dir_expanded:
+            return
+        for fp, hits in node["files"].items():
+            if fp not in file_expanded:
+                yield (len(hits), "file", fp, hits)
+        for child in node["children"].values():
+            yield from _file_candidates(child)
+
+    current_lines = _count_lines(root)
+
+    while current_lines < max_lines:
+        dir_cands = list(_dir_candidates(root))
+        file_cands = list(_file_candidates(root))
+
+        if not dir_cands and not file_cands:
+            break
+
+        best_dir = max(dir_cands, key=lambda x: x[0]) if dir_cands else None
+        best_file = max(file_cands, key=lambda x: x[0]) if file_cands else None
+
+        best_type = None
+        if best_dir and best_file:
+            best_type = "dir" if best_dir[0] >= best_file[0] else "file"
+        elif best_dir:
+            best_type = "dir"
+        else:
+            best_type = "file"
+
+        if best_type == "dir":
+            _, _, node = best_dir
+            n_items = len(node["files"]) + len(node["children"])
+
+            if n_items <= 1:
+                dir_expanded.add(id(node))
+                current_lines = _count_lines(root)
+                continue
+
+            net_cost = n_items - 1
+            if current_lines + net_cost <= max_lines:
+                dir_expanded.add(id(node))
+                current_lines = _count_lines(root)
+                continue
+
+            if best_file:
+                best_type = "file"
+            else:
+                break
+
+        if best_type == "file":
+            _, _, fp, hits = best_file
+            n_hits = len(hits)
+
+            if n_hits <= 1:
+                file_expanded.add(fp)
+                current_lines = _count_lines(root)
+                continue
+
+            net_cost = n_hits - 1
+            if current_lines + net_cost <= max_lines:
+                file_expanded.add(fp)
+                current_lines = _count_lines(root)
+                continue
+
+            budget_remaining = max_lines - current_lines
+            if budget_remaining < 2:
+                break
+            file_expanded.add(fp)
+            file_partial[fp] = budget_remaining
+            current_lines = _count_lines(root)
+            break
+
+    # ── Render ───────────────────────────────────────────────────
+    output = []
+
+    def render(node):
+        if id(node) not in dir_expanded:
+            if node["n_files"] == 1:
+                output.append(f"{node['path']}/ ({node['n_matches']} matches in 1 file)")
+            else:
+                output.append(f"{node['path']}/ ({node['n_matches']} matches in {node['n_files']} files)")
+            return
+
+        for fp in sorted(node["files"]):
+            hits = node["files"][fp]
+            if fp not in file_expanded:
+                output.append(f"{fp} ({len(hits)} matches)")
+                continue
+            limit = file_partial.get(fp)
+            if limit is not None and limit < len(hits):
+                for line_num, text in hits[:limit]:
+                    output.append(f"{fp}:{line_num}: {text}")
+                output.append(f"{fp}: ... and {len(hits) - limit} more matches")
+            else:
+                for line_num, text in hits:
+                    output.append(f"{fp}:{line_num}: {text}")
+
+        for name in sorted(node["children"]):
+            render(node["children"][name])
+
+    render(root)
+
+    n_files = len(file_matches)
+    header = f"{total_matches} matches across {n_files} files for {regex!r}"
+    has_collapsed = (
+        any(True for _ in _dir_candidates(root))
+        or any(True for _ in _file_candidates(root))
+        or bool(file_partial)
+    )
+    if has_collapsed:
+        header += f" (budget: {max_lines} lines, some entries collapsed)"
 
     return header + "\n" + "\n".join(output)
 '''
@@ -1716,6 +1977,59 @@ class Tools:
                 await _emit(__event_emitter__, "Search failed", done=True)
                 return _prepend_warning(
                     f"Error: glob script failed (exit {exit_code}).\n{result[:500]}",
+                    _sb_warning,
+                )
+
+            await _emit(__event_emitter__, "Search complete", done=True)
+            return _prepend_warning(result, _sb_warning)
+
+        return await _tool_context(__event_emitter__, _run)
+
+    async def grep(
+        self,
+        pattern: str,
+        files: str = "**/*",
+        max_lines: int = _GREP_MAX_LINES,
+        __user__: dict = {},
+        __event_emitter__=None,
+    ) -> str:
+        """
+        Search file contents in the sandbox workspace by regex.
+        Returns matches grouped by file with line numbers. Dense
+        directories and files are collapsed with match counts;
+        narrow the file scope or increase max_lines to expand them.
+        :param pattern: Regex pattern to search for (e.g. 'import.*asyncio', 'TODO|FIXME', 'class\\s+\\w+').
+        :param files: File scope as comma-separated globs with optional !-prefix exclusion (default: '**/*'). Examples: '**/*.py', 'src/**/*.ts,!**/*.test.ts'.
+        :param max_lines: Maximum output lines (default: 100). Increase to see more detail.
+        """
+        async def _run(client):
+            email = _get_email(__user__)
+            sandbox_id, _sb_warning = await _ensure_sandbox(self.valves, email, client, __event_emitter__)
+
+            await _emit(__event_emitter__, f"Searching for {pattern!r}...")
+
+            clamped = max(1, min(500, max_lines))
+            base_dir = "/home/daytona/workspace"
+            script = (
+                _GREP_SCRIPT
+                + f"\nprint(grep_hierarchy({base_dir!r}, {pattern!r}, {files!r}, {clamped!r}))"
+            )
+
+            resp = await client.post(
+                _toolbox(self.valves, sandbox_id, "/process/execute"),
+                headers=_headers(self.valves),
+                json={"command": f"python3 -c {_shell_quote(script)}", "timeout": 30000},
+                timeout=60.0,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            result = data.get("result", "")
+            exit_code = data.get("exitCode", -1)
+
+            if exit_code != 0:
+                await _emit(__event_emitter__, "Search failed", done=True)
+                return _prepend_warning(
+                    f"Error: grep script failed (exit {exit_code}).\n{result[:500]}",
                     _sb_warning,
                 )
 
