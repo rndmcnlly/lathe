@@ -4,11 +4,11 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <link rel="stylesheet" href="style.css">
-    <title>Lathe — a coding agent surface for Open WebUI</title>
-    <meta name="description" content="Lathe gives any Open WebUI model a full coding agent toolkit: bash, file editing, web services, SSH access, and more — all running in persistent cloud sandboxes.">
+    <title>Lathe — code interpreter meets coding agent, in your own chat</title>
+    <meta name="description" content="Lathe brings ChatGPT-style code execution and Claude Code-level sandbox capabilities to Open WebUI — with any model, on your infrastructure. Persistent cloud sandboxes, full Linux VM, zero setup for users.">
     <meta property="og:title" content="Lathe">
     <meta property="og:type" content="website">
-    <meta property="og:description" content="A coding agent surface for Open WebUI. Persistent sandboxes, real tools, zero setup for users.">
+    <meta property="og:description" content="ChatGPT-style code interpreter meets full coding agent — running on your Open WebUI instance, with any model you choose.">
     <meta property="og:url" content="https://lathe.tools/">
 </head>
 <body>
@@ -17,7 +17,7 @@
 <div id="canvas-container">
     <div class="hero-overlay">
         <h1>Lathe</h1>
-        <p>A coding agent surface for Open WebUI</p>
+        <p>Code interpreter meets coding agent &mdash; in your own chat</p>
         <div class="hero-links">
             <a href="https://github.com/rndmcnlly/lathe">
                 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor"><path d="M12 0c-6.626 0-12 5.373-12 12 0 5.302 3.438 9.8 8.207 11.387.599.111.793-.261.793-.577v-2.234c-3.338.726-4.033-1.416-4.033-1.416-.546-1.387-1.333-1.756-1.333-1.756-1.089-.745.083-.729.083-.729 1.205.084 1.839 1.237 1.839 1.237 1.07 1.834 2.807 1.304 3.492.997.107-.775.418-1.305.762-1.604-2.665-.305-5.467-1.334-5.467-5.931 0-1.311.469-2.381 1.236-3.221-.124-.303-.535-1.524.117-3.176 0 0 1.008-.322 3.301 1.23.957-.266 1.983-.399 3.003-.404 1.02.005 2.047.138 3.006.404 2.291-1.552 3.297-1.23 3.297-1.23.653 1.653.242 2.874.118 3.176.77.84 1.235 1.911 1.235 3.221 0 4.609-2.807 5.624-5.479 5.921.43.372.823 1.102.823 2.222v3.293c0 .319.192.694.801.576 4.765-1.589 8.199-6.086 8.199-11.386 0-6.627-5.373-12-12-12z"/></svg>
@@ -35,10 +35,48 @@
 
 <!-- ── What it is ─────────────────────────────────── -->
 <div class="callout">
-    <strong>Lathe</strong> is an <a href="https://docs.openwebui.com/">Open WebUI</a> toolkit &mdash; a single Python file
-    your admin installs once. After that, every model on the server can
-    run shell commands, edit code, expose web services, and SSH into
-    a persistent cloud sandbox. One sandbox per user, survives across conversations.
+    ChatGPT has code interpreter. Claude has artifacts and computer use.
+    <strong>Lathe</strong> brings the same class of capability to
+    <a href="https://docs.openwebui.com/">Open WebUI</a> &mdash; with any model
+    you choose, on infrastructure you control. One Python file, installed once by
+    an admin. After that, every model on the server gets a full coding agent
+    toolkit backed by a persistent cloud sandbox: shell, file editing, code search,
+    web services, SSH, and a browser IDE. One sandbox per user, survives across conversations.
+</div>
+
+<!-- ── Positioning ─────────────────────────────────── -->
+<div class="section">
+    <div class="section-label">Why</div>
+    <h2 class="section-title">The tools you expect, where you already work</h2>
+    <p>
+        Proprietary chat platforms bundle their coding agent capabilities behind
+        closed ecosystems. Terminal-native agents like Claude Code and Codex
+        are powerful but leave non-developers behind. Lathe occupies the space
+        between: the conversational interface of a web chat with the full
+        sandbox capabilities of a coding agent.
+    </p>
+    <div class="comparison-grid">
+        <div class="comparison-card">
+            <h3>Like ChatGPT Code Interpreter</h3>
+            <p>The model writes and runs code in a sandbox, right inside
+            your chat conversation. No terminal needed. Users just talk.</p>
+        </div>
+        <div class="comparison-card">
+            <h3>Like Claude Code / Codex CLI</h3>
+            <p>Full Linux VM with bash, file editing, git, package managers, and
+            persistent state across sessions. Not a toy &mdash; a real machine.</p>
+        </div>
+        <div class="comparison-card">
+            <h3>Your models, your server</h3>
+            <p>Works with any model your Open WebUI instance can reach &mdash;
+            open-weight or proprietary. No vendor lock-in on the intelligence.</p>
+        </div>
+        <div class="comparison-card">
+            <h3>Multi-user from day one</h3>
+            <p>Every user gets their own isolated sandbox. Admins install once;
+            users don't configure anything. Built for shared deployments.</p>
+        </div>
+    </div>
 </div>
 
 <!-- ── Explainer video ────────────────────────────── -->
@@ -74,12 +112,16 @@
 <!-- ── Tools ──────────────────────────────────────── -->
 <div class="section">
     <div class="section-label">Tools</div>
-    <h2 class="section-title">What your model can do</h2>
+    <h2 class="section-title">What your agent can do</h2>
     <p>
-        Each tool runs against a persistent sandbox VM that follows you anywhere
-        your browser does.
+        Ten tools, same as the best proprietary agents. Each one runs against a
+        persistent Linux sandbox that follows you anywhere your browser does.
     </p>
     <div class="tool-grid">
+        <div class="tool-card">
+            <h3>lathe</h3>
+            <p>Built-in manual. The model calls this to learn the sandbox model, workflows, and gotchas before its first real tool use.</p>
+        </div>
         <div class="tool-card">
             <h3>bash</h3>
             <p>Run any shell command. Install packages, compile code, run tests, manage git repos.</p>
@@ -97,6 +139,14 @@
             <p>Exact string replacement in files. Safer than rewriting the whole file.</p>
         </div>
         <div class="tool-card">
+            <h3>glob</h3>
+            <p>Search for files by pattern. Returns a hierarchical listing that collapses dense directories.</p>
+        </div>
+        <div class="tool-card">
+            <h3>grep</h3>
+            <p>Search file contents by regex. Returns matches grouped by file with line numbers.</p>
+        </div>
+        <div class="tool-card">
             <h3>expose</h3>
             <p>One-step file browser (<code>"dufs"</code>), browser IDE (<code>"code-server"</code>), public URL for any web service (<code>"http:&lt;port&gt;"</code>), or time-limited SSH command (<code>"ssh"</code>).</p>
         </div>
@@ -106,7 +156,7 @@
         </div>
         <div class="tool-card">
             <h3>destroy</h3>
-            <p>Wipe your sandbox and start fresh. Requires explicit confirmation.</p>
+            <p>Wipe your sandbox VM and start fresh. Persistent volume data survives. Requires explicit confirmation.</p>
         </div>
     </div>
 </div>
@@ -152,14 +202,15 @@
     <div class="section-label">Persistence</div>
     <h2 class="section-title">Your workspace survives</h2>
     <p>
-        Unlike ephemeral code interpreters, your Lathe sandbox is yours. It has your
-        files, your installed packages, your git repos, your running servers. Start a
-        conversation Monday, come back Wednesday &mdash; everything is where you left it.
+        ChatGPT's code interpreter resets every conversation. Lathe doesn't. Your
+        sandbox is yours &mdash; files, installed packages, git repos, running servers.
+        Start a conversation Monday, come back Wednesday, everything is where you left it.
     </p>
     <p>
-        The sandbox sleeps when idle and archives after an hour.
-        The next tool call wakes it transparently. If you want a clean slate,
-        ask the model to <code>destroy</code> it.
+        The sandbox stops after ~15 minutes of idle, then archives about an hour
+        later. Either way, the next tool call wakes it transparently &mdash; your
+        files and installed packages survive both. Only running processes are lost.
+        If you want a clean slate, ask the model to <code>destroy</code> it.
     </p>
 </div>
 
