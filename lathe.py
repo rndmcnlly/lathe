@@ -1255,27 +1255,46 @@ def _build_delegate_prompt(task: str, file_sections: list[str]) -> str:
 
 
 
-_DELEGATE_SYSTEM_PROMPT = textwrap.dedent("""\
-    You are a focused sub-agent with direct access to a Linux sandbox.
-    You have been delegated a specific task by the calling agent.
+def _build_delegate_system_prompt(max_steps: int) -> str:
+    """Build the system prompt for a delegate sub-agent.
 
-    ## Rules
+    Includes the step budget so the sub-agent can plan its work and
+    ensure it produces a final summary before the limit is reached.
+    """
+    return textwrap.dedent(f"""\
+        You are a focused sub-agent with direct access to a Linux sandbox.
+        You have been delegated a specific task by the calling agent.
 
-    - Be autonomous. Make decisions. Do not ask questions — the user cannot see you.
-    - Your final text response (when you stop calling tools) is your deliverable.
-      It will be returned to the calling agent as a single tool result. Make it a
-      concise summary of what you did and what you found. Include relevant data,
-      file paths, error messages, or code snippets — whatever the caller needs to
-      act on your findings.
-    - Do not repeat the task description back. Jump straight into working.
-    - All file paths must be absolute (e.g. /home/daytona/workspace/file.py).
-    - The default working directory is /home/daytona/workspace.
-    - /home/daytona/volume is persistent storage that survives sandbox destruction.
-    - Commands are non-interactive. Use -y flags where needed.
-    - You cannot expose URLs or interact with the user. Focus on the sandbox.
-    - If you encounter an error, try to recover or work around it. Report what
-      happened in your final summary.
-    """)
+        ## Step budget
+
+        You have {max_steps} steps total. Each step is one inference call (thinking +
+        tool calls count as one step). When you stop calling tools and produce a
+        text response, that is your final step.
+
+        Plan accordingly:
+        - For a {max_steps}-step budget, reserve at least the last step for writing
+          your summary. Do not start new investigation branches when you are near
+          the limit.
+        - If you are running low on steps, wrap up with what you have. A partial
+          summary is far more valuable than getting cut off with no output.
+
+        ## Rules
+
+        - Be autonomous. Make decisions. Do not ask questions — the user cannot see you.
+        - Your final text response (when you stop calling tools) is your deliverable.
+          It will be returned to the calling agent as a single tool result. Make it a
+          concise summary of what you did and what you found. Include relevant data,
+          file paths, error messages, or code snippets — whatever the caller needs to
+          act on your findings.
+        - Do not repeat the task description back. Jump straight into working.
+        - All file paths must be absolute (e.g. /home/daytona/workspace/file.py).
+        - The default working directory is /home/daytona/workspace.
+        - /home/daytona/volume is persistent storage that survives sandbox destruction.
+        - Commands are non-interactive. Use -y flags where needed.
+        - You cannot expose URLs or interact with the user. Focus on the sandbox.
+        - If you encounter an error, try to recover or work around it. Report what
+          happened in your final summary.
+        """)
 
 # Tools withheld from the sub-agent and their reasons (for reference):
 #   lathe()    — sub-agent gets instructions via system prompt
@@ -1287,6 +1306,9 @@ _DELEGATE_WITHHELD = {"lathe", "onboard", "expose", "destroy", "delegate"}
 
 
 _DELEGATE_BASH_FOREGROUND_SECONDS = 15
+
+# Nudge threshold: inject a wrap-up reminder when this many steps remain.
+_DELEGATE_NUDGE_REMAINING = 2
 
 def _build_delegate_tools(valves, sandbox_id: str, client: httpx.AsyncClient, user_pairs: list[tuple[str, str]]):
     """Build pydantic-ai Tool objects that operate against a resolved sandbox.
@@ -1912,9 +1934,11 @@ class Tools:
             delegate (no recursion).
 
             The sub-agent makes up to max_steps inference calls (default 10,
-            max 30), executing tools as needed. When it decides it's done (or
-            hits the step limit), its final text response is returned to you
-            as the delegate() tool result.
+            max 30), executing tools as needed. It knows its step budget
+            upfront and receives a wrap-up nudge when close to the limit, so
+            it can prioritize producing a useful summary over starting new
+            work. Its final text response is returned to you as the
+            delegate() tool result.
 
             ## When to use delegate
 
@@ -1963,6 +1987,22 @@ class Tools:
 
             All paths must be absolute. Delegation fails immediately if
             any path does not exist on the sandbox.
+
+            ## Step budget and wrap-up behavior
+
+            The sub-agent's system prompt tells it how many steps it has
+            and instructs it to reserve time for a summary. Additionally,
+            when 2 steps remain, Lathe injects a wrap-up nudge into the
+            conversation — a synthetic message urging the sub-agent to
+            stop investigating and write its final summary immediately.
+
+            This means: even if the sub-agent misjudges its pacing, it
+            gets a hard nudge before the limit cuts it off. The "(no output)"
+            failure mode (sub-agent exhausts budget mid-investigation) should
+            be much less common.
+
+            If you find "(no output)" still happening, increase max_steps
+            or simplify the task.
 
             ## Cost model
 
@@ -2548,7 +2588,7 @@ class Tools:
 
             agent = Agent(
                 model,
-                system_prompt=_DELEGATE_SYSTEM_PROMPT,
+                system_prompt=_build_delegate_system_prompt(clamped_steps),
                 tools=tools,
                 output_type=str,
             )
@@ -2557,6 +2597,7 @@ class Tools:
 
             try:
                 step_count = 0
+                nudge_injected = False
 
                 async with agent.iter(
                     user_message,
@@ -2565,10 +2606,29 @@ class Tools:
                     async for node in agent_run:
                         if Agent.is_model_request_node(node):
                             step_count += 1
+                            remaining = clamped_steps - step_count
                             await _emit(
                                 __event_emitter__,
                                 f"Sub-agent thinking... ({step_count}/{clamped_steps})"
                             )
+                            # Inject wrap-up nudge when approaching the limit
+                            if (
+                                remaining <= _DELEGATE_NUDGE_REMAINING
+                                and remaining > 0
+                                and not nudge_injected
+                            ):
+                                from pydantic_ai.messages import ModelRequest, UserPromptPart
+                                nudge_msg = ModelRequest(parts=[UserPromptPart(
+                                    content=(
+                                        f"[SYSTEM: You have {remaining} step(s) remaining out of "
+                                        f"{clamped_steps}. Wrap up now — stop investigating and "
+                                        f"write your final summary with what you have. A partial "
+                                        f"summary is far better than being cut off with no output.]"
+                                    ),
+                                )])
+                                agent_run._graph_run.state.message_history.append(nudge_msg)
+                                nudge_injected = True
+
                         elif Agent.is_call_tools_node(node):
                             # Extract tool names and args summary
                             calls = []

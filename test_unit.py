@@ -588,19 +588,54 @@ async def test_grep_script(R: Results):
 
 async def test_delegate_infrastructure(R: Results):
     from lathe import (
-        _DELEGATE_SYSTEM_PROMPT, _DELEGATE_WITHHELD,
+        _build_delegate_system_prompt, _DELEGATE_WITHHELD,
+        _DELEGATE_NUDGE_REMAINING,
         _build_tool_catalog, Tools,
     )
 
-    print("\n── delegate: system prompt ──")
-    R.check("system prompt non-empty", len(_DELEGATE_SYSTEM_PROMPT) > 100,
-            f"length={len(_DELEGATE_SYSTEM_PROMPT)}")
+    print("\n── delegate: system prompt (static content) ──")
+    # Test with a representative budget
+    prompt_10 = _build_delegate_system_prompt(10)
+    R.check("system prompt non-empty", len(prompt_10) > 100,
+            f"length={len(prompt_10)}")
     R.check("system prompt mentions absolute paths",
-            "absolute" in _DELEGATE_SYSTEM_PROMPT.lower(),
+            "absolute" in prompt_10.lower(),
             "should mention absolute path requirement")
     R.check("system prompt mentions /home/daytona/workspace",
-            "/home/daytona/workspace" in _DELEGATE_SYSTEM_PROMPT,
+            "/home/daytona/workspace" in prompt_10,
             "should mention default working directory")
+
+    print("\n── delegate: system prompt (step budget) ──")
+    R.check("prompt includes step count",
+            "10 steps" in prompt_10,
+            "should state the budget")
+    R.check("prompt mentions planning",
+            "plan" in prompt_10.lower(),
+            "should tell sub-agent to plan")
+    R.check("prompt mentions summary",
+            "summary" in prompt_10.lower(),
+            "should mention reserving steps for summary")
+    R.check("prompt mentions partial summary value",
+            "partial" in prompt_10.lower(),
+            "should say partial > nothing")
+
+    # Verify budget is parameterized, not hardcoded
+    prompt_5 = _build_delegate_system_prompt(5)
+    R.check("budget is parameterized (5 vs 10)",
+            "5 steps" in prompt_5 and "10 steps" not in prompt_5,
+            f"5-step prompt should say '5 steps'")
+    prompt_1 = _build_delegate_system_prompt(1)
+    R.check("budget works for edge case (1 step)",
+            "1 steps" in prompt_1,
+            "1-step prompt should state the budget")
+
+    print("\n── delegate: nudge threshold ──")
+    R.check("nudge threshold is positive int",
+            isinstance(_DELEGATE_NUDGE_REMAINING, int) and _DELEGATE_NUDGE_REMAINING > 0,
+            f"got {_DELEGATE_NUDGE_REMAINING}")
+    R.check("nudge threshold is reasonable (<=5)",
+            _DELEGATE_NUDGE_REMAINING <= 5,
+            f"got {_DELEGATE_NUDGE_REMAINING}, should not be too aggressive")
 
     print("\n── delegate: withheld tools ──")
     R.check("withheld is a set", isinstance(_DELEGATE_WITHHELD, set),
