@@ -586,6 +586,86 @@ async def test_grep_script(R: Results):
                 f"got {len(content_part)}")
 
 
+async def test_delegate_infrastructure(R: Results):
+    from lathe import (
+        _DELEGATE_SYSTEM_PROMPT, _DELEGATE_WITHHELD,
+        _build_tool_catalog, Tools,
+    )
+
+    print("\n── delegate: system prompt ──")
+    R.check("system prompt non-empty", len(_DELEGATE_SYSTEM_PROMPT) > 100,
+            f"length={len(_DELEGATE_SYSTEM_PROMPT)}")
+    R.check("system prompt mentions absolute paths",
+            "absolute" in _DELEGATE_SYSTEM_PROMPT.lower(),
+            "should mention absolute path requirement")
+    R.check("system prompt mentions /home/daytona/workspace",
+            "/home/daytona/workspace" in _DELEGATE_SYSTEM_PROMPT,
+            "should mention default working directory")
+
+    print("\n── delegate: withheld tools ──")
+    R.check("withheld is a set", isinstance(_DELEGATE_WITHHELD, set),
+            type(_DELEGATE_WITHHELD).__name__)
+    R.check("lathe withheld", "lathe" in _DELEGATE_WITHHELD, str(_DELEGATE_WITHHELD))
+    R.check("onboard withheld", "onboard" in _DELEGATE_WITHHELD, str(_DELEGATE_WITHHELD))
+    R.check("expose withheld", "expose" in _DELEGATE_WITHHELD, str(_DELEGATE_WITHHELD))
+    R.check("destroy withheld", "destroy" in _DELEGATE_WITHHELD, str(_DELEGATE_WITHHELD))
+    R.check("delegate withheld (no recursion)", "delegate" in _DELEGATE_WITHHELD, str(_DELEGATE_WITHHELD))
+    R.check("bash NOT withheld", "bash" not in _DELEGATE_WITHHELD, str(_DELEGATE_WITHHELD))
+    R.check("read NOT withheld", "read" not in _DELEGATE_WITHHELD, str(_DELEGATE_WITHHELD))
+
+    print("\n── delegate: tool catalog includes delegate ──")
+    tools = Tools()
+    catalog = _build_tool_catalog(tools)
+    R.check("catalog includes delegate", "delegate(" in catalog,
+            "delegate should appear in tool catalog")
+    R.check("catalog includes bash", "bash(" in catalog,
+            "bash should appear in tool catalog")
+    # Verify delegate params are shown (task, context, max_steps)
+    delegate_line = [l for l in catalog.split("\n") if "delegate(" in l]
+    R.check("delegate line exists", len(delegate_line) == 1,
+            f"got {len(delegate_line)} lines")
+    if delegate_line:
+        R.check("delegate shows task param", "task" in delegate_line[0],
+                delegate_line[0])
+        R.check("delegate shows context param", "context" in delegate_line[0],
+                delegate_line[0])
+        R.check("delegate shows max_steps param", "max_steps" in delegate_line[0],
+                delegate_line[0])
+
+
+async def test_delegate_tools_build(R: Results):
+    """Test that _build_delegate_tools produces the expected set of tools."""
+    from lathe import _build_delegate_tools
+
+    print("\n── delegate tools: structure ──")
+
+    # We can't call the tools (they need a real sandbox), but we can
+    # verify the factory produces the right number and names.
+    # Use a mock valves/sandbox_id/client — the factory only captures
+    # them in closures, doesn't call anything during construction.
+    class FakeValves:
+        daytona_api_key = "fake"
+        daytona_api_url = "https://fake.api"
+        daytona_proxy_url = "https://fake.proxy"
+
+    tools = _build_delegate_tools(FakeValves(), "fake-sandbox-id", None, [])
+    tool_names = {t.name for t in tools}
+
+    R.check("produces 6 tools", len(tools) == 6, f"got {len(tools)}")
+    R.check("has bash", "bash" in tool_names, str(tool_names))
+    R.check("has read", "read" in tool_names, str(tool_names))
+    R.check("has write", "write" in tool_names, str(tool_names))
+    R.check("has edit", "edit" in tool_names, str(tool_names))
+    R.check("has glob", "glob" in tool_names, str(tool_names))
+    R.check("has grep", "grep" in tool_names, str(tool_names))
+
+    # Verify withheld tools are NOT present
+    from lathe import _DELEGATE_WITHHELD
+    for withheld in _DELEGATE_WITHHELD:
+        R.check(f"does not have {withheld}", withheld not in tool_names,
+                str(tool_names))
+
+
 # ── Test registry and runner ─────────────────────────────────────────
 
 TESTS = {
@@ -597,6 +677,8 @@ TESTS = {
     "build_tool_catalog": test_build_tool_catalog,
     "glob_script": test_glob_script,
     "grep_script": test_grep_script,
+    "delegate_infrastructure": test_delegate_infrastructure,
+    "delegate_tools_build": test_delegate_tools_build,
 }
 
 

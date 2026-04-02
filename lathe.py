@@ -2,10 +2,10 @@
 title: Lathe
 author: Adam Smith
 author_url: https://adamsmith.as
-description: Coding agent tools (lathe, bash, read, write, edit, glob, grep, onboard, expose, destroy) backed by per-user sandbox VMs with transparent lifecycle management.
+description: Coding agent tools (lathe, bash, read, write, edit, glob, grep, delegate, onboard, expose, destroy) backed by per-user sandbox VMs with transparent lifecycle management.
 required_open_webui_version: 0.4.0
-requirements: httpx
-version: 0.12.0
+requirements: httpx, pydantic-ai-slim[openai]
+version: 0.13.0
 licence: MIT
 """
 
@@ -790,6 +790,287 @@ def _build_onboard_script(project_path: str) -> str:
 
 
 
+# ── delegate() sub-agent infrastructure ─────────────────────────────
+
+_DELEGATE_SYSTEM_PROMPT = textwrap.dedent("""\
+    You are a focused sub-agent with direct access to a Linux sandbox.
+    You have been delegated a specific task by the calling agent.
+
+    ## Rules
+
+    - Be autonomous. Make decisions. Do not ask questions — the user cannot see you.
+    - Your final text response (when you stop calling tools) is your deliverable.
+      It will be returned to the calling agent as a single tool result. Make it a
+      concise summary of what you did and what you found. Include relevant data,
+      file paths, error messages, or code snippets — whatever the caller needs to
+      act on your findings.
+    - Do not repeat the task description back. Jump straight into working.
+    - All file paths must be absolute (e.g. /home/daytona/workspace/file.py).
+    - The default working directory is /home/daytona/workspace.
+    - /home/daytona/volume is persistent storage that survives sandbox destruction.
+    - Commands are non-interactive. Use -y flags where needed.
+    - You cannot expose URLs or interact with the user. Focus on the sandbox.
+    - If you encounter an error, try to recover or work around it. Report what
+      happened in your final summary.
+    """)
+
+# Tools withheld from the sub-agent and their reasons (for reference):
+#   lathe()    — sub-agent gets instructions via system prompt
+#   onboard()  — caller already has project context
+#   expose()   — user-facing; sub-agent has no user to give a URL to
+#   destroy()  — irreversible lifecycle operation
+#   delegate() — no recursion
+_DELEGATE_WITHHELD = {"lathe", "onboard", "expose", "destroy", "delegate"}
+
+
+def _build_delegate_tools(valves, sandbox_id: str, client: httpx.AsyncClient, user_pairs: list[tuple[str, str]]):
+    """Build pydantic-ai Tool objects that operate against a resolved sandbox.
+
+    Returns a list of Tool instances. Each tool is a thin closure over the
+    already-resolved sandbox_id and client — no per-call sandbox lookup.
+    """
+    from pydantic_ai import Tool
+
+    # ── bash ─────────────────────────────────────────────────────────
+    async def bash(command: str, workdir: str = "/home/daytona/workspace", timeout_seconds: int = 120) -> str:
+        """Execute a bash command in the sandbox.
+
+        Args:
+            command: The bash command to execute.
+            workdir: Working directory (default: /home/daytona/workspace).
+            timeout_seconds: Max seconds to wait (default: 120). Commands running longer are killed.
+        """
+        timeout_seconds = max(5, min(300, timeout_seconds))
+
+        user_env_lines = "".join(
+            f"export {k}={_shell_quote(v)}\n" for k, v in user_pairs
+        )
+        script = (
+            "#!/usr/bin/env bash\n"
+            "set -e -o pipefail\n"
+            "export DEBIAN_FRONTEND=noninteractive "
+            "GIT_TERMINAL_PROMPT=0 "
+            "PIP_NO_INPUT=1 "
+            "NPM_CONFIG_YES=true "
+            "CI=true\n"
+            + user_env_lines
+            + command
+            + "\n"
+        )
+        resp = await client.post(
+            _toolbox(valves, sandbox_id, "/process/execute"),
+            headers=_headers(valves),
+            json={
+                "command": f"cd {_shell_quote(workdir)} && bash -c {_shell_quote(script)}",
+                "timeout": timeout_seconds * 1000,
+            },
+            timeout=float(timeout_seconds + 30),
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        result = data.get("result", "")
+        exit_code = data.get("exitCode", -1)
+
+        output, was_truncated, meta = _truncate_tail(result)
+
+        if exit_code != 0:
+            output = f"Exit code: {exit_code}\n{output}"
+
+        if not output.strip():
+            output = "(no output)"
+
+        if was_truncated:
+            start = meta["shown_start_line"]
+            end = meta["shown_end_line"]
+            total = meta["total_lines"]
+            output += f"\n\n[Truncated: showing lines {start}-{end} of {total}]"
+
+        return output
+
+    # ── read ─────────────────────────────────────────────────────────
+    async def read(path: str, offset: int = 1, limit: int = 2000) -> str:
+        """Read a file from the sandbox. Returns numbered lines.
+
+        Args:
+            path: Absolute path to the file.
+            offset: Starting line number (1-indexed, default: 1).
+            limit: Max lines to return (default: 2000).
+        """
+        err = _require_abs_path(path)
+        if err:
+            return err
+        resp = await client.get(
+            _toolbox(valves, sandbox_id, "/files/download"),
+            params={"path": path},
+            headers=_headers(valves),
+            timeout=60.0,
+        )
+        if resp.status_code == 404:
+            return f"Error: File not found: {path}"
+        resp.raise_for_status()
+        content = resp.text
+        lines = content.split("\n")
+        if lines and lines[-1] == "":
+            lines = lines[:-1]
+        total_lines = len(lines)
+        start_idx = max(0, offset - 1)
+        end_idx = start_idx + limit
+        selected = lines[start_idx:end_idx]
+        numbered = "\n".join(
+            f"{start_idx + i + 1}: {line}"
+            for i, line in enumerate(selected)
+        )
+        header = f"File: {path} ({total_lines} lines total)"
+        if start_idx > 0 or end_idx < total_lines:
+            header += f", showing lines {start_idx + 1}-{min(end_idx, total_lines)}"
+        return f"{header}\n{numbered}"
+
+    # ── write ────────────────────────────────────────────────────────
+    async def write(path: str, content: str) -> str:
+        """Write a file to the sandbox (creates parents automatically).
+
+        Args:
+            path: Absolute path to write to.
+            content: The full file content.
+        """
+        err = _require_abs_path(path)
+        if err:
+            return err
+        parent = "/".join(path.rstrip("/").split("/")[:-1])
+        if parent:
+            await client.post(
+                _toolbox(valves, sandbox_id, "/files/folder"),
+                headers=_headers(valves),
+                json={"path": parent, "mode": "755"},
+                timeout=30.0,
+            )
+        content_bytes = content.encode("utf-8")
+        resp = await client.post(
+            _toolbox(valves, sandbox_id, "/files/upload"),
+            params={"path": path},
+            headers={"Authorization": f"Bearer {valves.daytona_api_key}"},
+            files={"file": ("file", io.BytesIO(content_bytes), "application/octet-stream")},
+            timeout=60.0,
+        )
+        resp.raise_for_status()
+        n_bytes = len(content_bytes)
+        n_lines = content.count("\n") + (0 if content.endswith("\n") else 1)
+        return f"Wrote {n_bytes} bytes ({n_lines} lines) to {path}"
+
+    # ── edit ─────────────────────────────────────────────────────────
+    async def edit(path: str, old_string: str, new_string: str, replace_all: bool = False) -> str:
+        """Edit a file by exact string replacement.
+
+        Args:
+            path: Absolute path to the file.
+            old_string: Exact text to find.
+            new_string: Replacement text.
+            replace_all: Replace all occurrences (default: false).
+        """
+        err = _require_abs_path(path)
+        if err:
+            return err
+        resp = await client.get(
+            _toolbox(valves, sandbox_id, "/files/download"),
+            params={"path": path},
+            headers=_headers(valves),
+            timeout=60.0,
+        )
+        if resp.status_code == 404:
+            return f"Error: File not found: {path}"
+        resp.raise_for_status()
+        content = resp.text
+        count = content.count(old_string)
+        if count == 0:
+            return f"Error: old_string not found in {path}"
+        if count > 1 and not replace_all:
+            return (
+                f"Error: Found {count} matches in {path}. "
+                f"Provide more context or set replace_all=true."
+            )
+        if replace_all:
+            new_content = content.replace(old_string, new_string)
+        else:
+            new_content = content.replace(old_string, new_string, 1)
+        content_bytes = new_content.encode("utf-8")
+        resp = await client.post(
+            _toolbox(valves, sandbox_id, "/files/upload"),
+            params={"path": path},
+            headers={"Authorization": f"Bearer {valves.daytona_api_key}"},
+            files={"file": ("file", io.BytesIO(content_bytes), "application/octet-stream")},
+            timeout=60.0,
+        )
+        resp.raise_for_status()
+        replaced = count if replace_all else 1
+        return f"Replaced {replaced} occurrence(s) in {path}"
+
+    # ── glob ─────────────────────────────────────────────────────────
+    async def glob(pattern: str, max_lines: int = _GLOB_MAX_LINES) -> str:
+        """Search for files by glob pattern in /home/daytona/workspace.
+
+        Args:
+            pattern: Comma-separated globs, !-prefix to exclude. Examples: '**/*.py', 'src/**/*.ts,!**/node_modules/**'.
+            max_lines: Max output lines (default: 100).
+        """
+        clamped = max(1, min(500, max_lines))
+        base_dir = "/home/daytona/workspace"
+        script = (
+            _GLOB_SCRIPT
+            + f"\nprint(glob_hierarchy({base_dir!r}, {pattern!r}, {clamped!r}))"
+        )
+        resp = await client.post(
+            _toolbox(valves, sandbox_id, "/process/execute"),
+            headers=_headers(valves),
+            json={"command": f"python3 -c {_shell_quote(script)}", "timeout": 30000},
+            timeout=60.0,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        result = data.get("result", "")
+        exit_code = data.get("exitCode", -1)
+        if exit_code != 0:
+            return f"Error: glob failed (exit {exit_code}).\n{result[:500]}"
+        return result
+
+    # ── grep ─────────────────────────────────────────────────────────
+    async def grep(pattern: str, files: str = "**/*", max_lines: int = _GREP_MAX_LINES) -> str:
+        """Search file contents by regex in /home/daytona/workspace.
+
+        Args:
+            pattern: Regex to search for (e.g. 'import.*asyncio', 'TODO|FIXME').
+            files: File scope as comma-separated globs (default: '**/*'). !-prefix to exclude.
+            max_lines: Max output lines (default: 100).
+        """
+        clamped = max(1, min(500, max_lines))
+        base_dir = "/home/daytona/workspace"
+        script = (
+            _GREP_SCRIPT
+            + f"\nprint(grep_hierarchy({base_dir!r}, {pattern!r}, {files!r}, {clamped!r}))"
+        )
+        resp = await client.post(
+            _toolbox(valves, sandbox_id, "/process/execute"),
+            headers=_headers(valves),
+            json={"command": f"python3 -c {_shell_quote(script)}", "timeout": 30000},
+            timeout=60.0,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        result = data.get("result", "")
+        exit_code = data.get("exitCode", -1)
+        if exit_code != 0:
+            return f"Error: grep failed (exit {exit_code}).\n{result[:500]}"
+        return result
+
+    return [
+        Tool(bash, takes_ctx=False),
+        Tool(read, takes_ctx=False),
+        Tool(write, takes_ctx=False),
+        Tool(edit, takes_ctx=False),
+        Tool(glob, takes_ctx=False, name="glob"),
+        Tool(grep, takes_ctx=False, name="grep"),
+    ]
+
+
 VOLUME_MOUNT_PATH = "/home/daytona/volume"
 
 # ── Service fast-path constants ──────────────────────────────────────
@@ -1337,6 +1618,62 @@ class Tools:
             ```
             Then call expose(target="http:8080").
             """),
+        "delegate": textwrap.dedent("""\
+            # Lathe — Delegate
+
+            ## What delegate() does
+
+            delegate(task, context, max_steps) spawns an autonomous sub-agent
+            that runs the same model against the same sandbox. The sub-agent
+            has access to: bash, read, write, edit, glob, grep. It does NOT
+            have: lathe, onboard, expose, destroy, or delegate (no recursion).
+
+            The sub-agent makes up to max_steps inference calls (default 10,
+            max 30), executing tools as needed. When it decides it's done (or
+            hits the step limit), its final text response is returned to you
+            as the delegate() tool result.
+
+            ## When to use delegate
+
+            - **Exploration**: "Find all test files and determine the testing
+              framework and coverage structure."
+            - **Refactoring**: "Rename all occurrences of getFoo to get_foo
+              across the Python codebase, updating tests."
+            - **Debugging**: "The build fails with error X. Investigate,
+              identify the root cause, and fix it."
+            - **Research**: "Read the configuration files and summarize the
+              project's dependency tree."
+            - **Batch operations**: "Add type hints to all functions in
+              src/utils/ that are missing them."
+
+            ## When NOT to use delegate
+
+            - Single-step operations (just call the tool directly).
+            - Tasks requiring user interaction (URLs, uploads, questions).
+            - Tasks requiring expose() or destroy().
+
+            ## Writing good task descriptions
+
+            The sub-agent cannot ask clarifying questions. Be specific:
+
+            Bad:  "Fix the tests"
+            Good: "Run pytest in /home/daytona/workspace. For each failure,
+                   read the failing test and the source it tests, identify
+                   the bug, and fix it. Re-run pytest to confirm."
+
+            ## The context parameter
+
+            Pass relevant context the sub-agent would otherwise need to
+            discover: file contents, error messages, prior findings, specific
+            file paths. This saves the sub-agent steps and tokens.
+
+            ## Cost model
+
+            Each step is a full inference call billed to the same provider.
+            A 10-step delegation costs ~10x a single tool call in tokens.
+            The usage summary in the tool result shows exact token counts.
+            Use max_steps to cap cost for bounded tasks.
+            """),
         "overview": textwrap.dedent("""\
             # Lathe Toolkit — Overview
 
@@ -1398,6 +1735,14 @@ class Tools:
             discover available skills. Searches both the project directory and
             ~/.agents/ for global agent instructions and skills.
 
+            **Delegating multi-step work:**
+            Use delegate(task="...") to hand off autonomous multi-step tasks
+            to a sub-agent. The sub-agent has bash/read/write/edit/glob/grep
+            and runs against the same sandbox. Good for: exploration, refactoring,
+            debugging, test fixing, research. The sub-agent cannot interact with
+            the user or expose URLs — it just works and returns a summary.
+            See lathe(manpage="delegate") for details.
+
             **Network requests:**
             Use bash("curl ...") or bash("wget ...") for HTTP requests. The
             sandbox can reach a broad allowlist of hosts directly (package
@@ -1439,6 +1784,7 @@ class Tools:
     # lookups and useful for the model to decide which page to request).
     _MANPAGE_INDEX: dict[str, str] = {
         "overview": "Big-picture orientation: sandbox model, tool catalog, key workflows, gotchas.",
+        "delegate": "Sub-agent delegation: when to use, task writing, cost model.",
         "recipes": "Bootstrap scripts for common tools: dufs (file browser), code-server (IDE).",
         "background": "Background job sidecar files, and peek/poll/kill recipes.",
         "egress": "Egress restrictions, workarounds (dufs upload, browser-side fetch), Tier 3.",
@@ -2160,6 +2506,166 @@ class Tools:
             replaced = count if replace_all else 1
             await _emit(__event_emitter__, "Edit complete", done=True)
             return _prepend_warning(f"Replaced {replaced} occurrence(s) in {path}", _sb_warning)
+
+        return await _tool_context(__event_emitter__, _run)
+
+    async def delegate(
+        self,
+        task: str,
+        context: str = "",
+        max_steps: int = 10,
+        __user__: dict = {},
+        __model__: dict = {},
+        __request__=None,
+        __event_emitter__=None,
+    ) -> str:
+        """
+        Delegate a multi-step task to an autonomous sub-agent with sandbox access.
+        The sub-agent runs the same model, has bash/read/write/edit/glob/grep tools,
+        and returns a summary when done. Use for exploration, refactoring, debugging,
+        or any multi-step work that doesn't need user interaction.
+        :param task: What the sub-agent should accomplish. Be specific — it cannot ask clarifying questions.
+        :param context: Optional context (code snippets, file contents, prior findings) to include in the sub-agent's prompt.
+        :param max_steps: Maximum inference calls the sub-agent may make (default: 10, max: 30).
+        """
+        async def _run(client):
+            email = _get_email(__user__)
+            sandbox_id, _sb_warning = await _ensure_sandbox(self.valves, email, client, __event_emitter__)
+
+            await _emit(__event_emitter__, "Preparing delegate...")
+
+            # ── Resolve model and build ASGI transport ───────────────
+            if __request__ is None:
+                return "Error: delegate() requires the OWUI request context (__request__). This tool only works inside Open WebUI."
+
+            model_id = __model__.get("id", "")
+            if not model_id:
+                return "Error: delegate() could not determine the current model ID."
+
+            # Extract JWT for authenticating against OWUI's own API
+            token = ""
+            try:
+                token = __request__.state.token.credentials
+            except AttributeError:
+                return "Error: delegate() could not extract authentication token from request."
+
+            # ASGI transport — in-process call to OWUI's FastAPI app.
+            # Uses /api/chat/completions which handles all model types:
+            # direct connection models, workspace models, AND pipe/manifold
+            # models (which have custom routing like Anthropic caching).
+            # The /openai/chat/completions endpoint only knows about raw
+            # connection models and cannot route pipe models.
+            app = __request__.app
+            transport = httpx.ASGITransport(app=app)
+            inner_client = httpx.AsyncClient(transport=transport, base_url="http://localhost")
+
+            from pydantic_ai import Agent, UsageLimits
+            from pydantic_ai.models.openai import OpenAIChatModel
+            from pydantic_ai.providers.openai import OpenAIProvider
+
+            provider = OpenAIProvider(
+                base_url="http://localhost/api",
+                api_key=token,
+                http_client=inner_client,
+            )
+            model = OpenAIChatModel(model_id, provider=provider)
+
+            # ── Collect user env vars for sub-agent bash ─────────────
+            user_valves = __user__.get("valves")
+            user_pairs: list[tuple[str, str]] = []
+            if user_valves:
+                raw_env = getattr(user_valves, "env_vars", "") or ""
+                user_pairs = _parse_env_vars(raw_env)
+
+            # ── Build sub-agent tools ────────────────────────────────
+            tools = _build_delegate_tools(self.valves, sandbox_id, client, user_pairs)
+
+            # ── Build the prompt ─────────────────────────────────────
+            user_message = task
+            if context:
+                user_message = f"## Task\n\n{task}\n\n## Context\n\n{context}"
+
+            # ── Create and run the agent ─────────────────────────────
+            clamped_steps = max(1, min(30, max_steps))
+
+            agent = Agent(
+                model,
+                system_prompt=_DELEGATE_SYSTEM_PROMPT,
+                tools=tools,
+                output_type=str,
+            )
+
+            await _emit(__event_emitter__, "Sub-agent starting...")
+
+            try:
+                step_count = 0
+
+                async with agent.iter(
+                    user_message,
+                    usage_limits=UsageLimits(request_limit=clamped_steps),
+                ) as agent_run:
+                    async for node in agent_run:
+                        if Agent.is_model_request_node(node):
+                            step_count += 1
+                            await _emit(
+                                __event_emitter__,
+                                f"Sub-agent thinking... ({step_count}/{clamped_steps})"
+                            )
+                        elif Agent.is_call_tools_node(node):
+                            # Extract tool names and args summary
+                            calls = []
+                            for p in node.model_response.parts:
+                                if hasattr(p, "tool_name"):
+                                    name = p.tool_name
+                                    # Build a short args hint
+                                    try:
+                                        args = p.args_as_dict()
+                                        if name == "bash" and "command" in args:
+                                            cmd = args["command"]
+                                            hint = cmd[:60] + ("..." if len(cmd) > 60 else "")
+                                            calls.append(f"bash({hint!r})")
+                                        elif name in ("read", "write", "edit") and "path" in args:
+                                            path = args["path"]
+                                            short = path.rsplit("/", 1)[-1]
+                                            calls.append(f"{name}({short})")
+                                        elif name in ("glob", "grep") and "pattern" in args:
+                                            calls.append(f"{name}({args['pattern']!r})")
+                                        else:
+                                            calls.append(name)
+                                    except Exception:
+                                        calls.append(name)
+                            if calls:
+                                await _emit(
+                                    __event_emitter__,
+                                    f"Sub-agent → {', '.join(calls)}"
+                                )
+
+                    usage = agent_run.usage()
+                    result_output = agent_run.result.output if agent_run.result else "(no output)"
+
+            except Exception as e:
+                error_type = type(e).__name__
+                await _emit(__event_emitter__, f"Delegation failed: {error_type}", done=True)
+                return _prepend_warning(
+                    f"Delegation failed after {step_count} step(s): {error_type}: {e}",
+                    _sb_warning,
+                )
+            finally:
+                await inner_client.aclose()
+
+            # ── Format result with usage summary ─────────────────────
+            parts = [f"{step_count} step(s)", f"{usage.tool_calls} tool call(s)"]
+            if usage.input_tokens:
+                parts.append(f"{usage.input_tokens:,} prompt + {usage.output_tokens:,} completion tokens")
+            usage_note = f"\n\n[Delegate completed: {', '.join(parts)}]"
+
+            await _emit(
+                __event_emitter__,
+                f"Delegation complete ({step_count} steps, {usage.tool_calls} tool calls)",
+                done=True,
+            )
+
+            return _prepend_warning(result_output + usage_note, _sb_warning)
 
         return await _tool_context(__event_emitter__, _run)
 

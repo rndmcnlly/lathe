@@ -5,6 +5,7 @@ requires-python = ">=3.11"
 dependencies = [
     "httpx",
     "pydantic",
+    "pydantic-ai-slim[openai]",
     "python-dotenv",
     "python-socketio[asyncio_client]",
     "aiohttp",

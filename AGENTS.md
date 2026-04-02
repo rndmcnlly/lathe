@@ -99,6 +99,16 @@ Both are embedded on the docs site (`docs/index.html`) via release asset URLs.
 
 Changes to `lathe.py` can break the demo video if they affect user-visible behavior (e.g. tool output format, expose URL structure, sandbox lifecycle). The demo workflow is a reasonable smoke test for the live deployment but should not block merges — it depends on external services (OWUI, Daytona, model inference) that can fail independently.
 
+## Debugging techniques for OWUI integration
+
+Lathe runs inside the OWUI process. Some bugs only manifest at runtime — in the OWUI request context, with real model routing, real auth, and real pipe/manifold behavior. Two techniques that proved essential during delegate() development:
+
+**Temporary diagnostic tools.** When you need to inspect runtime state that only exists inside OWUI (e.g. `__model__` dict contents, `__request__` attributes, ASGI transport behavior), add a temporary tool method to the `Tools` class. Keep it minimal — dump the specific values you need, make one inference call to gather data, then remove it before committing. The `diagnose()` pattern: accept the OWUI dunder params, format them into a string, return it. The model calls it, you read the output, you know what OWUI is actually providing. This is faster and more reliable than guessing from source code, because OWUI's model routing involves caches, pipe functions, workspace model resolution, and access control that interact in ways the source doesn't make obvious.
+
+**Local scripts hitting OWUI endpoints directly.** For testing sub-agent infrastructure (pydantic-ai agent loops, tool-calling response format, usage accounting), write a `uv run --script` file that talks to the live OWUI instance over HTTP using credentials from `.env`. This isolates the pydantic-ai ↔ OWUI interaction from the Lathe toolkit context, making failures easier to attribute. The script can test raw httpx requests (to see exact response JSON), then pydantic-ai agent runs (to see what the SDK makes of it). During delegate() development, this caught that the Anthropic pipe's non-streaming `_complete()` method returned incomplete ChatCompletion dicts — a bug invisible to normal OWUI chat (which uses streaming) but fatal for pydantic-ai's response parser.
+
+Both artifacts are disposable — remove them before committing. They exist to close the feedback loop between "what does the code say" and "what actually happens at runtime."
+
 ## Architecture notes
 
 - **Single file** — everything lives in `lathe.py`. Resist splitting it.
