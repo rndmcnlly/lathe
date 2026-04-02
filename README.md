@@ -1,12 +1,12 @@
 # Lathe
 
-A single-file Open WebUI toolkit that gives any model a coding agent's tool surface — `bash`, `read`, `write`, `edit`, `onboard`, `expose`, `destroy` — executing against per-user cloud sandboxes via [Daytona](https://www.daytona.io/).
+A single-file Open WebUI toolkit that gives any model a coding agent's tool surface — `bash`, `read`, `write`, `edit`, `glob`, `grep`, `delegate`, `onboard`, `expose`, `destroy` — executing against per-user cloud sandboxes via [Daytona](https://www.daytona.io/).
 
 **For users**: See [lathe.tools](https://lathe.tools) for what Lathe can do, how to use it, and example workflows.
 
 ## What it does to your instance
 
-Lathe registers eight tools that models can call in [Native function calling mode](https://docs.openwebui.com/features/extensibility/plugin/tools/). When a user's model calls a tool, Lathe creates, starts, or resumes a cloud sandbox VM via the Daytona control plane and toolbox APIs. All sandbox operations go outbound from your OWUI server.
+Lathe registers eleven tools that models can call in [Native function calling mode](https://docs.openwebui.com/features/extensibility/plugin/tools/). When a user's model calls a tool, Lathe creates, starts, or resumes a cloud sandbox VM via the Daytona control plane and toolbox APIs. All sandbox operations go outbound from your OWUI server.
 
 No OWUI internals are touched. The toolkit does not import `open_webui.*`, does not use OWUI file storage, and does not modify models, prompts, users, or other configuration. Its only runtime dependency is `httpx`.
 
@@ -55,6 +55,7 @@ To update an existing installation, use the `/api/v1/tools/id/lathe/update` endp
 | `auto_stop_minutes` | `15` | Idle timeout before sandbox stops |
 | `auto_archive_minutes` | `60` | Minutes after stop before sandbox archives |
 | `sandbox_language` | `python` | Default sandbox runtime |
+| `foreground_timeout_seconds` | `30` | Seconds to wait for a bash command before auto-backgrounding (1–300) |
 
 ## UserValves (per-user configuration)
 
@@ -68,30 +69,32 @@ To update an existing installation, use the `/api/v1/tools/id/lathe/update` endp
 |------|---------|
 | `lathe(manpage)` | Agent-facing manual system — orientation, recipes, troubleshooting |
 | `onboard(path)` | Load project context (AGENTS.md + skill catalog) |
-| `bash(command, workdir)` | Execute shell commands (auto-backgrounds after ~30s, output truncated to last 2000 lines / 50 KB) |
+| `bash(command, workdir, foreground_seconds)` | Execute shell commands (auto-backgrounds after ~30s, output truncated to last 2000 lines / 50 KB) |
 | `read(path, offset, limit)` | Read file with line numbers |
 | `write(path, content)` | Write/create file (auto-creates parent dirs) |
 | `edit(path, old_string, new_string, replace_all)` | Exact string replacement |
+| `glob(pattern, max_lines)` | Search for files by glob pattern (hierarchical output, collapsed directories) |
+| `grep(pattern, files, max_lines)` | Search file contents by regex (grouped by file with line numbers) |
+| `delegate(task, context_files, max_steps)` | Dispatch a sub-agent to perform a multi-step task autonomously |
 | `expose(target)` | Expose a sandbox service — `"http:5000"` for a public HTTPS URL, `"ssh"` for a time-limited SSH command |
 | `destroy(confirm)` | Permanently delete the sandbox (requires `confirm=true`) |
 
 ## Testing
 
 ```bash
-uv run --script test_harness.py              # run everything
-uv run --script test_harness.py unit         # unit tests only (no sandbox, ~0.1s)
-uv run --script test_harness.py bash env_vars  # specific groups only
-uv run --script test_harness.py --list       # list available groups
+uv run python test_unit.py                   # no sandbox needed (~0.7s)
+uv run python test_integration.py            # needs DAYTONA_API_KEY in .env
+uv run python test_deployment.py [--verbose] # needs OWUI_URL, OWUI_TOKEN, OWUI_MODEL in .env
 ```
-
-Requires `DAYTONA_API_KEY` in a `.env` file (not needed for `unit`).
 
 ## Files
 
 | File | Purpose |
 |------|---------|
 | `lathe.py` | The OWUI toolkit (single file, deployed via OWUI admin API) |
-| `test_harness.py` | Test suite (`uv run --script test_harness.py`) |
+| `test_unit.py` | Unit tests (pure-Python helpers, no sandbox) |
+| `test_integration.py` | Integration tests (live sandbox API) |
+| `test_deployment.py` | Deployment tests (live OWUI instance via Socket.IO) |
 | `AGENTS.md` | Agent/contributor working instructions |
 | `docs/` | User-facing docs site ([lathe.tools](https://lathe.tools)) |
 
