@@ -792,17 +792,14 @@ def _build_onboard_script(project_path: str) -> str:
 # ── delegate() sub-agent infrastructure ─────────────────────────────
 
 
-def _build_delegate_prompt(task: str, context: str, file_sections: list[str]) -> str:
+def _build_delegate_prompt(task: str, file_sections: list[str]) -> str:
     """Build the user message for a delegate sub-agent.
 
     Args:
-        task: The task description.
-        context: Free-text context (may be empty).
+        task: The task description (including any context).
         file_sections: Pre-formatted file sections (each "### path\\n\\ncontent").
     """
     parts: list[str] = [f"## Task\n\n{task}"]
-    if context:
-        parts.append(f"## Context\n\n{context}")
     if file_sections:
         parts.append(f"## Reference Files\n\n" + "\n\n".join(file_sections))
     return "\n\n".join(parts)
@@ -1640,11 +1637,11 @@ class Tools:
 
             ## What delegate() does
 
-            delegate(task, context, context_files, max_steps) spawns an
-            autonomous sub-agent that runs the same model against the same
-            sandbox. The sub-agent has access to: bash, read, write, edit,
-            glob, grep. It does NOT have: lathe, onboard, expose, destroy,
-            or delegate (no recursion).
+            delegate(task, context_files, max_steps) spawns an autonomous
+            sub-agent that runs the same model against the same sandbox.
+            The sub-agent has access to: bash, read, write, edit, glob,
+            grep. It does NOT have: lathe, onboard, expose, destroy, or
+            delegate (no recursion).
 
             The sub-agent makes up to max_steps inference calls (default 10,
             max 30), executing tools as needed. When it decides it's done (or
@@ -1672,18 +1669,17 @@ class Tools:
 
             ## Writing good task descriptions
 
-            The sub-agent cannot ask clarifying questions. Be specific:
+            The sub-agent cannot ask clarifying questions. Be specific
+            and include all relevant context (error messages, prior
+            findings, instructions) directly in the task string:
 
             Bad:  "Fix the tests"
             Good: "Run pytest in /home/daytona/workspace. For each failure,
                    read the failing test and the source it tests, identify
                    the bug, and fix it. Re-run pytest to confirm."
 
-            ## The context parameter
-
-            Pass free-text context the sub-agent would otherwise need to
-            discover: error messages, prior findings, instructions. This
-            saves the sub-agent steps and tokens.
+            Bad:  task="Fix the build", context="Error: module X not found"
+            Good: task="Fix the build. The error is: module X not found"
 
             ## The context_files parameter
 
@@ -1695,7 +1691,7 @@ class Tools:
 
             This is the recommended way to pass project context. If you
             discovered relevant files via onboard() or glob(), name them
-            here rather than re-pasting their contents into context.
+            here rather than pasting their contents into the task string.
 
             All paths must be absolute. Delegation fails immediately if
             any path does not exist on the sandbox.
@@ -2547,7 +2543,6 @@ class Tools:
     async def delegate(
         self,
         task: str,
-        context: str = "",
         context_files: list[str] = [],
         max_steps: int = 10,
         __user__: dict = {},
@@ -2560,8 +2555,7 @@ class Tools:
         The sub-agent runs the same model, has bash/read/write/edit/glob/grep tools,
         and returns a summary when done. Use for exploration, refactoring, debugging,
         or any multi-step work that doesn't need user interaction.
-        :param task: What the sub-agent should accomplish. Be specific — it cannot ask clarifying questions.
-        :param context: Free-text context (error messages, prior findings, instructions) to include in the sub-agent's prompt.
+        :param task: What the sub-agent should accomplish. Be specific — it cannot ask clarifying questions. Include any context (error messages, prior findings, instructions) directly in the task description.
         :param context_files: Absolute sandbox file paths to inject into the sub-agent's prompt (e.g. AGENTS.md, SKILL.md, config files). Fetched at delegation time — the sub-agent sees their contents without spending steps reading them.
         :param max_steps: Maximum inference calls the sub-agent may make (default: 10, max: 30).
         """
@@ -2640,7 +2634,7 @@ class Tools:
                     file_sections.append(f"### {fpath}\n\n{resp.text}")
 
             # ── Build the prompt ─────────────────────────────────────
-            user_message = _build_delegate_prompt(task, context, file_sections)
+            user_message = _build_delegate_prompt(task, file_sections)
 
             # ── Create and run the agent ─────────────────────────────
             clamped_steps = max(1, min(30, max_steps))
