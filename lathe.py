@@ -789,8 +789,25 @@ def _build_onboard_script(project_path: str) -> str:
 
 
 
-
 # ── delegate() sub-agent infrastructure ─────────────────────────────
+
+
+def _build_delegate_prompt(task: str, context: str, file_sections: list[str]) -> str:
+    """Build the user message for a delegate sub-agent.
+
+    Args:
+        task: The task description.
+        context: Free-text context (may be empty).
+        file_sections: Pre-formatted file sections (each "### path\\n\\ncontent").
+    """
+    parts: list[str] = [f"## Task\n\n{task}"]
+    if context:
+        parts.append(f"## Context\n\n{context}")
+    if file_sections:
+        parts.append(f"## Reference Files\n\n" + "\n\n".join(file_sections))
+    return "\n\n".join(parts)
+
+
 
 _DELEGATE_SYSTEM_PROMPT = textwrap.dedent("""\
     You are a focused sub-agent with direct access to a Linux sandbox.
@@ -1623,10 +1640,11 @@ class Tools:
 
             ## What delegate() does
 
-            delegate(task, context, max_steps) spawns an autonomous sub-agent
-            that runs the same model against the same sandbox. The sub-agent
-            has access to: bash, read, write, edit, glob, grep. It does NOT
-            have: lathe, onboard, expose, destroy, or delegate (no recursion).
+            delegate(task, context, context_files, max_steps) spawns an
+            autonomous sub-agent that runs the same model against the same
+            sandbox. The sub-agent has access to: bash, read, write, edit,
+            glob, grep. It does NOT have: lathe, onboard, expose, destroy,
+            or delegate (no recursion).
 
             The sub-agent makes up to max_steps inference calls (default 10,
             max 30), executing tools as needed. When it decides it's done (or
@@ -1663,9 +1681,24 @@ class Tools:
 
             ## The context parameter
 
-            Pass relevant context the sub-agent would otherwise need to
-            discover: file contents, error messages, prior findings, specific
-            file paths. This saves the sub-agent steps and tokens.
+            Pass free-text context the sub-agent would otherwise need to
+            discover: error messages, prior findings, instructions. This
+            saves the sub-agent steps and tokens.
+
+            ## The context_files parameter
+
+            Pass a list of absolute sandbox paths (e.g. AGENTS.md, SKILL.md,
+            config files) whose contents should be injected into the
+            sub-agent's prompt. The files are fetched once at delegation
+            time and appear as a "Reference Files" section — the sub-agent
+            sees their full contents without spending steps reading them.
+
+            This is the recommended way to pass project context. If you
+            discovered relevant files via onboard() or glob(), name them
+            here rather than re-pasting their contents into context.
+
+            All paths must be absolute. Delegation fails immediately if
+            any path does not exist on the sandbox.
 
             ## Cost model
 
@@ -1739,7 +1772,9 @@ class Tools:
             Use delegate(task="...") to hand off autonomous multi-step tasks
             to a sub-agent. The sub-agent has bash/read/write/edit/glob/grep
             and runs against the same sandbox. Good for: exploration, refactoring,
-            debugging, test fixing, research. The sub-agent cannot interact with
+            debugging, test fixing, research. Use context_files= to inject
+            AGENTS.md, skills, or other reference files into the sub-agent's
+            prompt without re-reading them. The sub-agent cannot interact with
             the user or expose URLs — it just works and returns a summary.
             See lathe(manpage="delegate") for details.
 
@@ -1784,7 +1819,7 @@ class Tools:
     # lookups and useful for the model to decide which page to request).
     _MANPAGE_INDEX: dict[str, str] = {
         "overview": "Big-picture orientation: sandbox model, tool catalog, key workflows, gotchas.",
-        "delegate": "Sub-agent delegation: when to use, task writing, cost model.",
+        "delegate": "Sub-agent delegation: when to use, task writing, context_files, cost model.",
         "recipes": "Bootstrap scripts for common tools: dufs (file browser), code-server (IDE).",
         "background": "Background job sidecar files, and peek/poll/kill recipes.",
         "egress": "Egress restrictions, workarounds (dufs upload, browser-side fetch), Tier 3.",
@@ -2513,6 +2548,7 @@ class Tools:
         self,
         task: str,
         context: str = "",
+        context_files: list[str] = [],
         max_steps: int = 10,
         __user__: dict = {},
         __model__: dict = {},
@@ -2525,7 +2561,8 @@ class Tools:
         and returns a summary when done. Use for exploration, refactoring, debugging,
         or any multi-step work that doesn't need user interaction.
         :param task: What the sub-agent should accomplish. Be specific — it cannot ask clarifying questions.
-        :param context: Optional context (code snippets, file contents, prior findings) to include in the sub-agent's prompt.
+        :param context: Free-text context (error messages, prior findings, instructions) to include in the sub-agent's prompt.
+        :param context_files: Absolute sandbox file paths to inject into the sub-agent's prompt (e.g. AGENTS.md, SKILL.md, config files). Fetched at delegation time — the sub-agent sees their contents without spending steps reading them.
         :param max_steps: Maximum inference calls the sub-agent may make (default: 10, max: 30).
         """
         async def _run(client):
@@ -2580,10 +2617,30 @@ class Tools:
             # ── Build sub-agent tools ────────────────────────────────
             tools = _build_delegate_tools(self.valves, sandbox_id, client, user_pairs)
 
+            # ── Fetch context_files from sandbox ─────────────────────
+            file_sections: list[str] = []
+            if context_files:
+                for fpath in context_files:
+                    err = _require_abs_path(fpath, "context_files entry")
+                    if err:
+                        return err
+                for fpath in context_files:
+                    resp = await client.get(
+                        _toolbox(self.valves, sandbox_id, "/files/download"),
+                        params={"path": fpath},
+                        headers=_headers(self.valves),
+                        timeout=60.0,
+                    )
+                    if resp.status_code == 404:
+                        return (
+                            f"Error: context_files entry not found on sandbox: {fpath}\n"
+                            f"Verify the path exists before delegating."
+                        )
+                    resp.raise_for_status()
+                    file_sections.append(f"### {fpath}\n\n{resp.text}")
+
             # ── Build the prompt ─────────────────────────────────────
-            user_message = task
-            if context:
-                user_message = f"## Task\n\n{task}\n\n## Context\n\n{context}"
+            user_message = _build_delegate_prompt(task, context, file_sections)
 
             # ── Create and run the agent ─────────────────────────────
             clamped_steps = max(1, min(30, max_steps))

@@ -620,7 +620,7 @@ async def test_delegate_infrastructure(R: Results):
             "delegate should appear in tool catalog")
     R.check("catalog includes bash", "bash(" in catalog,
             "bash should appear in tool catalog")
-    # Verify delegate params are shown (task, context, max_steps)
+    # Verify delegate params are shown (task, context, context_files, max_steps)
     delegate_line = [l for l in catalog.split("\n") if "delegate(" in l]
     R.check("delegate line exists", len(delegate_line) == 1,
             f"got {len(delegate_line)} lines")
@@ -629,8 +629,61 @@ async def test_delegate_infrastructure(R: Results):
                 delegate_line[0])
         R.check("delegate shows context param", "context" in delegate_line[0],
                 delegate_line[0])
+        R.check("delegate shows context_files param", "context_files" in delegate_line[0],
+                delegate_line[0])
         R.check("delegate shows max_steps param", "max_steps" in delegate_line[0],
                 delegate_line[0])
+
+
+async def test_delegate_prompt_build(R: Results):
+    """Test _build_delegate_prompt assembles the sub-agent prompt correctly."""
+    from lathe import _build_delegate_prompt
+
+    print("\n── delegate prompt: task only ──")
+    msg = _build_delegate_prompt("Do the thing", "", [])
+    R.check("task-only starts with ## Task", msg.startswith("## Task"), msg[:30])
+    R.check("task-only contains task text", "Do the thing" in msg, msg)
+    R.check("task-only no Context section", "## Context" not in msg, msg)
+    R.check("task-only no Reference Files section", "## Reference Files" not in msg, msg)
+
+    print("\n── delegate prompt: task + context ──")
+    msg = _build_delegate_prompt("Do the thing", "Error: something broke", [])
+    R.check("has Task section", "## Task" in msg, msg)
+    R.check("has Context section", "## Context" in msg, msg)
+    R.check("context text present", "Error: something broke" in msg, msg)
+    R.check("no Reference Files section", "## Reference Files" not in msg, msg)
+
+    print("\n── delegate prompt: task + context_files ──")
+    files = ["### /home/daytona/workspace/AGENTS.md\n\nBe careful."]
+    msg = _build_delegate_prompt("Do the thing", "", files)
+    R.check("has Task section", "## Task" in msg, msg)
+    R.check("no Context section", "## Context" not in msg, msg)
+    R.check("has Reference Files section", "## Reference Files" in msg, msg)
+    R.check("file path in output", "/home/daytona/workspace/AGENTS.md" in msg, msg)
+    R.check("file content in output", "Be careful." in msg, msg)
+
+    print("\n── delegate prompt: all three ──")
+    files = [
+        "### /home/daytona/workspace/AGENTS.md\n\nBe careful.",
+        "### /home/daytona/workspace/.agents/skills/deploy/SKILL.md\n\nDeploy instructions.",
+    ]
+    msg = _build_delegate_prompt("Fix the deploy", "Build failed with exit 1", files)
+    R.check("has all three sections",
+            "## Task" in msg and "## Context" in msg and "## Reference Files" in msg,
+            msg[:200])
+    R.check("task text", "Fix the deploy" in msg, msg)
+    R.check("context text", "Build failed with exit 1" in msg, msg)
+    R.check("first file present", "AGENTS.md" in msg, msg)
+    R.check("second file present", "SKILL.md" in msg, msg)
+    R.check("second file content", "Deploy instructions." in msg, msg)
+
+    print("\n── delegate prompt: section ordering ──")
+    # Task must come before Context, Context before Reference Files
+    task_pos = msg.index("## Task")
+    ctx_pos = msg.index("## Context")
+    ref_pos = msg.index("## Reference Files")
+    R.check("Task before Context", task_pos < ctx_pos, f"{task_pos} vs {ctx_pos}")
+    R.check("Context before Reference Files", ctx_pos < ref_pos, f"{ctx_pos} vs {ref_pos}")
 
 
 async def test_delegate_tools_build(R: Results):
@@ -678,6 +731,7 @@ TESTS = {
     "glob_script": test_glob_script,
     "grep_script": test_grep_script,
     "delegate_infrastructure": test_delegate_infrastructure,
+    "delegate_prompt_build": test_delegate_prompt_build,
     "delegate_tools_build": test_delegate_tools_build,
 }
 
