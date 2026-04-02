@@ -273,6 +273,129 @@ code {
     color: var(--text);
 }
 
+/* ── Highlight card (delegate) ────────────────────── */
+
+.tool-card.highlight-card {
+    border-color: var(--border-hover);
+    background: linear-gradient(135deg, var(--bg-raised), var(--bg-inset));
+    position: relative;
+}
+
+.tool-card.highlight-card::before {
+    content: "new";
+    position: absolute;
+    top: 0.5rem;
+    right: 0.6rem;
+    font-size: 0.55rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    color: var(--bg);
+    background: var(--dim);
+    padding: 0.1em 0.45em;
+    border-radius: 2px;
+    line-height: 1.4;
+}
+
+/* ── Delegate diagram ────────────────────────────── */
+
+.delegate-diagram {
+    margin: 1.5rem 0;
+    display: flex;
+    flex-direction: column;
+    gap: 0;
+}
+
+.delegate-step {
+    display: flex;
+    align-items: flex-start;
+    gap: 1rem;
+    padding: 0.75rem 0;
+    border-left: 2px solid var(--border);
+    margin-left: 0.75rem;
+    padding-left: 1.25rem;
+    position: relative;
+}
+
+.delegate-step:first-child {
+    padding-top: 0;
+}
+
+.delegate-step:last-child {
+    border-left-color: transparent;
+    padding-bottom: 0;
+}
+
+.delegate-step-num {
+    position: absolute;
+    left: -0.65rem;
+    top: 0.55rem;
+    width: 1.3rem;
+    height: 1.3rem;
+    background: var(--bg-inset);
+    border: 2px solid var(--border-hover);
+    border-radius: 50%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 0.65rem;
+    font-weight: 700;
+    color: var(--fg-soft);
+    flex-shrink: 0;
+}
+
+.delegate-step:first-child .delegate-step-num {
+    top: 0;
+}
+
+.delegate-step-text {
+    font-size: 0.85rem;
+    color: var(--subtle);
+    line-height: 1.5;
+}
+
+.delegate-step-text strong {
+    color: var(--heading);
+}
+
+/* ── Delegate examples ───────────────────────────── */
+
+.delegate-examples {
+    background: var(--bg-raised);
+    border: 1px solid var(--border);
+    border-radius: 3px;
+    padding: 1rem 1.25rem;
+    margin-top: 1.25rem;
+}
+
+.delegate-examples h3 {
+    font-size: 0.75rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--dim);
+    margin-bottom: 0.6rem;
+}
+
+.delegate-examples ul {
+    list-style: none;
+    padding: 0;
+    margin: 0;
+}
+
+.delegate-examples li {
+    font-size: 0.8rem;
+    color: var(--subtle);
+    padding: 0.3rem 0;
+    line-height: 1.5;
+}
+
+.delegate-examples em {
+    color: var(--fg-soft);
+    font-style: normal;
+    font-weight: 600;
+}
+
 /* ── Comparison grid ──────────────────────────────── */
 
 .comparison-grid {
