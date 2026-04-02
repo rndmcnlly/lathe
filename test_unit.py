@@ -724,6 +724,311 @@ async def test_delegate_tools_build(R: Results):
         R.check(f"does not have {withheld}", withheld not in tool_names,
                 str(tool_names))
 
+    # Verify _doc_from_core decorator populates docstrings from _core_*
+    print("\n── delegate tools: docstrings from _core_* ──")
+    from lathe import _core_read, _core_write, _core_edit, _core_bash, _core_glob, _core_grep
+    import inspect
+    cores = {
+        "bash": _core_bash, "read": _core_read, "write": _core_write,
+        "edit": _core_edit, "glob": _core_glob, "grep": _core_grep,
+    }
+    for t in tools:
+        core_fn = cores[t.name]
+        core_doc = inspect.getdoc(core_fn) or ""
+        # The tool's description should be the summary from the core docstring
+        # (everything before the first :param line)
+        summary = core_doc.split(":param")[0].strip()
+        R.check(f"{t.name} description from core",
+                t.description == summary,
+                f"got {t.description!r}, expected {summary!r}")
+        # Verify param descriptions made it into the schema
+        td = t.tool_def
+        schema_props = td.parameters_json_schema.get("properties", {})
+        for line in core_doc.split("\n"):
+            line = line.strip()
+            if line.startswith(":param "):
+                # Parse ":param name: description"
+                rest = line[len(":param "):]
+                pname, pdesc = rest.split(":", 1)
+                pname = pname.strip()
+                pdesc = pdesc.strip()
+                if pname in ("valves", "sandbox_id", "client", "emit", "user_pairs"):
+                    continue  # infrastructure params not in closure signature
+                if pname in schema_props:
+                    got_desc = schema_props[pname].get("description", "")
+                    R.check(f"{t.name}.{pname} has description",
+                            got_desc == pdesc,
+                            f"got {got_desc!r}, expected {pdesc!r}")
+
+
+async def test_build_bash_script(R: Results):
+    from lathe import _build_bash_script
+
+    print("\n── _build_bash_script: basic structure ──")
+    script = _build_bash_script("echo hello", [], "/tmp/cmd/test/pid", "/tmp/cmd/test/log")
+    R.check("starts with shebang", script.startswith("#!/usr/bin/env bash\n"), script[:30])
+    R.check("has set -e", "set -e -o pipefail" in script, script[:100])
+    R.check("has DEBIAN_FRONTEND", "DEBIAN_FRONTEND=noninteractive" in script, "missing env")
+    R.check("writes PID", "/tmp/cmd/test/pid" in script, "missing PID path")
+    R.check("tees to log", "/tmp/cmd/test/log" in script, "missing log path")
+    R.check("has command", "echo hello" in script, "missing command")
+    R.check("ends with newline", script.endswith("\n"), "should end with newline")
+
+    print("\n── _build_bash_script: user env vars ──")
+    script = _build_bash_script("ls", [("FOO", "bar"), ("SECRET", "it's a \"test\"")],
+                                "/tmp/cmd/x/pid", "/tmp/cmd/x/log")
+    R.check("exports FOO", "export FOO='bar'" in script, script[:300])
+    R.check("exports SECRET with quoting", "export SECRET=" in script, script[:300])
+    # The value should be shell-quoted
+    R.check("SECRET value quoted", "'it'\\''s a \"test\"'" in script, script[:300])
+
+    print("\n── _build_bash_script: no env vars ──")
+    script = _build_bash_script("pwd", [], "/tmp/cmd/y/pid", "/tmp/cmd/y/log")
+    R.check("no export lines", "export FOO" not in script, "should have no user exports")
+    R.check("still has CI=true", "CI=true" in script, "missing CI env")
+
+
+async def test_format_bash_result(R: Results):
+    from lathe import _format_bash_result, _MAX_BYTES
+
+    print("\n── _format_bash_result: successful command ──")
+    result = _format_bash_result("hello world", 0, False, {})
+    R.check("returns output", result == "hello world", result)
+
+    print("\n── _format_bash_result: non-zero exit code ──")
+    result = _format_bash_result("some error", 1, False, {})
+    R.check("prepends exit code", result.startswith("Exit code: 1\n"), result[:30])
+    R.check("includes output", "some error" in result, result)
+
+    print("\n── _format_bash_result: empty output ──")
+    result = _format_bash_result("", 0, False, {})
+    R.check("empty becomes (no output)", result == "(no output)", result)
+
+    result = _format_bash_result("   \n  ", 0, False, {})
+    R.check("whitespace-only becomes (no output)", result == "(no output)", result)
+
+    print("\n── _format_bash_result: truncated with spill path ──")
+    meta = {
+        "total_lines": 5000,
+        "total_bytes": 200000,
+        "shown_start_line": 3001,
+        "shown_end_line": 5000,
+        "truncated_by": "lines",
+    }
+    result = _format_bash_result("tail content", 0, True, meta, spill_path="/tmp/cmd/abc/log")
+    R.check("has truncation notice", "[Showing lines" in result, result[-100:])
+    R.check("mentions spill path", "/tmp/cmd/abc/log" in result, result[-100:])
+
+    print("\n── _format_bash_result: truncated by bytes ──")
+    meta["truncated_by"] = "bytes"
+    result = _format_bash_result("tail content", 0, True, meta, spill_path="/tmp/cmd/abc/log")
+    R.check("mentions byte limit", "limit" in result, result[-150:])
+
+    print("\n── _format_bash_result: backgrounded command ──")
+    result = _format_bash_result("partial output", None, False, {},
+                                 background_info={"elapsed": 30, "cmd_id": "abc-123"})
+    R.check("has backgrounded notice", "Backgrounded after 30s" in result, result)
+    R.check("has CMD id", "CMD=abc-123" in result, result)
+    R.check("has sidecar refs", "/tmp/cmd/$CMD/" in result, result)
+    R.check("mentions manpage", "lathe(manpage=" in result, result)
+
+    print("\n── _format_bash_result: backgrounded with empty output ──")
+    result = _format_bash_result("", None, False, {},
+                                 background_info={"elapsed": 5, "cmd_id": "xyz"})
+    R.check("empty becomes (no output yet)", "(no output yet)" in result, result[:30])
+
+    print("\n── _format_bash_result: exit code 0 not shown ──")
+    result = _format_bash_result("ok", 0, False, {})
+    R.check("exit code 0 not prepended", not result.startswith("Exit code:"), result[:20])
+
+
+async def test_core_read_mock(R: Results):
+    """Test _core_read with a mock httpx client."""
+    from lathe import _core_read
+    import io as _io
+
+    class FakeValves:
+        daytona_api_key = "fake"
+        daytona_api_url = "https://fake.api"
+        daytona_proxy_url = "https://fake.proxy"
+
+    class FakeResponse:
+        def __init__(self, status_code, text=""):
+            self.status_code = status_code
+            self.text = text
+        def raise_for_status(self):
+            if self.status_code >= 400:
+                raise Exception(f"HTTP {self.status_code}")
+
+    class FakeClient:
+        def __init__(self, responses):
+            self._responses = responses
+            self._call_idx = 0
+        async def get(self, url, **kwargs):
+            resp = self._responses[self._call_idx]
+            self._call_idx += 1
+            return resp
+
+    print("\n── _core_read: relative path rejected ──")
+    result = await _core_read(FakeValves(), "sb-id", FakeClient([]),
+                              path="relative/path.py")
+    R.check("rejects relative path", "absolute path" in result, result[:80])
+
+    print("\n── _core_read: 404 handling ──")
+    client = FakeClient([FakeResponse(404)])
+    result = await _core_read(FakeValves(), "sb-id", client,
+                              path="/home/daytona/workspace/missing.py")
+    R.check("reports file not found", "File not found" in result, result)
+
+    print("\n── _core_read: normal file ──")
+    content = "line1\nline2\nline3\n"
+    client = FakeClient([FakeResponse(200, content)])
+    result = await _core_read(FakeValves(), "sb-id", client,
+                              path="/home/daytona/workspace/test.py")
+    R.check("has file header", "File: /home/daytona/workspace/test.py" in result, result[:80])
+    R.check("has total lines", "3 lines total" in result, result[:80])
+    R.check("has line numbers", "1: line1" in result, result)
+    R.check("has line 2", "2: line2" in result, result)
+    R.check("has line 3", "3: line3" in result, result)
+
+    print("\n── _core_read: offset and limit ──")
+    content = "\n".join(f"line{i}" for i in range(1, 11)) + "\n"
+    client = FakeClient([FakeResponse(200, content)])
+    result = await _core_read(FakeValves(), "sb-id", client,
+                              path="/home/daytona/workspace/big.py",
+                              offset=3, limit=2)
+    R.check("shows correct range", "showing lines 3-4" in result, result[:100])
+    R.check("starts at line 3", "3: line3" in result, result)
+    R.check("has line 4", "4: line4" in result, result)
+    R.check("no line 5", "5: line5" not in result, result)
+
+
+async def test_core_write_mock(R: Results):
+    """Test _core_write with a mock httpx client."""
+    from lathe import _core_write
+
+    class FakeValves:
+        daytona_api_key = "fake"
+        daytona_api_url = "https://fake.api"
+        daytona_proxy_url = "https://fake.proxy"
+
+    class FakeResponse:
+        def __init__(self, status_code=200):
+            self.status_code = status_code
+        def raise_for_status(self):
+            pass
+
+    class FakeClient:
+        def __init__(self):
+            self.calls = []
+        async def post(self, url, **kwargs):
+            self.calls.append({"url": url, "kwargs": kwargs})
+            return FakeResponse()
+
+    print("\n── _core_write: relative path rejected ──")
+    result = await _core_write(FakeValves(), "sb-id", FakeClient(),
+                               path="relative.py", content="hello")
+    R.check("rejects relative path", "absolute path" in result, result[:80])
+
+    print("\n── _core_write: creates parent and uploads ──")
+    client = FakeClient()
+    result = await _core_write(FakeValves(), "sb-id", client,
+                               path="/home/daytona/workspace/sub/file.py",
+                               content="hello\nworld\n")
+    R.check("reports bytes", "12 bytes" in result, result)
+    R.check("reports lines", "2 lines" in result, result)
+    R.check("reports path", "/home/daytona/workspace/sub/file.py" in result, result)
+    R.check("made 2 calls (mkdir + upload)", len(client.calls) == 2,
+            f"got {len(client.calls)} calls")
+    # First call should be folder creation
+    R.check("first call is folder", "/files/folder" in client.calls[0]["url"],
+            client.calls[0]["url"])
+    R.check("second call is upload", "/files/upload" in client.calls[1]["url"],
+            client.calls[1]["url"])
+
+
+async def test_core_edit_mock(R: Results):
+    """Test _core_edit with a mock httpx client."""
+    from lathe import _core_edit
+
+    class FakeValves:
+        daytona_api_key = "fake"
+        daytona_api_url = "https://fake.api"
+        daytona_proxy_url = "https://fake.proxy"
+
+    class FakeResponse:
+        def __init__(self, status_code=200, text=""):
+            self.status_code = status_code
+            self.text = text
+        def raise_for_status(self):
+            pass
+
+    class FakeClient:
+        def __init__(self, get_response):
+            self._get_response = get_response
+            self.post_calls = []
+        async def get(self, url, **kwargs):
+            return self._get_response
+        async def post(self, url, **kwargs):
+            self.post_calls.append({"url": url, "kwargs": kwargs})
+            return FakeResponse()
+
+    print("\n── _core_edit: relative path rejected ──")
+    result = await _core_edit(FakeValves(), "sb-id",
+                              FakeClient(FakeResponse(200, "")),
+                              path="rel.py", old_string="a", new_string="b")
+    R.check("rejects relative path", "absolute path" in result, result[:80])
+
+    print("\n── _core_edit: file not found ──")
+    result = await _core_edit(FakeValves(), "sb-id",
+                              FakeClient(FakeResponse(404)),
+                              path="/home/daytona/workspace/x.py",
+                              old_string="a", new_string="b")
+    R.check("reports not found", "File not found" in result, result)
+
+    print("\n── _core_edit: no match ──")
+    result = await _core_edit(FakeValves(), "sb-id",
+                              FakeClient(FakeResponse(200, "hello world")),
+                              path="/home/daytona/workspace/x.py",
+                              old_string="ZZZNOMATCH", new_string="b")
+    R.check("reports no match", "not found" in result, result)
+
+    print("\n── _core_edit: ambiguous match ──")
+    result = await _core_edit(FakeValves(), "sb-id",
+                              FakeClient(FakeResponse(200, "foo foo foo")),
+                              path="/home/daytona/workspace/x.py",
+                              old_string="foo", new_string="bar")
+    R.check("reports multiple matches", "3 matches" in result, result)
+    R.check("suggests replace_all", "replace_all" in result, result)
+
+    print("\n── _core_edit: single match succeeds ──")
+    client = FakeClient(FakeResponse(200, "hello world"))
+    result = await _core_edit(FakeValves(), "sb-id", client,
+                              path="/home/daytona/workspace/x.py",
+                              old_string="hello", new_string="goodbye")
+    R.check("reports success", "Replaced 1 occurrence" in result, result)
+    R.check("uploaded new content", len(client.post_calls) == 1,
+            f"got {len(client.post_calls)} calls")
+
+    print("\n── _core_edit: replace_all ──")
+    client = FakeClient(FakeResponse(200, "foo bar foo"))
+    result = await _core_edit(FakeValves(), "sb-id", client,
+                              path="/home/daytona/workspace/x.py",
+                              old_string="foo", new_string="baz",
+                              replace_all=True)
+    R.check("reports 2 replacements", "2 occurrence" in result, result)
+
+
+async def test_delegate_bash_foreground(R: Results):
+    """Test that delegate bash uses a shorter foreground timeout."""
+    from lathe import _DELEGATE_BASH_FOREGROUND_SECONDS
+
+    print("\n── delegate bash foreground default ──")
+    R.check("shorter than 30s", _DELEGATE_BASH_FOREGROUND_SECONDS < 30,
+            f"got {_DELEGATE_BASH_FOREGROUND_SECONDS}")
+    R.check("at least 5s", _DELEGATE_BASH_FOREGROUND_SECONDS >= 5,
+            f"got {_DELEGATE_BASH_FOREGROUND_SECONDS}")
+
 
 # ── Test registry and runner ─────────────────────────────────────────
 
@@ -739,6 +1044,12 @@ TESTS = {
     "delegate_infrastructure": test_delegate_infrastructure,
     "delegate_prompt_build": test_delegate_prompt_build,
     "delegate_tools_build": test_delegate_tools_build,
+    "build_bash_script": test_build_bash_script,
+    "format_bash_result": test_format_bash_result,
+    "core_read_mock": test_core_read_mock,
+    "core_write_mock": test_core_write_mock,
+    "core_edit_mock": test_core_edit_mock,
+    "delegate_bash_foreground": test_delegate_bash_foreground,
 }
 
 

@@ -688,6 +688,455 @@ def grep_hierarchy(base_dir, regex, files_pattern, max_lines):
 '''
 
 
+# ── shared tool cores ───────────────────────────────────────────────
+#
+# Each _core_* function encapsulates the I/O logic for a tool.  Both
+# the Tools class methods and the delegate closures call these, so
+# behavior stays in sync.  The dependency signature is explicit:
+# (valves, sandbox_id, client, **tool_params) -> str.
+#
+# Docstrings on _core_* are the **single source of truth** for tool
+# descriptions and parameter docs.  Use :param: format.  The decorator
+# _doc_from_core() converts them to Google-style Args: blocks for the
+# delegate closures (which pydantic-ai parses for schema generation).
+# Tools class methods can add OWUI-specific behavioral guidance beyond
+# what the core docstring says.
+
+
+def _doc_from_core(core_fn):
+    """Decorator: copy a _core_* docstring onto a target function.
+
+    Both OWUI and pydantic-ai parse :param: format natively, so no
+    conversion is needed.  Extra :param: lines for params not in the
+    target's signature (valves, sandbox_id, client, etc.) are silently
+    ignored by both schema generators.
+    """
+    doc = inspect.getdoc(core_fn) or ""
+    def decorator(fn):
+        fn.__doc__ = doc
+        return fn
+    return decorator
+
+
+async def _core_read(valves, sandbox_id: str, client: httpx.AsyncClient, *,
+                     path: str, offset: int = 1, limit: int = 2000) -> str:
+    """Read a file from the sandbox. Returns numbered lines.
+
+    :param path: Absolute path to the file.
+    :param offset: Starting line number (1-indexed, default: 1).
+    :param limit: Max lines to return (default: 2000).
+    """
+    err = _require_abs_path(path)
+    if err:
+        return err
+    resp = await client.get(
+        _toolbox(valves, sandbox_id, "/files/download"),
+        params={"path": path},
+        headers=_headers(valves),
+        timeout=60.0,
+    )
+    if resp.status_code == 404:
+        return f"Error: File not found: {path}"
+    resp.raise_for_status()
+    content = resp.text
+    lines = content.split("\n")
+    if lines and lines[-1] == "":
+        lines = lines[:-1]
+    total_lines = len(lines)
+    start_idx = max(0, offset - 1)
+    end_idx = start_idx + limit
+    selected = lines[start_idx:end_idx]
+    numbered = "\n".join(
+        f"{start_idx + i + 1}: {line}"
+        for i, line in enumerate(selected)
+    )
+    header = f"File: {path} ({total_lines} lines total)"
+    if start_idx > 0 or end_idx < total_lines:
+        header += f", showing lines {start_idx + 1}-{min(end_idx, total_lines)}"
+    return f"{header}\n{numbered}"
+
+
+async def _core_write(valves, sandbox_id: str, client: httpx.AsyncClient, *,
+                      path: str, content: str) -> str:
+    """Write a file to the sandbox (creates parents automatically).
+
+    :param path: Absolute path to write to.
+    :param content: The full file content.
+    """
+    err = _require_abs_path(path)
+    if err:
+        return err
+    parent = "/".join(path.rstrip("/").split("/")[:-1])
+    if parent:
+        await client.post(
+            _toolbox(valves, sandbox_id, "/files/folder"),
+            headers=_headers(valves),
+            json={"path": parent, "mode": "755"},
+            timeout=30.0,
+        )
+    content_bytes = content.encode("utf-8")
+    resp = await client.post(
+        _toolbox(valves, sandbox_id, "/files/upload"),
+        params={"path": path},
+        headers={"Authorization": f"Bearer {valves.daytona_api_key}"},
+        files={"file": ("file", io.BytesIO(content_bytes), "application/octet-stream")},
+        timeout=60.0,
+    )
+    resp.raise_for_status()
+    n_bytes = len(content_bytes)
+    n_lines = content.count("\n") + (0 if content.endswith("\n") else 1)
+    return f"Wrote {n_bytes} bytes ({n_lines} lines) to {path}"
+
+
+async def _core_edit(valves, sandbox_id: str, client: httpx.AsyncClient, *,
+                     path: str, old_string: str, new_string: str,
+                     replace_all: bool = False) -> str:
+    """Edit a file by exact string replacement. Fails on ambiguous matches unless replace_all=true.
+
+    :param path: Absolute path to the file.
+    :param old_string: Exact text to find.
+    :param new_string: Replacement text.
+    :param replace_all: Replace all occurrences (default: false).
+    """
+    err = _require_abs_path(path)
+    if err:
+        return err
+    resp = await client.get(
+        _toolbox(valves, sandbox_id, "/files/download"),
+        params={"path": path},
+        headers=_headers(valves),
+        timeout=60.0,
+    )
+    if resp.status_code == 404:
+        return f"Error: File not found: {path}"
+    resp.raise_for_status()
+    content = resp.text
+    count = content.count(old_string)
+    if count == 0:
+        return f"Error: old_string not found in {path}"
+    if count > 1 and not replace_all:
+        return (
+            f"Error: Found {count} matches for old_string in {path}. "
+            f"Provide more surrounding context to identify a unique match, "
+            f"or set replace_all=true to replace all occurrences."
+        )
+    if replace_all:
+        new_content = content.replace(old_string, new_string)
+    else:
+        new_content = content.replace(old_string, new_string, 1)
+    content_bytes = new_content.encode("utf-8")
+    resp = await client.post(
+        _toolbox(valves, sandbox_id, "/files/upload"),
+        params={"path": path},
+        headers={"Authorization": f"Bearer {valves.daytona_api_key}"},
+        files={"file": ("file", io.BytesIO(content_bytes), "application/octet-stream")},
+        timeout=60.0,
+    )
+    resp.raise_for_status()
+    replaced = count if replace_all else 1
+    return f"Replaced {replaced} occurrence(s) in {path}"
+
+
+async def _core_glob(valves, sandbox_id: str, client: httpx.AsyncClient, *,
+                     pattern: str, max_lines: int = _GLOB_MAX_LINES) -> str:
+    """Search for files in the sandbox workspace by glob pattern.
+    Returns a hierarchical listing of matches with absolute paths.
+    Dense directories are collapsed with match counts; narrow the
+    pattern or increase max_lines to expand them.
+
+    :param pattern: Comma-separated globs, !-prefix to exclude. Examples: '**/*.py', 'src/**/*.ts,!**/node_modules/**'.
+    :param max_lines: Max output lines (default: 100).
+    """
+    clamped = max(1, min(500, max_lines))
+    base_dir = "/home/daytona/workspace"
+    script = (
+        _GLOB_SCRIPT
+        + f"\nprint(glob_hierarchy({base_dir!r}, {pattern!r}, {clamped!r}))"
+    )
+    resp = await client.post(
+        _toolbox(valves, sandbox_id, "/process/execute"),
+        headers=_headers(valves),
+        json={"command": f"python3 -c {_shell_quote(script)}", "timeout": 30000},
+        timeout=60.0,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    result = data.get("result", "")
+    exit_code = data.get("exitCode", -1)
+    if exit_code != 0:
+        return f"Error: glob script failed (exit {exit_code}).\n{result[:500]}"
+    return result
+
+
+async def _core_grep(valves, sandbox_id: str, client: httpx.AsyncClient, *,
+                     pattern: str, files: str = "**/*",
+                     max_lines: int = _GREP_MAX_LINES) -> str:
+    """Search file contents in the sandbox workspace by regex.
+    Returns matches grouped by file with line numbers. Dense
+    directories and files are collapsed with match counts;
+    narrow the file scope or increase max_lines to expand them.
+
+    :param pattern: Regex to search for (e.g. 'import.*asyncio', 'TODO|FIXME').
+    :param files: File scope as comma-separated globs (default: '**/*'). !-prefix to exclude.
+    :param max_lines: Max output lines (default: 100).
+    """
+    clamped = max(1, min(500, max_lines))
+    base_dir = "/home/daytona/workspace"
+    script = (
+        _GREP_SCRIPT
+        + f"\nprint(grep_hierarchy({base_dir!r}, {pattern!r}, {files!r}, {clamped!r}))"
+    )
+    resp = await client.post(
+        _toolbox(valves, sandbox_id, "/process/execute"),
+        headers=_headers(valves),
+        json={"command": f"python3 -c {_shell_quote(script)}", "timeout": 30000},
+        timeout=60.0,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    result = data.get("result", "")
+    exit_code = data.get("exitCode", -1)
+    if exit_code != 0:
+        return f"Error: grep script failed (exit {exit_code}).\n{result[:500]}"
+    return result
+
+
+# ── bash core (session + sidecar protocol) ──────────────────────────
+
+
+def _build_bash_script(command: str, user_pairs: list[tuple[str, str]],
+                       pid_path: str, log_path: str) -> str:
+    """Build the bash wrapper script with sidecar file setup.
+
+    The script:
+    - Sets standard non-interactive env vars
+    - Injects user env vars (shell-quoted)
+    - Writes its own PID to pid_path
+    - Tees stdout+stderr to log_path
+    - Executes the user command
+    """
+    user_env_lines = "".join(
+        f"export {k}={_shell_quote(v)}\n" for k, v in user_pairs
+    )
+    return (
+        "#!/usr/bin/env bash\n"
+        "set -e -o pipefail\n"
+        "export DEBIAN_FRONTEND=noninteractive "
+        "GIT_TERMINAL_PROMPT=0 "
+        "PIP_NO_INPUT=1 "
+        "NPM_CONFIG_YES=true "
+        "CI=true\n"
+        + user_env_lines
+        + f"echo $BASHPID > {_shell_quote(pid_path)}\n"
+        + f"exec > >(tee {_shell_quote(log_path)}) 2>&1\n"
+        + command
+        + "\n"
+    )
+
+
+def _format_bash_result(output: str, exit_code: int | None,
+                        was_truncated: bool, meta: dict,
+                        spill_path: str | None = None,
+                        background_info: dict | None = None) -> str:
+    """Format bash output for return to the caller.
+
+    Args:
+        output: The raw command output (possibly already truncated).
+        exit_code: Process exit code, or None if still running.
+        was_truncated: Whether _truncate_tail truncated the output.
+        meta: Truncation metadata from _truncate_tail.
+        spill_path: Path to the full log file on disk (for truncation notice).
+        background_info: If set, dict with keys 'elapsed', 'cmd_id' for
+            the auto-background notice.
+    """
+    if background_info is not None:
+        # Auto-backgrounded: command still running
+        if not output.strip():
+            output = "(no output yet)"
+        elapsed = background_info["elapsed"]
+        cmd_id = background_info["cmd_id"]
+        bg_notice = (
+            f"\n\n[Backgrounded after {elapsed}s — command is still running]\n"
+            f"CMD={cmd_id}\n"
+            f"Ref /tmp/cmd/$CMD/{{sh,pid,log,exit}}\n"
+            f"See lathe(manpage=\"background\") for peek/poll/kill recipes.\n"
+            f"Tell the user the command is running. Don't poll until they ask or "
+            f"you have a concrete reason to expect completion."
+        )
+        return output + bg_notice
+
+    # Finished command
+    if exit_code is not None and exit_code != 0:
+        output = f"Exit code: {exit_code}\n{output}"
+
+    if not output.strip():
+        output = "(no output)"
+
+    if was_truncated and spill_path:
+        start = meta["shown_start_line"]
+        end = meta["shown_end_line"]
+        total = meta["total_lines"]
+        total_size = _human_size(meta["total_bytes"])
+        if meta["truncated_by"] == "lines":
+            notice = (
+                f"\n\n[Showing lines {start}-{end} of {total}. "
+                f"Full output ({total_size}): {spill_path}]"
+            )
+        else:
+            notice = (
+                f"\n\n[Showing lines {start}-{end} of {total} "
+                f"({_human_size(_MAX_BYTES)} limit, full output is {total_size}). "
+                f"Full output: {spill_path}]"
+            )
+        output += notice
+
+    return output
+
+
+async def _core_bash(valves, sandbox_id: str, client: httpx.AsyncClient, *,
+                     command: str, workdir: str = "/home/daytona/workspace",
+                     user_pairs: list[tuple[str, str]],
+                     foreground_seconds: int = 30,
+                     emit=None) -> str:
+    """Execute a bash command in the sandbox. Non-interactive only.
+    Commands that finish within the foreground window return output directly.
+    Long-running commands auto-background and return a descriptor with log
+    file paths for monitoring.
+
+    :param command: The bash command to execute.
+    :param workdir: Working directory (default: /home/daytona/workspace).
+    :param foreground_seconds: Seconds to wait before auto-backgrounding (default: 15). Use higher values for known-slow commands.
+    """
+    cmd_id = str(uuid.uuid4())
+    cmd_dir = f"/tmp/cmd/{cmd_id}"
+    log_path = f"{cmd_dir}/log"
+    pid_path = f"{cmd_dir}/pid"
+    exit_path = f"{cmd_dir}/exit"
+    script_path = f"{cmd_dir}/sh"
+
+    script = _build_bash_script(command, user_pairs, pid_path, log_path)
+
+    # Upload the script (creates parent dirs automatically)
+    await client.post(
+        _toolbox(valves, sandbox_id, "/files/upload"),
+        params={"path": script_path},
+        headers={"Authorization": f"Bearer {valves.daytona_api_key}"},
+        files={"file": ("file", io.BytesIO(script.encode("utf-8")), "application/octet-stream")},
+        timeout=60.0,
+    )
+
+    # ── Create a per-command session ─────────────────────────────
+    # Each bash() call gets its own session so commands never
+    # queue behind each other.  This is critical: a shared
+    # session serialises commands, so monitoring a backgrounded
+    # build via tail/cat would block until the build finishes.
+    session_id = f"lathe-cmd-{cmd_id}"
+    resp = await client.post(
+        _toolbox(valves, sandbox_id, f"/process/session"),
+        headers=_headers(valves),
+        json={"sessionId": session_id},
+        timeout=30.0,
+    )
+    if resp.status_code not in (200, 409):
+        resp.raise_for_status()
+
+    # ── Execute asynchronously in the session ────────────────────
+    # The actual command writes exit code to a sidecar file so
+    # the agent can check completion even after backgrounding.
+    # Session exec has no cwd parameter, so we cd explicitly.
+    exec_command = (
+        f"cd {_shell_quote(workdir)} && "
+        f"bash {script_path}; EC=$?; "
+        f"echo $EC > {_shell_quote(exit_path)}; "
+        f"(exit $EC)"
+    )
+    resp = await client.post(
+        _toolbox(valves, sandbox_id, f"/process/session/{session_id}/exec"),
+        headers=_headers(valves),
+        json={
+            "command": exec_command,
+            "runAsync": True,
+        },
+        timeout=30.0,
+    )
+    resp.raise_for_status()
+    session_cmd_id = resp.json().get("cmdId", "")
+
+    # ── Foreground polling window ────────────────────────────────
+    fg_timeout = max(1, min(300, foreground_seconds))
+    deadline = time.time() + fg_timeout
+    poll_interval = 0.25
+    last_status_at = time.time()
+    finished = False
+    exit_code = None
+
+    while time.time() < deadline:
+        await asyncio.sleep(poll_interval)
+        poll_interval = min(poll_interval * 1.5, 2.0)
+
+        # Check command status via session info
+        resp = await client.get(
+            _toolbox(valves, sandbox_id, f"/process/session/{session_id}"),
+            headers=_headers(valves),
+            timeout=15.0,
+        )
+        if resp.status_code != 200:
+            continue
+        session_info = resp.json()
+        commands = session_info.get("commands", [])
+
+        # Find our command by id
+        for cmd in commands:
+            if cmd.get("id") == session_cmd_id:
+                ec = cmd.get("exitCode")
+                if ec is not None:
+                    exit_code = ec
+                    finished = True
+                break
+
+        if finished:
+            break
+
+        # Emit progress every ~5s
+        now = time.time()
+        if now - last_status_at >= 5.0:
+            elapsed = int(now - (deadline - fg_timeout))
+            await _emit(emit, f"Running... ({elapsed}s)")
+            last_status_at = now
+
+    # ── Fetch logs ──────────────────────────────────────────────
+    # NOTE: We intentionally do NOT delete the session here.
+    # Daytona session deletion kills all processes spawned within
+    # it, including children backgrounded with nohup/&. Since
+    # "nohup server & ... expose()" is the primary workflow for
+    # exposing services, deleting the session would silently kill
+    # the server the user just asked for. Sessions are lightweight
+    # and the sandbox itself is reaped on idle, so accumulation
+    # is not a practical concern.
+    logs_resp = await client.get(
+        _toolbox(valves, sandbox_id, f"/process/session/{session_id}/command/{session_cmd_id}/logs"),
+        headers=_headers(valves),
+        timeout=30.0,
+    )
+    result = logs_resp.text if logs_resp.status_code == 200 else ""
+
+    output, was_truncated, meta = _truncate_tail(result)
+
+    if not finished:
+        elapsed = int(time.time() - (deadline - fg_timeout))
+        return _format_bash_result(
+            output, exit_code, was_truncated, meta,
+            background_info={"elapsed": elapsed, "cmd_id": cmd_id},
+        )
+
+    # Command finished within foreground window
+    spill_path = log_path if was_truncated else None
+    return _format_bash_result(
+        output, exit_code, was_truncated, meta,
+        spill_path=spill_path,
+    )
+
+
 def _build_onboard_script(project_path: str) -> str:
     """Build a Python script that collects agent context from a sandbox.
 
@@ -837,252 +1286,71 @@ _DELEGATE_SYSTEM_PROMPT = textwrap.dedent("""\
 _DELEGATE_WITHHELD = {"lathe", "onboard", "expose", "destroy", "delegate"}
 
 
+_DELEGATE_BASH_FOREGROUND_SECONDS = 15
+
 def _build_delegate_tools(valves, sandbox_id: str, client: httpx.AsyncClient, user_pairs: list[tuple[str, str]]):
     """Build pydantic-ai Tool objects that operate against a resolved sandbox.
 
     Returns a list of Tool instances. Each tool is a thin closure over the
     already-resolved sandbox_id and client — no per-call sandbox lookup.
+    The closures delegate to the shared _core_* functions.
     """
     from pydantic_ai import Tool
 
     # ── bash ─────────────────────────────────────────────────────────
-    async def bash(command: str, workdir: str = "/home/daytona/workspace", timeout_seconds: int = 120) -> str:
-        """Execute a bash command in the sandbox.
-
-        Args:
-            command: The bash command to execute.
-            workdir: Working directory (default: /home/daytona/workspace).
-            timeout_seconds: Max seconds to wait (default: 120). Commands running longer are killed.
-        """
-        timeout_seconds = max(5, min(300, timeout_seconds))
-
-        user_env_lines = "".join(
-            f"export {k}={_shell_quote(v)}\n" for k, v in user_pairs
+    @_doc_from_core(_core_bash)
+    async def bash(command: str, workdir: str = "/home/daytona/workspace",
+                   foreground_seconds: int = _DELEGATE_BASH_FOREGROUND_SECONDS) -> str:
+        return await _core_bash(
+            valves, sandbox_id, client,
+            command=command,
+            workdir=workdir,
+            user_pairs=user_pairs,
+            foreground_seconds=foreground_seconds,
         )
-        script = (
-            "#!/usr/bin/env bash\n"
-            "set -e -o pipefail\n"
-            "export DEBIAN_FRONTEND=noninteractive "
-            "GIT_TERMINAL_PROMPT=0 "
-            "PIP_NO_INPUT=1 "
-            "NPM_CONFIG_YES=true "
-            "CI=true\n"
-            + user_env_lines
-            + command
-            + "\n"
-        )
-        resp = await client.post(
-            _toolbox(valves, sandbox_id, "/process/execute"),
-            headers=_headers(valves),
-            json={
-                "command": f"cd {_shell_quote(workdir)} && bash -c {_shell_quote(script)}",
-                "timeout": timeout_seconds * 1000,
-            },
-            timeout=float(timeout_seconds + 30),
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        result = data.get("result", "")
-        exit_code = data.get("exitCode", -1)
-
-        output, was_truncated, meta = _truncate_tail(result)
-
-        if exit_code != 0:
-            output = f"Exit code: {exit_code}\n{output}"
-
-        if not output.strip():
-            output = "(no output)"
-
-        if was_truncated:
-            start = meta["shown_start_line"]
-            end = meta["shown_end_line"]
-            total = meta["total_lines"]
-            output += f"\n\n[Truncated: showing lines {start}-{end} of {total}]"
-
-        return output
 
     # ── read ─────────────────────────────────────────────────────────
+    @_doc_from_core(_core_read)
     async def read(path: str, offset: int = 1, limit: int = 2000) -> str:
-        """Read a file from the sandbox. Returns numbered lines.
-
-        Args:
-            path: Absolute path to the file.
-            offset: Starting line number (1-indexed, default: 1).
-            limit: Max lines to return (default: 2000).
-        """
-        err = _require_abs_path(path)
-        if err:
-            return err
-        resp = await client.get(
-            _toolbox(valves, sandbox_id, "/files/download"),
-            params={"path": path},
-            headers=_headers(valves),
-            timeout=60.0,
+        return await _core_read(
+            valves, sandbox_id, client,
+            path=path, offset=offset, limit=limit,
         )
-        if resp.status_code == 404:
-            return f"Error: File not found: {path}"
-        resp.raise_for_status()
-        content = resp.text
-        lines = content.split("\n")
-        if lines and lines[-1] == "":
-            lines = lines[:-1]
-        total_lines = len(lines)
-        start_idx = max(0, offset - 1)
-        end_idx = start_idx + limit
-        selected = lines[start_idx:end_idx]
-        numbered = "\n".join(
-            f"{start_idx + i + 1}: {line}"
-            for i, line in enumerate(selected)
-        )
-        header = f"File: {path} ({total_lines} lines total)"
-        if start_idx > 0 or end_idx < total_lines:
-            header += f", showing lines {start_idx + 1}-{min(end_idx, total_lines)}"
-        return f"{header}\n{numbered}"
 
     # ── write ────────────────────────────────────────────────────────
+    @_doc_from_core(_core_write)
     async def write(path: str, content: str) -> str:
-        """Write a file to the sandbox (creates parents automatically).
-
-        Args:
-            path: Absolute path to write to.
-            content: The full file content.
-        """
-        err = _require_abs_path(path)
-        if err:
-            return err
-        parent = "/".join(path.rstrip("/").split("/")[:-1])
-        if parent:
-            await client.post(
-                _toolbox(valves, sandbox_id, "/files/folder"),
-                headers=_headers(valves),
-                json={"path": parent, "mode": "755"},
-                timeout=30.0,
-            )
-        content_bytes = content.encode("utf-8")
-        resp = await client.post(
-            _toolbox(valves, sandbox_id, "/files/upload"),
-            params={"path": path},
-            headers={"Authorization": f"Bearer {valves.daytona_api_key}"},
-            files={"file": ("file", io.BytesIO(content_bytes), "application/octet-stream")},
-            timeout=60.0,
+        return await _core_write(
+            valves, sandbox_id, client,
+            path=path, content=content,
         )
-        resp.raise_for_status()
-        n_bytes = len(content_bytes)
-        n_lines = content.count("\n") + (0 if content.endswith("\n") else 1)
-        return f"Wrote {n_bytes} bytes ({n_lines} lines) to {path}"
 
     # ── edit ─────────────────────────────────────────────────────────
+    @_doc_from_core(_core_edit)
     async def edit(path: str, old_string: str, new_string: str, replace_all: bool = False) -> str:
-        """Edit a file by exact string replacement.
-
-        Args:
-            path: Absolute path to the file.
-            old_string: Exact text to find.
-            new_string: Replacement text.
-            replace_all: Replace all occurrences (default: false).
-        """
-        err = _require_abs_path(path)
-        if err:
-            return err
-        resp = await client.get(
-            _toolbox(valves, sandbox_id, "/files/download"),
-            params={"path": path},
-            headers=_headers(valves),
-            timeout=60.0,
+        return await _core_edit(
+            valves, sandbox_id, client,
+            path=path, old_string=old_string, new_string=new_string,
+            replace_all=replace_all,
         )
-        if resp.status_code == 404:
-            return f"Error: File not found: {path}"
-        resp.raise_for_status()
-        content = resp.text
-        count = content.count(old_string)
-        if count == 0:
-            return f"Error: old_string not found in {path}"
-        if count > 1 and not replace_all:
-            return (
-                f"Error: Found {count} matches in {path}. "
-                f"Provide more context or set replace_all=true."
-            )
-        if replace_all:
-            new_content = content.replace(old_string, new_string)
-        else:
-            new_content = content.replace(old_string, new_string, 1)
-        content_bytes = new_content.encode("utf-8")
-        resp = await client.post(
-            _toolbox(valves, sandbox_id, "/files/upload"),
-            params={"path": path},
-            headers={"Authorization": f"Bearer {valves.daytona_api_key}"},
-            files={"file": ("file", io.BytesIO(content_bytes), "application/octet-stream")},
-            timeout=60.0,
-        )
-        resp.raise_for_status()
-        replaced = count if replace_all else 1
-        return f"Replaced {replaced} occurrence(s) in {path}"
 
     # ── glob ─────────────────────────────────────────────────────────
+    @_doc_from_core(_core_glob)
     async def glob(pattern: str, max_lines: int = _GLOB_MAX_LINES) -> str:
-        """Search for files by glob pattern in /home/daytona/workspace.
-
-        Args:
-            pattern: Comma-separated globs, !-prefix to exclude. Examples: '**/*.py', 'src/**/*.ts,!**/node_modules/**'.
-            max_lines: Max output lines (default: 100).
-        """
-        clamped = max(1, min(500, max_lines))
-        base_dir = "/home/daytona/workspace"
-        script = (
-            _GLOB_SCRIPT
-            + f"\nprint(glob_hierarchy({base_dir!r}, {pattern!r}, {clamped!r}))"
+        return await _core_glob(
+            valves, sandbox_id, client,
+            pattern=pattern, max_lines=max_lines,
         )
-        resp = await client.post(
-            _toolbox(valves, sandbox_id, "/process/execute"),
-            headers=_headers(valves),
-            json={"command": f"python3 -c {_shell_quote(script)}", "timeout": 30000},
-            timeout=60.0,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        result = data.get("result", "")
-        exit_code = data.get("exitCode", -1)
-        if exit_code != 0:
-            return f"Error: glob failed (exit {exit_code}).\n{result[:500]}"
-        return result
 
     # ── grep ─────────────────────────────────────────────────────────
+    @_doc_from_core(_core_grep)
     async def grep(pattern: str, files: str = "**/*", max_lines: int = _GREP_MAX_LINES) -> str:
-        """Search file contents by regex in /home/daytona/workspace.
-
-        Args:
-            pattern: Regex to search for (e.g. 'import.*asyncio', 'TODO|FIXME').
-            files: File scope as comma-separated globs (default: '**/*'). !-prefix to exclude.
-            max_lines: Max output lines (default: 100).
-        """
-        clamped = max(1, min(500, max_lines))
-        base_dir = "/home/daytona/workspace"
-        script = (
-            _GREP_SCRIPT
-            + f"\nprint(grep_hierarchy({base_dir!r}, {pattern!r}, {files!r}, {clamped!r}))"
+        return await _core_grep(
+            valves, sandbox_id, client,
+            pattern=pattern, files=files, max_lines=max_lines,
         )
-        resp = await client.post(
-            _toolbox(valves, sandbox_id, "/process/execute"),
-            headers=_headers(valves),
-            json={"command": f"python3 -c {_shell_quote(script)}", "timeout": 30000},
-            timeout=60.0,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        result = data.get("result", "")
-        exit_code = data.get("exitCode", -1)
-        if exit_code != 0:
-            return f"Error: grep failed (exit {exit_code}).\n{result[:500]}"
-        return result
 
-    return [
-        Tool(bash, takes_ctx=False),
-        Tool(read, takes_ctx=False),
-        Tool(write, takes_ctx=False),
-        Tool(edit, takes_ctx=False),
-        Tool(glob, takes_ctx=False, name="glob"),
-        Tool(grep, takes_ctx=False, name="grep"),
-    ]
+    return [Tool(f) for f in (bash, read, write, edit, glob, grep)]
 
 
 VOLUME_MOUNT_PATH = "/home/daytona/volume"
@@ -2019,6 +2287,7 @@ class Tools:
 
         return await _tool_context(__event_emitter__, _run)
 
+    @_doc_from_core(_core_bash)
     async def bash(
         self,
         command: str,
@@ -2027,16 +2296,6 @@ class Tools:
         __user__: dict = {},
         __event_emitter__=None,
     ) -> str:
-        """
-        Execute a bash command in the persistent Linux sandbox. Non-interactive only.
-        Commands that finish within the foreground window return output directly.
-        Long-running commands auto-background and return a descriptor with log
-        file paths for monitoring.
-        If you have not read the manual yet, call lathe(manpage="overview") first.
-        :param command: The bash command to execute.
-        :param workdir: Working directory (default: /home/daytona/workspace).
-        :param foreground_seconds: Seconds to wait before auto-backgrounding (default: per admin setting, usually 30). Use higher values when waiting for a known-slow command to finish.
-        """
         async def _run(client):
             email = _get_email(__user__)
             sandbox_id, _sb_warning = await _ensure_sandbox(self.valves, email, client, __event_emitter__)
@@ -2051,206 +2310,27 @@ class Tools:
                 raw_env = getattr(user_valves, "env_vars", "") or ""
                 user_pairs = _parse_env_vars(raw_env)
 
-            # ── Build wrapper script ────────────────────────────────
-            #
-            # Each command gets a /proc-style directory under /tmp/cmd/:
-            #   /tmp/cmd/<uuid>/sh    — the wrapper script
-            #   /tmp/cmd/<uuid>/pid   — wrapper process ID (written before exec; kill to stop the job)
-            #   /tmp/cmd/<uuid>/log   — stdout+stderr (tee'd live)
-            #   /tmp/cmd/<uuid>/exit  — exit code (written on completion)
-            cmd_id = str(uuid.uuid4())
-            cmd_dir = f"/tmp/cmd/{cmd_id}"
-            log_path = f"{cmd_dir}/log"
-            pid_path = f"{cmd_dir}/pid"
-            exit_path = f"{cmd_dir}/exit"
-            script_path = f"{cmd_dir}/sh"
-
-            user_env_lines = "".join(
-                f"export {k}={_shell_quote(v)}\n" for k, v in user_pairs
-            )
-            script = (
-                "#!/usr/bin/env bash\n"
-                "set -e -o pipefail\n"
-                "export DEBIAN_FRONTEND=noninteractive "
-                "GIT_TERMINAL_PROMPT=0 "
-                "PIP_NO_INPUT=1 "
-                "NPM_CONFIG_YES=true "
-                "CI=true\n"
-                + user_env_lines
-                + f"echo $BASHPID > {_shell_quote(pid_path)}\n"
-                + f"exec > >(tee {_shell_quote(log_path)}) 2>&1\n"
-                + command
-                + "\n"
-            )
-
-            # Upload the script (creates parent dirs automatically)
-            await client.post(
-                _toolbox(self.valves, sandbox_id, "/files/upload"),
-                params={"path": script_path},
-                headers={"Authorization": f"Bearer {self.valves.daytona_api_key}"},
-                files={"file": ("file", io.BytesIO(script.encode("utf-8")), "application/octet-stream")},
-                timeout=60.0,
-            )
-
-            # ── Create a per-command session ─────────────────────────
-            # Each bash() call gets its own session so commands never
-            # queue behind each other.  This is critical: a shared
-            # session serialises commands, so monitoring a backgrounded
-            # build via tail/cat would block until the build finishes.
-            session_id = f"lathe-cmd-{cmd_id}"
-            resp = await client.post(
-                _toolbox(self.valves, sandbox_id, f"/process/session"),
-                headers=_headers(self.valves),
-                json={"sessionId": session_id},
-                timeout=30.0,
-            )
-            if resp.status_code not in (200, 409):
-                resp.raise_for_status()
-
-            # ── Execute asynchronously in the session ────────────────
-            # The actual command writes exit code to a sidecar file so
-            # the agent can check completion even after backgrounding.
-            # Session exec has no cwd parameter, so we cd explicitly.
-            exec_command = (
-                f"cd {_shell_quote(workdir)} && "
-                f"bash {script_path}; EC=$?; "
-                f"echo $EC > {_shell_quote(exit_path)}; "
-                f"(exit $EC)"
-            )
-            resp = await client.post(
-                _toolbox(self.valves, sandbox_id, f"/process/session/{session_id}/exec"),
-                headers=_headers(self.valves),
-                json={
-                    "command": exec_command,
-                    "runAsync": True,
-                },
-                timeout=30.0,
-            )
-            resp.raise_for_status()
-            session_cmd_id = resp.json().get("cmdId", "")
-
-            # ── Foreground polling window ────────────────────────────
             # Per-call override wins; 0 (default) falls back to Valve.
-            fg_timeout = max(1, min(300,
+            fg_seconds = (
                 foreground_seconds if foreground_seconds > 0
-                else self.valves.foreground_timeout_seconds))
-            deadline = time.time() + fg_timeout
-            poll_interval = 0.25
-            last_status_at = time.time()
-            finished = False
-            exit_code = None
-
-            while time.time() < deadline:
-                await asyncio.sleep(poll_interval)
-                poll_interval = min(poll_interval * 1.5, 2.0)
-
-                # Check command status via session info
-                resp = await client.get(
-                    _toolbox(self.valves, sandbox_id, f"/process/session/{session_id}"),
-                    headers=_headers(self.valves),
-                    timeout=15.0,
-                )
-                if resp.status_code != 200:
-                    continue
-                session_info = resp.json()
-                commands = session_info.get("commands", [])
-
-                # Find our command by id
-                for cmd in commands:
-                    if cmd.get("id") == session_cmd_id:
-                        ec = cmd.get("exitCode")
-                        if ec is not None:
-                            exit_code = ec
-                            finished = True
-                        break
-
-                if finished:
-                    break
-
-                # Emit progress every ~5s
-                now = time.time()
-                if now - last_status_at >= 5.0:
-                    elapsed = int(now - (deadline - fg_timeout))
-                    await _emit(__event_emitter__, f"Running... ({elapsed}s)")
-                    last_status_at = now
-
-            # ── Fetch logs and clean up session ─────────────────────
-            logs_resp = await client.get(
-                _toolbox(self.valves, sandbox_id, f"/process/session/{session_id}/command/{session_cmd_id}/logs"),
-                headers=_headers(self.valves),
-                timeout=30.0,
+                else self.valves.foreground_timeout_seconds
             )
-            result = logs_resp.text if logs_resp.status_code == 200 else ""
 
-            # NOTE: We intentionally do NOT delete the session here.
-            # Daytona session deletion kills all processes spawned within
-            # it, including children backgrounded with nohup/&. Since
-            # "nohup server & ... expose()" is the primary workflow for
-            # exposing services, deleting the session would silently kill
-            # the server the user just asked for. Sessions are lightweight
-            # and the sandbox itself is reaped on idle, so accumulation
-            # is not a practical concern.
-
-            # ── Auto-backgrounded: command still running ────────────
-            if not finished:
-                elapsed = int(time.time() - (deadline - fg_timeout))
-                await _emit(__event_emitter__, f"Command backgrounded ({elapsed}s)", done=True)
-
-                # Return partial output + background descriptor
-                output, was_truncated, meta = _truncate_tail(result)
-                if not output.strip():
-                    output = "(no output yet)"
-
-                bg_notice = (
-                    f"\n\n[Backgrounded after {elapsed}s — command is still running]\n"
-                    f"CMD={cmd_id}\n"
-                    f"Ref /tmp/cmd/$CMD/{{sh,pid,log,exit}}\n"
-                    f"See lathe(manpage=\"background\") for peek/poll/kill recipes.\n"
-                    f"Tell the user the command is running. Don't poll until they ask or "
-                    f"you have a concrete reason to expect completion."
-                )
-                return _prepend_warning(output + bg_notice, _sb_warning)
-
-            # ── Command finished within foreground window ────────────
-            output, was_truncated, meta = _truncate_tail(result)
-            spill_path = None
-
-            if was_truncated:
-                # The log file already exists on disk (tee'd by the
-                # wrapper script), so just point at it — no upload needed.
-                spill_path = log_path
+            result = await _core_bash(
+                self.valves, sandbox_id, client,
+                command=command,
+                workdir=workdir,
+                user_pairs=user_pairs,
+                foreground_seconds=fg_seconds,
+                emit=__event_emitter__,
+            )
 
             await _emit(__event_emitter__, "Command complete", done=True)
-
-            # ── Format the return value ─────────────────────────────
-            if exit_code != 0:
-                output = f"Exit code: {exit_code}\n{output}"
-
-            if not output.strip():
-                output = "(no output)"
-
-            if was_truncated and spill_path:
-                start = meta["shown_start_line"]
-                end = meta["shown_end_line"]
-                total = meta["total_lines"]
-                total_size = _human_size(meta["total_bytes"])
-                if meta["truncated_by"] == "lines":
-                    notice = (
-                        f"\n\n[Showing lines {start}-{end} of {total}. "
-                        f"Full output ({total_size}): {spill_path}]"
-                    )
-                else:
-                    notice = (
-                        f"\n\n[Showing lines {start}-{end} of {total} "
-                        f"({_human_size(_MAX_BYTES)} limit, full output is {total_size}). "
-                        f"Full output: {spill_path}]"
-                    )
-                output += notice
-
-            return _prepend_warning(output, _sb_warning)
+            return _prepend_warning(result, _sb_warning)
 
         return await _tool_context(__event_emitter__, _run)
 
+    @_doc_from_core(_core_read)
     async def read(
         self,
         path: str,
@@ -2259,58 +2339,20 @@ class Tools:
         __user__: dict = {},
         __event_emitter__=None,
     ) -> str:
-        """
-        Read a file from the sandbox. Returns numbered lines.
-        :param path: Absolute path (e.g. /home/daytona/workspace/main.py).
-        :param offset: Starting line number (1-indexed, default: 1).
-        :param limit: Max lines to return (default: 2000).
-        """
         async def _run(client):
-            err = _require_abs_path(path)
-            if err:
-                return err
             email = _get_email(__user__)
             sandbox_id, _sb_warning = await _ensure_sandbox(self.valves, email, client, __event_emitter__)
-
             await _emit(__event_emitter__, f"Reading {path}...")
-
-            resp = await client.get(
-                _toolbox(self.valves, sandbox_id, "/files/download"),
-                params={"path": path},
-                headers=_headers(self.valves),
-                timeout=60.0,
+            result = await _core_read(
+                self.valves, sandbox_id, client,
+                path=path, offset=offset, limit=limit,
             )
-
-            if resp.status_code == 404:
-                await _emit(__event_emitter__, "File not found", done=True)
-                return f"Error: File not found: {path}"
-
-            resp.raise_for_status()
-            content = resp.text
-
-            lines = content.split("\n")
-            if lines and lines[-1] == "":
-                lines = lines[:-1]
-
-            total_lines = len(lines)
-            start_idx = max(0, offset - 1)
-            end_idx = start_idx + limit
-            selected = lines[start_idx:end_idx]
-
-            numbered = "\n".join(
-                f"{start_idx + i + 1}: {line}"
-                for i, line in enumerate(selected)
-            )
-
             await _emit(__event_emitter__, "Read complete", done=True)
-
-            header = f"File: {path} ({total_lines} lines total)"
-            if start_idx > 0 or end_idx < total_lines:
-                header += f", showing lines {start_idx + 1}-{min(end_idx, total_lines)}"
-            return _prepend_warning(f"{header}\n{numbered}", _sb_warning)
+            return _prepend_warning(result, _sb_warning)
 
         return await _tool_context(__event_emitter__, _run)
 
+    @_doc_from_core(_core_glob)
     async def glob(
         self,
         pattern: str,
@@ -2318,50 +2360,20 @@ class Tools:
         __user__: dict = {},
         __event_emitter__=None,
     ) -> str:
-        """
-        Search for files in the sandbox workspace by glob pattern.
-        Returns a hierarchical listing of matches with absolute paths.
-        Dense directories are collapsed with match counts; narrow the
-        pattern or increase max_lines to expand them.
-        :param pattern: Comma-separated glob patterns relative to /home/daytona/workspace. Prefix with ! to exclude. Examples: '**/*.py', 'src/**/*.ts,src/**/*.tsx', '**/*,!**/node_modules/**,!**/.git/**'.
-        :param max_lines: Maximum output lines (default: 100). Increase to see more detail.
-        """
         async def _run(client):
             email = _get_email(__user__)
             sandbox_id, _sb_warning = await _ensure_sandbox(self.valves, email, client, __event_emitter__)
-
             await _emit(__event_emitter__, f"Searching for {pattern}...")
-
-            clamped = max(1, min(500, max_lines))
-            base_dir = "/home/daytona/workspace"
-            script = (
-                _GLOB_SCRIPT
-                + f"\nprint(glob_hierarchy({base_dir!r}, {pattern!r}, {clamped!r}))"
+            result = await _core_glob(
+                self.valves, sandbox_id, client,
+                pattern=pattern, max_lines=max_lines,
             )
-
-            resp = await client.post(
-                _toolbox(self.valves, sandbox_id, "/process/execute"),
-                headers=_headers(self.valves),
-                json={"command": f"python3 -c {_shell_quote(script)}", "timeout": 30000},
-                timeout=60.0,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            result = data.get("result", "")
-            exit_code = data.get("exitCode", -1)
-
-            if exit_code != 0:
-                await _emit(__event_emitter__, "Search failed", done=True)
-                return _prepend_warning(
-                    f"Error: glob script failed (exit {exit_code}).\n{result[:500]}",
-                    _sb_warning,
-                )
-
             await _emit(__event_emitter__, "Search complete", done=True)
             return _prepend_warning(result, _sb_warning)
 
         return await _tool_context(__event_emitter__, _run)
 
+    @_doc_from_core(_core_grep)
     async def grep(
         self,
         pattern: str,
@@ -2370,51 +2382,20 @@ class Tools:
         __user__: dict = {},
         __event_emitter__=None,
     ) -> str:
-        """
-        Search file contents in the sandbox workspace by regex.
-        Returns matches grouped by file with line numbers. Dense
-        directories and files are collapsed with match counts;
-        narrow the file scope or increase max_lines to expand them.
-        :param pattern: Regex pattern to search for (e.g. 'import.*asyncio', 'TODO|FIXME', 'class\\s+\\w+').
-        :param files: File scope as comma-separated globs with optional !-prefix exclusion (default: '**/*'). Examples: '**/*.py', 'src/**/*.ts,!**/*.test.ts'.
-        :param max_lines: Maximum output lines (default: 100). Increase to see more detail.
-        """
         async def _run(client):
             email = _get_email(__user__)
             sandbox_id, _sb_warning = await _ensure_sandbox(self.valves, email, client, __event_emitter__)
-
             await _emit(__event_emitter__, f"Searching for {pattern!r}...")
-
-            clamped = max(1, min(500, max_lines))
-            base_dir = "/home/daytona/workspace"
-            script = (
-                _GREP_SCRIPT
-                + f"\nprint(grep_hierarchy({base_dir!r}, {pattern!r}, {files!r}, {clamped!r}))"
+            result = await _core_grep(
+                self.valves, sandbox_id, client,
+                pattern=pattern, files=files, max_lines=max_lines,
             )
-
-            resp = await client.post(
-                _toolbox(self.valves, sandbox_id, "/process/execute"),
-                headers=_headers(self.valves),
-                json={"command": f"python3 -c {_shell_quote(script)}", "timeout": 30000},
-                timeout=60.0,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            result = data.get("result", "")
-            exit_code = data.get("exitCode", -1)
-
-            if exit_code != 0:
-                await _emit(__event_emitter__, "Search failed", done=True)
-                return _prepend_warning(
-                    f"Error: grep script failed (exit {exit_code}).\n{result[:500]}",
-                    _sb_warning,
-                )
-
             await _emit(__event_emitter__, "Search complete", done=True)
             return _prepend_warning(result, _sb_warning)
 
         return await _tool_context(__event_emitter__, _run)
 
+    @_doc_from_core(_core_write)
     async def write(
         self,
         path: str,
@@ -2422,48 +2403,20 @@ class Tools:
         __user__: dict = {},
         __event_emitter__=None,
     ) -> str:
-        """
-        Write a file to the sandbox (created if it doesn't exist, parents auto-created).
-        :param path: Absolute path (e.g. /home/daytona/workspace/main.py).
-        :param content: The full file content to write.
-        """
         async def _run(client):
-            err = _require_abs_path(path)
-            if err:
-                return err
             email = _get_email(__user__)
             sandbox_id, _sb_warning = await _ensure_sandbox(self.valves, email, client, __event_emitter__)
-
             await _emit(__event_emitter__, f"Writing {path}...")
-
-            parent = "/".join(path.rstrip("/").split("/")[:-1])
-            if parent:
-                await client.post(
-                    _toolbox(self.valves, sandbox_id, "/files/folder"),
-                    headers=_headers(self.valves),
-                    json={"path": parent, "mode": "755"},
-                    timeout=30.0,
-                )
-
-            content_bytes = content.encode("utf-8")
-            resp = await client.post(
-                _toolbox(self.valves, sandbox_id, "/files/upload"),
-                params={"path": path},
-                headers={
-                    "Authorization": f"Bearer {self.valves.daytona_api_key}",
-                },
-                files={"file": ("file", io.BytesIO(content_bytes), "application/octet-stream")},
-                timeout=60.0,
+            result = await _core_write(
+                self.valves, sandbox_id, client,
+                path=path, content=content,
             )
-            resp.raise_for_status()
-
-            n_bytes = len(content_bytes)
-            n_lines = content.count("\n") + (0 if content.endswith("\n") else 1)
             await _emit(__event_emitter__, "Write complete", done=True)
-            return _prepend_warning(f"Wrote {n_bytes} bytes ({n_lines} lines) to {path}", _sb_warning)
+            return _prepend_warning(result, _sb_warning)
 
         return await _tool_context(__event_emitter__, _run)
 
+    @_doc_from_core(_core_edit)
     async def edit(
         self,
         path: str,
@@ -2473,70 +2426,17 @@ class Tools:
         __user__: dict = {},
         __event_emitter__=None,
     ) -> str:
-        """
-        Edit a file by exact string replacement. Fails on ambiguous matches unless replace_all=true.
-        :param path: Absolute path (e.g. /home/daytona/workspace/main.py).
-        :param old_string: Exact text to find (must match including whitespace).
-        :param new_string: The replacement text.
-        :param replace_all: Replace all occurrences (default: false).
-        """
         async def _run(client):
-            err = _require_abs_path(path)
-            if err:
-                return err
             email = _get_email(__user__)
             sandbox_id, _sb_warning = await _ensure_sandbox(self.valves, email, client, __event_emitter__)
-
             await _emit(__event_emitter__, f"Editing {path}...")
-
-            resp = await client.get(
-                _toolbox(self.valves, sandbox_id, "/files/download"),
-                params={"path": path},
-                headers=_headers(self.valves),
-                timeout=60.0,
+            result = await _core_edit(
+                self.valves, sandbox_id, client,
+                path=path, old_string=old_string, new_string=new_string,
+                replace_all=replace_all,
             )
-
-            if resp.status_code == 404:
-                await _emit(__event_emitter__, "File not found", done=True)
-                return f"Error: File not found: {path}"
-
-            resp.raise_for_status()
-            content = resp.text
-
-            count = content.count(old_string)
-
-            if count == 0:
-                await _emit(__event_emitter__, "No match found", done=True)
-                return f"Error: old_string not found in {path}"
-
-            if count > 1 and not replace_all:
-                await _emit(__event_emitter__, "Multiple matches", done=True)
-                return (
-                    f"Error: Found {count} matches for old_string in {path}. "
-                    f"Provide more surrounding context to identify a unique match, "
-                    f"or set replace_all=true to replace all occurrences."
-                )
-
-            if replace_all:
-                new_content = content.replace(old_string, new_string)
-            else:
-                new_content = content.replace(old_string, new_string, 1)
-
-            content_bytes = new_content.encode("utf-8")
-            resp = await client.post(
-                _toolbox(self.valves, sandbox_id, "/files/upload"),
-                params={"path": path},
-                headers={
-                    "Authorization": f"Bearer {self.valves.daytona_api_key}",
-                },
-                files={"file": ("file", io.BytesIO(content_bytes), "application/octet-stream")},
-                timeout=60.0,
-            )
-            resp.raise_for_status()
-
-            replaced = count if replace_all else 1
             await _emit(__event_emitter__, "Edit complete", done=True)
-            return _prepend_warning(f"Replaced {replaced} occurrence(s) in {path}", _sb_warning)
+            return _prepend_warning(result, _sb_warning)
 
         return await _tool_context(__event_emitter__, _run)
 
