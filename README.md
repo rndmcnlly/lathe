@@ -8,7 +8,7 @@ A single-file Open WebUI toolkit that gives any model a coding agent's tool surf
 
 Lathe registers eleven tools that models can call in [Native function calling mode](https://docs.openwebui.com/features/extensibility/plugin/tools/). When a user's model calls a tool, Lathe creates, starts, or resumes a cloud sandbox VM via the Daytona control plane and toolbox APIs. All sandbox operations go outbound from your OWUI server.
 
-No OWUI internals are touched. The toolkit does not import `open_webui.*`, does not use OWUI file storage, and does not modify models, prompts, users, or other configuration. Its only runtime dependency is `httpx`.
+No OWUI internals are touched. The toolkit does not import `open_webui.*`, does not use OWUI file storage, and does not modify models, prompts, users, or other configuration. Its runtime dependencies are `httpx` and `pydantic-ai-slim[openai]`.
 
 ## Security and trust model
 
