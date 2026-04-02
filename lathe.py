@@ -2061,6 +2061,13 @@ class Tools:
               for known-slow commands or when waiting for a backgrounded command to
               finish). The command keeps running even after backgrounding.
               See lathe(manpage="background") for peek/poll/kill recipes.
+            - Do NOT use shell-level & + wait to parallelize work inside a single
+              bash() call. Each bash() call already gets its own independent session,
+              so the right way to parallelize is to make multiple bash() tool calls
+              simultaneously at the agent level. Shell-level & + wait adds no
+              benefit and risks tripping the foreground timeout on the wait builtin,
+              producing an alarming background descriptor even when the real work
+              is already done.
             - bash() output is truncated to the last 2000 lines / 50 KB. If
               truncated, the full output is available in the log file at
               /tmp/cmd/<id>/log — use read() to inspect specific sections.
