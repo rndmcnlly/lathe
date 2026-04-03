@@ -415,6 +415,49 @@ async def test_glob_script(R: Results):
         R.check("negation counts conserved", accounted == total,
                 f"accounted {accounted} vs header {total}")
 
+        # ── Absolute pattern under base is silently relativized ──
+        print("\n── glob_script: absolute pattern relativized ──")
+        # A model that knows the workspace root naturally uses absolute
+        # paths like /tmp/something/**/*.py.  The fix should strip the
+        # base prefix and produce the same result as the relative form.
+        # Use the resolved path because Path.resolve() normalises symlinks
+        # (e.g. /var -> /private/var on macOS), matching what the script
+        # itself does when it calls Path(base_dir).resolve().
+        import pathlib as _pathlib
+        abs_pattern = str(_pathlib.Path(tmp).resolve()) + "/**/*.py"
+        rel_pattern = "**/*.py"
+        out_abs = run_glob(tmp, abs_pattern, 100)
+        out_rel = run_glob(tmp, rel_pattern, 100)
+        R.check("abs pattern no script error",
+                not out_abs.startswith("SCRIPT ERROR") and not out_abs.startswith("Error:"),
+                out_abs[:200])
+        R.check("abs pattern matches same count as relative",
+                parse_header(out_abs) == parse_header(out_rel),
+                f"abs={parse_header(out_abs)}, rel={parse_header(out_rel)}")
+
+        # ── Absolute pattern outside base works ─────────────────
+        print("\n── glob_script: absolute pattern outside base ──")
+        # Create a sibling directory outside the "workspace" tmp dir
+        # and verify we can glob into it with an absolute pattern.
+        import pathlib as _pathlib2
+        sibling = tempfile.mkdtemp()
+        try:
+            open(os.path.join(sibling, "outside.py"), "w").close()
+            resolved_sibling = str(_pathlib2.Path(sibling).resolve())
+            out_outside = run_glob(tmp, resolved_sibling + "/**/*.py", 100)
+            R.check("outside-base pattern no error",
+                    not out_outside.startswith("SCRIPT ERROR") and not out_outside.startswith("Error:"),
+                    out_outside[:200])
+            R.check("outside-base finds file",
+                    parse_header(out_outside) == 1,
+                    out_outside.split("\n")[0])
+            R.check("outside-base shows absolute path",
+                    "outside.py" in out_outside,
+                    out_outside)
+        finally:
+            import shutil
+            shutil.rmtree(sibling)
+
 
 async def test_grep_script(R: Results):
     from lathe import _GREP_SCRIPT
@@ -584,6 +627,45 @@ async def test_grep_script(R: Results):
         content_part = lines[0].split(": ", 1)[1] if ": " in lines[0] else lines[0]
         R.check("truncated within limit", len(content_part) <= 210,
                 f"got {len(content_part)}")
+
+        # ── Absolute files pattern under base is relativized ─────
+        print("\n── grep_script: absolute files pattern relativized ──")
+        # Use the resolved path (see glob test comment above).
+        import pathlib as _pathlib
+        abs_files = str(_pathlib.Path(tmp).resolve()) + "/**/*.py"
+        rel_files = "**/*.py"
+        out_abs = run_grep(tmp, "def ", abs_files, 100)
+        out_rel = run_grep(tmp, "def ", rel_files, 100)
+        R.check("abs files pattern no script error",
+                not out_abs.startswith("SCRIPT ERROR") and not out_abs.startswith("Error:"),
+                out_abs[:200])
+        R.check("abs files pattern matches same count as relative",
+                parse_header_matches(out_abs) == parse_header_matches(out_rel),
+                f"abs={parse_header_matches(out_abs)}, rel={parse_header_matches(out_rel)}")
+
+        # ── Absolute files pattern outside base works ────────────
+        print("\n── grep_script: absolute files pattern outside base ──")
+        # Create a sibling directory outside the "workspace" tmp dir
+        # and verify we can grep into it with an absolute files pattern.
+        import pathlib as _pathlib2
+        sibling = tempfile.mkdtemp()
+        try:
+            with open(os.path.join(sibling, "outside.py"), "w") as f:
+                f.write("def outside_func():\n    pass\n")
+            resolved_sibling = str(_pathlib2.Path(sibling).resolve())
+            out_outside = run_grep(tmp, "def ", resolved_sibling + "/**/*.py", 100)
+            R.check("outside-base files pattern no error",
+                    not out_outside.startswith("SCRIPT ERROR") and not out_outside.startswith("Error:"),
+                    out_outside[:200])
+            R.check("outside-base grep finds match",
+                    parse_header_matches(out_outside) == 1,
+                    out_outside.split("\n")[0])
+            R.check("outside-base grep shows file",
+                    "outside.py" in out_outside,
+                    out_outside)
+        finally:
+            import shutil
+            shutil.rmtree(sibling)
 
 
 async def test_delegate_infrastructure(R: Results):

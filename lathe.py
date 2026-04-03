@@ -278,15 +278,44 @@ def glob_hierarchy(base_dir, pattern, max_lines):
         return f"Error: pattern must include at least one positive glob (got {pattern!r})"
 
     # ── Exhaustive glob ──────────────────────────────────────────
-    base_prefix = str(base) + os.sep
+
+    def _resolve_glob(g):
+        """Return (root, relative_pattern) for a glob term.
+
+        Python 3.14 rejects non-relative patterns in Path.glob().
+        For relative patterns, root is the workspace base.
+        For absolute patterns, we extract the longest non-glob prefix
+        as the root and glob relative to it — so the agent can glob
+        anywhere on the filesystem, not just within the workspace.
+        """
+        if not g.startswith("/"):
+            return base, g
+        # Walk the path components; the root is everything before the
+        # first component containing a glob metacharacter.
+        parts = g.split(os.sep)  # ['', 'home', 'daytona', '**', '*.py']
+        root_parts = []
+        for i, part in enumerate(parts):
+            if any(c in part for c in ("*", "?", "[", "{")):
+                break
+            root_parts.append(part)
+        else:
+            # No glob chars at all — pattern is a literal absolute path.
+            # Treat as "glob everything under this directory".
+            root_dir = Path(g).resolve()
+            return root_dir, "**/*"
+        root_dir = Path(os.sep.join(root_parts) or os.sep).resolve()
+        rel = os.sep.join(parts[i:])
+        return root_dir, rel
 
     def _collect(globs):
         result = set()
         for g in globs:
-            for p in base.glob(g):
-                s = str(p.resolve())
-                if p.is_file() and s.startswith(base_prefix):
-                    result.add(s)
+            root, rel = _resolve_glob(g)
+            if not root.is_dir():
+                continue
+            for p in root.glob(rel):
+                if p.is_file():
+                    result.add(str(p.resolve()))
         return result
 
     included = _collect(positive)
@@ -297,11 +326,23 @@ def glob_hierarchy(base_dir, pattern, max_lines):
     if not matches:
         return f"0 matches for {pattern!r} in {base}"
 
+    # ── Compute effective base for trie rendering ────────────────
+    # When all results are under the workspace, effective_base == base.
+    # When results span other directories, effective_base is their
+    # longest common directory prefix, so the trie stays coherent.
+    if all(m.startswith(str(base) + os.sep) for m in matches):
+        effective_base = str(base)
+    else:
+        effective_base = os.path.commonpath(matches)
+        # commonpath may return a file prefix — ensure it's a directory
+        if not os.path.isdir(effective_base):
+            effective_base = os.path.dirname(effective_base)
+
     # ── Build trie ───────────────────────────────────────────────
-    root = {"children": {}, "files": [], "count": 0, "path": str(base)}
+    root = {"children": {}, "files": [], "count": 0, "path": effective_base}
 
     for filepath in matches:
-        rel = os.path.relpath(filepath, base)
+        rel = os.path.relpath(filepath, effective_base)
         parts = rel.split(os.sep)
         node = root
         node["count"] += 1
@@ -418,7 +459,7 @@ def glob_hierarchy(base_dir, pattern, max_lines):
 
     render(root)
 
-    header = f"{len(matches)} matches for {pattern!r} in {base}"
+    header = f"{len(matches)} matches for {pattern!r} in {effective_base}"
     has_collapsed = bool(list(_collapsible(root))) or bool(partial_limit)
     if has_collapsed:
         header += f" (budget: {max_lines} lines, some directories collapsed)"
@@ -476,15 +517,40 @@ def grep_hierarchy(base_dir, regex, files_pattern, max_lines):
         return f"Error: files pattern must include at least one positive glob (got {files_pattern!r})"
 
     # ── Collect files ────────────────────────────────────────────
-    base_prefix = str(base) + os.sep
+
+    def _resolve_glob(g):
+        """Return (root, relative_pattern) for a glob term.
+
+        Python 3.14 rejects non-relative patterns in Path.glob().
+        For relative patterns, root is the workspace base.
+        For absolute patterns, we extract the longest non-glob prefix
+        as the root and glob relative to it — so the agent can search
+        anywhere on the filesystem, not just within the workspace.
+        """
+        if not g.startswith("/"):
+            return base, g
+        parts = g.split(os.sep)
+        root_parts = []
+        for i, part in enumerate(parts):
+            if any(c in part for c in ("*", "?", "[", "{")):
+                break
+            root_parts.append(part)
+        else:
+            root_dir = Path(g).resolve()
+            return root_dir, "**/*"
+        root_dir = Path(os.sep.join(root_parts) or os.sep).resolve()
+        rel = os.sep.join(parts[i:])
+        return root_dir, rel
 
     def _collect(globs):
         result = set()
         for g in globs:
-            for p in base.glob(g):
-                s = str(p.resolve())
-                if p.is_file() and s.startswith(base_prefix):
-                    result.add(s)
+            root, rel = _resolve_glob(g)
+            if not root.is_dir():
+                continue
+            for p in root.glob(rel):
+                if p.is_file():
+                    result.add(str(p.resolve()))
         return result
 
     included = _collect(positive)
@@ -518,14 +584,23 @@ def grep_hierarchy(base_dir, regex, files_pattern, max_lines):
     if not file_matches:
         return f"0 matches for {regex!r} in {len(files)} files"
 
+    # ── Compute effective base for trie rendering ────────────────
+    matched_paths = list(file_matches.keys())
+    if all(m.startswith(str(base) + os.sep) for m in matched_paths):
+        effective_base = str(base)
+    else:
+        effective_base = os.path.commonpath(matched_paths)
+        if not os.path.isdir(effective_base):
+            effective_base = os.path.dirname(effective_base)
+
     # ── Build trie of files with matches ─────────────────────────
     root = {
-        "children": {}, "files": {}, "path": str(base),
+        "children": {}, "files": {}, "path": effective_base,
         "n_files": 0, "n_matches": 0,
     }
 
     for filepath, hits in sorted(file_matches.items()):
-        rel = os.path.relpath(filepath, base)
+        rel = os.path.relpath(filepath, effective_base)
         parts = rel.split(os.sep)
         node = root
         node["n_files"] += 1
