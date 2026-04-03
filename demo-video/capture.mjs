@@ -599,6 +599,23 @@ try {
   log("done", "Capture complete");
   await page.waitForTimeout(1000);
 
+  // Delete the recorded conversation on success — leave it on failure
+  // so we can inspect the rubble.
+  if (chatUrl) {
+    const chatId = chatUrl.match(/\/c\/([a-f0-9-]+)/)?.[1];
+    if (chatId) {
+      try {
+        await fetch(`${OWUI_URL}/api/v1/chats/${chatId}`, {
+          method: "DELETE",
+          headers: { Authorization: `Bearer ${token}` },
+        });
+        log("cleanup", `Deleted demo chat ${chatId}`);
+      } catch (err) {
+        log("cleanup", `Failed to delete demo chat: ${err.message}`);
+      }
+    }
+  }
+
 } finally {
   const video = page.video();
   await context.close();
