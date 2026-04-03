@@ -5,7 +5,7 @@ author_url: https://adamsmith.as
 description: Coding agent tools (lathe, bash, read, write, edit, glob, grep, delegate, onboard, expose, destroy) backed by per-user sandbox VMs with transparent lifecycle management.
 required_open_webui_version: 0.4.0
 requirements: httpx, pydantic-ai-slim[openai]
-version: 0.13.0
+version: 0.14.0
 licence: MIT
 """
 
@@ -812,6 +812,8 @@ async def _core_read(valves, sandbox_id: str, client: httpx.AsyncClient, *,
     )
     if resp.status_code == 404:
         return f"Error: File not found: {path}"
+    if resp.status_code == 400:
+        return f"Error: Bad request reading {path} (is it a directory?)"
     resp.raise_for_status()
     content = resp.text
     lines = content.split("\n")
@@ -1314,6 +1316,46 @@ def _build_onboard_script(project_path: str) -> str:
 
 
 # ── delegate() sub-agent infrastructure ─────────────────────────────
+
+# Default foreground wait for delegate() before auto-backgrounding.
+_DELEGATE_FOREGROUND_SECONDS = 30
+
+
+async def _sandbox_write_file(valves, sandbox_id: str, client: httpx.AsyncClient,
+                               path: str, content: str):
+    """Write a small file to the sandbox. Creates parent dirs. Fire-and-forget safe."""
+    parent = "/".join(path.rstrip("/").split("/")[:-1])
+    if parent:
+        await client.post(
+            _toolbox(valves, sandbox_id, "/files/folder"),
+            headers=_headers(valves),
+            json={"path": parent, "mode": "755"},
+            timeout=30.0,
+        )
+    content_bytes = content.encode("utf-8")
+    await client.post(
+        _toolbox(valves, sandbox_id, "/files/upload"),
+        params={"path": path},
+        headers={"Authorization": f"Bearer {valves.daytona_api_key}"},
+        files={"file": ("file", io.BytesIO(content_bytes), "application/octet-stream")},
+        timeout=60.0,
+    )
+
+
+def _format_delegate_background(delegate_id: str, elapsed: int, log_preview: str) -> str:
+    """Format the background descriptor returned when a delegate is auto-backgrounded."""
+    did = delegate_id
+    if not log_preview.strip():
+        log_preview = "(no progress yet)"
+    return (
+        f"{log_preview}\n\n"
+        f"[Backgrounded after {elapsed}s — sub-agent is still running]\n"
+        f"DELEGATE={did}\n"
+        f"Ref /tmp/delegate/$DELEGATE/{{task,log,result,error,usage}}\n"
+        f"See lathe(manpage=\"delegate\") for background monitoring recipes.\n"
+        f"Tell the user the delegate is running. Don't poll until they ask or "
+        f"you have a concrete reason to expect completion."
+    )
 
 
 def _build_delegate_prompt(task: str, file_sections: list[str]) -> str:
@@ -2002,18 +2044,81 @@ class Tools:
 
             ## What delegate() does
 
-            delegate(task, context_files, max_steps) spawns an autonomous
-            sub-agent that runs the same model against the same sandbox.
-            The sub-agent has access to: bash, read, write, edit, glob,
-            grep. It does NOT have: lathe, onboard, expose, destroy, or
-            delegate (no recursion).
+            delegate(task, context_files, max_steps, foreground_seconds)
+            spawns an autonomous sub-agent that runs the same model against
+            the same sandbox. The sub-agent has access to: bash, read,
+            write, edit, glob, grep. It does NOT have: lathe, onboard,
+            expose, destroy, or delegate (no recursion).
 
             The sub-agent makes up to max_steps inference calls (default 10,
             max 30), executing tools as needed. It knows its step budget
             upfront and receives a wrap-up nudge when close to the limit, so
             it can prioritize producing a useful summary over starting new
-            work. Its final text response is returned to you as the
-            delegate() tool result.
+            work.
+
+            ## Foreground vs. background execution
+
+            Like bash(), delegate() has a foreground window controlled by
+            foreground_seconds (default 30, max 300). If the sub-agent
+            finishes within this window, its result is returned inline
+            (same as before). If the window expires, the delegation is
+            auto-backgrounded: you get a descriptor with sidecar paths,
+            and the sub-agent continues running asynchronously.
+
+            ### Sidecar files
+
+            Where DELEGATE=/tmp/delegate/<id>:
+
+              DELEGATE/task    — the original task description
+              DELEGATE/log     — timestamped progress entries (live)
+              DELEGATE/result  — final sub-agent output (on success)
+              DELEGATE/error   — error message (on failure)
+              DELEGATE/usage   — JSON: steps, tool_calls, tokens
+
+            DELEGATE/result or DELEGATE/error appears when the sub-agent
+            finishes. Absence of both means it's still running.
+
+            ### Monitoring recipes
+
+            **Check if done:**
+            ```
+            test -f $DELEGATE/result && echo DONE || test -f $DELEGATE/error && echo FAILED || echo RUNNING
+            ```
+
+            **Read the result:**
+            ```
+            cat $DELEGATE/result
+            ```
+
+            **Peek at progress:**
+            ```
+            cat $DELEGATE/log
+            ```
+
+            **Read usage stats:**
+            ```
+            cat $DELEGATE/usage
+            ```
+
+            ## Agent teams and swarms
+
+            Background delegation is the primitive for running agent teams:
+
+            1. Fire off multiple delegates with foreground_seconds=0 (or a
+               short window):
+               ```
+               delegate(task="Refactor module A...", foreground_seconds=0)
+               delegate(task="Fix tests in module B...", foreground_seconds=0)
+               delegate(task="Write docs for module C...", foreground_seconds=0)
+               ```
+            2. Each returns a DELEGATE id immediately.
+            3. Check completion by reading result files.
+            4. Delegates can coordinate through the shared filesystem —
+               writing task specs, partial results, or completion sentinels
+               for each other to read.
+
+            No special swarm API is needed. The pattern falls out naturally
+            from background delegation + shared sandbox filesystem.
 
             ## When to use delegate
 
@@ -2027,6 +2132,8 @@ class Tools:
               project's dependency tree."
             - **Batch operations**: "Add type hints to all functions in
               src/utils/ that are missing them."
+            - **Parallel work** (background): Fan out multiple independent
+              tasks, then collect results.
 
             ## When NOT to use delegate
 
@@ -2155,6 +2262,10 @@ class Tools:
             AGENTS.md, skills, or other reference files into the sub-agent's
             prompt without re-reading them. The sub-agent cannot interact with
             the user or expose URLs — it just works and returns a summary.
+            Like bash(), delegate() auto-backgrounds if the sub-agent takes longer
+            than foreground_seconds (default 30), returning a descriptor with
+            sidecar file paths. Use foreground_seconds=0 to fire-and-forget
+            multiple delegates in parallel (agent teams / swarms).
             See lathe(manpage="delegate") for details.
 
             **Network requests:**
@@ -2189,6 +2300,10 @@ class Tools:
             - edit() requires an exact string match (including whitespace). If
               the match is ambiguous, provide more surrounding context or use
               replace_all=true.
+            - delegate() auto-backgrounds after ~30 seconds (configurable via
+              foreground_seconds). Backgrounded delegates write to
+              /tmp/delegate/<id>/{log,result,error,usage}. Use foreground_seconds=0
+              to fire-and-forget for parallel agent teams.
             - expose() URLs expire after ~1 hour (call expose again for a fresh URL). The sandbox itself stops on
               idle (~15 min default), killing servers.
             - destroy() is irreversible. The volume is preserved.
@@ -2205,7 +2320,7 @@ class Tools:
     # lookups and useful for the model to decide which page to request).
     _MANPAGE_INDEX: dict[str, str] = {
         "overview": "Big-picture orientation: sandbox model, tool catalog, key workflows, gotchas.",
-        "delegate": "Sub-agent delegation: when to use, task writing, context_files, cost model.",
+        "delegate": "Sub-agent delegation: foreground/background, sidecar files, agent teams, cost model.",
         "recipes": "Bootstrap scripts for common tools: dufs (file browser), code-server (IDE).",
         "background": "Background job sidecar files, and peek/poll/kill recipes.",
         "egress": "Egress restrictions, workarounds (dufs upload, browser-side fetch), Tier 3.",
@@ -2567,6 +2682,7 @@ class Tools:
         task: str,
         context_files: list[str] = [],
         max_steps: int = 10,
+        foreground_seconds: int = -1,
         __user__: dict = {},
         __model__: dict = {},
         __request__=None,
@@ -2577,9 +2693,12 @@ class Tools:
         The sub-agent runs the same model, has bash/read/write/edit/glob/grep tools,
         and returns a summary when done. Use for exploration, refactoring, debugging,
         or any multi-step work that doesn't need user interaction.
+        Long-running delegations auto-background and return a descriptor with log/result
+        file paths for monitoring, exactly like bash() does for long commands.
         :param task: What the sub-agent should accomplish. Be specific — it cannot ask clarifying questions. Include any context (error messages, prior findings, instructions) directly in the task description.
         :param context_files: Absolute sandbox file paths to inject into the sub-agent's prompt (e.g. AGENTS.md, SKILL.md, config files). Fetched at delegation time — the sub-agent sees their contents without spending steps reading them.
         :param max_steps: Maximum inference calls the sub-agent may make (default: 10, max: 30).
+        :param foreground_seconds: Seconds to wait before auto-backgrounding (default: 30, max: 300). Set 0 for immediate background (fire-and-forget). Omit or set -1 to use the default.
         """
         async def _run(client):
             email = _get_email(__user__)
@@ -2630,8 +2749,16 @@ class Tools:
                 raw_env = getattr(user_valves, "env_vars", "") or ""
                 user_pairs = _parse_env_vars(raw_env)
 
+            # ── Background-safe client for the sub-agent ─────────────
+            # _tool_context closes `client` when _run() returns, which
+            # happens immediately when we background.  The sub-agent's
+            # tool closures and sidecar writes need a client that stays
+            # open for the lifetime of the background task.  We create
+            # bg_client here; _run_agent closes it in its finally block.
+            bg_client = httpx.AsyncClient()
+
             # ── Build sub-agent tools ────────────────────────────────
-            tools = _build_delegate_tools(self.valves, sandbox_id, client, user_pairs)
+            tools = _build_delegate_tools(self.valves, sandbox_id, bg_client, user_pairs)
 
             # ── Fetch context_files from sandbox ─────────────────────
             file_sections: list[str] = []
@@ -2668,97 +2795,242 @@ class Tools:
                 output_type=str,
             )
 
+            # ── Sidecar directory on the sandbox ─────────────────────
+            delegate_id = str(uuid.uuid4())
+            delegate_dir = f"/tmp/delegate/{delegate_id}"
+            log_path = f"{delegate_dir}/log"
+            result_path = f"{delegate_dir}/result"
+            error_path = f"{delegate_dir}/error"
+            usage_path = f"{delegate_dir}/usage"
+            task_path = f"{delegate_dir}/task"
+
+            # Write the task file immediately
+            await _sandbox_write_file(
+                self.valves, sandbox_id, client,
+                task_path, task,
+            )
+            # Initialize empty log file
+            await _sandbox_write_file(
+                self.valves, sandbox_id, client,
+                log_path, "",
+            )
+
             await _emit(__event_emitter__, "Sub-agent starting...")
 
-            try:
+            # ── Foreground timeout ───────────────────────────────────
+            # The signature default is -1 (meaning "use the module default").
+            # Explicit 0 means immediate background (fire-and-forget).
+            # Any positive value is the actual foreground window.
+            if foreground_seconds < 0:
+                fg_seconds = _DELEGATE_FOREGROUND_SECONDS
+            else:
+                fg_seconds = min(300, foreground_seconds)
+
+            # Log lines accumulated during execution (for sidecar and
+            # for the background descriptor preview).
+            log_lines: list[str] = []
+
+            async def _append_log(line: str):
+                """Append a timestamped line to the in-memory log and sandbox file."""
+                ts = time.strftime("%H:%M:%S")
+                entry = f"[{ts}] {line}"
+                log_lines.append(entry)
+                try:
+                    await _sandbox_write_file(
+                        self.valves, sandbox_id, bg_client,
+                        log_path, "\n".join(log_lines) + "\n",
+                    )
+                except Exception:
+                    pass  # best-effort log writes
+
+            # ── The actual sub-agent execution coroutine ─────────────
+            # This is separated so it can either run inline (foreground)
+            # or be detached as a background task.
+
+            agent_done = asyncio.Event()
+            agent_result: dict = {}  # populated by _run_agent
+            # Mutable flag: outer code sets this to False when backgrounding
+            # so _run_agent stops calling the OWUI emitter (which may hang
+            # or raise once the HTTP response stream has closed).
+            emit_to_owui = [True]
+
+            async def _run_agent():
+                """Run the sub-agent to completion, writing sidecar files."""
                 step_count = 0
                 nudge_injected = False
 
-                async with agent.iter(
-                    user_message,
-                    usage_limits=UsageLimits(request_limit=clamped_steps),
-                ) as agent_run:
-                    async for node in agent_run:
-                        if Agent.is_model_request_node(node):
-                            step_count += 1
-                            remaining = clamped_steps - step_count
-                            await _emit(
-                                __event_emitter__,
-                                f"Sub-agent thinking... ({step_count}/{clamped_steps})"
-                            )
-                            # Inject wrap-up nudge when approaching the limit
-                            if (
-                                remaining <= _DELEGATE_NUDGE_REMAINING
-                                and remaining > 0
-                                and not nudge_injected
-                            ):
-                                from pydantic_ai.messages import ModelRequest, UserPromptPart
-                                nudge_msg = ModelRequest(parts=[UserPromptPart(
-                                    content=(
-                                        f"[SYSTEM: You have {remaining} step(s) remaining out of "
-                                        f"{clamped_steps}. Wrap up now — stop investigating and "
-                                        f"write your final summary with what you have. A partial "
-                                        f"summary is far better than being cut off with no output.]"
-                                    ),
-                                )])
-                                agent_run._graph_run.state.message_history.append(nudge_msg)
-                                nudge_injected = True
+                try:
+                    async with agent.iter(
+                        user_message,
+                        usage_limits=UsageLimits(request_limit=clamped_steps),
+                    ) as agent_run:
+                        async for node in agent_run:
+                            if Agent.is_model_request_node(node):
+                                step_count += 1
+                                remaining = clamped_steps - step_count
+                                status = f"Sub-agent thinking... ({step_count}/{clamped_steps})"
+                                await _append_log(status)
+                                if emit_to_owui[0]:
+                                    await _emit(__event_emitter__, status)
+                                # Inject wrap-up nudge when approaching the limit
+                                if (
+                                    remaining <= _DELEGATE_NUDGE_REMAINING
+                                    and remaining > 0
+                                    and not nudge_injected
+                                ):
+                                    from pydantic_ai.messages import ModelRequest, UserPromptPart
+                                    nudge_msg = ModelRequest(parts=[UserPromptPart(
+                                        content=(
+                                            f"[SYSTEM: You have {remaining} step(s) remaining out of "
+                                            f"{clamped_steps}. Wrap up now — stop investigating and "
+                                            f"write your final summary with what you have. A partial "
+                                            f"summary is far better than being cut off with no output.]"
+                                        ),
+                                    )])
+                                    agent_run._graph_run.state.message_history.append(nudge_msg)
+                                    nudge_injected = True
 
-                        elif Agent.is_call_tools_node(node):
-                            # Extract tool names and args summary
-                            calls = []
-                            for p in node.model_response.parts:
-                                if hasattr(p, "tool_name"):
-                                    name = p.tool_name
-                                    # Build a short args hint
-                                    try:
-                                        args = p.args_as_dict()
-                                        if name == "bash" and "command" in args:
-                                            cmd = args["command"]
-                                            hint = cmd[:60] + ("..." if len(cmd) > 60 else "")
-                                            calls.append(f"bash({hint!r})")
-                                        elif name in ("read", "write", "edit") and "path" in args:
-                                            path = args["path"]
-                                            short = path.rsplit("/", 1)[-1]
-                                            calls.append(f"{name}({short})")
-                                        elif name in ("glob", "grep") and "pattern" in args:
-                                            calls.append(f"{name}({args['pattern']!r})")
-                                        else:
+                            elif Agent.is_call_tools_node(node):
+                                # Extract tool names and args summary
+                                calls = []
+                                for p in node.model_response.parts:
+                                    if hasattr(p, "tool_name"):
+                                        name = p.tool_name
+                                        # Build a short args hint
+                                        try:
+                                            args = p.args_as_dict()
+                                            if name == "bash" and "command" in args:
+                                                cmd = args["command"]
+                                                hint = cmd[:60] + ("..." if len(cmd) > 60 else "")
+                                                calls.append(f"bash({hint!r})")
+                                            elif name in ("read", "write", "edit") and "path" in args:
+                                                path = args["path"]
+                                                short = path.rsplit("/", 1)[-1]
+                                                calls.append(f"{name}({short})")
+                                            elif name in ("glob", "grep") and "pattern" in args:
+                                                calls.append(f"{name}({args['pattern']!r})")
+                                            else:
+                                                calls.append(name)
+                                        except Exception:
                                             calls.append(name)
-                                    except Exception:
-                                        calls.append(name)
-                            if calls:
-                                await _emit(
-                                    __event_emitter__,
-                                    f"Sub-agent → {', '.join(calls)}"
-                                )
+                                if calls:
+                                    tool_status = f"Sub-agent → {', '.join(calls)}"
+                                    await _append_log(tool_status)
+                                    if emit_to_owui[0]:
+                                        await _emit(__event_emitter__, tool_status)
 
-                    usage = agent_run.usage()
-                    result_output = agent_run.result.output if agent_run.result else "(no output)"
+                        usage = agent_run.usage()
+                        result_output = agent_run.result.output if agent_run.result else "(no output)"
 
-            except Exception as e:
-                error_type = type(e).__name__
-                await _emit(__event_emitter__, f"Delegation failed: {error_type}", done=True)
+                    # ── Write sidecar result files ────────────────────
+                    await _sandbox_write_file(
+                        self.valves, sandbox_id, bg_client,
+                        result_path, result_output,
+                    )
+                    usage_data = {
+                        "steps": step_count,
+                        "tool_calls": usage.tool_calls,
+                        "input_tokens": usage.input_tokens,
+                        "output_tokens": usage.output_tokens,
+                    }
+                    await _sandbox_write_file(
+                        self.valves, sandbox_id, bg_client,
+                        usage_path, json.dumps(usage_data),
+                    )
+                    await _append_log(
+                        f"Completed: {step_count} steps, {usage.tool_calls} tool calls"
+                    )
+
+                    agent_result.update({
+                        "ok": True,
+                        "output": result_output,
+                        "step_count": step_count,
+                        "usage": usage,
+                    })
+
+                except Exception as e:
+                    error_type = type(e).__name__
+                    error_msg = f"Delegation failed after {step_count} step(s): {error_type}: {e}"
+                    agent_result.update({
+                        "ok": False,
+                        "error": error_msg,
+                        "step_count": step_count,
+                    })
+                    try:
+                        await _sandbox_write_file(
+                            self.valves, sandbox_id, bg_client,
+                            error_path, error_msg,
+                        )
+                        await _append_log(f"Error: {error_msg}")
+                    except Exception:
+                        pass  # best-effort error file write
+
+                finally:
+                    agent_done.set()
+                    await inner_client.aclose()
+                    await bg_client.aclose()
+
+            # ── Launch and wait with foreground timeout ───────────────
+            # We run _run_agent as a background task. During the foreground
+            # window, we poll agent_done. If it finishes in time, we return
+            # inline. Otherwise, we return a background descriptor and the
+            # task continues.
+
+            bg_task = asyncio.ensure_future(_run_agent())
+
+            # Wait for completion or timeout
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(agent_done.wait()),
+                    timeout=fg_seconds if fg_seconds > 0 else 0.01,
+                )
+            except asyncio.TimeoutError:
+                pass  # foreground window expired, proceed to background
+
+            if agent_done.is_set():
+                # ── Finished in foreground ───────────────────────────
+                await bg_task
+
+                if agent_result.get("ok"):
+                    result_output = agent_result["output"]
+                    usage = agent_result["usage"]
+                    step_count = agent_result["step_count"]
+                    parts = [f"{step_count} step(s)", f"{usage.tool_calls} tool call(s)"]
+                    if usage.input_tokens:
+                        parts.append(f"{usage.input_tokens:,} prompt + {usage.output_tokens:,} completion tokens")
+                    usage_note = f"\n\n[Delegate completed: {', '.join(parts)}]"
+                    await _emit(
+                        __event_emitter__,
+                        f"Delegation complete ({step_count} steps, {usage.tool_calls} tool calls)",
+                        done=True,
+                    )
+                    return _prepend_warning(result_output + usage_note, _sb_warning)
+                else:
+                    error_msg = agent_result.get("error", "Unknown error")
+                    await _emit(__event_emitter__, "Delegation failed", done=True)
+                    return _prepend_warning(error_msg, _sb_warning)
+
+            else:
+                # ── Backgrounded — return descriptor ─────────────────
+                # Kill the emitter BEFORE returning so the still-running
+                # _run_agent coroutine never tries to call it.  The OWUI
+                # response stream will be closed once we return, and
+                # awaiting the emitter after that can hang or raise,
+                # stalling the background task entirely.
+                emit_to_owui[0] = False
+
+                elapsed = fg_seconds
+                # Grab recent log lines for the preview
+                preview = "\n".join(log_lines[-10:]) if log_lines else ""
+                await _emit(
+                    __event_emitter__,
+                    f"Delegation backgrounded after {elapsed}s",
+                    done=True,
+                )
                 return _prepend_warning(
-                    f"Delegation failed after {step_count} step(s): {error_type}: {e}",
+                    _format_delegate_background(delegate_id, elapsed, preview),
                     _sb_warning,
                 )
-            finally:
-                await inner_client.aclose()
-
-            # ── Format result with usage summary ─────────────────────
-            parts = [f"{step_count} step(s)", f"{usage.tool_calls} tool call(s)"]
-            if usage.input_tokens:
-                parts.append(f"{usage.input_tokens:,} prompt + {usage.output_tokens:,} completion tokens")
-            usage_note = f"\n\n[Delegate completed: {', '.join(parts)}]"
-
-            await _emit(
-                __event_emitter__,
-                f"Delegation complete ({step_count} steps, {usage.tool_calls} tool calls)",
-                done=True,
-            )
-
-            return _prepend_warning(result_output + usage_note, _sb_warning)
 
         return await _tool_context(__event_emitter__, _run)
 

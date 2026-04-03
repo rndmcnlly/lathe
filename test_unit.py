@@ -748,6 +748,8 @@ async def test_delegate_infrastructure(R: Results):
                 delegate_line[0])
         R.check("delegate shows max_steps param", "max_steps" in delegate_line[0],
                 delegate_line[0])
+        R.check("delegate shows foreground_seconds param", "foreground_seconds" in delegate_line[0],
+                delegate_line[0])
         # Ensure the old standalone "context" param is gone (context_files contains
         # "context" as a substring, so check the actual param list in parens)
         import re as _re
@@ -997,6 +999,13 @@ async def test_core_read_mock(R: Results):
                               path="/home/daytona/workspace/missing.py")
     R.check("reports file not found", "File not found" in result, result)
 
+    print("\n── _core_read: 400 handling (directory) ──")
+    client = FakeClient([FakeResponse(400)])
+    result = await _core_read(FakeValves(), "sb-id", client,
+                              path="/home/daytona/workspace")
+    R.check("reports bad request", "Bad request" in result, result)
+    R.check("suggests directory", "directory" in result, result)
+
     print("\n── _core_read: normal file ──")
     content = "line1\nline2\nline3\n"
     client = FakeClient([FakeResponse(200, content)])
@@ -1147,6 +1156,160 @@ async def test_delegate_bash_foreground(R: Results):
             f"got {_DELEGATE_BASH_FOREGROUND_SECONDS}")
 
 
+async def test_format_delegate_background(R: Results):
+    """Test the background delegate descriptor formatting."""
+    from lathe import _format_delegate_background
+
+    print("\n── _format_delegate_background: basic structure ──")
+    result = _format_delegate_background("abc-123", 30, "Sub-agent thinking... (1/10)")
+    R.check("has backgrounded notice", "Backgrounded after 30s" in result, result[:100])
+    R.check("has DELEGATE id", "DELEGATE=abc-123" in result, result)
+    R.check("has sidecar refs", "/tmp/delegate/$DELEGATE/" in result, result)
+    R.check("has log preview", "Sub-agent thinking" in result, result)
+    R.check("mentions manpage", "lathe(manpage=" in result, result)
+
+    print("\n── _format_delegate_background: empty preview ──")
+    result = _format_delegate_background("xyz-789", 5, "")
+    R.check("empty becomes no progress yet", "(no progress yet)" in result, result[:50])
+    R.check("still has DELEGATE", "DELEGATE=xyz-789" in result, result)
+
+    print("\n── _format_delegate_background: whitespace-only preview ──")
+    result = _format_delegate_background("qqq", 10, "   \n  ")
+    R.check("whitespace becomes no progress yet", "(no progress yet)" in result, result[:50])
+
+
+async def test_delegate_foreground_constant(R: Results):
+    """Test the delegate foreground timeout constant."""
+    from lathe import _DELEGATE_FOREGROUND_SECONDS
+
+    print("\n── delegate foreground constant ──")
+    R.check("is positive int",
+            isinstance(_DELEGATE_FOREGROUND_SECONDS, int) and _DELEGATE_FOREGROUND_SECONDS > 0,
+            f"got {_DELEGATE_FOREGROUND_SECONDS}")
+    R.check("reasonable default (15-60s)",
+            15 <= _DELEGATE_FOREGROUND_SECONDS <= 60,
+            f"got {_DELEGATE_FOREGROUND_SECONDS}")
+
+
+async def test_delegate_catalog_foreground_param(R: Results):
+    """Test that delegate's foreground_seconds param appears in the tool catalog."""
+    from lathe import _build_tool_catalog, Tools
+
+    print("\n── delegate catalog: foreground_seconds param ──")
+    tools = Tools()
+    catalog = _build_tool_catalog(tools)
+    delegate_line = [l for l in catalog.split("\n") if "delegate(" in l]
+    R.check("delegate line exists", len(delegate_line) == 1,
+            f"got {len(delegate_line)} lines")
+    if delegate_line:
+        R.check("delegate shows foreground_seconds param",
+                "foreground_seconds" in delegate_line[0],
+                delegate_line[0])
+
+
+async def test_delegate_background_branching(R: Results):
+    """Test the foreground/background asyncio branching pattern used by delegate().
+
+    This exercises the exact same pattern as delegate(): ensure_future +
+    wait_for(shield(event.wait())) + mutable emit flag.
+    """
+    from lathe import _DELEGATE_FOREGROUND_SECONDS
+
+    # ── Helper: simulates _run_agent with configurable delay ─────────
+    async def fake_agent(delay: float, done_event: asyncio.Event,
+                         result: dict, emit_flag: list):
+        """Mimics _run_agent: waits, writes result, sets event."""
+        try:
+            await asyncio.sleep(delay)
+            result.update({"ok": True, "output": "done", "step_count": 1})
+        except asyncio.CancelledError:
+            result.update({"ok": False, "error": "cancelled"})
+        finally:
+            done_event.set()
+
+    # ── Path 1: task finishes within foreground window ────────────────
+    print("\n── delegate branching: foreground completion ──")
+    done = asyncio.Event()
+    result: dict = {}
+    emit_flag = [True]
+
+    task = asyncio.ensure_future(fake_agent(0.01, done, result, emit_flag))
+    try:
+        await asyncio.wait_for(asyncio.shield(done.wait()), timeout=1.0)
+    except asyncio.TimeoutError:
+        pass
+
+    R.check("fg: event is set", done.is_set(), f"done={done.is_set()}")
+    R.check("fg: result is ok", result.get("ok") is True, str(result))
+    R.check("fg: emit still True", emit_flag[0] is True, str(emit_flag))
+    await task  # clean up
+
+    # ── Path 2: task exceeds foreground window → backgrounded ────────
+    print("\n── delegate branching: auto-background ──")
+    done = asyncio.Event()
+    result = {}
+    emit_flag = [True]
+
+    task = asyncio.ensure_future(fake_agent(5.0, done, result, emit_flag))
+    try:
+        await asyncio.wait_for(asyncio.shield(done.wait()), timeout=0.05)
+    except asyncio.TimeoutError:
+        pass
+
+    R.check("bg: event NOT set", not done.is_set(), f"done={done.is_set()}")
+    R.check("bg: result still empty", len(result) == 0, str(result))
+
+    # Simulate what delegate does: flip the emit flag
+    emit_flag[0] = False
+    R.check("bg: emit flag flipped", emit_flag[0] is False, str(emit_flag))
+
+    # The background task should still be running and eventually complete
+    await asyncio.wait_for(done.wait(), timeout=10.0)
+    R.check("bg: task eventually completes", done.is_set(), f"done={done.is_set()}")
+    R.check("bg: result populated", result.get("ok") is True, str(result))
+    await task  # clean up
+
+    # ── Path 3: immediate background (fg_seconds=0 → timeout=0.01) ───
+    print("\n── delegate branching: immediate background ──")
+    done = asyncio.Event()
+    result = {}
+    emit_flag = [True]
+
+    task = asyncio.ensure_future(fake_agent(0.5, done, result, emit_flag))
+    try:
+        await asyncio.wait_for(asyncio.shield(done.wait()), timeout=0.01)
+    except asyncio.TimeoutError:
+        pass
+
+    R.check("imm: event NOT set immediately", not done.is_set(),
+            f"done={done.is_set()}")
+    emit_flag[0] = False
+
+    await asyncio.wait_for(done.wait(), timeout=5.0)
+    R.check("imm: task completes after background", done.is_set(),
+            f"done={done.is_set()}")
+    R.check("imm: result ok", result.get("ok") is True, str(result))
+    await task  # clean up
+
+    # ── Verify shield prevents cancellation ──────────────────────────
+    print("\n── delegate branching: shield prevents cancel ──")
+    done = asyncio.Event()
+    result = {}
+
+    task = asyncio.ensure_future(fake_agent(0.5, done, result, [True]))
+    try:
+        await asyncio.wait_for(asyncio.shield(done.wait()), timeout=0.01)
+    except asyncio.TimeoutError:
+        pass
+
+    # The key invariant: the background task was NOT cancelled by wait_for
+    R.check("shield: task not cancelled", not task.cancelled(),
+            f"cancelled={task.cancelled()}")
+    await asyncio.wait_for(done.wait(), timeout=5.0)
+    R.check("shield: task completed ok", result.get("ok") is True, str(result))
+    await task
+
+
 # ── Test registry and runner ─────────────────────────────────────────
 
 TESTS = {
@@ -1167,6 +1330,10 @@ TESTS = {
     "core_write_mock": test_core_write_mock,
     "core_edit_mock": test_core_edit_mock,
     "delegate_bash_foreground": test_delegate_bash_foreground,
+    "format_delegate_background": test_format_delegate_background,
+    "delegate_foreground_constant": test_delegate_foreground_constant,
+    "delegate_catalog_foreground_param": test_delegate_catalog_foreground_param,
+    "delegate_background_branching": test_delegate_background_branching,
 }
 
 
