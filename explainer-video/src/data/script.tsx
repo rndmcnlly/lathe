@@ -12,8 +12,8 @@
 import React from "react";
 import {
   Video, Part, Slide,
-  Title, Text, Chat, User, Agent, CodeBlock, ToolCall, Scene,
-  Inspiration, Clip, ArchDiagramTag, LifecycleDiagramTag,
+  Title, Text, Chat, User, Agent, CodeBlock, ToolCall, Scene, Callout,
+  Conversation, Inspiration, Clip, ArchDiagramTag, LifecycleDiagramTag,
   extractNarrations, toComposition, getTotalFrames, extractTimeline,
 } from "./tags";
 
@@ -55,18 +55,16 @@ const script = (
       </Slide>
 
       <Slide id="sandbox-spins-up">
-        <CodeBlock
-          language="text"
-          code={`⠋ Spinning up sandbox...
-  Creating VM for user@example.com
-  Starting sandbox instance
-  Waiting for toolbox daemon...
+        <Conversation
+          userMessage="Can you clone it and get oriented?"
+          toolName="bash"
+          toolArgs={'"git clone https://github.com/..."'}
+          toolResultPreview={`⠋ Spinning up sandbox...
 ✓ Sandbox ready (4.2s)
-
-$ bash("git clone https://github.com/...")
 Cloning into '/home/daytona/workspace'...
 ✓ Done`}
-          caption="First tool call triggers sandbox creation"
+          toolIcon="terminal"
+          agentReply="Cloned. A sandbox spun up automatically — let me look around."
         />
         A sandbox spins up. A full Linux VM, provisioned on demand,
         dedicated to this user. The model didn't ask for it. The user
@@ -89,17 +87,14 @@ Cloning into '/home/daytona/workspace'...
     <Part id="work" label="Get to Work">
 
       <Slide id="clones-repo" section>
-        <ToolCall
-          tool="bash"
-          args={'"ls -la /home/daytona/workspace/"'}
-          result={`total 48
-drwxr-xr-x  8 daytona daytona 4096 Mar 26 09:14 .
--rw-r--r--  1 daytona daytona 1247 Mar 26 09:14 README.md
--rw-r--r--  1 daytona daytona  892 Mar 26 09:14 AGENTS.md
-drwxr-xr-x  4 daytona daytona 4096 Mar 26 09:14 src/
--rw-r--r--  1 daytona daytona  340 Mar 26 09:14 package.json
-drwxr-xr-x  2 daytona daytona 4096 Mar 26 09:14 tests/`}
-          icon="terminal"
+        <Conversation
+          userMessage="What's in the repo?"
+          toolName="bash"
+          toolArgs={'"ls -la /home/daytona/workspace/"'}
+          toolResultPreview={`README.md  AGENTS.md  src/
+package.json  tests/`}
+          toolIcon="terminal"
+          agentReply="It's a Node project with source in src/, tests in tests/, and an AGENTS.md with project conventions."
         />
         The agent clones the repo and explores the project structure.
         Shell commands, file reads, edits — the full surface of a coding
@@ -107,18 +102,16 @@ drwxr-xr-x  2 daytona daytona 4096 Mar 26 09:14 tests/`}
       </Slide>
 
       <Slide id="onboards">
-        <ToolCall
-          tool="onboard"
-          args=""
-          result={`Loaded project context from AGENTS.md:
-
+        <Conversation
+          userMessage="Get familiar with how this project works."
+          toolName="onboard"
+          toolArgs=""
+          toolResultPreview={`Loaded project context from AGENTS.md
 • Test with: npm test
 • Style: Prettier, no semicolons
-• Branch convention: feature/<name>
-• Deploy: push to main triggers CI
-
-3 files indexed, 1 convention file loaded.`}
-          icon="book"
+• Deploy: push to main triggers CI`}
+          toolIcon="book"
+          agentReply="Got it — Prettier formatting, no semicolons, tests via npm test. I'll follow these conventions."
         />
         Then it calls onboard. This loads project-specific instructions,
         conventions, and context — all in one shot. The agent picks up
@@ -127,19 +120,15 @@ drwxr-xr-x  2 daytona daytona 4096 Mar 26 09:14 tests/`}
       </Slide>
 
       <Slide id="builds-something">
-        <CodeBlock
-          language="text"
-          code={`$ write("/home/daytona/workspace/src/api.ts",
-    "import express from 'express'\\n...")
-✓ Wrote 1.2 KB
-
-$ bash("npm install && npm run dev")
-added 47 packages in 3.1s
+        <Conversation
+          userMessage="Build out the API endpoint we discussed."
+          toolName="bash"
+          toolArgs={'"npm install && npm test"'}
+          toolResultPreview={`added 47 packages in 3.1s
 Server listening on port 3000
-
-$ bash("npm test")
 ✓ 12 tests passed`}
-          caption="Agent writes, installs, runs, tests"
+          toolIcon="terminal"
+          agentReply="API is up on port 3000 and all 12 tests pass. Ready for you to try it."
         />
         The agent gets to work. It writes code, installs dependencies,
         starts a dev server. Each step is a tool call — visible in the
@@ -148,16 +137,14 @@ $ bash("npm test")
       </Slide>
 
       <Slide id="expose-moment" section>
-        <ToolCall
-          tool="expose"
-          args='target="code-server"'
-          result={`IDE URL (valid ~1 hour):
-https://8080-sandbox-abc123.proxy.daytona.io/
-  ?token=eyJ...
-
-VS Code in the browser — full terminal,
-extensions, file editing.`}
-          icon="globe"
+        <Conversation
+          userMessage="Give me a VS Code editor for this project."
+          toolName="expose"
+          toolArgs={'target="code-server"'}
+          toolResultPreview={`IDE URL (valid ~1 hour):
+https://8080-sandbox-abc123.proxy...`}
+          toolIcon="globe"
+          agentReply="Here's your editor — VS Code in the browser, connected to the sandbox. Full terminal and extensions included."
         />
         Now here's where it gets interesting. The agent calls expose —
         and the user gets a public URL to whatever's running in the
@@ -184,6 +171,20 @@ extensions, file editing.`}
         another. They edit code directly while the agent makes structural
         changes through chat. Both work on the same filesystem, in the
         same sandbox, at the same time.
+      </Slide>
+
+      <Slide id="delegate-mention">
+        <Callout
+          icon="git-branch"
+          heading="Delegation"
+          body="The agent can hand off multi-step work to a sub-agent that shares the same sandbox. Long-running jobs move to the background automatically, so the main agent stays responsive."
+        />
+        For bigger tasks, the agent can delegate. A sub-agent picks up
+        the work in its own context window, and if it takes a while, the
+        job backgrounds automatically so the conversation keeps flowing.
+        With multiple delegates running at once, this becomes a kind of
+        agent swarm — but most of the time, it's just a convenient way to
+        offload a messy task.
       </Slide>
 
     </Part>
@@ -224,21 +225,15 @@ extensions, file editing.`}
       </Slide>
 
       <Slide id="comes-back">
-        <CodeBlock
-          language="text"
-          code={`⠋ Waking sandbox...
-✓ Sandbox ready (1.8s)
-
-$ onboard()
+        <Conversation
+          userMessage="I'm back — where did we leave off?"
+          toolName="onboard"
+          toolArgs=""
+          toolResultPreview={`✓ Sandbox ready (1.8s)
 Loaded project context from AGENTS.md
-  Last modified: 3 days ago
-  12 files in workspace, git history intact
-
-$ bash("git log --oneline -3")
-a1b2c3d Add auth middleware
-e4f5g6h Initial API scaffold
-i7j8k9l First commit`}
-          caption="New conversation, same workspace"
+12 files in workspace, git history intact`}
+          toolIcon="book"
+          agentReply="Welcome back. Your workspace is intact — last commit was the auth middleware, three days ago."
         />
         Days later, the user starts a new conversation. The sandbox
         wakes transparently on the first tool call. Files, packages, git

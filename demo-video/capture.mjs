@@ -2,12 +2,13 @@
 /**
  * Playwright video capture of a real Lathe session on an Open WebUI instance.
  *
- * Captures: login → enable Lathe → clone a repo → ask for VS Code →
- * model calls expose(target="code-server") → open the live IDE URL →
- * return to chat → ask model to stop the server.
+ * Captures: login → pre-warm sandbox → enable Lathe → clone a repo →
+ * ask for VS Code → model calls expose(target="code-server") → open
+ * the live IDE URL → return to chat → ask model to stop the server →
+ * delegate a gimmick task to a sub-agent.
  *
  * Usage:  node capture.mjs
- * Env:    DEMO_OWUI_URL, DEMO_EMAIL, DEMO_PASS (loaded from .env if present)
+ * Env:    DEMO_OWUI_URL, DEMO_EMAIL, DEMO_PASS, DEMO_MODEL (loaded from .env if present)
  * Output: capture.webm
  */
 
@@ -334,6 +335,78 @@ if (loginPage.url().includes("/auth")) {
 const token = await loginPage.evaluate(() => localStorage.getItem("token"));
 const cookies = await loginContext.cookies();
 log("login", `Token: ${token ? token.slice(0, 20) + "..." : "null"}`);
+
+// ── Pre-warm: wake the sandbox before recording starts ──────────
+// Send a trivial Lathe-triggering message in the unrecorded browser
+// so the VM is hot by the time the recorded session begins.
+log("prewarm", "Waking sandbox...");
+try {
+  await loginPage.goto(`${OWUI_URL}/`);
+  await loginPage.waitForLoadState("networkidle").catch(() => {});
+  await loginPage.waitForTimeout(500);
+
+  // Dismiss "What's New" modal again if it reappears
+  await loginPage.evaluate(() => {
+    for (const b of document.querySelectorAll("button"))
+      if (b.textContent.trim() === "Okay, Let's Go!") b.click();
+  });
+
+  // Enable Lathe in this throwaway chat
+  const warmIntBtn = await loginPage.evaluate(() => {
+    for (const sel of ["#integration-menu-button", "#tools-menu-button"])
+      if (document.querySelector(sel)) return sel;
+    return null;
+  });
+  if (warmIntBtn) {
+    await loginPage.click(warmIntBtn);
+    await loginPage.waitForTimeout(300);
+    await loginPage.evaluate(() => {
+      for (const el of document.querySelectorAll("*"))
+        if (el.textContent.trim().startsWith("Tools ") && el.getBoundingClientRect().height > 20 && el.getBoundingClientRect().height < 60)
+          { el.click(); break; }
+    });
+    await loginPage.waitForTimeout(300);
+    await loginPage.evaluate(() => {
+      for (const b of document.querySelectorAll("button"))
+        if (b.textContent.trim().endsWith("Lathe") && b.getBoundingClientRect().y > 0)
+          { b.click(); break; }
+    });
+    await loginPage.waitForTimeout(300);
+    await loginPage.keyboard.press("Escape");
+  }
+
+  // Send a trivial message that triggers a tool call
+  await loginPage.evaluate(() => {
+    const input = document.getElementById("chat-input");
+    if (!input) return;
+    input.focus();
+    input.innerHTML = "<p>Run: echo warm</p>";
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+  await loginPage.waitForTimeout(200);
+  try {
+    await loginPage.waitForSelector("#send-message-button", { state: "visible", timeout: 2000 });
+  } catch {}
+  await loginPage.click("#send-message-button");
+
+  // Wait for the response (sandbox wake + model reply)
+  await waitForResponse(loginPage, { timeoutMs: 120000, stableMs: 3000 });
+  log("prewarm", "Sandbox is awake");
+
+  // Delete the throwaway conversation
+  const warmChatUrl = loginPage.url();
+  const warmChatId = warmChatUrl.match(/\/c\/([a-f0-9-]+)/)?.[1];
+  if (warmChatId) {
+    await fetch(`${OWUI_URL}/api/v1/chats/${warmChatId}`, {
+      method: "DELETE",
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    log("prewarm", `Deleted warm-up chat ${warmChatId}`);
+  }
+} catch (err) {
+  log("prewarm", `Pre-warm failed: ${err.message} — continuing anyway`);
+}
+
 await loginContext.close();
 
 // ── Recorded context starts here ────────────────────────────────
@@ -425,13 +498,12 @@ try {
   await page.waitForTimeout(800);
   await page.keyboard.press("Escape");
   await cursorHide(page);
-  await page.waitForTimeout(1000);
+  await page.waitForTimeout(300);
 
   // ── Beat 3: First prompt — clone repo ──────────────────────────
   log("beat3", "Typing first prompt...");
   await cursorClick(page, "#chat-input");
   await typeMessage(page, "Clone https://github.com/rndmcnlly/lathe and give me a friendly one-paragraph description of what it does.");
-  await page.waitForTimeout(500);
 
   // ── Beat 4: Send and wait ──────────────────────────────────────
   log("beat4", "Sending first prompt...");
@@ -443,13 +515,11 @@ try {
   // Capture the chat URL so we can return to this conversation later
   chatUrl = page.url();
   log("beat4", `Chat URL: ${chatUrl}`);
-  await page.waitForTimeout(500);
 
   // ── Beat 5: Second prompt — VS Code ─────────────────────────────
   log("beat5", "Typing second prompt...");
   await cursorClick(page, "#chat-input");
   await typeMessage(page, `Give me a VS Code editor for this repo. When you share the link, use a markdown link with a friendly label instead of showing the raw URL.`);
-  await page.waitForTimeout(500);
 
   // ── Beat 6: Send and wait for code-server install + expose ─────
   log("beat6", "Sending second prompt...");
@@ -457,7 +527,6 @@ try {
   await sendMessage(page);
   await cursorHide(page);
   await waitForResponse(page, { timeoutMs: 180000, stableMs: 5000 });
-  await page.waitForTimeout(500);
 
   // ── Beat 7: Highlight and open the VS Code URL ─────────────────
   // The model was asked to use a markdown link, so the raw URL is only
@@ -480,10 +549,7 @@ try {
         }
       }
     }, exposeUrl);
-    await page.waitForTimeout(800);
     await cursorClick(page, "[data-capture-expose-link]");
-    await page.waitForTimeout(500);
-
     await page.goto(exposeUrl);
     await page.waitForTimeout(6000);
     log("beat7", "VS Code visible");
@@ -505,36 +571,30 @@ try {
   log("beat9", "Typing stop-server prompt...");
   await cursorClick(page, "#chat-input");
   await typeMessage(page, "Thanks! Please stop the code-server now, I'm done with it.");
-  await page.waitForTimeout(500);
 
   log("beat9", "Sending stop-server prompt...");
   await cursorClick(page, "#send-message-button");
   await sendMessage(page);
   await cursorHide(page);
   await waitForResponse(page, { timeoutMs: 60000, stableMs: 5000 });
-  await page.waitForTimeout(500);
 
   // ── Beat 10: Let the cleanup response sit visibly ──────────────
   log("beat10", "Showing cleanup response...");
   await scrollToBottom(page);
-  await page.waitForTimeout(500);
 
-  // ── Beat 11: Gimmick — run whatever's in DEMO_GIMMICK.md ──────
+  // ── Beat 11: Gimmick — delegate to a sub-agent ─────────────────
   log("beat11", "Typing gimmick prompt...");
   await cursorClick(page, "#chat-input");
-  await typeMessage(page, "Do the thing in /home/daytona/workspace/DEMO_GIMMICK.md");
-  await page.waitForTimeout(500);
+  await typeMessage(page, "There's a file called DEMO_GIMMICK.md in the workspace. Don't read it yourself — delegate it to a sub-agent. Have the sub-agent read the file, do whatever it says, and explain what it did.");
 
   log("beat11", "Sending gimmick prompt...");
   await cursorClick(page, "#send-message-button");
   await sendMessage(page);
   await cursorHide(page);
-  await waitForResponse(page, { timeoutMs: 120000, stableMs: 5000 });
-  await page.waitForTimeout(500);
+  await waitForResponse(page, { timeoutMs: 240000, stableMs: 5000 });
 
   log("beat12", "Showing gimmick response...");
   await scrollToBottom(page);
-  await page.waitForTimeout(500);
 
   log("done", "Capture complete");
   await page.waitForTimeout(1000);

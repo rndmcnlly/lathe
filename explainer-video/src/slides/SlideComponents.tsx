@@ -1154,5 +1154,211 @@ export const InspirationSlide: React.FC<InspirationProps> = ({
   );
 };
 
+// ── Conversation Slide ────────────────────────────────────────────
+// A conversational wrapper: user bubble → compact tool card → agent bubble.
+// Shifts visual emphasis from tool output to the chat experience.
+
+type ConversationProps = {
+  userMessage: string;
+  agentReply: string;
+  // Compact tool call (optional — some conversations are CodeBlock-based)
+  toolName?: string;
+  toolArgs?: string;
+  toolResultPreview?: string;  // first few lines of result, truncated
+  toolIcon?: string;
+  partId: PartId;
+};
+
+export const ConversationSlide: React.FC<ConversationProps> = ({
+  userMessage,
+  agentReply,
+  toolName,
+  toolArgs,
+  toolResultPreview,
+  toolIcon,
+  partId,
+}) => {
+  const frame = useCurrentFrame();
+  const { fps, durationInFrames } = useVideoConfig();
+  const theme = PART_THEMES[partId];
+  const isStill = durationInFrames === 1;
+
+  // Staggered entrance: user → tool → agent
+  const userProgress = isStill
+    ? 1
+    : spring({ frame, fps, config: { damping: 200 } });
+  const toolProgress = isStill
+    ? 1
+    : spring({ frame: frame - 15, fps, config: { damping: 200 } });
+  const agentProgress = isStill
+    ? 1
+    : spring({ frame: frame - 30, fps, config: { damping: 200 } });
+
+  const IconComponent = toolIcon ? TOOL_ICONS[toolIcon] : null;
+  const hasTool = toolName != null;
+
+  return (
+    <div
+      style={{
+        display: "flex",
+        flexDirection: "column",
+        gap: hasTool ? 16 : 28,
+        width: "100%",
+        maxWidth: 1400,
+      }}
+    >
+      {/* User bubble */}
+      <div
+        style={{
+          alignSelf: "flex-start",
+          maxWidth: "80%",
+          opacity: Math.max(0, userProgress),
+          transform: `translateY(${interpolate(userProgress, [0, 1], [20, 0])}px)`,
+        }}
+      >
+        <div
+          style={{
+            fontSize: 14,
+            fontWeight: 600,
+            color: COLORS.textMuted,
+            marginBottom: 6,
+            textTransform: "uppercase",
+            letterSpacing: "0.08em",
+          }}
+        >
+          You
+        </div>
+        <div
+          style={{
+            padding: "16px 24px",
+            borderRadius: "16px 16px 16px 4px",
+            backgroundColor: COLORS.bgCard,
+            border: `1px solid ${COLORS.terminalBorder}`,
+          }}
+        >
+          <div
+            style={{
+              fontSize: 24,
+              lineHeight: 1.4,
+              color: COLORS.text,
+            }}
+          >
+            {userMessage}
+          </div>
+        </div>
+      </div>
+
+      {/* Compact tool card (if present) */}
+      {hasTool && (
+        <div
+          style={{
+            alignSelf: "center",
+            width: "90%",
+            opacity: Math.max(0, toolProgress),
+            transform: `translateY(${interpolate(toolProgress, [0, 1], [15, 0])}px)`,
+          }}
+        >
+          {/* Tool header */}
+          <div
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: 10,
+              padding: "10px 20px",
+              borderRadius: toolResultPreview ? "10px 10px 0 0" : "10px",
+              backgroundColor: `${theme.accent}18`,
+              border: `1px solid ${theme.accent}33`,
+              borderBottom: toolResultPreview ? "none" : undefined,
+            }}
+          >
+            {IconComponent && <IconComponent color={theme.accent} size={18} />}
+            <div
+              style={{
+                fontSize: 17,
+                fontFamily: FONTS.mono,
+                fontWeight: 600,
+                color: theme.accent,
+              }}
+            >
+              {toolName}({toolArgs || ""})
+            </div>
+          </div>
+          {/* Compact result preview */}
+          {toolResultPreview && (
+            <div
+              style={{
+                padding: "12px 20px",
+                borderRadius: "0 0 10px 10px",
+                backgroundColor: `${COLORS.terminal}cc`,
+                border: `1px solid ${COLORS.terminalBorder}`,
+                borderTop: `1px solid ${theme.accent}22`,
+              }}
+            >
+              {toolResultPreview.split("\n").slice(0, 4).map((line, i) => (
+                <div
+                  key={i}
+                  style={{
+                    fontFamily: FONTS.mono,
+                    fontSize: 16,
+                    lineHeight: 1.5,
+                    color: line.startsWith("✓") ? COLORS.green : COLORS.code,
+                    opacity: 0.8,
+                    whiteSpace: "pre",
+                    overflow: "hidden",
+                  }}
+                >
+                  {line}
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Agent bubble */}
+      <div
+        style={{
+          alignSelf: "flex-end",
+          maxWidth: "80%",
+          opacity: Math.max(0, agentProgress),
+          transform: `translateY(${interpolate(agentProgress, [0, 1], [20, 0])}px)`,
+        }}
+      >
+        <div
+          style={{
+            fontSize: 14,
+            fontWeight: 600,
+            color: theme.accent,
+            marginBottom: 6,
+            textTransform: "uppercase",
+            letterSpacing: "0.08em",
+            textAlign: "right",
+          }}
+        >
+          Agent
+        </div>
+        <div
+          style={{
+            padding: "16px 24px",
+            borderRadius: "16px 16px 4px 16px",
+            backgroundColor: `${theme.accent}18`,
+            border: `1px solid ${theme.accent}33`,
+          }}
+        >
+          <div
+            style={{
+              fontSize: 24,
+              lineHeight: 1.4,
+              color: COLORS.text,
+            }}
+          >
+            {agentReply}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+};
+
 // Re-export TOOL_ICONS for use in other components
 export { TOOL_ICONS };

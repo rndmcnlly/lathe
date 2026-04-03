@@ -24,6 +24,7 @@ import {
   ToolCallSlide,
   SceneSlide,
   InspirationSlide,
+  ConversationSlide,
 } from "../slides/SlideComponents";
 import { ArchDiagram } from "../slides/ArchDiagram";
 import { LifecycleDiagram } from "../slides/LifecycleDiagram";
@@ -85,6 +86,14 @@ export const Clip: React.FC<{
   label: string;
   file: string;
   url: string;
+}> = () => null;
+export const Conversation: React.FC<{
+  userMessage: string;
+  agentReply: string;
+  toolName?: string;
+  toolArgs?: string;
+  toolResultPreview?: string;
+  toolIcon?: string;
 }> = () => null;
 
 // ── Shared tree-walking helpers ───────────────────────────────────
@@ -194,6 +203,20 @@ function renderVisual(el: React.ReactElement<any>, partId: PartId): React.ReactN
       if (clipEl.type === Clip) clips.push({ label: clipEl.props.label, file: clipEl.props.file, url: clipEl.props.url });
     });
     return <InspirationSlide clips={clips} tagline={props.tagline} partId={partId} />;
+  }
+
+  if (type === Conversation) {
+    return (
+      <ConversationSlide
+        userMessage={props.userMessage}
+        agentReply={props.agentReply}
+        toolName={props.toolName}
+        toolArgs={props.toolArgs}
+        toolResultPreview={props.toolResultPreview}
+        toolIcon={props.toolIcon}
+        partId={partId}
+      />
+    );
   }
 
   throw new Error(`Unknown visual tag: ${type}`);

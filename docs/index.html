@@ -150,9 +150,9 @@
             <h3>expose</h3>
             <p>One-step file browser (<code>"dufs"</code>), browser IDE (<code>"code-server"</code>), public URL for any web service (<code>"http:&lt;port&gt;"</code>), or time-limited SSH command (<code>"ssh"</code>).</p>
         </div>
-        <div class="tool-card highlight-card">
+        <div class="tool-card">
             <h3>delegate</h3>
-            <p>Spawn an autonomous sub-agent that works the same sandbox with up to 30 steps. It does the heavy lifting in its own context window and reports back with a clean summary.</p>
+            <p>Hand off a multi-step task to a sub-agent that works the same sandbox in its own context window and reports back with a summary.</p>
         </div>
         <div class="tool-card">
             <h3>onboard</h3>
@@ -167,69 +167,36 @@
 
 <!-- ── Delegate ───────────────────────────────────── -->
 <div class="section">
-    <div class="section-label">New</div>
-    <h2 class="section-title">Sub-agents via delegate()</h2>
+    <div class="section-label">Delegation</div>
+    <h2 class="section-title">Offloading multi-step work</h2>
     <p>
-        The hardest problems take dozens of steps: explore a codebase, find the bug,
-        fix it, run the tests, iterate. If the main agent does all of that inline,
-        every file read, every test output, every intermediate edit accumulates in
-        its context window &mdash; crowding out the actual conversation.
+        Some tasks take many steps &mdash; cloning a repo, reading a dozen files,
+        running tests, fixing failures, re-running. If the main agent does all of
+        that inline, every intermediate result accumulates in the conversation,
+        crowding out the parts you care about.
     </p>
     <p>
-        <code>delegate()</code> offloads that work to a sub-agent that runs the same
-        model against the same sandbox but in its own, separate context. The sub-agent
-        works autonomously, then distills everything it did into a concise summary
-        that flows back as a single tool result. The main agent gets the answer
-        without the noise.
+        <code>delegate()</code> hands that work to a sub-agent: same model, same
+        sandbox, but its own context window. The sub-agent works autonomously
+        through however many steps it needs (up to 30), then sends a concise
+        summary back as a single tool result.
     </p>
-    <div class="delegate-diagram">
-        <div class="delegate-step">
-            <div class="delegate-step-num">1</div>
-            <div class="delegate-step-text">
-                <strong>You ask</strong> &mdash; "Clone this repo, run the tests,
-                and fix any failures."
-            </div>
-        </div>
-        <div class="delegate-step">
-            <div class="delegate-step-num">2</div>
-            <div class="delegate-step-text">
-                <strong>Model delegates</strong> &mdash; spawns a sub-agent with a
-                clear task, optional context, and reference files.
-            </div>
-        </div>
-        <div class="delegate-step">
-            <div class="delegate-step-num">3</div>
-            <div class="delegate-step-text">
-                <strong>Sub-agent works</strong> &mdash; up to 30 steps of bash, read,
-                write, edit, glob, grep &mdash; all in its own context window.
-            </div>
-        </div>
-        <div class="delegate-step">
-            <div class="delegate-step-num">4</div>
-            <div class="delegate-step-text">
-                <strong>Summary returns</strong> &mdash; dozens of steps compressed into
-                one tool result. The main agent's context stays clean.
-            </div>
-        </div>
-    </div>
+    <p>
+        Each delegated job runs in the foreground for a configurable timeout
+        (default 30 seconds). If the sub-agent finishes quickly, the result
+        comes back immediately. If it takes longer, the job moves to the
+        background automatically &mdash; the main agent stays responsive to you
+        while the sub-agent keeps working. Background results are written to
+        sidecar files in the sandbox that the main agent can check later.
+    </p>
     <p>
         The sub-agent gets <code>bash</code>, <code>read</code>, <code>write</code>,
         <code>edit</code>, <code>glob</code>, and <code>grep</code>. It can't
-        <code>expose</code> URLs, <code>destroy</code> the sandbox, or spawn further
-        sub-agents &mdash; no recursion. Pass <code>context_files</code> to inject
-        AGENTS.md or config files directly into the sub-agent's prompt so it
-        doesn't waste steps discovering what you already know.
+        <code>expose</code> URLs, <code>destroy</code> the sandbox, or spawn
+        further sub-agents. Pass <code>context_files</code> to inject project
+        docs directly into the sub-agent's prompt so it doesn't waste steps
+        on orientation.
     </p>
-    <div class="delegate-examples">
-        <h3>Good delegate tasks</h3>
-        <ul>
-            <li><em>Exploration</em> &mdash; "Find all test files and determine the testing framework and coverage structure."</li>
-            <li><em>Refactoring</em> &mdash; "Rename all occurrences of getFoo to get_foo across the Python codebase, updating tests."</li>
-            <li><em>Debugging</em> &mdash; "The build fails with error X. Investigate, identify the root cause, and fix it."</li>
-            <li><em>Research</em> &mdash; "Read the configuration files and summarize the project's dependency tree."</li>
-            <li><em>Batch operations</em> &mdash; "Add type hints to all functions in src/utils/ that are missing them."</li>
-        </ul>
-    </div>
 </div>
 
 <!-- ── Recipes ────────────────────────────────────── -->
@@ -267,7 +234,7 @@
         </li>
         <li>
             <span class="recipe-label">Delegate the hard stuff</span>
-            <span class="recipe-desc">"Run the test suite, investigate every failure, and fix them all." &mdash; the model spawns a sub-agent that works autonomously through each failure.</span>
+            <span class="recipe-desc">"Run the test suite and fix any failures" &mdash; the model can hand this off to a sub-agent that works through the problem without cluttering your conversation.</span>
         </li>
     </ul>
 </div>
