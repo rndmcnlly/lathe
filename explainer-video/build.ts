@@ -68,7 +68,6 @@ function normalizeForTTS(text: string): string {
   ];
   for (const [from, to] of swaps) t = t.replaceAll(from, to);
   t = t.replaceAll("Lathe", "lathe");
-  t = t.replaceAll("Daytona", "Day tona");
   t = t.replaceAll(" — ", ", ").replaceAll("—", ", ");
   return t;
 }
@@ -211,6 +210,29 @@ function generateVTT(manifest: Record<string, ManifestEntry>): void {
   console.log(`  WebVTT: ${vttPath}`);
 }
 
+// ── Demo video download ───────────────────────────────────────────
+
+const IMAGES_DIR = join(ROOT, "public", "images");
+const DEMO_VIDEO_PATH = join(IMAGES_DIR, "demo.webm");
+const DEMO_RELEASE_TAG = "demo-video-latest";
+const DEMO_ASSET_NAME = "demo.webm";
+
+async function ensureDemoVideo(): Promise<void> {
+  if (existsSync(DEMO_VIDEO_PATH)) {
+    console.log(`  [cached] demo.webm`);
+    return;
+  }
+
+  console.log(`  [downloading] demo.webm from GitHub release ${DEMO_RELEASE_TAG}...`);
+  const url = `https://github.com/rndmcnlly/lathe/releases/download/${DEMO_RELEASE_TAG}/${DEMO_ASSET_NAME}`;
+  const resp = await fetch(url);
+  if (!resp.ok) throw new Error(`Failed to download demo video: HTTP ${resp.status}`);
+  const buf = Buffer.from(await resp.arrayBuffer());
+  mkdirSync(IMAGES_DIR, { recursive: true });
+  writeFileSync(DEMO_VIDEO_PATH, buf);
+  console.log(`  [saved] demo.webm (${(buf.length / 1024 / 1024).toFixed(1)} MB)`);
+}
+
 // ── Main ──────────────────────────────────────────────────────────
 
 async function main() {
@@ -219,6 +241,9 @@ async function main() {
 
   mkdirSync(AUDIO_DIR, { recursive: true });
   mkdirSync(join(ROOT, "out"), { recursive: true });
+
+  console.log("\n── Demo video ──\n");
+  await ensureDemoVideo();
 
   const manifest = await renderTTS(forceTTS);
 

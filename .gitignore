@@ -9,6 +9,8 @@ explainer-video/public/audio/manifest.json
 explainer-video/public/audio/.narration-hashes.json
 explainer-video/src/data/manifest.json
 explainer-video/out/
+# Downloaded release assets (fetched by build.ts at build time)
+explainer-video/public/images/demo.webm
 .DS_Store
 
 # Demo video — captured output

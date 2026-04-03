@@ -13,7 +13,7 @@ import React from "react";
 import {
   Video, Part, Slide,
   Title, Text, Chat, User, Agent, CodeBlock, ToolCall, Scene, Callout,
-  Conversation, Inspiration, Clip, ArchDiagramTag, LifecycleDiagramTag,
+  Conversation, Inspiration, Clip, DemoClip, ArchDiagramTag, LifecycleDiagramTag,
   extractNarrations, toComposition, getTotalFrames, extractTimeline,
 } from "./tags";
 
@@ -28,8 +28,8 @@ const script = (
 
       <Slide id="title" section>
         <Title main="Lathe" sub="An agent harness for Open WebUI" />
-        Lathe is an agent harness for Open WebUI. Inspired by coding
-        agents like Pi and OpenCode — but built for the browser.
+        Here's Lathe, an agent harness for Open WebUI. Same idea as Pi
+        or OpenCode — but built for the browser.
       </Slide>
 
       <Slide id="the-landscape">
@@ -37,21 +37,15 @@ const script = (
           <Clip label="Pi" file="pi-demo.mp4" url="pi.dev" />
           <Clip label="OpenCode" file="opencode-demo.mp4" url="opencode.ai" />
         </Inspiration>
-        Terminal coding agents are everywhere now. They're fast, capable,
-        and deeply integrated with developer workflows. But they assume
-        you're at a workstation with a shell. Lathe brings that same
-        agent surface to Open WebUI — any model, any browser, no local
-        setup.
+        Terminal coding agents are everywhere. Fast. Capable. But they
+        assume you're at a workstation with a shell.
       </Slide>
 
       <Slide id="first-message" section>
-        <Chat>
-          <User>I have a project repo I need to work on. Can you clone it and get oriented?</User>
-          <Agent>Sure — let me pull that down and take a look.</Agent>
-        </Chat>
-        A user opens their browser and starts a conversation. Nothing
-        special yet — just a chat window. But the moment the model
-        reaches for a tool, something happens.
+        <DemoClip file="demo.webm" startSeconds={10} />
+        Lathe brings that to Open WebUI. Any model, any browser, no
+        local setup. The user opens a conversation. Just a chat window —
+        until the model reaches for a tool.
       </Slide>
 
       <Slide id="sandbox-spins-up">
@@ -66,18 +60,16 @@ Cloning into '/home/daytona/workspace'...
           toolIcon="terminal"
           agentReply="Cloned. A sandbox spun up automatically — let me look around."
         />
-        A sandbox spins up. A full Linux VM, provisioned on demand,
-        dedicated to this user. The model didn't ask for it. The user
-        didn't configure it. Lathe handled the lifecycle transparently —
-        create, start, wait for ready.
+        A sandbox spins up. Provisioned on demand. Dedicated to this
+        user. The model didn't ask for it. The user didn't configure it.
+        Lathe handles the lifecycle transparently.
       </Slide>
 
       <Slide id="arch-overview">
         <ArchDiagramTag />
-        The architecture is simple. The user talks to a model in Open
-        WebUI. The model calls Lathe's tools. Each tool executes in a
-        Daytona sandbox. Results flow back as tool output the model
-        reasons about.
+        User talks to a model in Open WebUI. Model calls Lathe's tools.
+        Tools execute in a Daytona sandbox. Results flow back as tool
+        output.
       </Slide>
 
     </Part>
@@ -96,9 +88,8 @@ package.json  tests/`}
           toolIcon="terminal"
           agentReply="It's a Node project with source in src/, tests in tests/, and an AGENTS.md with project conventions."
         />
-        The agent clones the repo and explores the project structure.
-        Shell commands, file reads, edits — the full surface of a coding
-        agent, running in the sandbox.
+        The agent clones the repo and explores. Shell commands, file
+        reads, edits — all running in the sandbox.
       </Slide>
 
       <Slide id="onboards">
@@ -113,10 +104,8 @@ package.json  tests/`}
           toolIcon="book"
           agentReply="Got it — Prettier formatting, no semicolons, tests via npm test. I'll follow these conventions."
         />
-        Then it calls onboard. This loads project-specific instructions,
-        conventions, and context — all in one shot. The agent picks up
-        the project's norms the same way a new teammate would read the
-        contributing guide.
+        Then it calls onboard. Project instructions, conventions,
+        context — loaded in one shot.
       </Slide>
 
       <Slide id="builds-something">
@@ -130,10 +119,9 @@ Server listening on port 3000
           toolIcon="terminal"
           agentReply="API is up on port 3000 and all 12 tests pass. Ready for you to try it."
         />
-        The agent gets to work. It writes code, installs dependencies,
-        starts a dev server. Each step is a tool call — visible in the
-        conversation as it happens. Packages stay installed across
-        conversations because the sandbox is persistent.
+        The agent writes code, installs dependencies, starts a dev
+        server. Packages persist across conversations. The sandbox is
+        stateful.
       </Slide>
 
       <Slide id="expose-moment" section>
@@ -146,10 +134,9 @@ https://8080-sandbox-abc123.proxy...`}
           toolIcon="globe"
           agentReply="Here's your editor — VS Code in the browser, connected to the sandbox. Full terminal and extensions included."
         />
-        Now here's where it gets interesting. The agent calls expose —
-        and the user gets a public URL to whatever's running in the
-        sandbox. A web app. A file browser. A full VS Code instance. One
-        tool call installs, starts, and signs the URL.
+        The agent calls expose. The user gets a signed URL to whatever's
+        running in the sandbox. A web app. A file browser. A full VS
+        Code instance.
       </Slide>
 
       <Slide id="beyond-chat">
@@ -167,10 +154,8 @@ https://8080-sandbox-abc123.proxy...`}
             "Runs test suite after each change",
           ]}
         />
-        The user opens VS Code in one tab and the running app in
-        another. They edit code directly while the agent makes structural
-        changes through chat. Both work on the same filesystem, in the
-        same sandbox, at the same time.
+        User edits code in VS Code. Agent makes structural changes
+        through chat. Same filesystem. Same sandbox. Same time.
       </Slide>
 
       <Slide id="delegate-mention">
@@ -179,12 +164,9 @@ https://8080-sandbox-abc123.proxy...`}
           heading="Delegation"
           body="The agent can hand off multi-step work to a sub-agent that shares the same sandbox. Long-running jobs move to the background automatically, so the main agent stays responsive."
         />
-        For bigger tasks, the agent can delegate. A sub-agent picks up
-        the work in its own context window, and if it takes a while, the
-        job backgrounds automatically so the conversation keeps flowing.
-        With multiple delegates running at once, this becomes a kind of
-        agent swarm — but most of the time, it's just a convenient way to
-        offload a messy task.
+        For bigger tasks, the agent delegates. A sub-agent picks up the
+        work in its own context. Long jobs background automatically. The
+        conversation keeps flowing.
       </Slide>
 
     </Part>
@@ -198,9 +180,8 @@ https://8080-sandbox-abc123.proxy...`}
           <User>That's good for today, thanks.</User>
           <Agent>Your sandbox will sleep automatically when idle. Files, packages, git history — all still there next time.</Agent>
         </Chat>
-        When the user is done, they just close the tab. The sandbox
-        idles for a few minutes, then sleeps on its own. No teardown.
-        No save button.
+        The user closes the tab. The sandbox sleeps on its own. No
+        teardown. No save button.
       </Slide>
 
       <Slide id="any-device">
@@ -218,10 +199,9 @@ https://8080-sandbox-abc123.proxy...`}
             "Same sandbox, same files",
           ]}
         />
-        And because the sandbox is in the cloud, it's not tied to a
-        machine — it's tied to you. Start a conversation on your laptop
-        at the office, then pick it up on your phone on the bus. Anywhere
-        you can reach your Open WebUI server, your sandbox is there.
+        The sandbox is in the cloud. Not tied to a machine — tied to
+        you. Start on your laptop. Pick up on your phone. Same sandbox
+        wherever you reach the server.
       </Slide>
 
       <Slide id="comes-back">
@@ -235,23 +215,21 @@ Loaded project context from AGENTS.md
           toolIcon="book"
           agentReply="Welcome back. Your workspace is intact — last commit was the auth middleware, three days ago."
         />
-        Days later, the user starts a new conversation. The sandbox
-        wakes transparently on the first tool call. Files, packages, git
-        history — all still there. The agent calls onboard and picks up
-        the project context immediately.
+        New conversation. The sandbox wakes on the first tool call.
+        Files, packages, git history — all intact. Onboard picks up the
+        project context immediately.
       </Slide>
 
       <Slide id="the-cycle" section>
         <LifecycleDiagramTag />
-        That's the cycle. Spin up, get to work, spin down. The sandbox
-        is infrastructure that appears when you need it and disappears
-        when you don't. One toolkit. One API key. Every model on the
+        Spin up, get to work, spin down. Infrastructure that appears
+        when you need it. One toolkit. One API key. Every model on the
         server gets a coding agent surface.
       </Slide>
 
       <Slide id="outro">
         <Title main="lathe.tools" sub="github.com/rndmcnlly/lathe" />
-        Lathe. An agent harness for Open WebUI.
+        That's Lathe. An agent harness for Open WebUI.
       </Slide>
 
     </Part>

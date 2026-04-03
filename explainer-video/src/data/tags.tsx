@@ -25,6 +25,7 @@ import {
   SceneSlide,
   InspirationSlide,
   ConversationSlide,
+  DemoClipSlide,
 } from "../slides/SlideComponents";
 import { ArchDiagram } from "../slides/ArchDiagram";
 import { LifecycleDiagram } from "../slides/LifecycleDiagram";
@@ -94,6 +95,12 @@ export const Conversation: React.FC<{
   toolArgs?: string;
   toolResultPreview?: string;
   toolIcon?: string;
+}> = () => null;
+
+// DemoClip: shows a clipped segment of the demo video, offset by startSeconds.
+export const DemoClip: React.FC<{
+  file: string;
+  startSeconds: number;
 }> = () => null;
 
 // ── Shared tree-walking helpers ───────────────────────────────────
@@ -217,6 +224,10 @@ function renderVisual(el: React.ReactElement<any>, partId: PartId): React.ReactN
         partId={partId}
       />
     );
+  }
+
+  if (type === DemoClip) {
+    return <DemoClipSlide file={props.file} startSeconds={props.startSeconds} />;
   }
 
   throw new Error(`Unknown visual tag: ${type}`);

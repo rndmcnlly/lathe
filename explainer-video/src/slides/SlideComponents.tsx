@@ -1128,6 +1128,7 @@ export const InspirationSlide: React.FC<InspirationProps> = ({
               <div style={{ position: "relative", width: "100%" }}>
                 <OffthreadVideo
                   src={staticFile(`images/${clip.file}`)}
+                  playbackRate={0.5}
                   style={{ width: "100%", display: "block" }}
                   muted
                 />
@@ -1356,6 +1357,42 @@ export const ConversationSlide: React.FC<ConversationProps> = ({
           </div>
         </div>
       </div>
+    </div>
+  );
+};
+
+// ── Demo Clip Slide ───────────────────────────────────────────────
+// Shows a segment of the demo video starting at startSeconds, filling
+// the full slide area. The video plays for however long the slide lasts.
+
+type DemoClipProps = {
+  file: string;
+  startSeconds: number;
+};
+
+export const DemoClipSlide: React.FC<DemoClipProps> = ({ file, startSeconds }) => {
+  const { fps } = useVideoConfig();
+  const startFromFrame = Math.round(startSeconds * fps);
+
+  return (
+    <div
+      style={{
+        position: "absolute",
+        inset: 0,
+        overflow: "hidden",
+        borderRadius: 0,
+      }}
+    >
+      <OffthreadVideo
+        src={staticFile(`images/${file}`)}
+        startFrom={startFromFrame}
+        style={{
+          width: "100%",
+          height: "100%",
+          objectFit: "cover",
+        }}
+        muted
+      />
     </div>
   );
 };
