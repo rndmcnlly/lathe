@@ -67,6 +67,7 @@ function normalizeForTTS(text: string): string {
     ["AGENTS.md", "agents dot M D"], ["httpx", "H T T P X"],
   ];
   for (const [from, to] of swaps) t = t.replaceAll(from, to);
+  t = t.replaceAll("Lathe", "lathe");
   t = t.replaceAll("Daytona", "Day tona");
   t = t.replaceAll(" — ", ", ").replaceAll("—", ", ");
   return t;
