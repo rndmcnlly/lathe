@@ -837,6 +837,12 @@ async def _core_write(valves, sandbox_id: str, client: httpx.AsyncClient, *,
                       path: str, content: str) -> str:
     """Write a file to the sandbox (creates parents automatically).
 
+    For large files, prefer a skeleton-then-edit workflow: write the file first
+    with overall structure and ``# PLACEHOLDER: <section>`` markers, then use
+    ``edit()`` to expand each placeholder incrementally. This makes progress
+    visible to the user in real time and keeps partial work on disk if
+    generation is interrupted.
+
     :param path: Absolute path to write to.
     :param content: The full file content.
     """
