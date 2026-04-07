@@ -169,6 +169,22 @@ https://8080-sandbox-abc123.proxy...`}
         conversation keeps flowing.
       </Slide>
 
+      <Slide id="handoff-tease">
+        <Conversation
+          userMessage="This conversation is getting long — let's hand off to a fresh one."
+          toolName="handoff"
+          toolArgs=""
+          toolResultPreview={`Write your handoff document as your
+reply to the user. Do NOT make
+any tool calls.`}
+          toolIcon="file"
+          agentReply={"Start a new conversation with tools enabled and paste everything below.\n───\nWe were working on the API auth refactor.\n### Goal\n### Accomplished\n### Unresolved\n### Key files"}
+        />
+        And when the conversation itself gets too long, the agent can
+        hand off. The tool releases instructions; the agent writes a
+        structured summary you paste into a fresh chat.
+      </Slide>
+
     </Part>
 
     {/* ── Act 3: Spin Down ────────────────────────────────────── */}
