@@ -5,7 +5,7 @@ author_url: https://adamsmith.as
 description: Coding agent tools (lathe, bash, read, write, edit, glob, grep, delegate, onboard, expose, destroy) backed by per-user sandbox VMs with transparent lifecycle management.
 required_open_webui_version: 0.4.0
 requirements: httpx, pydantic-ai-slim[openai]
-version: 0.15.0
+version: 0.16.0
 licence: MIT
 """
 
@@ -1432,7 +1432,77 @@ def _build_delegate_system_prompt(max_steps: int) -> str:
 #   expose()   — user-facing; sub-agent has no user to give a URL to
 #   destroy()  — irreversible lifecycle operation
 #   delegate() — no recursion
-_DELEGATE_WITHHELD = {"lathe", "onboard", "expose", "destroy", "delegate"}
+_DELEGATE_WITHHELD = {"lathe", "onboard", "expose", "destroy", "delegate", "handoff"}
+
+
+# ── handoff() instructions ──────────────────────────────────────────
+#
+# Returned verbatim by the handoff() tool.  The agent reads these
+# instructions and writes the handoff document as streamed reply text.
+# No tool calls, no sandbox I/O — the agent already has everything it
+# needs in context.
+
+_HANDOFF_INSTRUCTIONS = textwrap.dedent("""\
+    You just called handoff(). Your job now is to write a handoff
+    document as your reply to the user. Follow these rules exactly:
+
+    ## Format
+
+    Your reply has three parts, in order:
+
+    1. **User instruction** — a short sentence telling the user to
+       start a new conversation (with agent tools enabled) and paste
+       everything below the line as their opening message.
+
+    2. **Horizontal rule** — a markdown `---` on its own line.
+
+    3. **Handoff body** — everything below the line is what the user
+       will paste into the new conversation. The next agent reads it
+       cold.        Start with a single orienting sentence in the user's
+       evident chat style (same language, register, formality),
+       e.g. "We were just working in a long session on the task
+       below." Then the structured sections
+       (skip any that are empty):
+
+       ### Goal
+       What the user is trying to accomplish. Include verbatim quotes
+       of key user requests to prevent drift.
+
+       ### Accomplished
+       What was done in this conversation. Be specific: name files
+       modified, commands run, decisions made and why.
+
+       ### Unresolved
+       What remains. Specific next steps, not vague TODOs. If a task
+       was partially done, say exactly where it left off.
+
+       ### Key files
+       Absolute sandbox paths the next agent should read or pass as
+       context_files. Only include paths that actually exist and
+       matter — not every file touched.
+
+       ### What didn't work
+       Approaches that were tried and failed, so the next agent
+       doesn't repeat them. Skip this section if nothing failed.
+
+    ## Rules
+
+    - Do NOT make any tool calls. Write the handoff as your reply
+      text, then stop.
+    - Do NOT continue working on the task after writing the handoff.
+      The conversation is over. If the user replies asking you to
+      continue, tell them to delete the message that triggered the
+      handoff and continue from there instead — otherwise the handoff
+      text bloats the context with duplicated information.
+    - The handoff body should be dense and factual. The next agent
+      will read it cold — assume no prior context.
+    - Reference sandbox file paths rather than inlining code. The
+      sandbox persists across conversations — files written in this
+      session will be there in the next one. The next agent can read
+      them or pass them as context_files to delegate().
+    - Keep the total handoff under ~2000 words. A focused handoff is
+      more useful than an exhaustive one.
+    """)
 
 
 _DELEGATE_BASH_FOREGROUND_SECONDS = 15
@@ -2210,6 +2280,51 @@ class Tools:
             The usage summary in the tool result shows exact token counts.
             Use max_steps to cap cost for bounded tasks.
             """),
+        "handoff": textwrap.dedent("""\
+            # Lathe — Handoff
+
+            ## What handoff() does
+
+            handoff() returns instructions for writing a handoff document.
+            You write the document as your reply to the user — streamed
+            text, not a tool call. The user then starts a new conversation
+            and pastes the handoff as their opening message.
+
+            ## When to use it
+
+            - The user asks to "hand off", "compact", or "save context".
+            - You notice the conversation is getting long and suggest it.
+            - You can suggest the capability on your own, but don't
+              initiate the handoff unless the user agrees.
+
+            ## How it works
+
+            1. You call handoff(). No parameters needed.
+            2. The tool returns formatting instructions.
+            3. You write the handoff document as reply text, following
+               those instructions exactly.
+            4. You stop. No more tool calls after the handoff.
+
+            The handoff has a short preamble in the user's language
+            telling them what to do, a horizontal rule, then the
+            structured handoff body (Goal, Accomplished, Unresolved,
+            Key files, What didn't work).
+
+            ## Why reply text, not a file?
+
+            Reply text streams to the user in real time. Tool call
+            arguments don't appear until the agent finishes writing them
+            (long delay for big writes). The user should see the handoff
+            forming so they can judge its quality.
+
+            ## The sandbox persists
+
+            The sandbox filesystem survives across conversations. Files
+            you wrote in this session will be there when the user starts
+            a new conversation. The handoff document can reference sandbox
+            paths, and the next agent can read them or use them as
+            context_files in delegate() calls.
+            """),
         "overview": textwrap.dedent("""\
             # Lathe Toolkit — Overview
 
@@ -2293,6 +2408,13 @@ class Tools:
             If a request fails due to egress filtering, see
             lathe(manpage="egress") for workarounds.
 
+            **Handing off to a new conversation:**
+            When context gets long or the user asks, call handoff() to write
+            a structured handoff document. The user pastes it into a new
+            conversation as their opening message, and the next agent picks
+            up where you left off. The sandbox persists, so all files survive.
+            See lathe(manpage="handoff") for details.
+
             ## Gotchas
 
             - Commands are non-interactive. No stdin prompts, no curses UIs. Use
@@ -2338,6 +2460,7 @@ class Tools:
     _MANPAGE_INDEX: dict[str, str] = {
         "overview": "Big-picture orientation: sandbox model, tool catalog, key workflows, gotchas.",
         "delegate": "Sub-agent delegation: foreground/background, sidecar files, agent teams, cost model.",
+        "handoff": "Context handoff: writing a handoff document for continuing work in a new conversation.",
         "recipes": "Bootstrap scripts for common tools: dufs (file browser), code-server (IDE).",
         "background": "Background job sidecar files, and peek/poll/kill recipes.",
         "egress": "Egress restrictions, workarounds (dufs upload, browser-side fetch), Tier 3.",
@@ -2383,6 +2506,17 @@ class Tools:
             f"{index_lines}\n\n"
             f"Call lathe(manpage=\"overview\") for big-picture orientation."
         )
+
+    async def handoff(
+        self,
+        __user__: dict = {},
+        __event_emitter__=None,
+    ) -> str:
+        """
+        Prepare a handoff document for continuing this work in a new conversation. Call this when the user asks to compact, hand off, or save context for a fresh chat. After calling, write the handoff as your reply — do not make any more tool calls.
+        """
+        await _emit(__event_emitter__, "Handoff", done=True)
+        return _HANDOFF_INSTRUCTIONS
 
     async def destroy(
         self,

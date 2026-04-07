@@ -1312,6 +1312,73 @@ async def test_delegate_background_branching(R: Results):
 
 # ── Test registry and runner ─────────────────────────────────────────
 
+async def test_handoff(R: Results):
+    from lathe import _HANDOFF_INSTRUCTIONS, _DELEGATE_WITHHELD, _build_tool_catalog, Tools
+
+    print("\n── handoff: instructions content ──")
+    R.check("instructions non-empty",
+            len(_HANDOFF_INSTRUCTIONS) > 200,
+            f"length={len(_HANDOFF_INSTRUCTIONS)}")
+    R.check("instructions mention no tool calls",
+            "do not make any tool calls" in _HANDOFF_INSTRUCTIONS.lower(),
+            "should enforce no-tools rule")
+    R.check("instructions mention horizontal rule",
+            "---" in _HANDOFF_INSTRUCTIONS,
+            "should tell agent to write a separator")
+    R.check("instructions mention user instruction above line",
+            "user instruction" in _HANDOFF_INSTRUCTIONS.lower(),
+            "should describe the user-facing instruction")
+    R.check("instructions mention user's chat style",
+            "evident" in _HANDOFF_INSTRUCTIONS.lower()
+            and "language" in _HANDOFF_INSTRUCTIONS.lower(),
+            "should instruct to match the user's evident chat style and language")
+    R.check("instructions mention Goal section",
+            "### Goal" in _HANDOFF_INSTRUCTIONS,
+            "should have Goal section template")
+    R.check("instructions mention Accomplished section",
+            "### Accomplished" in _HANDOFF_INSTRUCTIONS,
+            "should have Accomplished section template")
+    R.check("instructions mention Unresolved section",
+            "### Unresolved" in _HANDOFF_INSTRUCTIONS,
+            "should have Unresolved section template")
+    R.check("instructions mention Key files section",
+            "### Key files" in _HANDOFF_INSTRUCTIONS,
+            "should have Key files section template")
+    R.check("instructions mention What didn't work",
+            "### What didn" in _HANDOFF_INSTRUCTIONS,
+            "should have What didn't work section template")
+    R.check("instructions mention verbatim quotes",
+            "verbatim" in _HANDOFF_INSTRUCTIONS.lower(),
+            "should encourage verbatim quotes to prevent drift")
+    R.check("instructions mention sandbox persists",
+            "persist" in _HANDOFF_INSTRUCTIONS.lower(),
+            "should note that sandbox survives across conversations")
+    R.check("instructions mention no-continue rule",
+            "delete" in _HANDOFF_INSTRUCTIONS.lower()
+            and "handoff" in _HANDOFF_INSTRUCTIONS.lower(),
+            "should tell agent to resist continuing after handoff")
+
+    print("\n── handoff: withheld from delegate ──")
+    R.check("handoff withheld from delegate",
+            "handoff" in _DELEGATE_WITHHELD,
+            f"should be in withheld set: {_DELEGATE_WITHHELD}")
+
+    print("\n── handoff: tool catalog ──")
+    tools = Tools()
+    catalog = _build_tool_catalog(tools)
+    R.check("handoff in tool catalog",
+            "handoff(" in catalog,
+            "handoff should appear in tool catalog")
+
+    print("\n── handoff: manpage index ──")
+    R.check("handoff in manpage index",
+            "handoff" in tools._MANPAGE_INDEX,
+            "handoff should have a manpage index entry")
+    R.check("handoff manpage exists",
+            "handoff" in tools._MANPAGES,
+            "handoff should have a manpage")
+
+
 TESTS = {
     "parse_env_vars": test_parse_env_vars,
     "onboard_script": test_onboard_script,
@@ -1334,6 +1401,7 @@ TESTS = {
     "delegate_foreground_constant": test_delegate_foreground_constant,
     "delegate_catalog_foreground_param": test_delegate_catalog_foreground_param,
     "delegate_background_branching": test_delegate_background_branching,
+    "handoff": test_handoff,
 }
 
 
