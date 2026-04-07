@@ -114,7 +114,7 @@
     <div class="section-label">Tools</div>
     <h2 class="section-title">What your agent can do</h2>
     <p>
-        Eleven tools, same caliber as the best proprietary agents. Each one runs against a
+        Twelve tools, same caliber as the best proprietary agents. Each one runs against a
         persistent Linux sandbox that follows you anywhere your browser does.
     </p>
     <div class="tool-grid">
@@ -161,6 +161,10 @@
         <div class="tool-card">
             <h3>destroy</h3>
             <p>Wipe your sandbox VM and start fresh. Persistent volume data survives. Requires explicit confirmation.</p>
+        </div>
+        <div class="tool-card highlight-card">
+            <h3>handoff</h3>
+            <p>Wrap up a long session. The model writes a structured handoff document you paste into a new conversation to pick up where you left off.</p>
         </div>
     </div>
 </div>
@@ -236,6 +240,10 @@
             <span class="recipe-label">Delegate the hard stuff</span>
             <span class="recipe-desc">"Run the test suite and fix any failures" &mdash; the model can hand this off to a sub-agent that works through the problem without cluttering your conversation.</span>
         </li>
+        <li>
+            <span class="recipe-label">Hand off a long session</span>
+            <span class="recipe-desc">"Let's hand off to a fresh conversation" &mdash; the model writes a structured summary you paste into a new chat. Your sandbox files are already there; the new agent picks up where you left off.</span>
+        </li>
     </ul>
 </div>
 
@@ -253,6 +261,12 @@
         later. Either way, the next tool call wakes it transparently &mdash; your
         files and installed packages survive both. Only running processes are lost.
         If you want a clean slate, ask the model to <code>destroy</code> it.
+    </p>
+    <p>
+        Your files persist, but conversation context doesn't &mdash; every new chat
+        starts cold. When a session runs long, ask the model to
+        <code>handoff</code>: it writes a structured summary you paste into a fresh
+        conversation, and the new agent picks up with full access to your sandbox.
     </p>
 </div>
 
