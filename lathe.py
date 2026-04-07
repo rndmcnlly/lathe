@@ -5,7 +5,7 @@ author_url: https://adamsmith.as
 description: Coding agent tools (lathe, bash, read, write, edit, glob, grep, delegate, onboard, expose, destroy) backed by per-user sandbox VMs with transparent lifecycle management.
 required_open_webui_version: 0.4.0
 requirements: httpx, pydantic-ai-slim[openai]
-version: 0.14.0
+version: 0.15.0
 licence: MIT
 """
 
@@ -1398,8 +1398,15 @@ def _build_delegate_system_prompt(max_steps: int) -> str:
         - For a {max_steps}-step budget, reserve at least the last step for writing
           your summary. Do not start new investigation branches when you are near
           the limit.
-        - If you are running low on steps, wrap up with what you have. A partial
-          summary is far more valuable than getting cut off with no output.
+        - If you are running low on steps, hand off your work rather than rushing
+          to finish. A clear handoff is far more valuable than getting cut off
+          with no output. Your handoff should include:
+            1. What you accomplished.
+            2. What remains unresolved — specific next steps, not vague TODOs.
+            3. Absolute paths to critical files in the sandbox that the calling
+               agent or a follow-up sub-agent would need to pick up the work
+               (source files you modified, test files that are failing, config
+               you discovered, logs worth reading).
 
         ## Rules
 
@@ -2176,18 +2183,22 @@ class Tools:
             All paths must be absolute. Delegation fails immediately if
             any path does not exist on the sandbox.
 
-            ## Step budget and wrap-up behavior
+            ## Step budget and handoff behavior
 
             The sub-agent's system prompt tells it how many steps it has
-            and instructs it to reserve time for a summary. Additionally,
-            when 2 steps remain, Lathe injects a wrap-up nudge into the
-            conversation — a synthetic message urging the sub-agent to
-            stop investigating and write its final summary immediately.
+            and instructs it to reserve time for a handoff summary.
+            Additionally, when 2 steps remain, Lathe injects a hard nudge
+            telling the sub-agent to stop making tool calls and write a
+            structured handoff: what was accomplished, what remains
+            unresolved, and absolute paths to critical sandbox files
+            needed to continue the work.
 
             This means: even if the sub-agent misjudges its pacing, it
             gets a hard nudge before the limit cuts it off. The "(no output)"
             failure mode (sub-agent exhausts budget mid-investigation) should
-            be much less common.
+            be much less common. And when a sub-agent does run out of
+            steps, its output is actionable — you can immediately
+            delegate a follow-up with the named files as context_files.
 
             If you find "(no output)" still happening, increase max_steps
             or simplify the task.
@@ -2308,7 +2319,7 @@ class Tools:
               replace_all=true.
             - delegate() auto-backgrounds after ~30 seconds (configurable via
               foreground_seconds). Backgrounded delegates write to
-              /tmp/delegate/<id>/{log,result,error,usage}. Use foreground_seconds=0
+              /tmp/delegate/<id>/{{log,result,error,usage}}. Use foreground_seconds=0
               to fire-and-forget for parallel agent teams.
             - expose() URLs expire after ~1 hour (call expose again for a fresh URL). The sandbox itself stops on
               idle (~15 min default), killing servers.
@@ -2888,9 +2899,13 @@ class Tools:
                                     nudge_msg = ModelRequest(parts=[UserPromptPart(
                                         content=(
                                             f"[SYSTEM: You have {remaining} step(s) remaining out of "
-                                            f"{clamped_steps}. Wrap up now — stop investigating and "
-                                            f"write your final summary with what you have. A partial "
-                                            f"summary is far better than being cut off with no output.]"
+                                            f"{clamped_steps}. Do not make any more tool calls. Use "
+                                            f"your final step to hand off your work. Write:\n"
+                                            f"1. What you accomplished.\n"
+                                            f"2. What remains unresolved — specific next steps.\n"
+                                            f"3. Absolute paths to critical sandbox files the calling "
+                                            f"agent or a follow-up sub-agent needs to continue "
+                                            f"(modified sources, failing tests, relevant logs).]"
                                         ),
                                     )])
                                     agent_run._graph_run.state.message_history.append(nudge_msg)
@@ -2956,7 +2971,22 @@ class Tools:
 
                 except Exception as e:
                     error_type = type(e).__name__
-                    error_msg = f"Delegation failed after {step_count} step(s): {error_type}: {e}"
+                    error_detail = str(e)
+                    # Detect provider-level failures (malformed upstream responses)
+                    # and surface a concise, actionable message instead of raw
+                    # pydantic validation noise.
+                    if "UnexpectedModelBehavior" in error_type or (
+                        "validation error" in error_detail.lower()
+                        and "ChatCompletion" in error_detail
+                    ):
+                        error_msg = (
+                            f"Delegation failed after {step_count} step(s): "
+                            f"the inference provider returned a malformed response "
+                            f"(not a valid ChatCompletion). This is usually a transient "
+                            f"upstream issue — retry the delegation."
+                        )
+                    else:
+                        error_msg = f"Delegation failed after {step_count} step(s): {error_type}: {error_detail}"
                     agent_result.update({
                         "ok": False,
                         "error": error_msg,

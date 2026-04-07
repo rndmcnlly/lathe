@@ -697,9 +697,9 @@ async def test_delegate_infrastructure(R: Results):
     R.check("prompt mentions summary",
             "summary" in prompt_10.lower(),
             "should mention reserving steps for summary")
-    R.check("prompt mentions partial summary value",
-            "partial" in prompt_10.lower(),
-            "should say partial > nothing")
+    R.check("prompt mentions handoff value",
+            "handoff" in prompt_10.lower() or "hand off" in prompt_10.lower(),
+            "should emphasize handing off work over rushing to finish")
 
     # Verify budget is parameterized, not hardcoded
     prompt_5 = _build_delegate_system_prompt(5)
