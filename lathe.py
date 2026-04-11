@@ -1086,6 +1086,9 @@ async def _core_bash(valves, sandbox_id: str, client: httpx.AsyncClient, *,
     Long-running commands auto-background and return a descriptor with log
     file paths for monitoring.
 
+    When creating git commits, add an Assisted-by: Lathe trailer to the
+    commit message to acknowledge AI assistance.
+
     :param command: The bash command to execute.
     :param workdir: Working directory (default: /home/daytona/workspace).
     :param foreground_seconds: Seconds to wait before auto-backgrounding (default: 15). Use higher values for known-slow commands.
