@@ -5,7 +5,7 @@ author_url: https://adamsmith.as
 description: Coding agent tools (lathe, bash, read, write, edit, glob, grep, delegate, onboard, expose, destroy) backed by per-user sandbox VMs with transparent lifecycle management.
 required_open_webui_version: 0.4.0
 requirements: httpx, pydantic-ai-slim[openai]
-version: 0.16.0
+version: 0.17.0
 licence: MIT
 """
 
@@ -1223,10 +1223,14 @@ async def _core_bash(valves, sandbox_id: str, client: httpx.AsyncClient, *,
     )
 
 
+_ONBOARD_LISTING_LINES = 20
+
 def _build_onboard_script(project_path: str) -> str:
     """Build a Python script that collects agent context from a sandbox.
 
-    Searches two locations:
+    Always produces a directory listing of project_path (via the shared
+    glob_hierarchy function).  Additionally searches two locations for
+    agent context:
       1. ~/.agents/          — global agent instructions and skills
       2. <project_path>/     — project-local instructions and skills
 
@@ -1236,11 +1240,21 @@ def _build_onboard_script(project_path: str) -> str:
     # The script is a self-contained Python program executed on the sandbox.
     # project_path is injected via repr() so it's safely quoted as a
     # Python string literal.  The rest of the script uses no interpolation.
-    return "import os, glob\n\nPROJECT = " + repr(project_path) + "\n" + textwrap.dedent("""\
+    # _GLOB_SCRIPT is prepended so glob_hierarchy() is available for the
+    # unconditional directory listing.
+    return (
+        _GLOB_SCRIPT
+        + "\nimport os, glob\n\nPROJECT = " + repr(project_path)
+        + "\n_LISTING_LINES = " + repr(_ONBOARD_LISTING_LINES)
+        + "\n" + textwrap.dedent("""\
         GLOBAL  = os.path.expanduser("~/.agents")
 
         sections = []
-        found = False
+
+        # ── Directory listing (unconditional) ────────────────────────
+
+        listing = glob_hierarchy(PROJECT, "*", _LISTING_LINES)
+        sections.append(f"# Directory: {PROJECT}\\n\\n{listing}")
 
         # ── Collect AGENTS.md files ──────────────────────────────────
 
@@ -1254,12 +1268,10 @@ def _build_onboard_script(project_path: str) -> str:
         global_md = read_agents_md(GLOBAL, "Global Agent Instructions")
         if global_md:
             sections.append(global_md)
-            found = True
 
         project_md = read_agents_md(PROJECT, "Project Agent Instructions")
         if project_md:
             sections.append(project_md)
-            found = True
 
         # ── Collect and merge skills ─────────────────────────────────
 
@@ -1300,7 +1312,6 @@ def _build_onboard_script(project_path: str) -> str:
             skills[name] = (desc, path)
 
         if order:
-            found = True
             lines = [
                 "# Available Skills",
                 "",
@@ -1315,12 +1326,9 @@ def _build_onboard_script(project_path: str) -> str:
 
         # ── Output ───────────────────────────────────────────────────
 
-        if not found:
-            print("ERROR_NO_CONTEXT")
-            raise SystemExit(1)
-
         print("\\n\\n---\\n\\n".join(sections))
     """)
+    )
 
 
 
@@ -2385,9 +2393,11 @@ class Tools:
             Remote SSH, or JetBrains Gateway.
 
             **Project context:**
-            Call onboard() at the start of a conversation to load AGENTS.md and
-            discover available skills. Searches both the project directory and
-            ~/.agents/ for global agent instructions and skills.
+            Call onboard() at the start of a conversation to get a directory
+            listing and load any AGENTS.md or skills. Works even without agent
+            files (you still get the listing). Pass "" or the workspace path to
+            onboard the default directory. Searches both the project directory
+            and ~/.agents/ for global agent instructions and skills.
 
             **Delegating multi-step work:**
             Use delegate(task="...") to hand off autonomous multi-step tasks
@@ -2618,8 +2628,9 @@ class Tools:
         __event_emitter__=None,
     ) -> str:
         """
-        Load project context (AGENTS.md + skill catalog) at the start of a conversation.
-        Searches both the project directory and ~/.agents/ for global context.
+        Load project context (directory listing, AGENTS.md, skill catalog) at the start of a conversation.
+        Always returns a directory listing of the target path. Additionally
+        searches the project directory and ~/.agents/ for agent instructions and skills.
         Use read() on a skill's SKILL.md path to load its full instructions later.
         :param path: Absolute path to the project root (e.g. /home/daytona/workspace/myproject).
         """
@@ -2629,7 +2640,13 @@ class Tools:
 
             await _emit(__event_emitter__, "Loading project context...")
 
-            p = path.rstrip("/")
+            # Models sometimes pass "" despite the docstring requiring an
+            # absolute path.  Silently default to the workspace root rather
+            # than error -- this is the most useful interpretation.
+            p = path.strip()
+            if not p:
+                p = "/home/daytona/workspace"
+            p = p.rstrip("/")
             script = _build_onboard_script(p)
 
             # Write script to temp file and execute it
@@ -2657,17 +2674,6 @@ class Tools:
 
             result = data.get("result", "")
             exit_code = data.get("exitCode", -1)
-
-            if "ERROR_NO_CONTEXT" in result:
-                await _emit(__event_emitter__, "No project context found", done=True)
-                return (
-                    f"Error: No agent context found. Searched:\n"
-                    f"  - {path}/AGENTS.md\n"
-                    f"  - {path}/.agents/skills/\n"
-                    f"  - ~/.agents/AGENTS.md\n"
-                    f"  - ~/.agents/skills/\n"
-                    f"At least one of these must exist to use onboard."
-                )
 
             if exit_code != 0:
                 await _emit(__event_emitter__, "Error loading context", done=True)

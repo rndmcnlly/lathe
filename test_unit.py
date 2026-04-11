@@ -99,7 +99,7 @@ async def test_onboard_script(R: Results):
 
     R.check("script has PROJECT assignment", "PROJECT = '/home/daytona/workspace/myproject'" in script, script[:200])
     R.check("script references ~/.agents", "~/.agents" in script, "missing global path")
-    R.check("script has ERROR_NO_CONTEXT sentinel", "ERROR_NO_CONTEXT" in script, "missing sentinel")
+    R.check("script calls glob_hierarchy", "glob_hierarchy" in script, "missing directory listing call")
 
     print("\n── _build_onboard_script: handles tricky paths ──")
     script = _build_onboard_script("/home/daytona/workspace/it's a \"test\"")
@@ -108,6 +108,10 @@ async def test_onboard_script(R: Results):
         R.check("tricky path compiles", True)
     except SyntaxError as e:
         R.check("tricky path compiles", False, str(e))
+
+    print("\n── _build_onboard_script: includes glob_hierarchy function ──")
+    script = _build_onboard_script("/tmp/test")
+    R.check("script includes glob_hierarchy definition", "def glob_hierarchy" in script, "missing glob_hierarchy function")
 
 
 async def test_truncate(R: Results):
