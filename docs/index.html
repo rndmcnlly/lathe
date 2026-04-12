@@ -4,11 +4,11 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <link rel="stylesheet" href="style.css">
-    <title>Lathe — code interpreter meets coding agent, in your own chat</title>
-    <meta name="description" content="Lathe brings ChatGPT-style code execution and Claude Code-level sandbox capabilities to Open WebUI — with any model, on your infrastructure. Persistent cloud sandboxes, full Linux VM, zero setup for users.">
+    <title>Lathe – code interpreter meets coding agent, in your own chat</title>
+    <meta name="description" content="Lathe brings ChatGPT-style code execution and Claude Code-level sandbox capabilities to Open WebUI, with any model, on your infrastructure. Persistent cloud sandboxes, full Linux VM, zero setup for users.">
     <meta property="og:title" content="Lathe">
     <meta property="og:type" content="website">
-    <meta property="og:description" content="ChatGPT-style code interpreter meets full coding agent — running on your Open WebUI instance, with any model you choose.">
+    <meta property="og:description" content="ChatGPT-style code interpreter meets full coding agent, running on your Open WebUI instance, with any model you choose.">
     <meta property="og:url" content="https://lathe.tools/">
 </head>
 <body>
@@ -17,7 +17,7 @@
 <div id="canvas-container">
     <div class="hero-overlay">
         <h1>Lathe</h1>
-        <p>Code interpreter meets coding agent &mdash; in your own chat</p>
+        <p>Code interpreter meets coding agent, in your own chat</p>
         <div class="hero-links">
             <a href="https://github.com/rndmcnlly/lathe">
                 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor"><path d="M12 0c-6.626 0-12 5.373-12 12 0 5.302 3.438 9.8 8.207 11.387.599.111.793-.261.793-.577v-2.234c-3.338.726-4.033-1.416-4.033-1.416-.546-1.387-1.333-1.756-1.333-1.756-1.089-.745.083-.729.083-.729 1.205.084 1.839 1.237 1.839 1.237 1.07 1.834 2.807 1.304 3.492.997.107-.775.418-1.305.762-1.604-2.665-.305-5.467-1.334-5.467-5.931 0-1.311.469-2.381 1.236-3.221-.124-.303-.535-1.524.117-3.176 0 0 1.008-.322 3.301 1.23.957-.266 1.983-.399 3.003-.404 1.02.005 2.047.138 3.006.404 2.291-1.552 3.297-1.23 3.297-1.23.653 1.653.242 2.874.118 3.176.77.84 1.235 1.911 1.235 3.221 0 4.609-2.807 5.624-5.479 5.921.43.372.823 1.102.823 2.222v3.293c0 .319.192.694.801.576 4.765-1.589 8.199-6.086 8.199-11.386 0-6.627-5.373-12-12-12z"/></svg>
@@ -37,7 +37,7 @@
 <div class="callout">
     ChatGPT has code interpreter. Claude has artifacts and computer use.
     <strong>Lathe</strong> brings the same class of capability to
-    <a href="https://docs.openwebui.com/">Open WebUI</a> &mdash; with any model
+    <a href="https://docs.openwebui.com/">Open WebUI</a>, with any model
     you choose, on infrastructure you control. One Python file, installed once by
     an admin. After that, every model on the server gets a full coding agent
     toolkit backed by a persistent cloud sandbox: shell, file editing, code search,
@@ -64,11 +64,11 @@
         <div class="comparison-card">
             <h3>Like Claude Code / Codex CLI</h3>
             <p>Full Linux VM with bash, file editing, git, package managers, and
-            persistent state across sessions. Not a toy &mdash; a real machine.</p>
+            persistent state across sessions. Not a toy: a real machine.</p>
         </div>
         <div class="comparison-card">
             <h3>Your models, your server</h3>
-            <p>Works with any model your Open WebUI instance can reach &mdash;
+            <p>Works with any model your Open WebUI instance can reach,
             open-weight or proprietary. No vendor lock-in on the intelligence.</p>
         </div>
         <div class="comparison-card">
@@ -88,7 +88,7 @@
             <source src="https://github.com/rndmcnlly/lathe/releases/download/explainer-video-latest/lathe-explainer.mp4" type="video/mp4">
         </video>
         <p class="video-caption">
-            Narrated explainer &mdash; rendered from source on every push.
+            Narrated explainer, rendered from source on every push.
             <a href="https://github.com/rndmcnlly/lathe/tree/main/explainer-video">Source</a>
         </p>
     </div>
@@ -103,7 +103,7 @@
             <source src="https://github.com/rndmcnlly/lathe/releases/download/demo-video-latest/demo.webm" type="video/webm">
         </video>
         <p class="video-caption">
-            Live session capture &mdash; a real conversation on a real deployment.
+            Live session capture: a real conversation on a real deployment.
             <a href="https://github.com/rndmcnlly/lathe/tree/main/demo-video">Source</a>
         </p>
     </div>
@@ -114,7 +114,7 @@
     <div class="section-label">Tools</div>
     <h2 class="section-title">What your agent can do</h2>
     <p>
-        Twelve tools, same caliber as the best proprietary agents. Each one runs against a
+        Thirteen tools, same caliber as the best proprietary agents. Each one runs against a
         persistent Linux sandbox that follows you anywhere your browser does.
     </p>
     <div class="tool-grid">
@@ -146,6 +146,10 @@
             <h3>grep</h3>
             <p>Search file contents by regex. Returns matches grouped by file with line numbers.</p>
         </div>
+        <div class="tool-card highlight-card">
+            <h3>interpret</h3>
+            <p>Persistent Python REPL. Variables, imports, and definitions survive across calls within the same conversation. Built for iterative data exploration.</p>
+        </div>
         <div class="tool-card">
             <h3>expose</h3>
             <p>One-step file browser (<code>"dufs"</code>), browser IDE (<code>"code-server"</code>), public URL for any web service (<code>"http:&lt;port&gt;"</code>), or time-limited SSH command (<code>"ssh"</code>).</p>
@@ -156,13 +160,13 @@
         </div>
         <div class="tool-card">
             <h3>onboard</h3>
-            <p>Load project context and agent skills from your repo's conventions.</p>
+            <p>Load project context: always lists the directory, plus any agent instructions and skills it finds in the repo.</p>
         </div>
         <div class="tool-card">
             <h3>destroy</h3>
             <p>Wipe your sandbox VM and start fresh. Persistent volume data survives. Requires explicit confirmation.</p>
         </div>
-        <div class="tool-card highlight-card">
+        <div class="tool-card">
             <h3>handoff</h3>
             <p>Wrap up a long session. The model writes a structured handoff document you paste into a new conversation to pick up where you left off.</p>
         </div>
@@ -174,7 +178,7 @@
     <div class="section-label">Delegation</div>
     <h2 class="section-title">Offloading multi-step work</h2>
     <p>
-        Some tasks take many steps &mdash; cloning a repo, reading a dozen files,
+        Some tasks take many steps: cloning a repo, reading a dozen files,
         running tests, fixing failures, re-running. If the main agent does all of
         that inline, every intermediate result accumulates in the conversation,
         crowding out the parts you care about.
@@ -189,7 +193,7 @@
         Each delegated job runs in the foreground for a configurable timeout
         (default 30 seconds). If the sub-agent finishes quickly, the result
         comes back immediately. If it takes longer, the job moves to the
-        background automatically &mdash; the main agent stays responsive to you
+        background automatically, and the main agent stays responsive to you
         while the sub-agent keeps working. Background results are written to
         sidecar files in the sandbox that the main agent can check later.
     </p>
@@ -201,6 +205,45 @@
         docs directly into the sub-agent's prompt so it doesn't waste steps
         on orientation.
     </p>
+</div>
+
+<!-- ── Interpret ──────────────────────────────────── -->
+<div class="section">
+    <div class="section-label">Interpreter</div>
+    <h2 class="section-title">Persistent Python REPL</h2>
+    <p>
+        <code>interpret()</code> runs Python code in a persistent session
+        tied to your conversation. Variables, imports, and function definitions
+        survive across calls: define a DataFrame in one message, filter it in
+        the next, plot it in a third. No re-importing, no re-loading.
+    </p>
+    <p>
+        This is the closest Lathe gets to ChatGPT's code interpreter experience.
+        The model writes Python, executes it, sees the output, and iterates,
+        all without leaving the chat. State resets when you start a new
+        conversation (your sandbox files still persist, only the in-memory
+        REPL session is per-chat).
+    </p>
+    <h3 class="subsection-title">When to use interpret vs bash</h3>
+    <div class="comparison-grid">
+        <div class="comparison-card">
+            <h3>interpret()</h3>
+            <p>Iterative exploration, data analysis, incremental computation.
+            State carries over between calls. Pure Python.</p>
+        </div>
+        <div class="comparison-card">
+            <h3>bash()</h3>
+            <p>Shell commands, package installs, git, running servers, anything
+            that isn't Python or needs process isolation.</p>
+        </div>
+    </div>
+    <h3 class="subsection-title">Limitations</h3>
+    <ul class="limit-list">
+        <li><strong>Python only.</strong> For other languages, use <code>bash()</code>.</li>
+        <li><strong>No top-level <code>await</code>.</strong> The REPL runs synchronous Python. Use <code>asyncio.run()</code> if you need async.</li>
+        <li><strong>No stdin.</strong> Interactive prompts (<code>input()</code>) will hang. Provide values in code.</li>
+        <li><strong>Chat-scoped.</strong> State resets with each new conversation. Files written to disk persist; in-memory variables do not.</li>
+    </ul>
 </div>
 
 <!-- ── Recipes ────────────────────────────────────── -->
@@ -218,7 +261,7 @@
         </li>
         <li>
             <span class="recipe-label">Browse &amp; transfer files</span>
-            <span class="recipe-desc">"Set up a file browser" &mdash; one tool call installs <a href="https://github.com/sigoden/dufs">dufs</a>, starts it, and gives you a URL with drag-and-drop upload/download.</span>
+            <span class="recipe-desc">"Set up a file browser": one tool call installs <a href="https://github.com/sigoden/dufs">dufs</a>, starts it, and gives you a URL with drag-and-drop upload/download.</span>
         </li>
         <li>
             <span class="recipe-label">Work on a repo</span>
@@ -226,23 +269,27 @@
         </li>
         <li>
             <span class="recipe-label">Provide credentials</span>
-            <span class="recipe-desc">Set <code>env_vars</code> in your user settings (e.g. <code>{"GITHUB_TOKEN":"ghp_..."}</code>) &mdash; every bash command gets them, the model never sees the values.</span>
+            <span class="recipe-desc">Set <code>env_vars</code> in your user settings (e.g. <code>{"GITHUB_TOKEN":"ghp_..."}</code>). Every bash command gets them; the model never sees the values.</span>
         </li>
         <li>
             <span class="recipe-label">Go hands-on</span>
-            <span class="recipe-desc">"Give me SSH access" &mdash; get a command you can paste into your terminal or VS Code.</span>
+            <span class="recipe-desc">"Give me SSH access": get a command you can paste into your terminal or VS Code.</span>
         </li>
         <li>
             <span class="recipe-label">Full IDE in the browser</span>
-            <span class="recipe-desc">"Set up code-server" &mdash; one tool call installs <a href="https://github.com/coder/code-server">code-server</a> and gives you VS Code in a browser tab.</span>
+            <span class="recipe-desc">"Set up code-server": one tool call installs <a href="https://github.com/coder/code-server">code-server</a> and gives you VS Code in a browser tab.</span>
+        </li>
+        <li>
+            <span class="recipe-label">Explore data interactively</span>
+            <span class="recipe-desc">"Load this CSV and show me the distribution of values in the status column": the model uses the persistent Python REPL to load, transform, and plot your data across multiple steps.</span>
         </li>
         <li>
             <span class="recipe-label">Delegate the hard stuff</span>
-            <span class="recipe-desc">"Run the test suite and fix any failures" &mdash; the model can hand this off to a sub-agent that works through the problem without cluttering your conversation.</span>
+            <span class="recipe-desc">"Run the test suite and fix any failures": the model can hand this off to a sub-agent that works through the problem without cluttering your conversation.</span>
         </li>
         <li>
             <span class="recipe-label">Hand off a long session</span>
-            <span class="recipe-desc">"Let's hand off to a fresh conversation" &mdash; the model writes a structured summary you paste into a new chat. Your sandbox files are already there; the new agent picks up where you left off.</span>
+            <span class="recipe-desc">"Let's hand off to a fresh conversation": the model writes a structured summary you paste into a new chat. Your sandbox files are already there; the new agent picks up where you left off.</span>
         </li>
     </ul>
 </div>
@@ -253,20 +300,28 @@
     <h2 class="section-title">Your workspace survives</h2>
     <p>
         ChatGPT's code interpreter resets every conversation. Lathe doesn't. Your
-        sandbox is yours &mdash; files, installed packages, git repos, running servers.
+        sandbox is yours: files, installed packages, git repos, running servers.
         Start a conversation Monday, come back Wednesday, everything is where you left it.
     </p>
     <p>
         The sandbox stops after ~15 minutes of idle, then archives about an hour
-        later. Either way, the next tool call wakes it transparently &mdash; your
+        later. Either way, the next tool call wakes it transparently: your
         files and installed packages survive both. Only running processes are lost.
         If you want a clean slate, ask the model to <code>destroy</code> it.
     </p>
     <p>
-        Your files persist, but conversation context doesn't &mdash; every new chat
+        Your files persist, but conversation context doesn't. Every new chat
         starts cold. When a session runs long, ask the model to
         <code>handoff</code>: it writes a structured summary you paste into a fresh
         conversation, and the new agent picks up with full access to your sandbox.
+    </p>
+    <h3 class="subsection-title">Under the hood</h3>
+    <p>
+        Lathe takes a filesystem snapshot on the first tool call of each
+        conversation, so it can detect what changed during the session. If a
+        delegated task finishes in the background, a completion notice is
+        automatically prepended to the next tool result the model sees, so
+        it can reference background work without being explicitly told about it.
     </p>
 </div>
 

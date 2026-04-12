@@ -194,6 +194,43 @@ code {
     margin-bottom: 0;
 }
 
+/* ── Subsection titles ────────────────────────────── */
+
+.subsection-title {
+    font-size: 0.9rem;
+    font-weight: 700;
+    color: var(--fg-soft);
+    margin: 1.5rem 0 0.75rem;
+}
+
+/* ── Limit list ──────────────────────────────────── */
+
+.limit-list {
+    list-style: none;
+    padding: 0;
+    margin: 0.75rem 0;
+}
+
+.limit-list li {
+    font-size: 0.85rem;
+    color: var(--subtle);
+    padding: 0.35rem 0;
+    line-height: 1.55;
+    padding-left: 1rem;
+    position: relative;
+}
+
+.limit-list li::before {
+    content: "\2013";
+    position: absolute;
+    left: 0;
+    color: var(--dim);
+}
+
+.limit-list li strong {
+    color: var(--fg-soft);
+}
+
 /* ── Videos ───────────────────────────────────────── */
 
 .video-block {
@@ -273,7 +310,7 @@ code {
     color: var(--text);
 }
 
-/* ── Highlight card (delegate) ────────────────────── */
+/* ── Highlight card (newest tool) ─────────────────── */
 
 .tool-card.highlight-card {
     border-color: var(--border-hover);
