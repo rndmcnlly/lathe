@@ -327,24 +327,25 @@ def _human_size(n: int) -> str:
     return f"{b:,.1f} TB"
 
 
-# ── hierarchical glob (runs on sandbox) ──────────────────────────────
+# ── shared glob infrastructure (runs on sandbox) ────────────────────
+#
+# Both _GLOB_SCRIPT and _GREP_SCRIPT need to parse comma-separated
+# glob patterns, resolve absolute vs. relative patterns, and collect
+# matching files.  This shared fragment is prepended to both scripts
+# so the logic lives in one place.
 
-_GLOB_MAX_LINES = 100
-
-_GLOB_SCRIPT = r'''
+_GLOB_COMMON = r'''
 import os
 import sys
 from pathlib import Path
 
 
-def glob_hierarchy(base_dir, pattern, max_lines):
-    base = Path(base_dir).resolve()
-    if not base.is_dir():
-        return f"Error: not a directory: {base_dir}"
+def _parse_pattern(pattern):
+    """Parse comma-separated glob string into (positive, negative) lists.
 
-    # ── Parse pattern: comma-separated, !prefix = exclude ────────
-    # Result = union(positive) - union(negative), order-independent.
-    # Commas inside {braces} are part of glob syntax, not delimiters.
+    Commas inside {braces} are part of glob syntax, not delimiters.
+    !-prefixed terms go into the negative list.
+    """
     terms, current, depth = [], [], 0
     for ch in pattern:
         if ch == "{": depth += 1
@@ -355,7 +356,6 @@ def glob_hierarchy(base_dir, pattern, max_lines):
             continue
         current.append(ch)
     terms.append("".join(current).strip())
-
     positive, negative = [], []
     for term in terms:
         if not term:
@@ -364,54 +364,66 @@ def glob_hierarchy(base_dir, pattern, max_lines):
             negative.append(term[1:])
         else:
             positive.append(term)
+    return positive, negative
 
+
+def _resolve_glob(base, g):
+    """Return (root, relative_pattern) for a glob term.
+
+    Python 3.14 rejects non-relative patterns in Path.glob().
+    For relative patterns, root is the workspace base.
+    For absolute patterns, we extract the longest non-glob prefix
+    as the root and glob relative to it, so the agent can glob
+    anywhere on the filesystem, not just within the workspace.
+    """
+    if not g.startswith("/"):
+        return base, g
+    parts = g.split(os.sep)
+    root_parts = []
+    for i, part in enumerate(parts):
+        if any(c in part for c in ("*", "?", "[", "{")):
+            break
+        root_parts.append(part)
+    else:
+        root_dir = Path(g).resolve()
+        return root_dir, "**/*"
+    root_dir = Path(os.sep.join(root_parts) or os.sep).resolve()
+    rel = os.sep.join(parts[i:])
+    return root_dir, rel
+
+
+def _collect_files(base, globs):
+    """Glob all patterns and return a set of resolved absolute file paths."""
+    result = set()
+    for g in globs:
+        root, rel = _resolve_glob(base, g)
+        if not root.is_dir():
+            continue
+        for p in root.glob(rel):
+            if p.is_file():
+                result.add(str(p.resolve()))
+    return result
+'''
+
+# ── hierarchical glob (runs on sandbox) ──────────────────────────────
+
+_GLOB_MAX_LINES = 100
+
+_GLOB_SCRIPT = _GLOB_COMMON + r'''
+
+
+def glob_hierarchy(base_dir, pattern, max_lines):
+    base = Path(base_dir).resolve()
+    if not base.is_dir():
+        return f"Error: not a directory: {base_dir}"
+
+    positive, negative = _parse_pattern(pattern)
     if not positive:
         return f"Error: pattern must include at least one positive glob (got {pattern!r})"
 
-    # ── Exhaustive glob ──────────────────────────────────────────
-
-    def _resolve_glob(g):
-        """Return (root, relative_pattern) for a glob term.
-
-        Python 3.14 rejects non-relative patterns in Path.glob().
-        For relative patterns, root is the workspace base.
-        For absolute patterns, we extract the longest non-glob prefix
-        as the root and glob relative to it — so the agent can glob
-        anywhere on the filesystem, not just within the workspace.
-        """
-        if not g.startswith("/"):
-            return base, g
-        # Walk the path components; the root is everything before the
-        # first component containing a glob metacharacter.
-        parts = g.split(os.sep)  # ['', 'home', 'daytona', '**', '*.py']
-        root_parts = []
-        for i, part in enumerate(parts):
-            if any(c in part for c in ("*", "?", "[", "{")):
-                break
-            root_parts.append(part)
-        else:
-            # No glob chars at all — pattern is a literal absolute path.
-            # Treat as "glob everything under this directory".
-            root_dir = Path(g).resolve()
-            return root_dir, "**/*"
-        root_dir = Path(os.sep.join(root_parts) or os.sep).resolve()
-        rel = os.sep.join(parts[i:])
-        return root_dir, rel
-
-    def _collect(globs):
-        result = set()
-        for g in globs:
-            root, rel = _resolve_glob(g)
-            if not root.is_dir():
-                continue
-            for p in root.glob(rel):
-                if p.is_file():
-                    result.add(str(p.resolve()))
-        return result
-
-    included = _collect(positive)
+    included = _collect_files(base, positive)
     if negative:
-        included -= _collect(negative)
+        included -= _collect_files(base, negative)
     matches = sorted(included)
 
     if not matches:
@@ -563,11 +575,8 @@ def glob_hierarchy(base_dir, pattern, max_lines):
 
 _GREP_MAX_LINES = 100
 
-_GREP_SCRIPT = r'''
-import os
+_GREP_SCRIPT = _GLOB_COMMON + r'''
 import re
-import sys
-from pathlib import Path
 
 _MAX_LINE_WIDTH = 200
 
@@ -583,70 +592,13 @@ def grep_hierarchy(base_dir, regex, files_pattern, max_lines):
     except re.error as e:
         return f"Error: invalid regex {regex!r}: {e}"
 
-    # ── Parse file scope: comma-separated, !prefix = exclude ────
-    terms, current, depth = [], [], 0
-    for ch in files_pattern:
-        if ch == "{": depth += 1
-        elif ch == "}": depth -= 1
-        elif ch == "," and depth == 0:
-            terms.append("".join(current).strip())
-            current = []
-            continue
-        current.append(ch)
-    terms.append("".join(current).strip())
-
-    positive, negative = [], []
-    for term in terms:
-        if not term:
-            continue
-        if term.startswith("!"):
-            negative.append(term[1:])
-        else:
-            positive.append(term)
-
+    positive, negative = _parse_pattern(files_pattern)
     if not positive:
         return f"Error: files pattern must include at least one positive glob (got {files_pattern!r})"
 
-    # ── Collect files ────────────────────────────────────────────
-
-    def _resolve_glob(g):
-        """Return (root, relative_pattern) for a glob term.
-
-        Python 3.14 rejects non-relative patterns in Path.glob().
-        For relative patterns, root is the workspace base.
-        For absolute patterns, we extract the longest non-glob prefix
-        as the root and glob relative to it — so the agent can search
-        anywhere on the filesystem, not just within the workspace.
-        """
-        if not g.startswith("/"):
-            return base, g
-        parts = g.split(os.sep)
-        root_parts = []
-        for i, part in enumerate(parts):
-            if any(c in part for c in ("*", "?", "[", "{")):
-                break
-            root_parts.append(part)
-        else:
-            root_dir = Path(g).resolve()
-            return root_dir, "**/*"
-        root_dir = Path(os.sep.join(root_parts) or os.sep).resolve()
-        rel = os.sep.join(parts[i:])
-        return root_dir, rel
-
-    def _collect(globs):
-        result = set()
-        for g in globs:
-            root, rel = _resolve_glob(g)
-            if not root.is_dir():
-                continue
-            for p in root.glob(rel):
-                if p.is_file():
-                    result.add(str(p.resolve()))
-        return result
-
-    included = _collect(positive)
+    included = _collect_files(base, positive)
     if negative:
-        included -= _collect(negative)
+        included -= _collect_files(base, negative)
     files = sorted(included)
 
     if not files:
@@ -1837,25 +1789,7 @@ async def _ensure_chat_init(
 _DELEGATE_FOREGROUND_SECONDS = 30
 
 
-async def _sandbox_write_file(valves, sandbox_id: str, client: httpx.AsyncClient,
-                               path: str, content: str):
-    """Write a small file to the sandbox. Creates parent dirs. Fire-and-forget safe."""
-    parent = "/".join(path.rstrip("/").split("/")[:-1])
-    if parent:
-        await client.post(
-            _toolbox(valves, sandbox_id, "/files/folder"),
-            headers=_headers(valves),
-            json={"path": parent, "mode": "755"},
-            timeout=30.0,
-        )
-    content_bytes = content.encode("utf-8")
-    await client.post(
-        _toolbox(valves, sandbox_id, "/files/upload"),
-        params={"path": path},
-        headers={"Authorization": f"Bearer {valves.daytona_api_key}"},
-        files={"file": ("file", io.BytesIO(content_bytes), "application/octet-stream")},
-        timeout=60.0,
-    )
+
 
 
 def _format_delegate_background(delegate_id: str, elapsed: int, log_preview: str) -> str:
@@ -3647,14 +3581,14 @@ class Tools:
             task_path = f"{delegate_dir}/task"
 
             # Write the task file immediately
-            await _sandbox_write_file(
+            await _core_write(
                 self.valves, sandbox_id, client,
-                task_path, task,
+                path=task_path, content=task,
             )
             # Initialize empty log file
-            await _sandbox_write_file(
+            await _core_write(
                 self.valves, sandbox_id, client,
-                log_path, "",
+                path=log_path, content="",
             )
 
             await _emit(__event_emitter__, "Sub-agent starting...")
@@ -3678,9 +3612,9 @@ class Tools:
                 entry = f"[{ts}] {line}"
                 log_lines.append(entry)
                 try:
-                    await _sandbox_write_file(
+                    await _core_write(
                         self.valves, sandbox_id, bg_client,
-                        log_path, "\n".join(log_lines) + "\n",
+                        path=log_path, content="\n".join(log_lines) + "\n",
                     )
                 except Exception:
                     pass  # best-effort log writes
@@ -3773,9 +3707,9 @@ class Tools:
                         result_output = agent_run.result.output if agent_run.result else "(no output)"
 
                     # ── Write sidecar result files ────────────────────
-                    await _sandbox_write_file(
+                    await _core_write(
                         self.valves, sandbox_id, bg_client,
-                        result_path, result_output,
+                        path=result_path, content=result_output,
                     )
                     usage_data = {
                         "steps": step_count,
@@ -3783,9 +3717,9 @@ class Tools:
                         "input_tokens": usage.input_tokens,
                         "output_tokens": usage.output_tokens,
                     }
-                    await _sandbox_write_file(
+                    await _core_write(
                         self.valves, sandbox_id, bg_client,
-                        usage_path, json.dumps(usage_data),
+                        path=usage_path, content=json.dumps(usage_data),
                     )
                     await _append_log(
                         f"Completed: {step_count} steps, {usage.tool_calls} tool calls"
@@ -3822,9 +3756,9 @@ class Tools:
                         "step_count": step_count,
                     })
                     try:
-                        await _sandbox_write_file(
+                        await _core_write(
                             self.valves, sandbox_id, bg_client,
-                            error_path, error_msg,
+                            path=error_path, content=error_msg,
                         )
                         await _append_log(f"Error: {error_msg}")
                     except Exception:
@@ -3993,134 +3927,107 @@ class Tools:
                     messages,
                 )
 
-            # ── dufs fast path: install + start + sign URL ──────────
+            # ── Shared helper: ensure service + sign URL ────────────
+            async def _ensure_and_sign(ensure_script, script_timeout_ms,
+                                       http_timeout, svc_port, svc_name,
+                                       ready_status, fail_status, result_msg):
+                """Run an optional ensure-script, sign a URL, return formatted result.
+
+                If ensure_script is None, skips straight to URL signing (for
+                services the agent already started manually).
+                """
+                pid = "?"
+                if ensure_script:
+                    await _emit(__event_emitter__, f"Preparing {svc_name}...")
+                    resp = await client.post(
+                        _toolbox(self.valves, sandbox_id, "/process/execute"),
+                        headers=_headers(self.valves),
+                        json={"command": ensure_script, "timeout": script_timeout_ms},
+                        timeout=http_timeout,
+                    )
+                    resp.raise_for_status()
+                    data = resp.json()
+                    result = data.get("result", "")
+                    if data.get("exitCode", -1) != 0 or "READY" not in result:
+                        await _emit(__event_emitter__, fail_status, done=True)
+                        return (
+                            f"Error: {svc_name} setup failed (exit {data.get('exitCode')}).\n"
+                            f"{result[:500]}\n\n"
+                            f"This usually means the sandbox cannot reach the install host "
+                            f"(egress filtering). See lathe(manpage=\"egress\") for workarounds, or "
+                            f"install {svc_name} manually and use expose(target=\"http:{svc_port}\")."
+                        )
+                    pid = _extract_pid(result)
+                else:
+                    await _emit(__event_emitter__, f"Generating URL for port {svc_port}...")
+
+                await _emit(__event_emitter__, "Generating URL...")
+                resp = await client.get(
+                    _api(self.valves, f"/sandbox/{sandbox_id}/ports/{svc_port}/signed-preview-url"),
+                    params={"expiresInSeconds": 3600},
+                    headers=_headers(self.valves),
+                    timeout=30.0,
+                )
+                resp.raise_for_status()
+                url = resp.json().get("url", "")
+                if not url:
+                    return "Error: Daytona returned an empty URL."
+
+                await _emit(__event_emitter__, ready_status, done=True)
+                messages = _drain_harness_messages(self._chat_state, __chat_id__, _sb_warning)
+                return _prepend_harness_messages(result_msg(url, pid), messages)
+
+            # ── dufs fast path ──────────────────────────────────────
             if is_dufs:
-                await _emit(__event_emitter__, "Preparing dufs file browser...")
-
-                # Single script: install if binary missing, start if port free.
-                resp = await client.post(
-                    _toolbox(self.valves, sandbox_id, "/process/execute"),
-                    headers=_headers(self.valves),
-                    json={"command": _DUFS_ENSURE_SCRIPT, "timeout": 30000},
-                    timeout=60.0,
-                )
-                resp.raise_for_status()
-                data = resp.json()
-                result = data.get("result", "")
-                if data.get("exitCode", -1) != 0 or "READY" not in result:
-                    await _emit(__event_emitter__, "dufs setup failed", done=True)
-                    return (
-                        f"Error: dufs setup failed (exit {data.get('exitCode')}).\n"
-                        f"{result[:500]}\n\n"
-                        f"This usually means the sandbox cannot reach GitHub (egress filtering). "
-                        f"See lathe(manpage=\"egress\") for workarounds, or install dufs manually "
-                        f"and use expose(target=\"http:{_DUFS_PORT}\")."
-                    )
-
-                pid = _extract_pid(result)
-
-                # Sign the URL
-                await _emit(__event_emitter__, "Generating URL...")
-                resp = await client.get(
-                    _api(self.valves, f"/sandbox/{sandbox_id}/ports/{_DUFS_PORT}/signed-preview-url"),
-                    params={"expiresInSeconds": 3600},
-                    headers=_headers(self.valves),
-                    timeout=30.0,
-                )
-                resp.raise_for_status()
-                url = resp.json().get("url", "")
-                if not url:
-                    return "Error: Daytona returned an empty URL."
-
-                await _emit(__event_emitter__, "File browser ready", done=True)
-                messages = _drain_harness_messages(self._chat_state, __chat_id__, _sb_warning)
-                return _prepend_harness_messages(
-                    f"File browser URL (valid ~1 hour): {url}\n\n"
-                    f"Give this URL to the user. In their browser they can:\n"
-                    f"- **Upload**: drag and drop files onto the page\n"
-                    f"- **Download**: click any file\n"
-                    f"- **Browse**: navigate folders\n\n"
-                    f"dufs is serving {_DUFS_ROOT} on port {_DUFS_PORT} (PID {pid}).",
-                    messages,
+                return await _ensure_and_sign(
+                    ensure_script=_DUFS_ENSURE_SCRIPT,
+                    script_timeout_ms=30000, http_timeout=60.0,
+                    svc_port=_DUFS_PORT, svc_name="dufs",
+                    ready_status="File browser ready",
+                    fail_status="dufs setup failed",
+                    result_msg=lambda url, pid: (
+                        f"File browser URL (valid ~1 hour): {url}\n\n"
+                        f"Give this URL to the user. In their browser they can:\n"
+                        f"- **Upload**: drag and drop files onto the page\n"
+                        f"- **Download**: click any file\n"
+                        f"- **Browse**: navigate folders\n\n"
+                        f"dufs is serving {_DUFS_ROOT} on port {_DUFS_PORT} (PID {pid})."
+                    ),
                 )
 
-            # ── code-server fast path: install + start + sign URL ───
+            # ── code-server fast path ───────────────────────────────
             if is_code_server:
-                await _emit(__event_emitter__, "Preparing code-server IDE...")
-
-                # Single script: install if binary missing, start if port free.
-                resp = await client.post(
-                    _toolbox(self.valves, sandbox_id, "/process/execute"),
-                    headers=_headers(self.valves),
-                    json={"command": _CS_ENSURE_SCRIPT, "timeout": 60000},
-                    timeout=120.0,
-                )
-                resp.raise_for_status()
-                data = resp.json()
-                result = data.get("result", "")
-                if data.get("exitCode", -1) != 0 or "READY" not in result:
-                    await _emit(__event_emitter__, "code-server setup failed", done=True)
-                    return (
-                        f"Error: code-server setup failed (exit {data.get('exitCode')}).\n"
-                        f"{result[:500]}\n\n"
-                        f"This usually means the sandbox cannot reach the install script host "
-                        f"(egress filtering). See lathe(manpage=\"egress\") for workarounds, or "
-                        f"install code-server manually and use expose(target=\"http:{_CS_PORT}\")."
-                    )
-
-                pid = _extract_pid(result)
-
-                # Sign the URL
-                await _emit(__event_emitter__, "Generating URL...")
-                resp = await client.get(
-                    _api(self.valves, f"/sandbox/{sandbox_id}/ports/{_CS_PORT}/signed-preview-url"),
-                    params={"expiresInSeconds": 3600},
-                    headers=_headers(self.valves),
-                    timeout=30.0,
-                )
-                resp.raise_for_status()
-                url = resp.json().get("url", "")
-                if not url:
-                    return "Error: Daytona returned an empty URL."
-
-                await _emit(__event_emitter__, "IDE ready", done=True)
-                messages = _drain_harness_messages(self._chat_state, __chat_id__, _sb_warning)
-                return _prepend_harness_messages(
-                    f"IDE URL (valid ~1 hour): {url}\n\n"
-                    f"Give this URL to the user. They get VS Code in the browser with:\n"
-                    f"- Full terminal access\n"
-                    f"- File editing and navigation\n"
-                    f"- Extension support\n\n"
-                    f"code-server is serving {_CS_ROOT} on port {_CS_PORT} (PID {pid}).",
-                    messages,
+                return await _ensure_and_sign(
+                    ensure_script=_CS_ENSURE_SCRIPT,
+                    script_timeout_ms=60000, http_timeout=120.0,
+                    svc_port=_CS_PORT, svc_name="code-server",
+                    ready_status="IDE ready",
+                    fail_status="code-server setup failed",
+                    result_msg=lambda url, pid: (
+                        f"IDE URL (valid ~1 hour): {url}\n\n"
+                        f"Give this URL to the user. They get VS Code in the browser with:\n"
+                        f"- Full terminal access\n"
+                        f"- File editing and navigation\n"
+                        f"- Extension support\n\n"
+                        f"code-server is serving {_CS_ROOT} on port {_CS_PORT} (PID {pid})."
+                    ),
                 )
 
-            # Port exposure path
-            await _emit(__event_emitter__, f"Generating URL for port {port}...")
-
-            resp = await client.get(
-                _api(self.valves, f"/sandbox/{sandbox_id}/ports/{port}/signed-preview-url"),
-                params={"expiresInSeconds": 3600},
-                headers=_headers(self.valves),
-                timeout=30.0,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-
-            url = data.get("url", "")
-            if not url:
-                return "Error: Daytona returned an empty URL."
-
-            await _emit(__event_emitter__, f"URL ready (port {port})", done=True)
-            messages = _drain_harness_messages(self._chat_state, __chat_id__, _sb_warning)
-            return _prepend_harness_messages(
-                f"Public URL (valid ~1 hour): {url}\n\n"
-                f"The user can open this in a new browser tab. "
-                f"They may see a Daytona security warning on first visit — they can click through it.\n\n"
-                f"Note: the sandbox auto-stops after ~{self.valves.auto_stop_minutes} min of inactivity regardless of "
-                f"running background processes, killing the server. If the user reports "
-                f"the URL stopped working, restart the server and call expose() again.",
-                messages,
+            # ── Generic port exposure ───────────────────────────────
+            return await _ensure_and_sign(
+                ensure_script=None,
+                script_timeout_ms=0, http_timeout=0,
+                svc_port=port, svc_name="service",
+                ready_status=f"URL ready (port {port})",
+                fail_status="",
+                result_msg=lambda url, pid: (
+                    f"Public URL (valid ~1 hour): {url}\n\n"
+                    f"The user can open this in a new browser tab. "
+                    f"They may see a Daytona security warning on first visit — they can click through it.\n\n"
+                    f"Note: the sandbox auto-stops after ~{self.valves.auto_stop_minutes} min of inactivity regardless of "
+                    f"running background processes, killing the server. If the user reports "
+                    f"the URL stopped working, restart the server and call expose() again."
+                ),
             )
 
         return await _tool_context(__event_emitter__, _run)
