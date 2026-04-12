@@ -9,4 +9,5 @@ dependencies = [
     "python-dotenv",
     "python-socketio[asyncio_client]",
     "aiohttp",
+    "cachetools>=7.0.5",
 ]

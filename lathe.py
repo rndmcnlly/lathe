@@ -4,8 +4,8 @@ author: Adam Smith
 author_url: https://adamsmith.as
 description: Coding agent tools (lathe, bash, read, write, edit, glob, grep, delegate, onboard, expose, destroy) backed by per-user sandbox VMs with transparent lifecycle management.
 required_open_webui_version: 0.4.0
-requirements: httpx, pydantic-ai-slim[openai]
-version: 0.17.0
+requirements: httpx, pydantic-ai-slim[openai], cachetools
+version: 0.18.0
 licence: MIT
 """
 
@@ -19,6 +19,7 @@ import urllib.parse
 import uuid
 
 import httpx
+from cachetools import LRUCache
 from pydantic import BaseModel, Field
 
 
@@ -96,9 +97,38 @@ async def _tool_context(emitter, fn):
         return f"Error: {e}"
 
 
-def _prepend_warning(result: str, warning: str | None) -> str:
-    """Prepend a sandbox lifecycle warning to a tool result if present."""
-    return f"{warning}\n{result}" if warning else result
+def _prepend_harness_messages(result: str, messages: list[str]) -> str:
+    """Prepend harness-injected context to a tool result.
+
+    Harness messages are things the infrastructure decides to push to the
+    agent alongside the tool's own output: sandbox lifecycle warnings,
+    auto-init snapshots, and (future) background job completion notices.
+    Each message is separated by a blank line for readability.
+    """
+    if not messages:
+        return result
+    prefix = "\n\n".join(messages)
+    return f"{prefix}\n\n{result}"
+
+
+def _drain_harness_messages(chat_state: LRUCache, chat_id: str | None,
+                            warning: str | None) -> list[str]:
+    """Collect all pending harness messages for a tool call.
+
+    Drains the pending queue in the chat state (if any) and includes the
+    sandbox lifecycle warning.  Returns a list of message strings to
+    prepend to the tool result.
+    """
+    messages: list[str] = []
+    if warning:
+        messages.append(warning)
+    if chat_id and chat_id in chat_state:
+        state = chat_state[chat_id]
+        pending = state.get("pending", [])
+        if pending:
+            messages.extend(pending)
+            state["pending"] = []
+    return messages
 
 
 def _shell_quote(s: str) -> str:
@@ -1223,14 +1253,12 @@ async def _core_bash(valves, sandbox_id: str, client: httpx.AsyncClient, *,
     )
 
 
-_ONBOARD_LISTING_LINES = 20
-
 def _build_onboard_script(project_path: str) -> str:
     """Build a Python script that collects agent context from a sandbox.
 
-    Always produces a directory listing of project_path (via the shared
-    glob_hierarchy function).  Additionally searches two locations for
-    agent context:
+    Always produces a flat directory listing of project_path (one level,
+    absolute paths, dirs marked with trailing /).  Additionally searches
+    two locations for agent context:
       1. ~/.agents/          — global agent instructions and skills
       2. <project_path>/     — project-local instructions and skills
 
@@ -1240,21 +1268,27 @@ def _build_onboard_script(project_path: str) -> str:
     # The script is a self-contained Python program executed on the sandbox.
     # project_path is injected via repr() so it's safely quoted as a
     # Python string literal.  The rest of the script uses no interpolation.
-    # _GLOB_SCRIPT is prepended so glob_hierarchy() is available for the
-    # unconditional directory listing.
     return (
-        _GLOB_SCRIPT
-        + "\nimport os, glob\n\nPROJECT = " + repr(project_path)
-        + "\n_LISTING_LINES = " + repr(_ONBOARD_LISTING_LINES)
+        "import os, glob\n\nPROJECT = " + repr(project_path)
         + "\n" + textwrap.dedent("""\
         GLOBAL  = os.path.expanduser("~/.agents")
 
         sections = []
 
-        # ── Directory listing (unconditional) ────────────────────────
+        # ── Directory listing (flat, one level) ──────────────────────
 
-        listing = glob_hierarchy(PROJECT, "*", _LISTING_LINES)
-        sections.append(f"# Directory: {PROJECT}\\n\\n{listing}")
+        if os.path.isdir(PROJECT):
+            entries = sorted(os.listdir(PROJECT))
+            lines = []
+            for e in entries:
+                full = os.path.join(PROJECT, e)
+                lines.append(full + "/" if os.path.isdir(full) else full)
+            if lines:
+                sections.append("# Directory: " + PROJECT + "\\n\\n" + "\\n".join(lines))
+            else:
+                sections.append("# Directory: " + PROJECT + "\\n\\n(empty)")
+        else:
+            sections.append("# Directory: " + PROJECT + "\\n\\n(not found)")
 
         # ── Collect AGENTS.md files ──────────────────────────────────
 
@@ -1330,6 +1364,151 @@ def _build_onboard_script(project_path: str) -> str:
     """)
     )
 
+
+# ── chat auto-init (first tool call per conversation) ───────────────
+#
+# On the first tool call in a new chat, run a lightweight snapshot of the
+# workspace and sandbox environment.  The result is prepended to the tool
+# output as a harness message, giving the model orientation context without
+# a dedicated tool call.  Subsequent calls in the same chat skip the
+# snapshot (tracked by chat_id in an LRU cache on the Tools instance).
+#
+# The snapshot is deliberately lighter than onboard(): no AGENTS.md, no
+# skills catalog, no deep directory scan.  Just enough to eliminate the
+# 2-5 exploratory turns models typically spend probing "what's here?" and
+# "what's installed?".
+
+_SNAPSHOT_SCRIPT = (
+    "import subprocess, os\n"
+    + textwrap.dedent("""\
+    BASE = "/home/daytona/workspace"
+    sections = []
+
+    # ── Workspace listing (flat, one level) ──────────────────────
+    if os.path.isdir(BASE):
+        entries = sorted(os.listdir(BASE))
+        lines = []
+        for e in entries:
+            full = os.path.join(BASE, e)
+            lines.append(full + "/" if os.path.isdir(full) else full)
+        if lines:
+            sections.append("Workspace:\\n" + "\\n".join(lines))
+    
+
+    # ── System info ──────────────────────────────────────────────
+    info_lines = []
+    for label, cmd in [
+        ("OS", ["uname", "-a"]),
+        ("Python", ["python3", "--version"]),
+        ("Node", ["node", "--version"]),
+    ]:
+        try:
+            out = subprocess.check_output(
+                cmd, stderr=subprocess.STDOUT, timeout=5
+            ).decode().strip()
+            info_lines.append(f"{label}: {out}")
+        except (subprocess.CalledProcessError, FileNotFoundError,
+                subprocess.TimeoutExpired):
+            pass
+    if info_lines:
+        sections.append("\\n".join(info_lines))
+
+    print("\\n\\n".join(sections))
+    """)
+)
+
+
+async def _chat_auto_init(
+    valves, sandbox_id: str, client: httpx.AsyncClient,
+    chat_state: LRUCache, chat_id: str,
+    user: dict,
+    emitter=None,
+) -> None:
+    """Run the first-call-per-chat environment snapshot.
+
+    Deposits the snapshot as a pending harness message in the chat state.
+    Non-fatal: silently swallows errors so it never blocks the actual
+    tool call.  Also fetches sandbox resource metadata from the Daytona
+    API (cpu, memory, disk, region) without an extra sandbox-side command.
+    """
+    parts: list[str] = ["[Auto-init: first tool call in this conversation]"]
+
+    # ── Sandbox-side snapshot (workspace listing + versions) ─────
+    try:
+        resp = await client.post(
+            _toolbox(valves, sandbox_id, "/process/execute"),
+            headers=_headers(valves),
+            json={"command": f"python3 -c {_shell_quote(_SNAPSHOT_SCRIPT)}", "timeout": 10000},
+            timeout=15.0,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            if data.get("exitCode") == 0 and data.get("result", "").strip():
+                parts.append(data["result"].strip())
+    except Exception:
+        pass  # non-fatal: snapshot is best-effort
+
+    # ── Sandbox metadata from Daytona API ────────────────────────
+    try:
+        resp = await client.get(
+            _api(valves, f"/sandbox/{sandbox_id}"),
+            headers=_headers(valves),
+            timeout=15.0,
+        )
+        if resp.status_code == 200:
+            sb = resp.json()
+            cpu = sb.get("cpu")
+            mem = sb.get("memory")
+            disk = sb.get("disk")
+            region = sb.get("region")
+            meta_parts = []
+            if cpu is not None:
+                meta_parts.append(f"{cpu} vCPU")
+            if mem is not None:
+                meta_parts.append(f"{mem} GB RAM")
+            if disk is not None:
+                meta_parts.append(f"{disk} GB disk")
+            if region:
+                meta_parts.append(f"region: {region}")
+            if meta_parts:
+                parts.append("Sandbox: " + ", ".join(meta_parts))
+    except Exception:
+        pass  # non-fatal
+
+    # ── User env var names (values never exposed) ────────────────
+    try:
+        user_valves = user.get("valves")
+        if user_valves:
+            raw_env = getattr(user_valves, "env_vars", "") or ""
+            pairs = _parse_env_vars(raw_env)
+            if pairs:
+                names = ", ".join(k for k, _v in pairs)
+                parts.append(f"User env vars: {names}")
+    except Exception:
+        pass  # non-fatal
+
+    if len(parts) > 1:
+        state = chat_state[chat_id]
+        state["pending"].append("\n".join(parts))
+
+
+async def _ensure_chat_init(
+    valves, sandbox_id: str, client: httpx.AsyncClient,
+    chat_state: LRUCache, chat_id: str | None,
+    user: dict,
+    emitter=None,
+) -> None:
+    """Ensure auto-init has run for this chat.  No-op if chat_id is None
+    (older OWUI versions that don't pass it) or if already initialized."""
+    if not chat_id:
+        return
+    if chat_id in chat_state and chat_state[chat_id].get("init"):
+        return
+    # First tool call in this chat: create state and run snapshot.
+    chat_state[chat_id] = {"init": True, "pending": []}
+    await _chat_auto_init(
+        valves, sandbox_id, client, chat_state, chat_id, user, emitter,
+    )
 
 
 # ── delegate() sub-agent infrastructure ─────────────────────────────
@@ -1931,6 +2110,17 @@ class Tools:
 
     def __init__(self):
         self.valves = self.Valves()
+        # Chat-scoped harness message queue.  Keyed by chat_id, value is a
+        # list[str] of messages waiting to be prepended to the next tool
+        # result.  The auto-init snapshot deposits the first message;
+        # future producers (e.g. background job completion notifications)
+        # can push here too, and the next tool call drains the queue.
+        #
+        # LRU(1024) bounds memory.  Eviction of an old chat_id just means
+        # its pending messages are lost (acceptable: the chat is likely
+        # dead) and the next tool call in that chat re-runs auto-init
+        # (idempotent, ~150 tokens).
+        self._chat_state: LRUCache = LRUCache(maxsize=1024)
 
     # ── agent-facing manual ──────────────────────────────────────────
     #
@@ -2625,6 +2815,7 @@ class Tools:
         self,
         path: str,
         __user__: dict = {},
+        __chat_id__: str = "",
         __event_emitter__=None,
     ) -> str:
         """
@@ -2637,6 +2828,10 @@ class Tools:
         async def _run(client):
             email = _get_email(__user__)
             sandbox_id, _sb_warning = await _ensure_sandbox(self.valves, email, client, __event_emitter__)
+            await _ensure_chat_init(
+                self.valves, sandbox_id, client,
+                self._chat_state, __chat_id__, __user__, __event_emitter__,
+            )
 
             await _emit(__event_emitter__, "Loading project context...")
 
@@ -2680,7 +2875,8 @@ class Tools:
                 return f"Error: onboard script failed (exit {exit_code}): {result[:500]}"
 
             await _emit(__event_emitter__, "Project context loaded", done=True)
-            return _prepend_warning(result if result else "(empty project context)", _sb_warning)
+            messages = _drain_harness_messages(self._chat_state, __chat_id__, _sb_warning)
+            return _prepend_harness_messages(result if result else "(empty project context)", messages)
 
         return await _tool_context(__event_emitter__, _run)
 
@@ -2691,11 +2887,16 @@ class Tools:
         workdir: str = "/home/daytona/workspace",
         foreground_seconds: int = 0,
         __user__: dict = {},
+        __chat_id__: str = "",
         __event_emitter__=None,
     ) -> str:
         async def _run(client):
             email = _get_email(__user__)
             sandbox_id, _sb_warning = await _ensure_sandbox(self.valves, email, client, __event_emitter__)
+            await _ensure_chat_init(
+                self.valves, sandbox_id, client,
+                self._chat_state, __chat_id__, __user__, __event_emitter__,
+            )
 
             await _emit(__event_emitter__, "Running command...")
 
@@ -2723,7 +2924,8 @@ class Tools:
             )
 
             await _emit(__event_emitter__, "Command complete", done=True)
-            return _prepend_warning(result, _sb_warning)
+            messages = _drain_harness_messages(self._chat_state, __chat_id__, _sb_warning)
+            return _prepend_harness_messages(result, messages)
 
         return await _tool_context(__event_emitter__, _run)
 
@@ -2734,18 +2936,24 @@ class Tools:
         offset: int = 1,
         limit: int = 2000,
         __user__: dict = {},
+        __chat_id__: str = "",
         __event_emitter__=None,
     ) -> str:
         async def _run(client):
             email = _get_email(__user__)
             sandbox_id, _sb_warning = await _ensure_sandbox(self.valves, email, client, __event_emitter__)
+            await _ensure_chat_init(
+                self.valves, sandbox_id, client,
+                self._chat_state, __chat_id__, __user__, __event_emitter__,
+            )
             await _emit(__event_emitter__, f"Reading {path}...")
             result = await _core_read(
                 self.valves, sandbox_id, client,
                 path=path, offset=offset, limit=limit,
             )
             await _emit(__event_emitter__, "Read complete", done=True)
-            return _prepend_warning(result, _sb_warning)
+            messages = _drain_harness_messages(self._chat_state, __chat_id__, _sb_warning)
+            return _prepend_harness_messages(result, messages)
 
         return await _tool_context(__event_emitter__, _run)
 
@@ -2755,18 +2963,24 @@ class Tools:
         pattern: str,
         max_lines: int = _GLOB_MAX_LINES,
         __user__: dict = {},
+        __chat_id__: str = "",
         __event_emitter__=None,
     ) -> str:
         async def _run(client):
             email = _get_email(__user__)
             sandbox_id, _sb_warning = await _ensure_sandbox(self.valves, email, client, __event_emitter__)
+            await _ensure_chat_init(
+                self.valves, sandbox_id, client,
+                self._chat_state, __chat_id__, __user__, __event_emitter__,
+            )
             await _emit(__event_emitter__, f"Searching for {pattern}...")
             result = await _core_glob(
                 self.valves, sandbox_id, client,
                 pattern=pattern, max_lines=max_lines,
             )
             await _emit(__event_emitter__, "Search complete", done=True)
-            return _prepend_warning(result, _sb_warning)
+            messages = _drain_harness_messages(self._chat_state, __chat_id__, _sb_warning)
+            return _prepend_harness_messages(result, messages)
 
         return await _tool_context(__event_emitter__, _run)
 
@@ -2777,18 +2991,24 @@ class Tools:
         files: str = "**/*",
         max_lines: int = _GREP_MAX_LINES,
         __user__: dict = {},
+        __chat_id__: str = "",
         __event_emitter__=None,
     ) -> str:
         async def _run(client):
             email = _get_email(__user__)
             sandbox_id, _sb_warning = await _ensure_sandbox(self.valves, email, client, __event_emitter__)
+            await _ensure_chat_init(
+                self.valves, sandbox_id, client,
+                self._chat_state, __chat_id__, __user__, __event_emitter__,
+            )
             await _emit(__event_emitter__, f"Searching for {pattern!r}...")
             result = await _core_grep(
                 self.valves, sandbox_id, client,
                 pattern=pattern, files=files, max_lines=max_lines,
             )
             await _emit(__event_emitter__, "Search complete", done=True)
-            return _prepend_warning(result, _sb_warning)
+            messages = _drain_harness_messages(self._chat_state, __chat_id__, _sb_warning)
+            return _prepend_harness_messages(result, messages)
 
         return await _tool_context(__event_emitter__, _run)
 
@@ -2798,18 +3018,24 @@ class Tools:
         path: str,
         content: str,
         __user__: dict = {},
+        __chat_id__: str = "",
         __event_emitter__=None,
     ) -> str:
         async def _run(client):
             email = _get_email(__user__)
             sandbox_id, _sb_warning = await _ensure_sandbox(self.valves, email, client, __event_emitter__)
+            await _ensure_chat_init(
+                self.valves, sandbox_id, client,
+                self._chat_state, __chat_id__, __user__, __event_emitter__,
+            )
             await _emit(__event_emitter__, f"Writing {path}...")
             result = await _core_write(
                 self.valves, sandbox_id, client,
                 path=path, content=content,
             )
             await _emit(__event_emitter__, "Write complete", done=True)
-            return _prepend_warning(result, _sb_warning)
+            messages = _drain_harness_messages(self._chat_state, __chat_id__, _sb_warning)
+            return _prepend_harness_messages(result, messages)
 
         return await _tool_context(__event_emitter__, _run)
 
@@ -2821,11 +3047,16 @@ class Tools:
         new_string: str,
         replace_all: bool = False,
         __user__: dict = {},
+        __chat_id__: str = "",
         __event_emitter__=None,
     ) -> str:
         async def _run(client):
             email = _get_email(__user__)
             sandbox_id, _sb_warning = await _ensure_sandbox(self.valves, email, client, __event_emitter__)
+            await _ensure_chat_init(
+                self.valves, sandbox_id, client,
+                self._chat_state, __chat_id__, __user__, __event_emitter__,
+            )
             await _emit(__event_emitter__, f"Editing {path}...")
             result = await _core_edit(
                 self.valves, sandbox_id, client,
@@ -2833,7 +3064,8 @@ class Tools:
                 replace_all=replace_all,
             )
             await _emit(__event_emitter__, "Edit complete", done=True)
-            return _prepend_warning(result, _sb_warning)
+            messages = _drain_harness_messages(self._chat_state, __chat_id__, _sb_warning)
+            return _prepend_harness_messages(result, messages)
 
         return await _tool_context(__event_emitter__, _run)
 
@@ -2844,6 +3076,7 @@ class Tools:
         max_steps: int = 10,
         foreground_seconds: int = -1,
         __user__: dict = {},
+        __chat_id__: str = "",
         __model__: dict = {},
         __request__=None,
         __event_emitter__=None,
@@ -2863,6 +3096,10 @@ class Tools:
         async def _run(client):
             email = _get_email(__user__)
             sandbox_id, _sb_warning = await _ensure_sandbox(self.valves, email, client, __event_emitter__)
+            await _ensure_chat_init(
+                self.valves, sandbox_id, client,
+                self._chat_state, __chat_id__, __user__, __event_emitter__,
+            )
 
             await _emit(__event_emitter__, "Preparing delegate...")
 
@@ -3183,11 +3420,13 @@ class Tools:
                         f"Delegation complete ({step_count} steps, {usage.tool_calls} tool calls)",
                         done=True,
                     )
-                    return _prepend_warning(result_output + usage_note, _sb_warning)
+                    messages = _drain_harness_messages(self._chat_state, __chat_id__, _sb_warning)
+                    return _prepend_harness_messages(result_output + usage_note, messages)
                 else:
                     error_msg = agent_result.get("error", "Unknown error")
                     await _emit(__event_emitter__, "Delegation failed", done=True)
-                    return _prepend_warning(error_msg, _sb_warning)
+                    messages = _drain_harness_messages(self._chat_state, __chat_id__, _sb_warning)
+                    return _prepend_harness_messages(error_msg, messages)
 
             else:
                 # ── Backgrounded — return descriptor ─────────────────
@@ -3206,9 +3445,10 @@ class Tools:
                     f"Delegation backgrounded after {elapsed}s",
                     done=True,
                 )
-                return _prepend_warning(
+                messages = _drain_harness_messages(self._chat_state, __chat_id__, _sb_warning)
+                return _prepend_harness_messages(
                     _format_delegate_background(delegate_id, elapsed, preview),
-                    _sb_warning,
+                    messages,
                 )
 
         return await _tool_context(__event_emitter__, _run)
@@ -3217,6 +3457,7 @@ class Tools:
         self,
         target: str,
         __user__: dict = {},
+        __chat_id__: str = "",
         __event_emitter__=None,
     ) -> str:
         """
@@ -3254,6 +3495,10 @@ class Tools:
 
             email = _get_email(__user__)
             sandbox_id, _sb_warning = await _ensure_sandbox(self.valves, email, client, __event_emitter__)
+            await _ensure_chat_init(
+                self.valves, sandbox_id, client,
+                self._chat_state, __chat_id__, __user__, __event_emitter__,
+            )
 
             if is_ssh:
                 await _emit(__event_emitter__, "Creating SSH access token...")
@@ -3274,14 +3519,15 @@ class Tools:
                     ssh_command = f"ssh {token}@ssh.app.daytona.io"
 
                 await _emit(__event_emitter__, "SSH access ready", done=True)
-                return _prepend_warning(
+                messages = _drain_harness_messages(self._chat_state, __chat_id__, _sb_warning)
+                return _prepend_harness_messages(
                     f"SSH command (valid 60 min):\n\n"
                     f"```\n{ssh_command}\n```\n\n"
                     f"The user can paste this into their terminal, VS Code Remote SSH, "
                     f"or JetBrains Gateway.\n\n"
                     f"Note: the sandbox auto-stops after ~{self.valves.auto_stop_minutes} min of inactivity. "
                     f"Active SSH sessions keep the sandbox alive.",
-                    _sb_warning,
+                    messages,
                 )
 
             # ── dufs fast path: install + start + sign URL ──────────
@@ -3324,14 +3570,15 @@ class Tools:
                     return "Error: Daytona returned an empty URL."
 
                 await _emit(__event_emitter__, "File browser ready", done=True)
-                return _prepend_warning(
+                messages = _drain_harness_messages(self._chat_state, __chat_id__, _sb_warning)
+                return _prepend_harness_messages(
                     f"File browser URL (valid ~1 hour): {url}\n\n"
                     f"Give this URL to the user. In their browser they can:\n"
                     f"- **Upload**: drag and drop files onto the page\n"
                     f"- **Download**: click any file\n"
                     f"- **Browse**: navigate folders\n\n"
                     f"dufs is serving {_DUFS_ROOT} on port {_DUFS_PORT} (PID {pid}).",
-                    _sb_warning,
+                    messages,
                 )
 
             # ── code-server fast path: install + start + sign URL ───
@@ -3374,14 +3621,15 @@ class Tools:
                     return "Error: Daytona returned an empty URL."
 
                 await _emit(__event_emitter__, "IDE ready", done=True)
-                return _prepend_warning(
+                messages = _drain_harness_messages(self._chat_state, __chat_id__, _sb_warning)
+                return _prepend_harness_messages(
                     f"IDE URL (valid ~1 hour): {url}\n\n"
                     f"Give this URL to the user. They get VS Code in the browser with:\n"
                     f"- Full terminal access\n"
                     f"- File editing and navigation\n"
                     f"- Extension support\n\n"
                     f"code-server is serving {_CS_ROOT} on port {_CS_PORT} (PID {pid}).",
-                    _sb_warning,
+                    messages,
                 )
 
             # Port exposure path
@@ -3401,14 +3649,15 @@ class Tools:
                 return "Error: Daytona returned an empty URL."
 
             await _emit(__event_emitter__, f"URL ready (port {port})", done=True)
-            return _prepend_warning(
+            messages = _drain_harness_messages(self._chat_state, __chat_id__, _sb_warning)
+            return _prepend_harness_messages(
                 f"Public URL (valid ~1 hour): {url}\n\n"
                 f"The user can open this in a new browser tab. "
                 f"They may see a Daytona security warning on first visit — they can click through it.\n\n"
                 f"Note: the sandbox auto-stops after ~{self.valves.auto_stop_minutes} min of inactivity regardless of "
                 f"running background processes, killing the server. If the user reports "
                 f"the URL stopped working, restart the server and call expose() again.",
-                _sb_warning,
+                messages,
             )
 
         return await _tool_context(__event_emitter__, _run)

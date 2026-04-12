@@ -99,7 +99,7 @@ async def test_onboard_script(R: Results):
 
     R.check("script has PROJECT assignment", "PROJECT = '/home/daytona/workspace/myproject'" in script, script[:200])
     R.check("script references ~/.agents", "~/.agents" in script, "missing global path")
-    R.check("script calls glob_hierarchy", "glob_hierarchy" in script, "missing directory listing call")
+    R.check("script uses os.listdir", "os.listdir" in script, "missing directory listing call")
 
     print("\n── _build_onboard_script: handles tricky paths ──")
     script = _build_onboard_script("/home/daytona/workspace/it's a \"test\"")
@@ -108,10 +108,6 @@ async def test_onboard_script(R: Results):
         R.check("tricky path compiles", True)
     except SyntaxError as e:
         R.check("tricky path compiles", False, str(e))
-
-    print("\n── _build_onboard_script: includes glob_hierarchy function ──")
-    script = _build_onboard_script("/tmp/test")
-    R.check("script includes glob_hierarchy definition", "def glob_hierarchy" in script, "missing glob_hierarchy function")
 
 
 async def test_truncate(R: Results):
@@ -1383,6 +1379,144 @@ async def test_handoff(R: Results):
             "handoff should have a manpage")
 
 
+async def test_harness_messages(R: Results):
+    from lathe import _prepend_harness_messages, _drain_harness_messages
+    from cachetools import LRUCache
+
+    print("\n── _prepend_harness_messages: empty list ──")
+    R.check("no messages = passthrough",
+            _prepend_harness_messages("hello", []) == "hello")
+
+    print("\n── _prepend_harness_messages: single message ──")
+    result = _prepend_harness_messages("tool output", ["[warning]"])
+    R.check("warning prepended", result.startswith("[warning]"), result[:50])
+    R.check("tool output follows", "tool output" in result, result)
+
+    print("\n── _prepend_harness_messages: multiple messages ──")
+    result = _prepend_harness_messages("output", ["msg1", "msg2", "msg3"])
+    R.check("all messages present", "msg1" in result and "msg2" in result and "msg3" in result, result)
+    R.check("output at end", result.endswith("output"), result[-20:])
+    R.check("messages separated by blank lines", "\n\n" in result)
+
+    print("\n── _drain_harness_messages: no chat_id ──")
+    cache = LRUCache(maxsize=10)
+    messages = _drain_harness_messages(cache, None, None)
+    R.check("no chat_id = empty", messages == [], str(messages))
+
+    messages = _drain_harness_messages(cache, None, "[restarted]")
+    R.check("no chat_id + warning = just warning", messages == ["[restarted]"], str(messages))
+
+    print("\n── _drain_harness_messages: chat_id with pending ──")
+    cache["chat-1"] = {"init": True, "pending": ["snapshot data", "job done"]}
+    messages = _drain_harness_messages(cache, "chat-1", "[restarted]")
+    R.check("drains warning + pending",
+            messages == ["[restarted]", "snapshot data", "job done"], str(messages))
+    R.check("pending cleared after drain",
+            cache["chat-1"]["pending"] == [], str(cache["chat-1"]))
+
+    print("\n── _drain_harness_messages: second drain is empty ──")
+    messages = _drain_harness_messages(cache, "chat-1", None)
+    R.check("second drain empty", messages == [], str(messages))
+
+    print("\n── _drain_harness_messages: unknown chat_id ──")
+    messages = _drain_harness_messages(cache, "chat-unknown", None)
+    R.check("unknown chat = empty", messages == [], str(messages))
+
+
+async def test_chat_state(R: Results):
+    from lathe import Tools
+    from cachetools import LRUCache
+
+    print("\n── Tools._chat_state: exists on init ──")
+    tools = Tools()
+    R.check("_chat_state exists", hasattr(tools, "_chat_state"))
+    R.check("_chat_state is LRUCache", isinstance(tools._chat_state, LRUCache))
+    R.check("_chat_state maxsize is 1024", tools._chat_state.maxsize == 1024,
+            f"got {tools._chat_state.maxsize}")
+    R.check("_chat_state starts empty", len(tools._chat_state) == 0)
+
+
+async def test_snapshot_script(R: Results):
+    from lathe import _SNAPSHOT_SCRIPT
+
+    print("\n── _SNAPSHOT_SCRIPT: generates valid Python ──")
+    try:
+        compile(_SNAPSHOT_SCRIPT, "<snapshot>", "exec")
+        R.check("script compiles", True)
+    except SyntaxError as e:
+        R.check("script compiles", False, str(e))
+
+    R.check("script references workspace",
+            "/home/daytona/workspace" in _SNAPSHOT_SCRIPT)
+    R.check("script uses os.listdir",
+            "os.listdir" in _SNAPSHOT_SCRIPT)
+    R.check("script checks uname",
+            "uname" in _SNAPSHOT_SCRIPT)
+    R.check("script checks python3",
+            "python3" in _SNAPSHOT_SCRIPT)
+    R.check("script checks node",
+            "node" in _SNAPSHOT_SCRIPT)
+
+
+async def test_ensure_chat_init(R: Results):
+    from lathe import _ensure_chat_init
+    from cachetools import LRUCache
+
+    print("\n── _ensure_chat_init: no chat_id is no-op ──")
+    cache = LRUCache(maxsize=10)
+    # Should not raise, should not modify cache
+    await _ensure_chat_init(None, "sb-id", None, cache, None, {})
+    R.check("empty chat_id = no-op", len(cache) == 0)
+    await _ensure_chat_init(None, "sb-id", None, cache, "", {})
+    R.check("blank chat_id = no-op", len(cache) == 0)
+
+    print("\n── _ensure_chat_init: second call is no-op ──")
+    # Pre-populate as if already initialized
+    cache["chat-already"] = {"init": True, "pending": ["existing"]}
+    await _ensure_chat_init(None, "sb-id", None, cache, "chat-already", {})
+    R.check("existing pending preserved",
+            cache["chat-already"]["pending"] == ["existing"],
+            str(cache["chat-already"]))
+
+    print("\n── _ensure_chat_init: new chat creates state ──")
+    # For a truly new chat with no valves/client, auto-init will fail
+    # gracefully (best-effort) but should still create the state entry.
+    await _ensure_chat_init(None, "sb-id", None, cache, "chat-new", {})
+    R.check("new chat entry created", "chat-new" in cache)
+    R.check("new chat marked init", cache["chat-new"].get("init") is True)
+    R.check("new chat has pending list",
+            isinstance(cache["chat-new"].get("pending"), list))
+
+
+async def test_chat_id_in_signatures(R: Results):
+    """Verify all sandbox-using Tools methods accept __chat_id__."""
+    import inspect
+    from lathe import Tools
+
+    print("\n── __chat_id__ in tool signatures ──")
+    tools = Tools()
+    # Tools that use _ensure_sandbox should have __chat_id__
+    sandbox_tools = ["bash", "read", "write", "edit", "glob", "grep",
+                     "onboard", "delegate", "expose"]
+    for name in sandbox_tools:
+        method = getattr(tools, name, None)
+        if method is None:
+            R.check(f"{name} exists", False, "method not found")
+            continue
+        sig = inspect.signature(method)
+        R.check(f"{name} has __chat_id__",
+                "__chat_id__" in sig.parameters,
+                f"params: {list(sig.parameters.keys())}")
+
+    # Tools that don't use _ensure_sandbox should NOT have __chat_id__
+    # (or it's fine if they do, but let's check they still work)
+    non_sandbox = ["lathe", "handoff"]
+    for name in non_sandbox:
+        method = getattr(tools, name, None)
+        if method is None:
+            R.check(f"{name} exists", False, "method not found")
+
+
 TESTS = {
     "parse_env_vars": test_parse_env_vars,
     "onboard_script": test_onboard_script,
@@ -1406,6 +1540,11 @@ TESTS = {
     "delegate_catalog_foreground_param": test_delegate_catalog_foreground_param,
     "delegate_background_branching": test_delegate_background_branching,
     "handoff": test_handoff,
+    "harness_messages": test_harness_messages,
+    "chat_state": test_chat_state,
+    "snapshot_script": test_snapshot_script,
+    "ensure_chat_init": test_ensure_chat_init,
+    "chat_id_signatures": test_chat_id_in_signatures,
 }
 
 
