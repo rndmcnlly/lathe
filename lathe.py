@@ -836,6 +836,129 @@ def _doc_from_core(core_fn):
     return decorator
 
 
+# Infrastructure params in _core_* signatures that are NOT tool params.
+# The _standard_tool factory skips these when building the OWUI-visible
+# method signature.
+_CORE_INFRA_PARAMS = frozenset({
+    "valves", "sandbox_id", "client", "emit", "user_pairs",
+    "foreground_seconds", "on_background", "chat_state", "chat_id",
+})
+
+
+def _standard_tool(core_fn, *, emit_start: str, emit_done: str,
+                   extra_core_kwargs=None):
+    """Build a Tools class method that wraps a _core_* function.
+
+    Generates a method with the correct OWUI-visible signature (tool params
+    from core_fn + OWUI dunder params), docstring from core_fn, and all
+    standard boilerplate (ensure_sandbox, ensure_chat_init, emit, drain
+    harness messages).
+
+    The generated method has an explicit ``__signature__`` so
+    ``inspect.signature()`` returns the exact parameter list OWUI expects.
+    ``functools.wraps`` does NOT copy ``__signature__``; we set it manually.
+
+    Args:
+        core_fn: The _core_* function to wrap.
+        emit_start: Status message emitted before calling the core.
+            May contain ``{kwargs}`` which is replaced with a dict of
+            the tool kwargs at call time, useful for messages like
+            "Reading {kwargs[path]}...".  Use a plain string without
+            ``{kwargs}`` for static messages.
+        emit_done: Status message emitted after the core returns.
+        extra_core_kwargs: Optional callable(self, sandbox_id, __chat_id__)
+            returning a dict of extra kwargs to pass to the core function
+            (e.g. chat_state and chat_id for interpret).
+    """
+    # ── Extract tool-visible parameters from the core function ───────
+    core_sig = inspect.signature(core_fn)
+    tool_params = []
+    for name, param in core_sig.parameters.items():
+        if name in _CORE_INFRA_PARAMS:
+            continue
+        # Convert keyword-only params to positional-or-keyword for OWUI
+        tool_params.append(
+            param.replace(kind=inspect.Parameter.POSITIONAL_OR_KEYWORD)
+        )
+
+    # ── Build the synthetic signature ────────────────────────────────
+    # self + tool params + OWUI dunder params
+    synth_params = [
+        inspect.Parameter("self", inspect.Parameter.POSITIONAL_OR_KEYWORD),
+    ] + tool_params + [
+        inspect.Parameter("__user__", inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                          default={}),
+        inspect.Parameter("__chat_id__", inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                          default=""),
+        inspect.Parameter("__event_emitter__", inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                          default=None),
+    ]
+    synth_sig = inspect.Signature(synth_params)
+
+    # Names of tool params for extracting kwargs at call time
+    tool_param_names = [p.name for p in tool_params]
+
+    async def _method(self, *args, **kwargs):
+        # Bind positional + keyword args to the synthetic signature.
+        # Skip 'self' (already bound by Python's method machinery).
+        bound = synth_sig.bind(self, *args, **kwargs)
+        bound.apply_defaults()
+        ba = bound.arguments
+
+        # Extract OWUI dunder params
+        __user__ = ba.pop("__user__")
+        __chat_id__ = ba.pop("__chat_id__")
+        __event_emitter__ = ba.pop("__event_emitter__")
+        ba.pop("self", None)
+
+        # Remaining args are tool kwargs
+        tool_kwargs = {k: ba[k] for k in tool_param_names if k in ba}
+
+        async def _run(client):
+            email = _get_email(__user__)
+            sandbox_id, _sb_warning = await _ensure_sandbox(
+                self.valves, email, client, __event_emitter__,
+            )
+            await _ensure_chat_init(
+                self.valves, sandbox_id, client,
+                self._chat_state, __chat_id__, __user__, __event_emitter__,
+            )
+
+            # Format emit_start with tool kwargs if it contains {kwargs}
+            if "{kwargs" in emit_start:
+                start_msg = emit_start.format(kwargs=tool_kwargs)
+            else:
+                start_msg = emit_start
+            await _emit(__event_emitter__, start_msg)
+
+            # Build core call kwargs
+            call_kwargs = dict(tool_kwargs)
+            if extra_core_kwargs:
+                call_kwargs.update(
+                    extra_core_kwargs(self, sandbox_id, __chat_id__)
+                )
+
+            result = await core_fn(
+                self.valves, sandbox_id, client, **call_kwargs,
+            )
+
+            await _emit(__event_emitter__, emit_done, done=True)
+            messages = _drain_harness_messages(
+                self._chat_state, __chat_id__, _sb_warning,
+            )
+            return _prepend_harness_messages(result, messages)
+
+        return await _tool_context(__event_emitter__, _run)
+
+    # ── Set the correct signature and docstring ──────────────────────
+    _method.__signature__ = synth_sig
+    _method.__doc__ = inspect.getdoc(core_fn) or ""
+    _method.__name__ = core_fn.__name__.replace("_core_", "")
+    _method.__qualname__ = f"Tools.{_method.__name__}"
+
+    return _method
+
+
 async def _core_read(valves, sandbox_id: str, client: httpx.AsyncClient, *,
                      path: str, offset: int = 1, limit: int = 2000) -> str:
     """Read a file from the sandbox. Returns numbered lines.
@@ -3279,173 +3402,45 @@ class Tools:
 
         return await _tool_context(__event_emitter__, _run)
 
-    @_doc_from_core(_core_read)
-    async def read(
-        self,
-        path: str,
-        offset: int = 1,
-        limit: int = 2000,
-        __user__: dict = {},
-        __chat_id__: str = "",
-        __event_emitter__=None,
-    ) -> str:
-        async def _run(client):
-            email = _get_email(__user__)
-            sandbox_id, _sb_warning = await _ensure_sandbox(self.valves, email, client, __event_emitter__)
-            await _ensure_chat_init(
-                self.valves, sandbox_id, client,
-                self._chat_state, __chat_id__, __user__, __event_emitter__,
-            )
-            await _emit(__event_emitter__, f"Reading {path}...")
-            result = await _core_read(
-                self.valves, sandbox_id, client,
-                path=path, offset=offset, limit=limit,
-            )
-            await _emit(__event_emitter__, "Read complete", done=True)
-            messages = _drain_harness_messages(self._chat_state, __chat_id__, _sb_warning)
-            return _prepend_harness_messages(result, messages)
+    read = _standard_tool(
+        _core_read,
+        emit_start="Reading {kwargs[path]}...",
+        emit_done="Read complete",
+    )
 
-        return await _tool_context(__event_emitter__, _run)
+    glob = _standard_tool(
+        _core_glob,
+        emit_start="Searching for {kwargs[pattern]}...",
+        emit_done="Search complete",
+    )
 
-    @_doc_from_core(_core_glob)
-    async def glob(
-        self,
-        pattern: str,
-        max_lines: int = _GLOB_MAX_LINES,
-        __user__: dict = {},
-        __chat_id__: str = "",
-        __event_emitter__=None,
-    ) -> str:
-        async def _run(client):
-            email = _get_email(__user__)
-            sandbox_id, _sb_warning = await _ensure_sandbox(self.valves, email, client, __event_emitter__)
-            await _ensure_chat_init(
-                self.valves, sandbox_id, client,
-                self._chat_state, __chat_id__, __user__, __event_emitter__,
-            )
-            await _emit(__event_emitter__, f"Searching for {pattern}...")
-            result = await _core_glob(
-                self.valves, sandbox_id, client,
-                pattern=pattern, max_lines=max_lines,
-            )
-            await _emit(__event_emitter__, "Search complete", done=True)
-            messages = _drain_harness_messages(self._chat_state, __chat_id__, _sb_warning)
-            return _prepend_harness_messages(result, messages)
+    grep = _standard_tool(
+        _core_grep,
+        emit_start="Searching for {kwargs[pattern]!r}...",
+        emit_done="Search complete",
+    )
 
-        return await _tool_context(__event_emitter__, _run)
+    write = _standard_tool(
+        _core_write,
+        emit_start="Writing {kwargs[path]}...",
+        emit_done="Write complete",
+    )
 
-    @_doc_from_core(_core_grep)
-    async def grep(
-        self,
-        pattern: str,
-        files: str = "**/*",
-        max_lines: int = _GREP_MAX_LINES,
-        __user__: dict = {},
-        __chat_id__: str = "",
-        __event_emitter__=None,
-    ) -> str:
-        async def _run(client):
-            email = _get_email(__user__)
-            sandbox_id, _sb_warning = await _ensure_sandbox(self.valves, email, client, __event_emitter__)
-            await _ensure_chat_init(
-                self.valves, sandbox_id, client,
-                self._chat_state, __chat_id__, __user__, __event_emitter__,
-            )
-            await _emit(__event_emitter__, f"Searching for {pattern!r}...")
-            result = await _core_grep(
-                self.valves, sandbox_id, client,
-                pattern=pattern, files=files, max_lines=max_lines,
-            )
-            await _emit(__event_emitter__, "Search complete", done=True)
-            messages = _drain_harness_messages(self._chat_state, __chat_id__, _sb_warning)
-            return _prepend_harness_messages(result, messages)
+    edit = _standard_tool(
+        _core_edit,
+        emit_start="Editing {kwargs[path]}...",
+        emit_done="Edit complete",
+    )
 
-        return await _tool_context(__event_emitter__, _run)
-
-    @_doc_from_core(_core_write)
-    async def write(
-        self,
-        path: str,
-        content: str,
-        __user__: dict = {},
-        __chat_id__: str = "",
-        __event_emitter__=None,
-    ) -> str:
-        async def _run(client):
-            email = _get_email(__user__)
-            sandbox_id, _sb_warning = await _ensure_sandbox(self.valves, email, client, __event_emitter__)
-            await _ensure_chat_init(
-                self.valves, sandbox_id, client,
-                self._chat_state, __chat_id__, __user__, __event_emitter__,
-            )
-            await _emit(__event_emitter__, f"Writing {path}...")
-            result = await _core_write(
-                self.valves, sandbox_id, client,
-                path=path, content=content,
-            )
-            await _emit(__event_emitter__, "Write complete", done=True)
-            messages = _drain_harness_messages(self._chat_state, __chat_id__, _sb_warning)
-            return _prepend_harness_messages(result, messages)
-
-        return await _tool_context(__event_emitter__, _run)
-
-    @_doc_from_core(_core_edit)
-    async def edit(
-        self,
-        path: str,
-        old_string: str,
-        new_string: str,
-        replace_all: bool = False,
-        __user__: dict = {},
-        __chat_id__: str = "",
-        __event_emitter__=None,
-    ) -> str:
-        async def _run(client):
-            email = _get_email(__user__)
-            sandbox_id, _sb_warning = await _ensure_sandbox(self.valves, email, client, __event_emitter__)
-            await _ensure_chat_init(
-                self.valves, sandbox_id, client,
-                self._chat_state, __chat_id__, __user__, __event_emitter__,
-            )
-            await _emit(__event_emitter__, f"Editing {path}...")
-            result = await _core_edit(
-                self.valves, sandbox_id, client,
-                path=path, old_string=old_string, new_string=new_string,
-                replace_all=replace_all,
-            )
-            await _emit(__event_emitter__, "Edit complete", done=True)
-            messages = _drain_harness_messages(self._chat_state, __chat_id__, _sb_warning)
-            return _prepend_harness_messages(result, messages)
-
-        return await _tool_context(__event_emitter__, _run)
-
-    @_doc_from_core(_core_interpret)
-    async def interpret(
-        self,
-        code: str,
-        timeout: int = _INTERPRET_DEFAULT_TIMEOUT,
-        __user__: dict = {},
-        __chat_id__: str = "",
-        __event_emitter__=None,
-    ) -> str:
-        async def _run(client):
-            email = _get_email(__user__)
-            sandbox_id, _sb_warning = await _ensure_sandbox(self.valves, email, client, __event_emitter__)
-            await _ensure_chat_init(
-                self.valves, sandbox_id, client,
-                self._chat_state, __chat_id__, __user__, __event_emitter__,
-            )
-            await _emit(__event_emitter__, "Running Python...")
-            result = await _core_interpret(
-                self.valves, sandbox_id, client,
-                self._chat_state, __chat_id__,
-                code=code, timeout=timeout,
-            )
-            await _emit(__event_emitter__, "Execution complete", done=True)
-            messages = _drain_harness_messages(self._chat_state, __chat_id__, _sb_warning)
-            return _prepend_harness_messages(result, messages)
-
-        return await _tool_context(__event_emitter__, _run)
+    interpret = _standard_tool(
+        _core_interpret,
+        emit_start="Running Python...",
+        emit_done="Execution complete",
+        extra_core_kwargs=lambda self, sandbox_id, chat_id: {
+            "chat_state": self._chat_state,
+            "chat_id": chat_id,
+        },
+    )
 
     async def delegate(
         self,

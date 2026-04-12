@@ -1763,6 +1763,186 @@ async def test_interpret_manpage(R: Results):
             "should compare with bash")
 
 
+async def test_tools_schema_parity(R: Results):
+    """Verify OWUI-visible parameter schemas for all Tools methods.
+
+    OWUI introspects method signatures to build JSON schemas for the model.
+    This test locks in the known-good parameter names, types, defaults, and
+    docstrings so a decorator or factory refactor can't silently break them.
+    """
+    from lathe import Tools
+    import inspect
+
+    print("\n── Tools schema parity: parameter signatures ──")
+
+    tools = Tools()
+
+    # Expected OWUI-visible parameters per method (excluding __dunder__ params).
+    # Format: {method_name: [(param_name, annotation_name, has_default, default_value), ...]}
+    # annotation_name is the simple type name (str, int, bool, list) or "empty"
+    # if no annotation.
+    EXPECTED = {
+        "lathe": [
+            ("manpage", "str", True, "overview"),
+        ],
+        "handoff": [],
+        "destroy": [
+            ("confirm", "bool", True, False),
+        ],
+        "onboard": [
+            ("path", "str", False, None),
+        ],
+        "bash": [
+            ("command", "str", False, None),
+            ("workdir", "str", True, "/home/daytona/workspace"),
+            ("foreground_seconds", "int", True, 0),
+        ],
+        "read": [
+            ("path", "str", False, None),
+            ("offset", "int", True, 1),
+            ("limit", "int", True, 2000),
+        ],
+        "glob": [
+            ("pattern", "str", False, None),
+            ("max_lines", "int", True, 100),
+        ],
+        "grep": [
+            ("pattern", "str", False, None),
+            ("files", "str", True, "**/*"),
+            ("max_lines", "int", True, 100),
+        ],
+        "write": [
+            ("path", "str", False, None),
+            ("content", "str", False, None),
+        ],
+        "edit": [
+            ("path", "str", False, None),
+            ("old_string", "str", False, None),
+            ("new_string", "str", False, None),
+            ("replace_all", "bool", True, False),
+        ],
+        "interpret": [
+            ("code", "str", False, None),
+            ("timeout", "int", True, 120),
+        ],
+        "delegate": [
+            ("task", "str", False, None),
+            ("context_files", "list", True, []),
+            ("max_steps", "int", True, 10),
+            ("foreground_seconds", "int", True, -1),
+        ],
+        "expose": [
+            ("target", "str", False, None),
+        ],
+    }
+
+    # Discover all public methods on the Tools instance
+    public_methods = {
+        name: method
+        for name, method in inspect.getmembers(tools, predicate=inspect.ismethod)
+        if not name.startswith("_")
+    }
+
+    R.check("all expected methods exist",
+            set(EXPECTED.keys()) == set(public_methods.keys()),
+            f"expected {sorted(EXPECTED.keys())}, got {sorted(public_methods.keys())}")
+
+    for method_name, expected_params in EXPECTED.items():
+        if method_name not in public_methods:
+            R.check(f"{method_name} exists", False, "method not found")
+            continue
+
+        method = public_methods[method_name]
+        sig = inspect.signature(method)
+
+        # Filter to OWUI-visible params (not __dunder__, not self)
+        visible_params = [
+            (name, param)
+            for name, param in sig.parameters.items()
+            if not name.startswith("__") and name != "self"
+        ]
+
+        R.check(f"{method_name}: param count",
+                len(visible_params) == len(expected_params),
+                f"expected {len(expected_params)}, got {len(visible_params)}: "
+                f"{[n for n, _ in visible_params]}")
+
+        for i, (pname, param) in enumerate(visible_params):
+            if i >= len(expected_params):
+                R.check(f"{method_name}.{pname}: unexpected param", False, "extra param")
+                continue
+            exp_name, exp_type, exp_has_default, exp_default = expected_params[i]
+
+            R.check(f"{method_name}: param[{i}] name",
+                    pname == exp_name,
+                    f"expected {exp_name!r}, got {pname!r}")
+
+            # Check annotation
+            ann = param.annotation
+            if ann is inspect.Parameter.empty:
+                ann_name = "empty"
+            elif hasattr(ann, "__name__"):
+                ann_name = ann.__name__
+            elif hasattr(ann, "_name"):  # typing generics
+                ann_name = ann._name
+            else:
+                ann_name = str(ann)
+            R.check(f"{method_name}.{pname}: type annotation",
+                    ann_name == exp_type,
+                    f"expected {exp_type!r}, got {ann_name!r}")
+
+            # Check default
+            has_default = param.default is not inspect.Parameter.empty
+            R.check(f"{method_name}.{pname}: has_default",
+                    has_default == exp_has_default,
+                    f"expected has_default={exp_has_default}, got {has_default}")
+            if has_default and exp_has_default:
+                R.check(f"{method_name}.{pname}: default value",
+                        param.default == exp_default,
+                        f"expected {exp_default!r}, got {param.default!r}")
+
+    # Verify docstrings are present on all public methods
+    print("\n── Tools schema parity: docstrings ──")
+    for method_name in EXPECTED:
+        if method_name not in public_methods:
+            continue
+        method = public_methods[method_name]
+        doc = inspect.getdoc(method) or ""
+        R.check(f"{method_name}: has docstring",
+                len(doc) > 10,
+                f"docstring too short: {doc!r}")
+
+    # Verify __dunder__ params are still present (OWUI needs them for injection)
+    print("\n── Tools schema parity: OWUI dunder params ──")
+    DUNDER_EXPECTATIONS = {
+        "lathe": {"__user__", "__event_emitter__"},
+        "handoff": {"__user__", "__event_emitter__"},
+        "destroy": {"__user__", "__event_emitter__"},
+        "onboard": {"__user__", "__chat_id__", "__event_emitter__"},
+        "bash": {"__user__", "__chat_id__", "__event_emitter__"},
+        "read": {"__user__", "__chat_id__", "__event_emitter__"},
+        "glob": {"__user__", "__chat_id__", "__event_emitter__"},
+        "grep": {"__user__", "__chat_id__", "__event_emitter__"},
+        "write": {"__user__", "__chat_id__", "__event_emitter__"},
+        "edit": {"__user__", "__chat_id__", "__event_emitter__"},
+        "interpret": {"__user__", "__chat_id__", "__event_emitter__"},
+        "delegate": {"__user__", "__chat_id__", "__event_emitter__", "__model__", "__request__"},
+        "expose": {"__user__", "__chat_id__", "__event_emitter__"},
+    }
+    for method_name, expected_dunders in DUNDER_EXPECTATIONS.items():
+        if method_name not in public_methods:
+            continue
+        method = public_methods[method_name]
+        sig = inspect.signature(method)
+        actual_dunders = {
+            name for name in sig.parameters
+            if name.startswith("__") and name.endswith("__")
+        }
+        R.check(f"{method_name}: dunder params",
+                actual_dunders == expected_dunders,
+                f"expected {sorted(expected_dunders)}, got {sorted(actual_dunders)}")
+
+
 TESTS = {
     "parse_env_vars": test_parse_env_vars,
     "onboard_script": test_onboard_script,
@@ -1797,6 +1977,7 @@ TESTS = {
     "ensure_interpreter_context": test_ensure_interpreter_context,
     "interpret_constant": test_interpret_constant,
     "interpret_manpage": test_interpret_manpage,
+    "tools_schema_parity": test_tools_schema_parity,
 }
 
 
