@@ -5,7 +5,7 @@ author_url: https://adamsmith.as
 description: Coding agent tools (lathe, bash, read, write, edit, glob, grep, delegate, onboard, expose, destroy) backed by per-user sandbox VMs with transparent lifecycle management.
 required_open_webui_version: 0.4.0
 requirements: httpx, pydantic-ai-slim[openai], cachetools
-version: 0.18.0
+version: 0.19.0
 licence: MIT
 """
 
@@ -118,6 +118,12 @@ def _drain_harness_messages(chat_state: LRUCache, chat_id: str | None,
     Drains the pending queue in the chat state (if any) and includes the
     sandbox lifecycle warning.  Returns a list of message strings to
     prepend to the tool result.
+
+    This function runs after every tool call, making it the natural
+    hook for trace accumulation: the caller knows the tool name, args,
+    and result by the time it calls here.  A future trace-aware handoff
+    (#54) would append a compact record to chat_state[chat_id]["trace"]
+    at this call site (or in the callers, which have richer context).
     """
     messages: list[str] = []
     if warning:
@@ -129,6 +135,61 @@ def _drain_harness_messages(chat_state: LRUCache, chat_id: str | None,
             messages.extend(pending)
             state["pending"] = []
     return messages
+
+
+def _push_bg_notice(chat_state: LRUCache, chat_id: str | None, notice: str):
+    """Push a background job completion notice into the chat's pending queue.
+
+    Safe to call even if the chat_id has been evicted from the LRU cache
+    (silently dropped — if the chat is that old, nobody is waiting).
+    """
+    if not chat_id or chat_id not in chat_state:
+        return
+    state = chat_state[chat_id]
+    pending = state.get("pending")
+    if pending is None:
+        state["pending"] = [notice]
+    else:
+        pending.append(notice)
+
+
+def _format_bg_bash_notice(cmd_id: str, exit_code: int | None,
+                           elapsed: int, tail: str) -> str:
+    """Format a completion notice for a backgrounded bash command."""
+    ec_str = str(exit_code) if exit_code is not None else "unknown"
+    lines = [f"[Background job completed: CMD-{cmd_id}]"]
+    lines.append(f"Exit code: {ec_str} (took {elapsed}s)")
+    tail = tail.strip()
+    if tail:
+        # Keep last 5 lines
+        tail_lines = tail.splitlines()[-5:]
+        lines.append("Last lines of output:")
+        for tl in tail_lines:
+            lines.append(f"  {tl}")
+    else:
+        lines.append("(no output)")
+    return "\n".join(lines)
+
+
+def _format_bg_delegate_notice(delegate_id: str, elapsed: int,
+                               step_count: int, tool_calls: int,
+                               result_preview: str, error: str | None) -> str:
+    """Format a completion notice for a backgrounded delegate."""
+    if error:
+        lines = [f"[Background delegation failed: DELEGATE-{delegate_id}]"]
+        lines.append(f"Failed after {elapsed}s: {error}")
+    else:
+        lines = [f"[Background delegation completed: DELEGATE-{delegate_id}]"]
+        lines.append(f"{step_count} step(s), {tool_calls} tool call(s) (took {elapsed}s)")
+        preview = result_preview.strip()
+        if preview:
+            preview_lines = preview.splitlines()[-10:]
+            lines.append("Result preview:")
+            for pl in preview_lines:
+                lines.append(f"  {pl}")
+        else:
+            lines.append("(no result text)")
+    return "\n".join(lines)
 
 
 def _shell_quote(s: str) -> str:
@@ -1110,7 +1171,8 @@ async def _core_bash(valves, sandbox_id: str, client: httpx.AsyncClient, *,
                      command: str, workdir: str = "/home/daytona/workspace",
                      user_pairs: list[tuple[str, str]],
                      foreground_seconds: int = 30,
-                     emit=None) -> str:
+                     emit=None,
+                     on_background=None) -> str:
     """Execute a bash command in the sandbox. Non-interactive only.
     Commands that finish within the foreground window return output directly.
     Long-running commands auto-background and return a descriptor with log
@@ -1240,6 +1302,10 @@ async def _core_bash(valves, sandbox_id: str, client: httpx.AsyncClient, *,
 
     if not finished:
         elapsed = int(time.time() - (deadline - fg_timeout))
+        if on_background:
+            on_background(sandbox_id=sandbox_id, session_id=session_id,
+                          session_cmd_id=session_cmd_id, cmd_id=cmd_id,
+                          start_time=deadline - fg_timeout)
         return _format_bash_result(
             output, exit_code, was_truncated, meta,
             background_info={"elapsed": elapsed, "cmd_id": cmd_id},
@@ -1251,6 +1317,77 @@ async def _core_bash(valves, sandbox_id: str, client: httpx.AsyncClient, *,
         output, exit_code, was_truncated, meta,
         spill_path=spill_path,
     )
+
+
+# ── Background bash completion polling ───────────────────────────────
+#
+# When a bash command auto-backgrounds, the outer bash() Tool method
+# spawns this coroutine to poll for completion and push a notice into
+# the chat's harness message queue.  The next tool call in the same
+# chat will see it prepended to the result.
+#
+# Max poll duration is 10 minutes.  If the command takes longer, the
+# notice is silently dropped (the model can still poll sidecar files).
+
+_BG_BASH_POLL_MAX_SECONDS = 600
+
+async def _poll_bg_bash(valves, sandbox_id: str, session_id: str,
+                        session_cmd_id: str, cmd_id: str, start_time: float,
+                        chat_state: LRUCache, chat_id: str):
+    """Poll a backgrounded bash command and push a completion notice."""
+    poll_interval = 2.0
+    deadline = time.time() + _BG_BASH_POLL_MAX_SECONDS
+    exit_code = None
+
+    async with httpx.AsyncClient() as poll_client:
+        try:
+            while time.time() < deadline:
+                await asyncio.sleep(poll_interval)
+                poll_interval = min(poll_interval * 1.5, 10.0)
+                try:
+                    resp = await poll_client.get(
+                        _toolbox(valves, sandbox_id, f"/process/session/{session_id}"),
+                        headers=_headers(valves),
+                        timeout=15.0,
+                    )
+                    if resp.status_code != 200:
+                        continue
+                    commands = resp.json().get("commands", [])
+                    for cmd in commands:
+                        if cmd.get("id") == session_cmd_id:
+                            ec = cmd.get("exitCode")
+                            if ec is not None:
+                                exit_code = ec
+                            break
+                    else:
+                        continue
+                    if exit_code is not None:
+                        break
+                except Exception:
+                    continue  # transient network error, keep polling
+            else:
+                return  # timed out, silently give up
+
+            # Fetch tail of log for the notice
+            elapsed = int(time.time() - start_time)
+            tail = ""
+            try:
+                log_resp = await poll_client.get(
+                    _toolbox(valves, sandbox_id,
+                             f"/process/session/{session_id}/command/{session_cmd_id}/logs"),
+                    headers=_headers(valves),
+                    timeout=30.0,
+                )
+                if log_resp.status_code == 200:
+                    tail = log_resp.text
+            except Exception:
+                pass  # best-effort
+
+            notice = _format_bg_bash_notice(cmd_id, exit_code, elapsed, tail)
+            _push_bg_notice(chat_state, chat_id, notice)
+
+        except Exception:
+            pass  # entire poller is best-effort, never propagate
 
 
 def _build_onboard_script(project_path: str) -> str:
@@ -1505,6 +1642,9 @@ async def _ensure_chat_init(
     if chat_id in chat_state and chat_state[chat_id].get("init"):
         return
     # First tool call in this chat: create state and run snapshot.
+    # Future: a "trace" key here (list of dicts) could accumulate a
+    # structured record of every tool call (tool name, key args, outcome)
+    # for flush to the persistent volume at handoff() time.  See #54.
     chat_state[chat_id] = {"init": True, "pending": []}
     await _chat_auto_init(
         valves, sandbox_id, client, chat_state, chat_id, user, emitter,
@@ -1631,6 +1771,15 @@ _DELEGATE_WITHHELD = {"lathe", "onboard", "expose", "destroy", "delegate", "hand
 # instructions and writes the handoff document as streamed reply text.
 # No tool calls, no sandbox I/O — the agent already has everything it
 # needs in context.
+#
+# Future (#54): handoff() could flush an in-memory trace (accumulated
+# via _drain_harness_messages / the _run closures) to a JSONL file on
+# the persistent volume, then reference it in _HANDOFF_INSTRUCTIONS so
+# the receiving agent can selectively grep it.  This would require
+# handoff() to acquire a client and sandbox_id (currently it bypasses
+# _tool_context entirely).  Deferred: the prose-only handoff is
+# adequate today, and the trace format should be co-designed with the
+# micro-compaction filter (#51) so both use a shared line schema.
 
 _HANDOFF_INSTRUCTIONS = textwrap.dedent("""\
     You just called handoff(). Your job now is to write a handoff
@@ -2914,6 +3063,15 @@ class Tools:
                 else self.valves.foreground_timeout_seconds
             )
 
+            # When the command auto-backgrounds, spawn a polling coroutine
+            # to push a completion notice into the chat's message queue.
+            def _on_bg(*, sandbox_id, session_id, session_cmd_id, cmd_id, start_time):
+                asyncio.ensure_future(_poll_bg_bash(
+                    self.valves, sandbox_id, session_id, session_cmd_id,
+                    cmd_id, start_time,
+                    self._chat_state, __chat_id__,
+                ))
+
             result = await _core_bash(
                 self.valves, sandbox_id, client,
                 command=command,
@@ -2921,6 +3079,7 @@ class Tools:
                 user_pairs=user_pairs,
                 foreground_seconds=fg_seconds,
                 emit=__event_emitter__,
+                on_background=_on_bg,
             )
 
             await _emit(__event_emitter__, "Command complete", done=True)
@@ -3250,6 +3409,10 @@ class Tools:
             # so _run_agent stops calling the OWUI emitter (which may hang
             # or raise once the HTTP response stream has closed).
             emit_to_owui = [True]
+            # Set to True by the outer code when backgrounding, so the
+            # finally block in _run_agent knows to push a completion notice.
+            was_backgrounded = [False]
+            bg_start_time = [time.time()]
 
             async def _run_agent():
                 """Run the sub-agent to completion, writing sidecar files."""
@@ -3383,6 +3546,18 @@ class Tools:
 
                 finally:
                     agent_done.set()
+                    # Push a completion notice if the delegate was backgrounded.
+                    if was_backgrounded[0]:
+                        elapsed = int(time.time() - bg_start_time[0])
+                        notice = _format_bg_delegate_notice(
+                            delegate_id, elapsed,
+                            step_count=agent_result.get("step_count", step_count),
+                            tool_calls=(agent_result.get("usage").tool_calls
+                                        if agent_result.get("usage") else 0),
+                            result_preview=agent_result.get("output", ""),
+                            error=agent_result.get("error"),
+                        )
+                        _push_bg_notice(self._chat_state, __chat_id__, notice)
                     await inner_client.aclose()
                     await bg_client.aclose()
 
@@ -3436,6 +3611,8 @@ class Tools:
                 # awaiting the emitter after that can hang or raise,
                 # stalling the background task entirely.
                 emit_to_owui[0] = False
+                was_backgrounded[0] = True
+                bg_start_time[0] = time.time()
 
                 elapsed = fg_seconds
                 # Grab recent log lines for the preview

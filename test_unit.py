@@ -1517,6 +1517,88 @@ async def test_chat_id_in_signatures(R: Results):
             R.check(f"{name} exists", False, "method not found")
 
 
+async def test_push_bg_notice(R: Results):
+    from lathe import _push_bg_notice
+    from cachetools import LRUCache
+
+    print("\n── _push_bg_notice: pushes to existing chat ──")
+    cache = LRUCache(maxsize=10)
+    cache["chat-1"] = {"init": True, "pending": ["existing"]}
+    _push_bg_notice(cache, "chat-1", "job done")
+    R.check("notice appended", cache["chat-1"]["pending"] == ["existing", "job done"],
+            str(cache["chat-1"]["pending"]))
+
+    print("\n── _push_bg_notice: no chat_id is no-op ──")
+    _push_bg_notice(cache, None, "notice")
+    _push_bg_notice(cache, "", "notice")
+    R.check("None chat_id no-op", True)  # no crash = pass
+
+    print("\n── _push_bg_notice: evicted chat_id is no-op ──")
+    _push_bg_notice(cache, "chat-gone", "notice")
+    R.check("evicted chat_id no-op", "chat-gone" not in cache)
+
+    print("\n── _push_bg_notice: empty pending list ──")
+    cache["chat-2"] = {"init": True, "pending": []}
+    _push_bg_notice(cache, "chat-2", "first notice")
+    R.check("pushed to empty pending", cache["chat-2"]["pending"] == ["first notice"],
+            str(cache["chat-2"]["pending"]))
+
+    print("\n── _push_bg_notice: missing pending key ──")
+    cache["chat-3"] = {"init": True}
+    _push_bg_notice(cache, "chat-3", "notice")
+    R.check("created pending list", cache["chat-3"]["pending"] == ["notice"],
+            str(cache["chat-3"]))
+
+
+async def test_format_bg_notices(R: Results):
+    from lathe import _format_bg_bash_notice, _format_bg_delegate_notice
+
+    print("\n── _format_bg_bash_notice: success with output ──")
+    result = _format_bg_bash_notice("abc-123", 0, 47, "line1\nline2\nline3")
+    R.check("has CMD id", "CMD-abc-123" in result, result[:80])
+    R.check("has exit code", "Exit code: 0" in result, result)
+    R.check("has elapsed", "47s" in result, result)
+    R.check("has output lines", "line3" in result, result)
+
+    print("\n── _format_bg_bash_notice: failure ──")
+    result = _format_bg_bash_notice("xyz", 1, 10, "error: bad thing")
+    R.check("has exit code 1", "Exit code: 1" in result, result)
+    R.check("has error output", "bad thing" in result, result)
+
+    print("\n── _format_bg_bash_notice: empty output ──")
+    result = _format_bg_bash_notice("qqq", 0, 5, "")
+    R.check("has no output marker", "(no output)" in result, result)
+
+    print("\n── _format_bg_bash_notice: unknown exit code ──")
+    result = _format_bg_bash_notice("rrr", None, 3, "stuff")
+    R.check("has unknown exit code", "unknown" in result, result)
+
+    print("\n── _format_bg_bash_notice: long output truncated to 5 lines ──")
+    long_output = "\n".join(f"line {i}" for i in range(20))
+    result = _format_bg_bash_notice("sss", 0, 30, long_output)
+    R.check("has last line", "line 19" in result, result)
+    R.check("no early line", "line 10" not in result, result)
+
+    print("\n── _format_bg_delegate_notice: success ──")
+    result = _format_bg_delegate_notice("del-123", 95, 12, 34, "task completed", None)
+    R.check("has DELEGATE id", "DELEGATE-del-123" in result, result[:80])
+    R.check("has steps", "12 step(s)" in result, result)
+    R.check("has tool calls", "34 tool call(s)" in result, result)
+    R.check("has elapsed", "95s" in result, result)
+    R.check("has preview", "task completed" in result, result)
+    R.check("says completed", "completed" in result.lower(), result[:80])
+
+    print("\n── _format_bg_delegate_notice: failure ──")
+    result = _format_bg_delegate_notice("del-456", 30, 3, 5, "", "timeout error")
+    R.check("has DELEGATE id", "DELEGATE-del-456" in result, result[:80])
+    R.check("says failed", "failed" in result.lower(), result[:80])
+    R.check("has error", "timeout error" in result, result)
+
+    print("\n── _format_bg_delegate_notice: empty preview ──")
+    result = _format_bg_delegate_notice("del-789", 10, 1, 2, "", None)
+    R.check("has no result marker", "(no result text)" in result, result)
+
+
 TESTS = {
     "parse_env_vars": test_parse_env_vars,
     "onboard_script": test_onboard_script,
@@ -1545,6 +1627,8 @@ TESTS = {
     "snapshot_script": test_snapshot_script,
     "ensure_chat_init": test_ensure_chat_init,
     "chat_id_signatures": test_chat_id_in_signatures,
+    "push_bg_notice": test_push_bg_notice,
+    "format_bg_notices": test_format_bg_notices,
 }
 
 
