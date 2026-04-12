@@ -2,10 +2,10 @@
 title: Lathe
 author: Adam Smith
 author_url: https://adamsmith.as
-description: Coding agent tools (lathe, bash, read, write, edit, glob, grep, delegate, onboard, expose, destroy) backed by per-user sandbox VMs with transparent lifecycle management.
+description: Coding agent tools (lathe, bash, read, write, edit, glob, grep, interpret, delegate, onboard, expose, destroy) backed by per-user sandbox VMs with transparent lifecycle management.
 required_open_webui_version: 0.4.0
-requirements: httpx, pydantic-ai-slim[openai], cachetools
-version: 0.19.0
+requirements: httpx, httpx-ws, pydantic-ai-slim[openai], cachetools
+version: 0.20.0
 licence: MIT
 """
 
@@ -1390,6 +1390,186 @@ async def _poll_bg_bash(valves, sandbox_id: str, session_id: str,
             pass  # entire poller is best-effort, never propagate
 
 
+# ── Code interpreter ─────────────────────────────────────────────────
+#
+# The Daytona toolbox exposes a persistent Python REPL via a WebSocket
+# endpoint.  Variables, imports, and definitions survive across calls
+# within the same "context".  We create one context per OWUI chat (keyed
+# by __chat_id__) and store its ID in _chat_state.  If the sandbox
+# restarts (killing the interpreter process), we detect the stale
+# context, create a fresh one, and warn the model that state was lost.
+#
+# The WS protocol:
+#   1. Connect to /process/interpreter/execute (HTTP upgrade)
+#   2. Send one JSON frame: {code, contextId, timeout}
+#   3. Receive N JSON frames: {type: "stdout"|"stderr"|"error", text, ...}
+#   4. Server sends WS close: code 1000 = normal, 4008 = timeout
+#
+# httpx-ws (aconnect_ws) handles the upgrade using the same
+# httpx.AsyncClient we already have, keeping the HTTP stack cohesive.
+
+_INTERPRET_DEFAULT_TIMEOUT = 120  # seconds; server default is 600
+
+
+async def _ensure_interpreter_context(
+    valves, sandbox_id: str, client: httpx.AsyncClient,
+    chat_state: LRUCache, chat_id: str,
+) -> str:
+    """Return the interpreter context ID for this chat, creating one if needed.
+
+    Stores the context ID in chat_state[chat_id]["interpreter_context_id"].
+    If the stored context is stale (404 on probe), creates a fresh one and
+    updates the state.  Returns (context_id, lost_state) where lost_state
+    is True if a previously valid context was replaced.
+    """
+    state = chat_state.get(chat_id, {})
+    ctx_id = state.get("interpreter_context_id")
+
+    if ctx_id:
+        # Probe: is the context still alive?  The list endpoint is cheap.
+        try:
+            resp = await client.get(
+                _toolbox(valves, sandbox_id, "/process/interpreter/context"),
+                headers=_headers(valves),
+                timeout=15.0,
+            )
+            if resp.status_code == 200:
+                contexts = resp.json().get("contexts", [])
+                if any(c.get("id") == ctx_id for c in contexts):
+                    return ctx_id, False
+        except Exception:
+            pass
+        # Context is gone (sandbox restarted, etc.)  Fall through to create.
+
+    # Create a new context.
+    resp = await client.post(
+        _toolbox(valves, sandbox_id, "/process/interpreter/context"),
+        headers=_headers(valves),
+        json={"language": "python", "cwd": "/home/daytona/workspace"},
+        timeout=30.0,
+    )
+    resp.raise_for_status()
+    new_id = resp.json().get("id")
+    if not new_id:
+        raise RuntimeError("Daytona returned an interpreter context with no ID")
+
+    # Store in chat state.
+    if chat_id in chat_state:
+        chat_state[chat_id]["interpreter_context_id"] = new_id
+    else:
+        chat_state[chat_id] = {"init": True, "pending": [],
+                               "interpreter_context_id": new_id}
+
+    lost_state = ctx_id is not None  # had one before, now replaced
+    return new_id, lost_state
+
+
+def _format_interpret_result(stdout: str, stderr: str,
+                             errors: list[dict], lost_state: bool) -> str:
+    """Format the result of an interpret() call for the model."""
+    parts = []
+
+    if lost_state:
+        parts.append(
+            "[Warning: the interpreter session was reset (sandbox restarted). "
+            "All previously defined variables, imports, and state are gone. "
+            "Re-run any necessary setup.]"
+        )
+
+    if errors:
+        for err in errors:
+            name = err.get("name", "Error")
+            value = err.get("value", "")
+            tb = err.get("traceback", "")
+            if tb:
+                parts.append(tb.rstrip())
+            else:
+                parts.append(f"{name}: {value}")
+
+    if stdout.strip():
+        parts.append(stdout.rstrip())
+
+    if stderr.strip():
+        parts.append(f"[stderr]\n{stderr.rstrip()}")
+
+    if not parts:
+        parts.append("(no output)")
+
+    return "\n\n".join(parts)
+
+
+async def _core_interpret(valves, sandbox_id: str, client: httpx.AsyncClient,
+                          chat_state: LRUCache, chat_id: str, *,
+                          code: str, timeout: int = _INTERPRET_DEFAULT_TIMEOUT) -> str:
+    """Run Python code in a persistent REPL session. Variables, imports, and
+    definitions survive across calls within the same conversation.
+    Use this for iterative data exploration, incremental computation, or
+    any workflow where you need state to persist between executions.
+    For one-shot shell commands or non-Python work, prefer bash() instead.
+
+    :param code: Python code to execute. Top-level await is not supported.
+    :param timeout: Max execution time in seconds (default: 120). Use 0 for no limit.
+    """
+    from httpx_ws import aconnect_ws, WebSocketDisconnect
+
+    if not code.strip():
+        return "Error: empty code. Provide Python code to execute."
+
+    context_id, lost_state = await _ensure_interpreter_context(
+        valves, sandbox_id, client, chat_state, chat_id,
+    )
+
+    # Build the WS URL from the proxy base (same host, /process/interpreter/execute).
+    ws_url = _toolbox(valves, sandbox_id, "/process/interpreter/execute")
+
+    stdout_parts: list[str] = []
+    stderr_parts: list[str] = []
+    errors: list[dict] = []
+    timed_out = False
+
+    try:
+        async with aconnect_ws(
+            ws_url, client,
+            keepalive_ping_interval_seconds=20,
+            headers=_headers(valves),
+        ) as ws:
+            # Send the execute request.
+            await ws.send_json({
+                "code": code,
+                "contextId": context_id,
+                "timeout": timeout if timeout > 0 else 0,
+            })
+
+            # Receive output frames until the server closes the connection.
+            while True:
+                try:
+                    msg = await ws.receive_json()
+                except WebSocketDisconnect as exc:
+                    if exc.code == 4008:
+                        timed_out = True
+                    break
+
+                msg_type = msg.get("type", "")
+                if msg_type == "stdout":
+                    stdout_parts.append(msg.get("text", ""))
+                elif msg_type == "stderr":
+                    stderr_parts.append(msg.get("text", ""))
+                elif msg_type == "error":
+                    errors.append(msg)
+
+    except Exception as e:
+        return f"Error connecting to interpreter: {e}"
+
+    stdout = "".join(stdout_parts)
+    stderr = "".join(stderr_parts)
+
+    result = _format_interpret_result(stdout, stderr, errors, lost_state)
+    if timed_out:
+        result = f"[Execution timed out after {timeout}s]\n\n{result}"
+
+    return result
+
+
 def _build_onboard_script(project_path: str) -> str:
     """Build a Python script that collects agent context from a sandbox.
 
@@ -1849,7 +2029,9 @@ _DELEGATE_BASH_FOREGROUND_SECONDS = 15
 # Nudge threshold: inject a wrap-up reminder when this many steps remain.
 _DELEGATE_NUDGE_REMAINING = 2
 
-def _build_delegate_tools(valves, sandbox_id: str, client: httpx.AsyncClient, user_pairs: list[tuple[str, str]]):
+def _build_delegate_tools(valves, sandbox_id: str, client: httpx.AsyncClient,
+                          user_pairs: list[tuple[str, str]],
+                          chat_state: LRUCache = None, chat_id: str = ""):
     """Build pydantic-ai Tool objects that operate against a resolved sandbox.
 
     Returns a list of Tool instances. Each tool is a thin closure over the
@@ -1911,7 +2093,21 @@ def _build_delegate_tools(valves, sandbox_id: str, client: httpx.AsyncClient, us
             pattern=pattern, files=files, max_lines=max_lines,
         )
 
-    return [Tool(f) for f in (bash, read, write, edit, glob, grep)]
+    # ── interpret ────────────────────────────────────────────────────
+    @_doc_from_core(_core_interpret)
+    async def interpret(code: str, timeout: int = _INTERPRET_DEFAULT_TIMEOUT) -> str:
+        if not chat_state or not chat_id:
+            return "Error: interpret() requires chat context (not available in this delegate session)."
+        return await _core_interpret(
+            valves, sandbox_id, client,
+            chat_state, chat_id,
+            code=code, timeout=timeout,
+        )
+
+    all_tools = [Tool(f) for f in (bash, read, write, edit, glob, grep)]
+    if chat_state and chat_id:
+        all_tools.append(Tool(interpret))
+    return all_tools
 
 
 VOLUME_MOUNT_PATH = "/home/daytona/volume"
@@ -2422,6 +2618,57 @@ class Tools:
             the process is the one you launched (e.g. check CMD/log for expected
             output before killing).
             """),
+        "interpret": textwrap.dedent("""\
+            # Lathe — Persistent Python Interpreter
+
+            interpret() runs Python code in a persistent REPL backed by the
+            Daytona code interpreter. Variables, imports, and definitions
+            survive across calls within the same conversation.
+
+            ## State model
+
+            - One interpreter context per conversation (chat), created lazily
+              on the first interpret() call.
+            - State persists across calls: define a function in one call, use
+              it in the next. Import a module once, use it everywhere.
+            - State is lost when the sandbox stops or restarts (idle timeout,
+              destroy, etc.). The tool detects this and warns you to re-run
+              setup code.
+
+            ## When to use interpret() vs bash()
+
+            **Use interpret() when:**
+            - You need state across calls (accumulating data, iterative
+              exploration, building up a computation step by step).
+            - You are doing data analysis, numerical computation, or
+              prototyping where seeing intermediate results matters.
+            - You want to define helper functions and reuse them.
+
+            **Use bash() when:**
+            - Running shell commands, installing packages, managing files.
+            - Running non-Python programs.
+            - Commands need shell features (pipes, redirection, env vars).
+            - One-shot scripts with no state to preserve.
+
+            ## Limitations
+
+            - Python only. For other languages, use bash().
+            - Top-level ``await`` is not supported. Use ``asyncio.run()``
+              for async code.
+            - No stdin interaction. The code runs non-interactively.
+            - Default timeout is 120 seconds. Pass timeout=0 for no limit,
+              or a custom value in seconds.
+            - Output is the raw stdout/stderr stream from the REPL. Large
+              outputs are not truncated (unlike bash), so be mindful of
+              printing huge data structures.
+
+            ## Sub-agent access
+
+            Delegates (sub-agents) share the same interpreter context as the
+            outer conversation. A delegate can define a variable that the
+            outer model later reads, or vice versa. This is useful for
+            parallel data pipelines.
+            """),
         "recipes": textwrap.dedent("""\
             # Lathe — Recipes
 
@@ -2752,6 +2999,15 @@ class Tools:
             multiple delegates in parallel (agent teams / swarms).
             See lathe(manpage="delegate") for details.
 
+            **Persistent Python REPL:**
+            Use interpret(code="...") for iterative Python work where state
+            needs to persist across calls: data analysis, incremental
+            computation, prototyping. Variables, imports, and definitions
+            survive within the conversation. For one-shot commands or
+            non-Python work, prefer bash(). The interpreter context is
+            per-conversation and is lost on sandbox restart.
+            See lathe(manpage="interpret") for details.
+
             **Network requests:**
             Use bash("curl ...") or bash("wget ...") for HTTP requests. The
             sandbox can reach a broad allowlist of hosts directly (package
@@ -2811,6 +3067,7 @@ class Tools:
     # lookups and useful for the model to decide which page to request).
     _MANPAGE_INDEX: dict[str, str] = {
         "overview": "Big-picture orientation: sandbox model, tool catalog, key workflows, gotchas.",
+        "interpret": "Persistent Python REPL: state model, when to use vs bash, limitations.",
         "delegate": "Sub-agent delegation: foreground/background, sidecar files, agent teams, cost model.",
         "handoff": "Context handoff: writing a handoff document for continuing work in a new conversation.",
         "recipes": "Bootstrap scripts for common tools: dufs (file browser), code-server (IDE).",
@@ -3228,6 +3485,34 @@ class Tools:
 
         return await _tool_context(__event_emitter__, _run)
 
+    @_doc_from_core(_core_interpret)
+    async def interpret(
+        self,
+        code: str,
+        timeout: int = _INTERPRET_DEFAULT_TIMEOUT,
+        __user__: dict = {},
+        __chat_id__: str = "",
+        __event_emitter__=None,
+    ) -> str:
+        async def _run(client):
+            email = _get_email(__user__)
+            sandbox_id, _sb_warning = await _ensure_sandbox(self.valves, email, client, __event_emitter__)
+            await _ensure_chat_init(
+                self.valves, sandbox_id, client,
+                self._chat_state, __chat_id__, __user__, __event_emitter__,
+            )
+            await _emit(__event_emitter__, "Running Python...")
+            result = await _core_interpret(
+                self.valves, sandbox_id, client,
+                self._chat_state, __chat_id__,
+                code=code, timeout=timeout,
+            )
+            await _emit(__event_emitter__, "Execution complete", done=True)
+            messages = _drain_harness_messages(self._chat_state, __chat_id__, _sb_warning)
+            return _prepend_harness_messages(result, messages)
+
+        return await _tool_context(__event_emitter__, _run)
+
     async def delegate(
         self,
         task: str,
@@ -3314,7 +3599,8 @@ class Tools:
             bg_client = httpx.AsyncClient()
 
             # ── Build sub-agent tools ────────────────────────────────
-            tools = _build_delegate_tools(self.valves, sandbox_id, bg_client, user_pairs)
+            tools = _build_delegate_tools(self.valves, sandbox_id, bg_client, user_pairs,
+                                            chat_state=self._chat_state, chat_id=__chat_id__)
 
             # ── Fetch context_files from sandbox ─────────────────────
             file_sections: list[str] = []

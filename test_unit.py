@@ -826,16 +826,29 @@ async def test_delegate_tools_build(R: Results):
         daytona_api_url = "https://fake.api"
         daytona_proxy_url = "https://fake.proxy"
 
-    tools = _build_delegate_tools(FakeValves(), "fake-sandbox-id", None, [])
+    from cachetools import LRUCache
+    chat_state = LRUCache(maxsize=10)
+    chat_state["test-chat"] = {"init": True, "pending": []}
+
+    tools = _build_delegate_tools(FakeValves(), "fake-sandbox-id", None, [],
+                                  chat_state=chat_state, chat_id="test-chat")
     tool_names = {t.name for t in tools}
 
-    R.check("produces 6 tools", len(tools) == 6, f"got {len(tools)}")
+    R.check("produces 7 tools", len(tools) == 7, f"got {len(tools)}")
     R.check("has bash", "bash" in tool_names, str(tool_names))
     R.check("has read", "read" in tool_names, str(tool_names))
     R.check("has write", "write" in tool_names, str(tool_names))
     R.check("has edit", "edit" in tool_names, str(tool_names))
     R.check("has glob", "glob" in tool_names, str(tool_names))
     R.check("has grep", "grep" in tool_names, str(tool_names))
+    R.check("has interpret", "interpret" in tool_names, str(tool_names))
+
+    print("\n── delegate tools: without chat context ──")
+    tools_no_chat = _build_delegate_tools(FakeValves(), "fake-sandbox-id", None, [])
+    R.check("produces 6 tools without chat", len(tools_no_chat) == 6,
+            f"got {len(tools_no_chat)}")
+    R.check("no interpret without chat",
+            "interpret" not in {t.name for t in tools_no_chat})
 
     # Verify withheld tools are NOT present
     from lathe import _DELEGATE_WITHHELD
@@ -845,11 +858,12 @@ async def test_delegate_tools_build(R: Results):
 
     # Verify _doc_from_core decorator populates docstrings from _core_*
     print("\n── delegate tools: docstrings from _core_* ──")
-    from lathe import _core_read, _core_write, _core_edit, _core_bash, _core_glob, _core_grep
+    from lathe import _core_read, _core_write, _core_edit, _core_bash, _core_glob, _core_grep, _core_interpret
     import inspect
     cores = {
         "bash": _core_bash, "read": _core_read, "write": _core_write,
         "edit": _core_edit, "glob": _core_glob, "grep": _core_grep,
+        "interpret": _core_interpret,
     }
     for t in tools:
         core_fn = cores[t.name]
@@ -871,7 +885,8 @@ async def test_delegate_tools_build(R: Results):
                 pname, pdesc = rest.split(":", 1)
                 pname = pname.strip()
                 pdesc = pdesc.strip()
-                if pname in ("valves", "sandbox_id", "client", "emit", "user_pairs"):
+                if pname in ("valves", "sandbox_id", "client", "emit", "user_pairs",
+                            "chat_state", "chat_id"):
                     continue  # infrastructure params not in closure signature
                 if pname in schema_props:
                     got_desc = schema_props[pname].get("description", "")
@@ -1497,7 +1512,7 @@ async def test_chat_id_in_signatures(R: Results):
     tools = Tools()
     # Tools that use _ensure_sandbox should have __chat_id__
     sandbox_tools = ["bash", "read", "write", "edit", "glob", "grep",
-                     "onboard", "delegate", "expose"]
+                     "interpret", "onboard", "delegate", "expose"]
     for name in sandbox_tools:
         method = getattr(tools, name, None)
         if method is None:
@@ -1599,6 +1614,155 @@ async def test_format_bg_notices(R: Results):
     R.check("has no result marker", "(no result text)" in result, result)
 
 
+async def test_format_interpret_result(R: Results):
+    from lathe import _format_interpret_result
+
+    print("\n── _format_interpret_result: stdout only ──")
+    result = _format_interpret_result("Hello world\n", "", [], False)
+    R.check("has stdout", "Hello world" in result, result)
+    R.check("no warning", "Warning" not in result, result)
+
+    print("\n── _format_interpret_result: stderr ──")
+    result = _format_interpret_result("", "some warning\n", [], False)
+    R.check("has stderr marker", "[stderr]" in result, result)
+    R.check("has warning text", "some warning" in result, result)
+
+    print("\n── _format_interpret_result: error with traceback ──")
+    result = _format_interpret_result("", "", [
+        {"name": "ValueError", "value": "bad", "traceback": "Traceback...\nValueError: bad"}
+    ], False)
+    R.check("has traceback", "Traceback" in result, result)
+
+    print("\n── _format_interpret_result: error without traceback ──")
+    result = _format_interpret_result("", "", [
+        {"name": "TypeError", "value": "oops", "traceback": ""}
+    ], False)
+    R.check("has error name", "TypeError" in result, result)
+    R.check("has error value", "oops" in result, result)
+
+    print("\n── _format_interpret_result: lost state warning ──")
+    result = _format_interpret_result("ok\n", "", [], True)
+    R.check("has lost state warning", "reset" in result.lower(), result[:120])
+    R.check("has stdout after warning", "ok" in result, result)
+
+    print("\n── _format_interpret_result: no output ──")
+    result = _format_interpret_result("", "", [], False)
+    R.check("has no output marker", "(no output)" in result, result)
+
+    print("\n── _format_interpret_result: stdout + stderr + error ──")
+    result = _format_interpret_result("line1\n", "warn\n", [
+        {"name": "E", "value": "x", "traceback": "tb"}
+    ], False)
+    R.check("has all three", "line1" in result and "warn" in result and "tb" in result, result)
+
+
+async def test_ensure_interpreter_context(R: Results):
+    from lathe import _ensure_interpreter_context
+    from cachetools import LRUCache
+
+    class FakeValves:
+        daytona_api_key = "fake"
+        daytona_api_url = "https://fake.api"
+        daytona_proxy_url = "https://fake.proxy"
+
+    class FakeResponse:
+        def __init__(self, status_code=200, json_data=None):
+            self.status_code = status_code
+            self._json = json_data or {}
+        def json(self):
+            return self._json
+        def raise_for_status(self):
+            if self.status_code >= 400:
+                raise Exception(f"HTTP {self.status_code}")
+
+    class FakeClient:
+        def __init__(self, get_response=None, post_response=None):
+            self._get_resp = get_response or FakeResponse(200, {"contexts": []})
+            self._post_resp = post_response or FakeResponse(200, {"id": "ctx-new"})
+            self.get_calls = []
+            self.post_calls = []
+        async def get(self, url, **kwargs):
+            self.get_calls.append(url)
+            return self._get_resp
+        async def post(self, url, **kwargs):
+            self.post_calls.append({"url": url, "kwargs": kwargs})
+            return self._post_resp
+
+    print("\n── _ensure_interpreter_context: new chat creates context ──")
+    cache = LRUCache(maxsize=10)
+    cache["chat-1"] = {"init": True, "pending": []}
+    client = FakeClient()
+    ctx_id, lost = await _ensure_interpreter_context(
+        FakeValves(), "sb-id", client, cache, "chat-1")
+    R.check("returns new context id", ctx_id == "ctx-new", f"got {ctx_id}")
+    R.check("not lost state", lost is False)
+    R.check("stored in cache", cache["chat-1"]["interpreter_context_id"] == "ctx-new")
+
+    print("\n── _ensure_interpreter_context: reuses existing context ──")
+    client2 = FakeClient(
+        get_response=FakeResponse(200, {"contexts": [{"id": "ctx-new"}]}))
+    ctx_id, lost = await _ensure_interpreter_context(
+        FakeValves(), "sb-id", client2, cache, "chat-1")
+    R.check("reuses existing", ctx_id == "ctx-new", f"got {ctx_id}")
+    R.check("no lost state", lost is False)
+    R.check("no POST call", len(client2.post_calls) == 0,
+            f"got {len(client2.post_calls)} calls")
+
+    print("\n── _ensure_interpreter_context: stale context replaced ──")
+    # Context exists in cache but not on server
+    cache["chat-2"] = {"init": True, "pending": [],
+                       "interpreter_context_id": "ctx-old"}
+    client3 = FakeClient(
+        get_response=FakeResponse(200, {"contexts": []}),  # ctx-old not listed
+        post_response=FakeResponse(200, {"id": "ctx-fresh"}))
+    ctx_id, lost = await _ensure_interpreter_context(
+        FakeValves(), "sb-id", client3, cache, "chat-2")
+    R.check("returns fresh id", ctx_id == "ctx-fresh", f"got {ctx_id}")
+    R.check("lost state = True", lost is True)
+    R.check("cache updated", cache["chat-2"]["interpreter_context_id"] == "ctx-fresh")
+
+    print("\n── _ensure_interpreter_context: no prior chat state ──")
+    cache2 = LRUCache(maxsize=10)
+    client4 = FakeClient(post_response=FakeResponse(200, {"id": "ctx-brand-new"}))
+    ctx_id, lost = await _ensure_interpreter_context(
+        FakeValves(), "sb-id", client4, cache2, "chat-brand-new")
+    R.check("creates new entry", "chat-brand-new" in cache2)
+    R.check("returns id", ctx_id == "ctx-brand-new", f"got {ctx_id}")
+    R.check("not lost", lost is False)
+
+
+async def test_interpret_constant(R: Results):
+    from lathe import _INTERPRET_DEFAULT_TIMEOUT
+
+    print("\n── interpret default timeout ──")
+    R.check("is positive int",
+            isinstance(_INTERPRET_DEFAULT_TIMEOUT, int) and _INTERPRET_DEFAULT_TIMEOUT > 0,
+            f"got {_INTERPRET_DEFAULT_TIMEOUT}")
+    R.check("reasonable default (30-300s)",
+            30 <= _INTERPRET_DEFAULT_TIMEOUT <= 300,
+            f"got {_INTERPRET_DEFAULT_TIMEOUT}")
+
+
+async def test_interpret_manpage(R: Results):
+    from lathe import Tools
+
+    print("\n── interpret manpage ──")
+    tools = Tools()
+    R.check("interpret in manpage index",
+            "interpret" in tools._MANPAGE_INDEX,
+            "should have index entry")
+    R.check("interpret manpage exists",
+            "interpret" in tools._MANPAGES,
+            "should have manpage content")
+    content = tools._MANPAGES.get("interpret", "")
+    R.check("manpage mentions state model",
+            "state" in content.lower() and "persist" in content.lower(),
+            "should describe state persistence")
+    R.check("manpage mentions bash comparison",
+            "bash" in content.lower(),
+            "should compare with bash")
+
+
 TESTS = {
     "parse_env_vars": test_parse_env_vars,
     "onboard_script": test_onboard_script,
@@ -1629,6 +1793,10 @@ TESTS = {
     "chat_id_signatures": test_chat_id_in_signatures,
     "push_bg_notice": test_push_bg_notice,
     "format_bg_notices": test_format_bg_notices,
+    "format_interpret_result": test_format_interpret_result,
+    "ensure_interpreter_context": test_ensure_interpreter_context,
+    "interpret_constant": test_interpret_constant,
+    "interpret_manpage": test_interpret_manpage,
 }
 
 

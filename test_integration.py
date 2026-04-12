@@ -538,6 +538,48 @@ async def test_int_destroy(R: Results, tools: Tools, user: dict):
 
 # ── Test group registry ──────────────────────────────────────────────
 
+async def test_int_interpret(R: Results, tools: Tools, user: dict):
+    import uuid
+    chat_id = f"test-interpret-{uuid.uuid4().hex[:8]}"
+    ctx = dict(__user__=user, __event_emitter__=mock_emitter, __chat_id__=chat_id)
+
+    print("\n── interpret: basic output ──")
+    r = await tools.interpret("print('hello from interpreter')", **ctx)
+    R.check("basic print works", "hello from interpreter" in r, r[:300])
+
+    print("\n── interpret: state persistence ──")
+    await tools.interpret("x = 42", **ctx)
+    r = await tools.interpret("print(x + 1)", **ctx)
+    R.check("state persists across calls", "43" in r, r[:300])
+
+    print("\n── interpret: import persistence ──")
+    await tools.interpret("import math", **ctx)
+    r = await tools.interpret("print(math.pi)", **ctx)
+    R.check("import persists", "3.14159" in r, r[:300])
+
+    print("\n── interpret: error handling ──")
+    r = await tools.interpret("1 / 0", **ctx)
+    R.check("ZeroDivisionError reported", "ZeroDivisionError" in r, r[:300])
+
+    print("\n── interpret: state survives after error ──")
+    r = await tools.interpret("print(x)", **ctx)
+    R.check("x still defined after error", "42" in r, r[:300])
+
+    print("\n── interpret: multi-line code ──")
+    r = await tools.interpret("for i in range(3):\n    print(i)", **ctx)
+    R.check("loop output", "0" in r and "1" in r and "2" in r, r[:300])
+
+    print("\n── interpret: empty code rejected ──")
+    r = await tools.interpret("   ", **ctx)
+    R.check("empty code error", "Error" in r and "empty" in r.lower(), r[:300])
+
+    print("\n── interpret: fresh chat gets fresh context ──")
+    chat_id2 = f"test-interpret-{uuid.uuid4().hex[:8]}"
+    ctx2 = dict(__user__=user, __event_emitter__=mock_emitter, __chat_id__=chat_id2)
+    r = await tools.interpret("print(x)", **ctx2)
+    R.check("fresh chat has no x", "NameError" in r or "not defined" in r, r[:300])
+
+
 TESTS = {
     "bash": test_int_bash,
     "write_read_edit": test_int_write_read_edit,
@@ -546,6 +588,7 @@ TESTS = {
     "bash_backgrounding": test_int_bash_backgrounding,
     "env_vars": test_int_env_vars,
     "expose": test_int_expose,
+    "interpret": test_int_interpret,
     "ensure_sandbox": test_int_ensure_sandbox,
     "destroy": test_int_destroy,  # must run last
 }
