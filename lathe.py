@@ -13,6 +13,7 @@ import asyncio
 import inspect
 import io
 import json
+import re
 import textwrap
 import time
 import urllib.parse
@@ -113,17 +114,10 @@ def _prepend_harness_messages(result: str, messages: list[str]) -> str:
 
 def _drain_harness_messages(chat_state: LRUCache, chat_id: str | None,
                             warning: str | None) -> list[str]:
-    """Collect all pending harness messages for a tool call.
+    """Collect pending harness messages and the sandbox lifecycle warning.
 
-    Drains the pending queue in the chat state (if any) and includes the
-    sandbox lifecycle warning.  Returns a list of message strings to
-    prepend to the tool result.
-
-    This function runs after every tool call, making it the natural
-    hook for trace accumulation: the caller knows the tool name, args,
-    and result by the time it calls here.  A future trace-aware handoff
-    (#54) would append a compact record to chat_state[chat_id]["trace"]
-    at this call site (or in the callers, which have richer context).
+    Runs after every tool call, making it a natural hook for future
+    trace accumulation (#54).
     """
     messages: list[str] = []
     if warning:
@@ -155,17 +149,15 @@ def _push_bg_notice(chat_state: LRUCache, chat_id: str | None, notice: str):
 
 def _format_bg_bash_notice(cmd_id: str, exit_code: int | None,
                            elapsed: int, tail: str) -> str:
-    """Format a completion notice for a backgrounded bash command."""
     ec_str = str(exit_code) if exit_code is not None else "unknown"
-    lines = [f"[Background job completed: CMD-{cmd_id}]"]
-    lines.append(f"Exit code: {ec_str} (took {elapsed}s)")
+    lines = [
+        f"[Background job completed: CMD-{cmd_id}]",
+        f"Exit code: {ec_str} (took {elapsed}s)",
+    ]
     tail = tail.strip()
     if tail:
-        # Keep last 5 lines
-        tail_lines = tail.splitlines()[-5:]
         lines.append("Last lines of output:")
-        for tl in tail_lines:
-            lines.append(f"  {tl}")
+        lines.extend(f"  {tl}" for tl in tail.splitlines()[-5:])
     else:
         lines.append("(no output)")
     return "\n".join(lines)
@@ -174,26 +166,26 @@ def _format_bg_bash_notice(cmd_id: str, exit_code: int | None,
 def _format_bg_delegate_notice(delegate_id: str, elapsed: int,
                                step_count: int, tool_calls: int,
                                result_preview: str, error: str | None) -> str:
-    """Format a completion notice for a backgrounded delegate."""
     if error:
-        lines = [f"[Background delegation failed: DELEGATE-{delegate_id}]"]
-        lines.append(f"Failed after {elapsed}s: {error}")
+        lines = [
+            f"[Background delegation failed: DELEGATE-{delegate_id}]",
+            f"Failed after {elapsed}s: {error}",
+        ]
     else:
-        lines = [f"[Background delegation completed: DELEGATE-{delegate_id}]"]
-        lines.append(f"{step_count} step(s), {tool_calls} tool call(s) (took {elapsed}s)")
+        lines = [
+            f"[Background delegation completed: DELEGATE-{delegate_id}]",
+            f"{step_count} step(s), {tool_calls} tool call(s) (took {elapsed}s)",
+        ]
         preview = result_preview.strip()
         if preview:
-            preview_lines = preview.splitlines()[-10:]
             lines.append("Result preview:")
-            for pl in preview_lines:
-                lines.append(f"  {pl}")
+            lines.extend(f"  {pl}" for pl in preview.splitlines()[-10:])
         else:
             lines.append("(no result text)")
     return "\n".join(lines)
 
 
 def _shell_quote(s: str) -> str:
-    """Single-quote a string for safe use in shell scripts."""
     return "'" + s.replace("'", "'\\''") + "'"
 
 
@@ -206,7 +198,6 @@ def _parse_env_vars(env_vars: str) -> list[tuple[str, str]]:
     Returns [] on empty input (not an error).
     Raises ValueError on malformed input so the caller can surface it to the agent.
     """
-    import re
     s = env_vars.strip()
     if not s or s == "{}":
         return []
@@ -250,7 +241,6 @@ def _get_email(user: dict) -> str:
 
 def _extract_pid(output: str) -> str:
     """Extract PID=<number> from ensure-script output. Returns the number or '?'."""
-    import re
     m = re.search(r"PID=(\d+)", output)
     return m.group(1) if m else "?"
 
@@ -1156,15 +1146,7 @@ async def _core_grep(valves, sandbox_id: str, client: httpx.AsyncClient, *,
 
 def _build_bash_script(command: str, user_pairs: list[tuple[str, str]],
                        pid_path: str, log_path: str) -> str:
-    """Build the bash wrapper script with sidecar file setup.
-
-    The script:
-    - Sets standard non-interactive env vars
-    - Injects user env vars (shell-quoted)
-    - Writes its own PID to pid_path
-    - Tees stdout+stderr to log_path
-    - Executes the user command
-    """
+    """Build the bash wrapper script with sidecar file setup."""
     user_env_lines = "".join(
         f"export {k}={_shell_quote(v)}\n" for k, v in user_pairs
     )
@@ -1188,17 +1170,7 @@ def _format_bash_result(output: str, exit_code: int | None,
                         was_truncated: bool, meta: dict,
                         spill_path: str | None = None,
                         background_info: dict | None = None) -> str:
-    """Format bash output for return to the caller.
-
-    Args:
-        output: The raw command output (possibly already truncated).
-        exit_code: Process exit code, or None if still running.
-        was_truncated: Whether _truncate_tail truncated the output.
-        meta: Truncation metadata from _truncate_tail.
-        spill_path: Path to the full log file on disk (for truncation notice).
-        background_info: If set, dict with keys 'elapsed', 'cmd_id' for
-            the auto-background notice.
-    """
+    """Format bash output for return to the caller."""
     if background_info is not None:
         # Auto-backgrounded: command still running
         if not output.strip():
@@ -1933,12 +1905,7 @@ def _format_delegate_background(delegate_id: str, elapsed: int, log_preview: str
 
 
 def _build_delegate_prompt(task: str, file_sections: list[str]) -> str:
-    """Build the user message for a delegate sub-agent.
-
-    Args:
-        task: The task description (including any context).
-        file_sections: Pre-formatted file sections (each "### path\\n\\ncontent").
-    """
+    """Build the user message for a delegate sub-agent."""
     parts: list[str] = [f"## Task\n\n{task}"]
     if file_sections:
         parts.append(f"## Reference Files\n\n" + "\n\n".join(file_sections))
@@ -1947,11 +1914,7 @@ def _build_delegate_prompt(task: str, file_sections: list[str]) -> str:
 
 
 def _build_delegate_system_prompt(max_steps: int) -> str:
-    """Build the system prompt for a delegate sub-agent.
-
-    Includes the step budget so the sub-agent can plan its work and
-    ensure it produces a final summary before the limit is reached.
-    """
+    """Build the delegate system prompt, embedding the step budget."""
     return textwrap.dedent(f"""\
         You are a focused sub-agent with direct access to a Linux sandbox.
         You have been delegated a specific task by the calling agent.
@@ -2538,7 +2501,6 @@ class Tools:
             ),
             json_schema_extra={"input": {"type": "password"}},
         )
-        pass
 
     def __init__(self):
         self.valves = self.Valves()
@@ -3176,10 +3138,8 @@ class Tools:
         tool_catalog = _build_tool_catalog(self)
 
         if manpage == "version":
-            # Extract version from the module docstring (single source of truth).
-            import re as _re
             mod_doc = globals().get("__doc__", "") or ""
-            match = _re.search(r"^version:\s*(.+)$", mod_doc, _re.MULTILINE)
+            match = re.search(r"^version:\s*(.+)$", mod_doc, re.MULTILINE)
             ver = match.group(1).strip() if match else "unknown"
             await _emit(__event_emitter__, f"Lathe v{ver}", done=True)
             return f"Lathe toolkit version: {ver}"
@@ -3646,14 +3606,12 @@ class Tools:
 
             agent_done = asyncio.Event()
             agent_result: dict = {}  # populated by _run_agent
-            # Mutable flag: outer code sets this to False when backgrounding
-            # so _run_agent stops calling the OWUI emitter (which may hang
-            # or raise once the HTTP response stream has closed).
-            emit_to_owui = [True]
-            # Set to True by the outer code when backgrounding, so the
-            # finally block in _run_agent knows to push a completion notice.
-            was_backgrounded = [False]
-            bg_start_time = [time.time()]
+            # Outer scope sets these when backgrounding; _run_agent reads
+            # them via closure (Python closures capture the variable, not
+            # the value, so outer rebinds are visible to the inner function).
+            emit_to_owui = True
+            was_backgrounded = False
+            bg_start_time = time.time()
 
             async def _run_agent():
                 """Run the sub-agent to completion, writing sidecar files."""
@@ -3671,7 +3629,7 @@ class Tools:
                                 remaining = clamped_steps - step_count
                                 status = f"Sub-agent thinking... ({step_count}/{clamped_steps})"
                                 await _append_log(status)
-                                if emit_to_owui[0]:
+                                if emit_to_owui:
                                     await _emit(__event_emitter__, status)
                                 # Inject wrap-up nudge when approaching the limit
                                 if (
@@ -3721,7 +3679,7 @@ class Tools:
                                 if calls:
                                     tool_status = f"Sub-agent → {', '.join(calls)}"
                                     await _append_log(tool_status)
-                                    if emit_to_owui[0]:
+                                    if emit_to_owui:
                                         await _emit(__event_emitter__, tool_status)
 
                         usage = agent_run.usage()
@@ -3788,8 +3746,8 @@ class Tools:
                 finally:
                     agent_done.set()
                     # Push a completion notice if the delegate was backgrounded.
-                    if was_backgrounded[0]:
-                        elapsed = int(time.time() - bg_start_time[0])
+                    if was_backgrounded:
+                        elapsed = int(time.time() - bg_start_time)
                         notice = _format_bg_delegate_notice(
                             delegate_id, elapsed,
                             step_count=agent_result.get("step_count", step_count),
@@ -3851,9 +3809,9 @@ class Tools:
                 # response stream will be closed once we return, and
                 # awaiting the emitter after that can hang or raise,
                 # stalling the background task entirely.
-                emit_to_owui[0] = False
-                was_backgrounded[0] = True
-                bg_start_time[0] = time.time()
+                emit_to_owui = False
+                was_backgrounded = True
+                bg_start_time = time.time()
 
                 elapsed = fg_seconds
                 # Grab recent log lines for the preview
@@ -3885,31 +3843,7 @@ class Tools:
         :param target: What to expose — "dufs" for file upload/download, "code-server" for a browser IDE, "ssh" for a shell, or "http:<port>" (e.g. "http:5000", port range 3000–9999) for an HTTP service you started manually.
         """
         async def _run(client):
-            # Parse target: "ssh", "dufs", "code-server", or "http:<port>"
             target_stripped = target.strip().lower()
-            is_ssh = target_stripped == "ssh"
-            is_dufs = target_stripped == "dufs"
-            is_code_server = target_stripped == "code-server"
-            port = 0
-
-            if not is_ssh and not is_dufs and not is_code_server:
-                if not target_stripped.startswith("http:"):
-                    return (
-                        f"Error: target must be \"ssh\", \"dufs\", \"code-server\", or \"http:<port>\" "
-                        f"(e.g. \"http:5000\"). Got: \"{target}\""
-                    )
-                port_str = target_stripped[len("http:"):]
-                try:
-                    port = int(port_str)
-                except (ValueError, TypeError):
-                    return (
-                        f"Error: port in \"http:<port>\" must be a number. "
-                        f"Got: \"{target}\""
-                    )
-                if port < 3000 or port > 9999:
-                    return (
-                        f"Error: port must be between 3000 and 9999. Got: {port}"
-                    )
 
             email = _get_email(__user__)
             sandbox_id, _sb_warning = await _ensure_sandbox(self.valves, email, client, __event_emitter__)
@@ -3918,45 +3852,11 @@ class Tools:
                 self._chat_state, __chat_id__, __user__, __event_emitter__,
             )
 
-            if is_ssh:
-                await _emit(__event_emitter__, "Creating SSH access token...")
-                resp = await client.post(
-                    _api(self.valves, f"/sandbox/{sandbox_id}/ssh-access"),
-                    params={"expiresInMinutes": 60},
-                    headers=_headers(self.valves),
-                    timeout=30.0,
-                )
-                resp.raise_for_status()
-                data = resp.json()
-
-                ssh_command = data.get("sshCommand", "")
-                if not ssh_command:
-                    token = data.get("token", "")
-                    if not token:
-                        return "Error: Daytona returned neither sshCommand nor token."
-                    ssh_command = f"ssh {token}@ssh.app.daytona.io"
-
-                await _emit(__event_emitter__, "SSH access ready", done=True)
-                messages = _drain_harness_messages(self._chat_state, __chat_id__, _sb_warning)
-                return _prepend_harness_messages(
-                    f"SSH command (valid 60 min):\n\n"
-                    f"```\n{ssh_command}\n```\n\n"
-                    f"The user can paste this into their terminal, VS Code Remote SSH, "
-                    f"or JetBrains Gateway.\n\n"
-                    f"Note: the sandbox auto-stops after ~{self.valves.auto_stop_minutes} min of inactivity. "
-                    f"Active SSH sessions keep the sandbox alive.",
-                    messages,
-                )
-
             # ── Shared helper: ensure service + sign URL ────────────
             async def _ensure_and_sign(ensure_script, script_timeout_ms,
                                        http_timeout, svc_port, svc_name,
                                        ready_status, fail_status, result_msg):
-                """Run an optional ensure-script, sign a URL, return formatted result.
-
-                If ensure_script is None, skips straight to URL signing (for
-                services the agent already started manually).
-                """
+                """Run ensure-script if provided, then sign a preview URL."""
                 pid = "?"
                 if ensure_script:
                     await _emit(__event_emitter__, f"Preparing {svc_name}...")
@@ -3998,8 +3898,37 @@ class Tools:
                 messages = _drain_harness_messages(self._chat_state, __chat_id__, _sb_warning)
                 return _prepend_harness_messages(result_msg(url, pid), messages)
 
-            # ── dufs fast path ──────────────────────────────────────
-            if is_dufs:
+            if target_stripped == "ssh":
+                await _emit(__event_emitter__, "Creating SSH access token...")
+                resp = await client.post(
+                    _api(self.valves, f"/sandbox/{sandbox_id}/ssh-access"),
+                    params={"expiresInMinutes": 60},
+                    headers=_headers(self.valves),
+                    timeout=30.0,
+                )
+                resp.raise_for_status()
+                data = resp.json()
+
+                ssh_command = data.get("sshCommand", "")
+                if not ssh_command:
+                    token = data.get("token", "")
+                    if not token:
+                        return "Error: Daytona returned neither sshCommand nor token."
+                    ssh_command = f"ssh {token}@ssh.app.daytona.io"
+
+                await _emit(__event_emitter__, "SSH access ready", done=True)
+                messages = _drain_harness_messages(self._chat_state, __chat_id__, _sb_warning)
+                return _prepend_harness_messages(
+                    f"SSH command (valid 60 min):\n\n"
+                    f"```\n{ssh_command}\n```\n\n"
+                    f"The user can paste this into their terminal, VS Code Remote SSH, "
+                    f"or JetBrains Gateway.\n\n"
+                    f"Note: the sandbox auto-stops after ~{self.valves.auto_stop_minutes} min of inactivity. "
+                    f"Active SSH sessions keep the sandbox alive.",
+                    messages,
+                )
+
+            if target_stripped == "dufs":
                 return await _ensure_and_sign(
                     ensure_script=_DUFS_ENSURE_SCRIPT,
                     script_timeout_ms=30000, http_timeout=60.0,
@@ -4016,8 +3945,7 @@ class Tools:
                     ),
                 )
 
-            # ── code-server fast path ───────────────────────────────
-            if is_code_server:
+            if target_stripped == "code-server":
                 return await _ensure_and_sign(
                     ensure_script=_CS_ENSURE_SCRIPT,
                     script_timeout_ms=60000, http_timeout=120.0,
@@ -4034,7 +3962,24 @@ class Tools:
                     ),
                 )
 
-            # ── Generic port exposure ───────────────────────────────
+            if not target_stripped.startswith("http:"):
+                return (
+                    f"Error: target must be \"ssh\", \"dufs\", \"code-server\", or \"http:<port>\" "
+                    f"(e.g. \"http:5000\"). Got: \"{target}\""
+                )
+            port_str = target_stripped.removeprefix("http:")
+            try:
+                port = int(port_str)
+            except (ValueError, TypeError):
+                return (
+                    f"Error: port in \"http:<port>\" must be a number. "
+                    f"Got: \"{target}\""
+                )
+            if port < 3000 or port > 9999:
+                return (
+                    f"Error: port must be between 3000 and 9999. Got: {port}"
+                )
+
             return await _ensure_and_sign(
                 ensure_script=None,
                 script_timeout_ms=0, http_timeout=0,
