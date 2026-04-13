@@ -205,8 +205,8 @@ async def test_int_onboard(R: Results, tools: Tools, user: dict):
 
     print("\n── onboard: missing context (no project, no global) ──")
     r = await tools.onboard("/home/daytona/workspace/empty_project", **ctx)
-    R.check("fails without any context", "Error" in r, r[:300])
-    R.check("error mentions ~/.agents/", "~/.agents/" in r, r[:300])
+    R.check("reports directory not found", "(not found)" in r, r[:300])
+    R.check("no error on missing dir", "Error" not in r, r[:300])
 
     print("\n── onboard: project AGENTS.md only ──")
     await tools.write("/home/daytona/workspace/test_project/AGENTS.md", "# Test Agent\nYou are a helpful test agent.\n", **ctx)
