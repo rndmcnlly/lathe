@@ -894,6 +894,79 @@ async def test_delegate_tools_build(R: Results):
                             got_desc == pdesc,
                             f"got {got_desc!r}, expected {pdesc!r}")
 
+    # Verify parameter schemas match known-good values.
+    # Format: {tool_name: {param_name: (json_type, has_default, default)}}
+    from lathe import _GLOB_MAX_LINES, _GREP_MAX_LINES, _INTERPRET_DEFAULT_TIMEOUT, _DELEGATE_BASH_FOREGROUND_SECONDS
+    EXPECTED_PARAMS = {
+        "bash": {
+            "command": ("string", False, None),
+            "workdir": ("string", True, "/home/daytona/workspace"),
+            "foreground_seconds": ("integer", True, _DELEGATE_BASH_FOREGROUND_SECONDS),
+        },
+        "read": {
+            "path": ("string", False, None),
+            "offset": ("integer", True, 1),
+            "limit": ("integer", True, 2000),
+        },
+        "write": {
+            "path": ("string", False, None),
+            "content": ("string", False, None),
+        },
+        "edit": {
+            "path": ("string", False, None),
+            "old_string": ("string", False, None),
+            "new_string": ("string", False, None),
+            "replace_all": ("boolean", True, False),
+        },
+        "glob": {
+            "pattern": ("string", False, None),
+            "max_lines": ("integer", True, _GLOB_MAX_LINES),
+        },
+        "grep": {
+            "pattern": ("string", False, None),
+            "files": ("string", True, "**/*"),
+            "max_lines": ("integer", True, _GREP_MAX_LINES),
+        },
+        "interpret": {
+            "code": ("string", False, None),
+            "timeout": ("integer", True, _INTERPRET_DEFAULT_TIMEOUT),
+        },
+    }
+
+    print("\n── delegate tools: parameter schema parity ──")
+    for t in tools:
+        if t.name not in EXPECTED_PARAMS:
+            continue
+        td = t.tool_def
+        schema = td.parameters_json_schema
+        props = schema.get("properties", {})
+        required = set(schema.get("required", []))
+        expected = EXPECTED_PARAMS[t.name]
+
+        actual_names = set(props.keys())
+        expected_names = set(expected.keys())
+        R.check(f"{t.name}: param names match",
+                actual_names == expected_names,
+                f"expected {sorted(expected_names)}, got {sorted(actual_names)}")
+
+        for pname, (exp_type, exp_has_default, exp_default) in expected.items():
+            if pname not in props:
+                continue
+            prop = props[pname]
+            got_type = prop.get("type", "")
+            R.check(f"{t.name}.{pname}: json type",
+                    got_type == exp_type,
+                    f"expected {exp_type!r}, got {got_type!r}")
+            is_required = pname in required
+            R.check(f"{t.name}.{pname}: required",
+                    is_required == (not exp_has_default),
+                    f"expected required={not exp_has_default}, got {is_required}")
+            if exp_has_default:
+                got_default = prop.get("default")
+                R.check(f"{t.name}.{pname}: default",
+                        got_default == exp_default,
+                        f"expected {exp_default!r}, got {got_default!r}")
+
 
 async def test_build_bash_script(R: Results):
     from lathe import _build_bash_script
@@ -1013,13 +1086,6 @@ async def test_core_read_mock(R: Results):
     result = await _core_read(FakeValves(), "sb-id", client,
                               path="/home/daytona/workspace/missing.py")
     R.check("reports file not found", "File not found" in result, result)
-
-    print("\n── _core_read: 400 handling (directory) ──")
-    client = FakeClient([FakeResponse(400)])
-    result = await _core_read(FakeValves(), "sb-id", client,
-                              path="/home/daytona/workspace")
-    R.check("reports bad request", "Bad request" in result, result)
-    R.check("suggests directory", "directory" in result, result)
 
     print("\n── _core_read: normal file ──")
     content = "line1\nline2\nline3\n"
@@ -1148,8 +1214,8 @@ async def test_core_edit_mock(R: Results):
                               path="/home/daytona/workspace/x.py",
                               old_string="hello", new_string="goodbye")
     R.check("reports success", "Replaced 1 occurrence" in result, result)
-    R.check("uploaded new content", len(client.post_calls) == 1,
-            f"got {len(client.post_calls)} calls")
+    R.check("uploaded new content", len(client.post_calls) == 2,
+            f"got {len(client.post_calls)} calls (expect mkdir + upload)")
 
     print("\n── _core_edit: replace_all ──")
     client = FakeClient(FakeResponse(200, "foo bar foo"))

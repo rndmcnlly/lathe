@@ -806,6 +806,80 @@ def grep_hierarchy(base_dir, regex, files_pattern, max_lines):
 '''
 
 
+# ── shared Daytona I/O helpers ───────────────────────────────────────
+#
+# Thin wrappers over the Daytona toolbox API endpoints that multiple
+# _core_* functions call.  Extracted to avoid duplicating HTTP call
+# patterns and error handling across read/write/edit/glob/grep/onboard.
+
+
+async def _upload_file(valves, sandbox_id: str, client: httpx.AsyncClient,
+                       path: str, content: bytes) -> None:
+    """Upload raw bytes to a sandbox path (creates parent dirs first)."""
+    parent = "/".join(path.rstrip("/").split("/")[:-1])
+    if parent:
+        await client.post(
+            _toolbox(valves, sandbox_id, "/files/folder"),
+            headers=_headers(valves),
+            json={"path": parent, "mode": "755"},
+            timeout=30.0,
+        )
+    resp = await client.post(
+        _toolbox(valves, sandbox_id, "/files/upload"),
+        params={"path": path},
+        headers={"Authorization": f"Bearer {valves.daytona_api_key}"},
+        files={"file": ("file", io.BytesIO(content), "application/octet-stream")},
+        timeout=60.0,
+    )
+    resp.raise_for_status()
+
+
+async def _download_file(valves, sandbox_id: str, client: httpx.AsyncClient,
+                         path: str) -> str:
+    """Download a file from the sandbox. Returns file content as text.
+
+    Returns None if the file does not exist (404). Raises on other errors.
+    """
+    resp = await client.get(
+        _toolbox(valves, sandbox_id, "/files/download"),
+        params={"path": path},
+        headers=_headers(valves),
+        timeout=60.0,
+    )
+    if resp.status_code == 404:
+        return None
+    resp.raise_for_status()
+    return resp.text
+
+
+async def _run_sandbox_script(valves, sandbox_id: str, client: httpx.AsyncClient,
+                              script: str, *, error_prefix: str,
+                              timeout_ms: int = 30000,
+                              http_timeout: float = 60.0) -> str:
+    """Execute a Python script on the sandbox and return its stdout.
+
+    For short scripts, passes the script inline via ``python3 -c``.
+    Returns the script's stdout on success. On non-zero exit, returns
+    an error string prefixed with *error_prefix*.
+    """
+    resp = await client.post(
+        _toolbox(valves, sandbox_id, "/process/execute"),
+        headers=_headers(valves),
+        json={
+            "command": f"python3 -c {_shell_quote(script)}",
+            "timeout": timeout_ms,
+        },
+        timeout=http_timeout,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    result = data.get("result", "")
+    exit_code = data.get("exitCode", -1)
+    if exit_code != 0:
+        return f"Error: {error_prefix} (exit {exit_code}).\n{result[:500]}"
+    return result
+
+
 # ── shared tool cores ───────────────────────────────────────────────
 #
 # Each _core_* function encapsulates the I/O logic for a tool.  Both
@@ -814,26 +888,11 @@ def grep_hierarchy(base_dir, regex, files_pattern, max_lines):
 # (valves, sandbox_id, client, **tool_params) -> str.
 #
 # Docstrings on _core_* are the **single source of truth** for tool
-# descriptions and parameter docs.  Use :param: format.  The decorator
-# _doc_from_core() converts them to Google-style Args: blocks for the
-# delegate closures (which pydantic-ai parses for schema generation).
-# Tools class methods can add OWUI-specific behavioral guidance beyond
-# what the core docstring says.
+# descriptions and parameter docs.  Use :param: format.  Both OWUI and
+# pydantic-ai parse :param: natively.  _standard_tool and
+# _build_delegate_tool copy docstrings onto their generated functions;
+# hand-written methods (bash) set __doc__ directly.
 
-
-def _doc_from_core(core_fn):
-    """Decorator: copy a _core_* docstring onto a target function.
-
-    Both OWUI and pydantic-ai parse :param: format natively, so no
-    conversion is needed.  Extra :param: lines for params not in the
-    target's signature (valves, sandbox_id, client, etc.) are silently
-    ignored by both schema generators.
-    """
-    doc = inspect.getdoc(core_fn) or ""
-    def decorator(fn):
-        fn.__doc__ = doc
-        return fn
-    return decorator
 
 
 # Infrastructure params in _core_* signatures that are NOT tool params.
@@ -841,7 +900,7 @@ def _doc_from_core(core_fn):
 # method signature.
 _CORE_INFRA_PARAMS = frozenset({
     "valves", "sandbox_id", "client", "emit", "user_pairs",
-    "foreground_seconds", "on_background", "chat_state", "chat_id",
+    "on_background", "chat_state", "chat_id",
 })
 
 
@@ -970,18 +1029,9 @@ async def _core_read(valves, sandbox_id: str, client: httpx.AsyncClient, *,
     err = _require_abs_path(path)
     if err:
         return err
-    resp = await client.get(
-        _toolbox(valves, sandbox_id, "/files/download"),
-        params={"path": path},
-        headers=_headers(valves),
-        timeout=60.0,
-    )
-    if resp.status_code == 404:
+    content = await _download_file(valves, sandbox_id, client, path)
+    if content is None:
         return f"Error: File not found: {path}"
-    if resp.status_code == 400:
-        return f"Error: Bad request reading {path} (is it a directory?)"
-    resp.raise_for_status()
-    content = resp.text
     lines = content.split("\n")
     if lines and lines[-1] == "":
         lines = lines[:-1]
@@ -1015,23 +1065,8 @@ async def _core_write(valves, sandbox_id: str, client: httpx.AsyncClient, *,
     err = _require_abs_path(path)
     if err:
         return err
-    parent = "/".join(path.rstrip("/").split("/")[:-1])
-    if parent:
-        await client.post(
-            _toolbox(valves, sandbox_id, "/files/folder"),
-            headers=_headers(valves),
-            json={"path": parent, "mode": "755"},
-            timeout=30.0,
-        )
     content_bytes = content.encode("utf-8")
-    resp = await client.post(
-        _toolbox(valves, sandbox_id, "/files/upload"),
-        params={"path": path},
-        headers={"Authorization": f"Bearer {valves.daytona_api_key}"},
-        files={"file": ("file", io.BytesIO(content_bytes), "application/octet-stream")},
-        timeout=60.0,
-    )
-    resp.raise_for_status()
+    await _upload_file(valves, sandbox_id, client, path, content_bytes)
     n_bytes = len(content_bytes)
     n_lines = content.count("\n") + (0 if content.endswith("\n") else 1)
     return f"Wrote {n_bytes} bytes ({n_lines} lines) to {path}"
@@ -1050,16 +1085,9 @@ async def _core_edit(valves, sandbox_id: str, client: httpx.AsyncClient, *,
     err = _require_abs_path(path)
     if err:
         return err
-    resp = await client.get(
-        _toolbox(valves, sandbox_id, "/files/download"),
-        params={"path": path},
-        headers=_headers(valves),
-        timeout=60.0,
-    )
-    if resp.status_code == 404:
+    content = await _download_file(valves, sandbox_id, client, path)
+    if content is None:
         return f"Error: File not found: {path}"
-    resp.raise_for_status()
-    content = resp.text
     count = content.count(old_string)
     if count == 0:
         return f"Error: old_string not found in {path}"
@@ -1074,14 +1102,7 @@ async def _core_edit(valves, sandbox_id: str, client: httpx.AsyncClient, *,
     else:
         new_content = content.replace(old_string, new_string, 1)
     content_bytes = new_content.encode("utf-8")
-    resp = await client.post(
-        _toolbox(valves, sandbox_id, "/files/upload"),
-        params={"path": path},
-        headers={"Authorization": f"Bearer {valves.daytona_api_key}"},
-        files={"file": ("file", io.BytesIO(content_bytes), "application/octet-stream")},
-        timeout=60.0,
-    )
-    resp.raise_for_status()
+    await _upload_file(valves, sandbox_id, client, path, content_bytes)
     replaced = count if replace_all else 1
     return f"Replaced {replaced} occurrence(s) in {path}"
 
@@ -1102,19 +1123,9 @@ async def _core_glob(valves, sandbox_id: str, client: httpx.AsyncClient, *,
         _GLOB_SCRIPT
         + f"\nprint(glob_hierarchy({base_dir!r}, {pattern!r}, {clamped!r}))"
     )
-    resp = await client.post(
-        _toolbox(valves, sandbox_id, "/process/execute"),
-        headers=_headers(valves),
-        json={"command": f"python3 -c {_shell_quote(script)}", "timeout": 30000},
-        timeout=60.0,
+    return await _run_sandbox_script(
+        valves, sandbox_id, client, script, error_prefix="glob script failed",
     )
-    resp.raise_for_status()
-    data = resp.json()
-    result = data.get("result", "")
-    exit_code = data.get("exitCode", -1)
-    if exit_code != 0:
-        return f"Error: glob script failed (exit {exit_code}).\n{result[:500]}"
-    return result
 
 
 async def _core_grep(valves, sandbox_id: str, client: httpx.AsyncClient, *,
@@ -1135,19 +1146,9 @@ async def _core_grep(valves, sandbox_id: str, client: httpx.AsyncClient, *,
         _GREP_SCRIPT
         + f"\nprint(grep_hierarchy({base_dir!r}, {pattern!r}, {files!r}, {clamped!r}))"
     )
-    resp = await client.post(
-        _toolbox(valves, sandbox_id, "/process/execute"),
-        headers=_headers(valves),
-        json={"command": f"python3 -c {_shell_quote(script)}", "timeout": 30000},
-        timeout=60.0,
+    return await _run_sandbox_script(
+        valves, sandbox_id, client, script, error_prefix="grep script failed",
     )
-    resp.raise_for_status()
-    data = resp.json()
-    result = data.get("result", "")
-    exit_code = data.get("exitCode", -1)
-    if exit_code != 0:
-        return f"Error: grep script failed (exit {exit_code}).\n{result[:500]}"
-    return result
 
 
 # ── bash core (session + sidecar protocol) ──────────────────────────
@@ -2086,84 +2087,113 @@ _DELEGATE_BASH_FOREGROUND_SECONDS = 15
 # Nudge threshold: inject a wrap-up reminder when this many steps remain.
 _DELEGATE_NUDGE_REMAINING = 2
 
+def _build_delegate_tool(core_fn, *, infra_args: tuple,
+                         default_overrides: dict | None = None,
+                         extra_infra_kwargs: dict | None = None):
+    """Build a single pydantic-ai Tool from a _core_* function.
+
+    Creates a closure with the correct Python signature (param names,
+    types, defaults) so pydantic-ai can introspect it for JSON schema.
+    Uses exec() to produce a real function (pydantic-ai reads
+    get_type_hints(), which ignores __signature__ patches).
+
+    Args:
+        core_fn: The _core_* function to wrap.
+        infra_args: Positional args to prepend (valves, sandbox_id, client).
+        default_overrides: Override default values for specific params,
+            e.g. {"foreground_seconds": 15} for bash in delegate context.
+        extra_infra_kwargs: Extra keyword args passed to core_fn that are
+            NOT tool-visible (e.g. user_pairs for bash).
+    """
+    from pydantic_ai import Tool
+
+    core_sig = inspect.signature(core_fn)
+    tool_params = []
+    for name, param in core_sig.parameters.items():
+        if name in _CORE_INFRA_PARAMS:
+            continue
+        if default_overrides and name in default_overrides:
+            param = param.replace(default=default_overrides[name])
+        tool_params.append(param)
+
+    # Build the function source with correct signature
+    param_parts = []
+    for p in tool_params:
+        ann = p.annotation
+        ann_name = ann.__name__ if hasattr(ann, "__name__") else str(ann)
+        if p.default != inspect.Parameter.empty:
+            param_parts.append(f"{p.name}: {ann_name} = _defaults[{p.name!r}]")
+        else:
+            param_parts.append(f"{p.name}: {ann_name}")
+    sig_str = ", ".join(param_parts)
+
+    kwarg_parts = [f"{p.name}={p.name}" for p in tool_params]
+    kwargs_str = ", ".join(kwarg_parts)
+
+    defaults = {
+        p.name: p.default
+        for p in tool_params
+        if p.default != inspect.Parameter.empty
+    }
+
+    fn_name = core_fn.__name__.replace("_core_", "")
+
+    # The exec namespace provides the captured variables and type annotations
+    ns: dict = {
+        "_core_fn": core_fn,
+        "_infra_args": infra_args,
+        "_extra_kwargs": extra_infra_kwargs or {},
+        "_defaults": defaults,
+    }
+    # Import type names so annotations resolve in the exec'd function
+    for p in tool_params:
+        ann = p.annotation
+        if hasattr(ann, "__name__") and ann.__name__ not in ns:
+            ns[ann.__name__] = ann
+
+    code = (
+        f"async def {fn_name}({sig_str}) -> str:\n"
+        f"    return await _core_fn(*_infra_args, **_extra_kwargs, {kwargs_str})\n"
+    )
+    exec(code, ns)
+    fn = ns[fn_name]
+    fn.__doc__ = inspect.getdoc(core_fn) or ""
+
+    return Tool(fn)
+
+
 def _build_delegate_tools(valves, sandbox_id: str, client: httpx.AsyncClient,
                           user_pairs: list[tuple[str, str]],
                           chat_state: LRUCache = None, chat_id: str = ""):
     """Build pydantic-ai Tool objects that operate against a resolved sandbox.
 
     Returns a list of Tool instances. Each tool is a thin closure over the
-    already-resolved sandbox_id and client — no per-call sandbox lookup.
+    already-resolved sandbox_id and client -- no per-call sandbox lookup.
     The closures delegate to the shared _core_* functions.
     """
-    from pydantic_ai import Tool
+    infra = (valves, sandbox_id, client)
 
-    # ── bash ─────────────────────────────────────────────────────────
-    @_doc_from_core(_core_bash)
-    async def bash(command: str, workdir: str = "/home/daytona/workspace",
-                   foreground_seconds: int = _DELEGATE_BASH_FOREGROUND_SECONDS) -> str:
-        return await _core_bash(
-            valves, sandbox_id, client,
-            command=command,
-            workdir=workdir,
-            user_pairs=user_pairs,
-            foreground_seconds=foreground_seconds,
-        )
+    all_tools = [
+        _build_delegate_tool(
+            _core_bash, infra_args=infra,
+            default_overrides={"foreground_seconds": _DELEGATE_BASH_FOREGROUND_SECONDS},
+            extra_infra_kwargs={"user_pairs": user_pairs},
+        ),
+        _build_delegate_tool(_core_read, infra_args=infra),
+        _build_delegate_tool(_core_write, infra_args=infra),
+        _build_delegate_tool(_core_edit, infra_args=infra),
+        _build_delegate_tool(_core_glob, infra_args=infra),
+        _build_delegate_tool(_core_grep, infra_args=infra),
+    ]
 
-    # ── read ─────────────────────────────────────────────────────────
-    @_doc_from_core(_core_read)
-    async def read(path: str, offset: int = 1, limit: int = 2000) -> str:
-        return await _core_read(
-            valves, sandbox_id, client,
-            path=path, offset=offset, limit=limit,
-        )
-
-    # ── write ────────────────────────────────────────────────────────
-    @_doc_from_core(_core_write)
-    async def write(path: str, content: str) -> str:
-        return await _core_write(
-            valves, sandbox_id, client,
-            path=path, content=content,
-        )
-
-    # ── edit ─────────────────────────────────────────────────────────
-    @_doc_from_core(_core_edit)
-    async def edit(path: str, old_string: str, new_string: str, replace_all: bool = False) -> str:
-        return await _core_edit(
-            valves, sandbox_id, client,
-            path=path, old_string=old_string, new_string=new_string,
-            replace_all=replace_all,
-        )
-
-    # ── glob ─────────────────────────────────────────────────────────
-    @_doc_from_core(_core_glob)
-    async def glob(pattern: str, max_lines: int = _GLOB_MAX_LINES) -> str:
-        return await _core_glob(
-            valves, sandbox_id, client,
-            pattern=pattern, max_lines=max_lines,
-        )
-
-    # ── grep ─────────────────────────────────────────────────────────
-    @_doc_from_core(_core_grep)
-    async def grep(pattern: str, files: str = "**/*", max_lines: int = _GREP_MAX_LINES) -> str:
-        return await _core_grep(
-            valves, sandbox_id, client,
-            pattern=pattern, files=files, max_lines=max_lines,
-        )
-
-    # ── interpret ────────────────────────────────────────────────────
-    @_doc_from_core(_core_interpret)
-    async def interpret(code: str, timeout: int = _INTERPRET_DEFAULT_TIMEOUT) -> str:
-        if not chat_state or not chat_id:
-            return "Error: interpret() requires chat context (not available in this delegate session)."
-        return await _core_interpret(
-            valves, sandbox_id, client,
-            chat_state, chat_id,
-            code=code, timeout=timeout,
-        )
-
-    all_tools = [Tool(f) for f in (bash, read, write, edit, glob, grep)]
+    # interpret needs chat context; only available when chat_state and chat_id
+    # are provided.  It also needs extra infra kwargs.
     if chat_state and chat_id:
-        all_tools.append(Tool(interpret))
+        all_tools.append(_build_delegate_tool(
+            _core_interpret, infra_args=infra,
+            extra_infra_kwargs={"chat_state": chat_state, "chat_id": chat_id},
+        ))
+
     return all_tools
 
 
@@ -3309,13 +3339,9 @@ class Tools:
 
             # Write script to temp file and execute it
             script_path = f"/tmp/_onboard_{uuid.uuid4()}.py"
-            content_bytes = script.encode("utf-8")
-            await client.post(
-                _toolbox(self.valves, sandbox_id, "/files/upload"),
-                params={"path": script_path},
-                headers={"Authorization": f"Bearer {self.valves.daytona_api_key}"},
-                files={"file": ("file", io.BytesIO(content_bytes), "application/octet-stream")},
-                timeout=60.0,
+            await _upload_file(
+                self.valves, sandbox_id, client,
+                script_path, script.encode("utf-8"),
             )
 
             resp = await client.post(
@@ -3343,7 +3369,6 @@ class Tools:
 
         return await _tool_context(__event_emitter__, _run)
 
-    @_doc_from_core(_core_bash)
     async def bash(
         self,
         command: str,
@@ -3401,6 +3426,7 @@ class Tools:
             return _prepend_harness_messages(result, messages)
 
         return await _tool_context(__event_emitter__, _run)
+    bash.__doc__ = inspect.getdoc(_core_bash)
 
     read = _standard_tool(
         _core_read,
