@@ -35,6 +35,17 @@ Unit tests can't catch broken HTTP paths or OWUI integration bugs. Real deployme
 
 **No OWUI storage dependency.** Use `expose()` for user-facing file access, not OWUI's file storage. Do not re-introduce storage coupling without a clear principle for halting scope creep.
 
+## OWUI parameter type coercion (#57)
+
+OWUI's schema generation is correct: `int` → `"integer"`, `bool` → `"boolean"` in the JSON schema sent to models. However, OWUI performs **zero type coercion at dispatch**: after `json.loads`, the parsed dict is splatted directly into the tool function with no validation against the schema. If a model (or OWUI's prompt-based tool calling path) sends `{"offset": "80"}` instead of `{"offset": 80}`, the string passes through unchanged.
+
+Every `_core_*` function and hand-written tool method must coerce non-string params at the boundary:
+
+- **`int` params**: `offset = int(offset)` at the top of the function body. Fails loud on garbage.
+- **`bool` params**: `if isinstance(x, str): x = x.lower() not in ("false", "0", "no", "")`. Critical because `bool("false")` is `True` in Python, so naive truthiness checks silently do the wrong thing.
+
+The `string_typed_params` unit test locks this in. When adding new numeric or boolean tool params, add a coercion line and a regression test case.
+
 ## Cold-start bootstrap
 
 The runtime agent must bootstrap from a blank Daytona sandbox. Recipes live in `lathe(manpage="recipes")`. Constraints: egress-allowlisted hosts only, no hardcoded version URLs (resolve via GitHub API), install to `/tmp`, x86_64 Linux (`*-musl` static builds preferred).
