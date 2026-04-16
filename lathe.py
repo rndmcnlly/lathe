@@ -3117,7 +3117,7 @@ class Tools:
               to fire-and-forget for parallel agent teams.
             - expose() URLs expire after ~1 hour (call expose again for a fresh URL). The sandbox itself stops on
               idle (~15 min default), killing servers.
-            - destroy() is irreversible. The volume is preserved.
+            - destroy() prompts for user confirmation via a dialog before proceeding. Irreversible. The volume is preserved.
             - **Network egress may be restricted.** Depending on the admin's
               Daytona tier, the sandbox may only reach a curated allowlist of
               hosts (package registries, git hosts, CDNs, AI APIs, etc.).
@@ -3191,23 +3191,37 @@ class Tools:
 
     async def destroy(
         self,
-        confirm: bool = False,
         __user__: dict = {},
         __event_emitter__=None,
+        __event_call__=None,
     ) -> str:
         """
-        Permanently destroy the sandbox VM. Irreversible. Set confirm=true to proceed.
+        Permanently destroy the sandbox VM. Irreversible.
+        Prompts the user for confirmation before proceeding.
         Persistent volume data is preserved and will reappear in the next sandbox.
-        :param confirm: Must be true to confirm destruction.
         """
-        # Coerce: OWUI may deliver bools as strings (#57).  The string
-        # "false" is truthy in Python, so we must parse it explicitly.
-        if isinstance(confirm, str):
-            confirm = confirm.lower() not in ("false", "0", "no", "")
-        if not confirm:
+        # Gate on real human consent via OWUI's confirmation dialog.
+        if __event_call__:
+            confirmed = await __event_call__({
+                "type": "confirmation",
+                "data": {
+                    "title": "Destroy sandbox?",
+                    "message": (
+                        "This will permanently destroy the sandbox VM and "
+                        "all its contents. Persistent volume data is preserved. "
+                        "This action cannot be undone."
+                    ),
+                },
+            })
+            if not confirmed:
+                await _emit(__event_emitter__, "Destroy cancelled", done=True)
+                return "Destroy cancelled by user."
+        else:
+            # Fallback: if __event_call__ is not available (old OWUI or
+            # testing), refuse to proceed rather than silently destroying.
             return (
-                "Destroy aborted: confirm was not set to true. "
-                "Set confirm=true to permanently destroy the sandbox and all its contents."
+                "Error: cannot confirm destruction — interactive confirmation "
+                "is not available. Update Open WebUI or try again from the chat UI."
             )
         try:
             email = _get_email(__user__)

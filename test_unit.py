@@ -1932,9 +1932,7 @@ async def test_tools_schema_parity(R: Results):
             ("manpage", "str", True, "overview"),
         ],
         "handoff": [],
-        "destroy": [
-            ("confirm", "bool", True, False),
-        ],
+        "destroy": [],
         "onboard": [
             ("path", "str", False, None),
         ],
@@ -2063,7 +2061,7 @@ async def test_tools_schema_parity(R: Results):
     DUNDER_EXPECTATIONS = {
         "lathe": {"__user__", "__event_emitter__"},
         "handoff": {"__user__", "__event_emitter__"},
-        "destroy": {"__user__", "__event_emitter__"},
+        "destroy": {"__user__", "__event_emitter__", "__event_call__"},
         "onboard": {"__user__", "__chat_id__", "__event_emitter__"},
         "bash": {"__user__", "__chat_id__", "__event_emitter__"},
         "read": {"__user__", "__chat_id__", "__event_emitter__"},
