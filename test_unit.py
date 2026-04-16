@@ -906,8 +906,8 @@ async def test_delegate_tools_build(R: Results):
         },
         "read": {
             "path": ("string", False, None),
-            "offset": ("integer", True, 1),
-            "limit": ("integer", True, 2000),
+            "start": ("integer", True, 1),
+            "stop": ("integer", True, 0),
         },
         "write": {
             "path": ("string", False, None),
@@ -1077,6 +1077,12 @@ async def test_core_read_mock(R: Results):
             self._call_idx += 1
             return resp
 
+    # Helper: 10-line file content for reuse
+    TEN_LINES = "\n".join(f"line{i}" for i in range(1, 11)) + "\n"
+
+    def _client(content=TEN_LINES):
+        return FakeClient([FakeResponse(200, content)])
+
     print("\n── _core_read: relative path rejected ──")
     result = await _core_read(FakeValves(), "sb-id", FakeClient([]),
                               path="relative/path.py")
@@ -1088,7 +1094,7 @@ async def test_core_read_mock(R: Results):
                               path="/home/daytona/workspace/missing.py")
     R.check("reports file not found", "File not found" in result, result)
 
-    print("\n── _core_read: normal file ──")
+    print("\n── _core_read: normal file (defaults) ──")
     content = "line1\nline2\nline3\n"
     client = FakeClient([FakeResponse(200, content)])
     result = await _core_read(FakeValves(), "sb-id", client,
@@ -1099,16 +1105,54 @@ async def test_core_read_mock(R: Results):
     R.check("has line 2", "2: line2" in result, result)
     R.check("has line 3", "3: line3" in result, result)
 
-    print("\n── _core_read: offset and limit ──")
-    content = "\n".join(f"line{i}" for i in range(1, 11)) + "\n"
-    client = FakeClient([FakeResponse(200, content)])
-    result = await _core_read(FakeValves(), "sb-id", client,
+    print("\n── _core_read: positive start/stop ──")
+    result = await _core_read(FakeValves(), "sb-id", _client(),
                               path="/home/daytona/workspace/big.py",
-                              offset=3, limit=2)
+                              start=3, stop=5)
     R.check("shows correct range", "showing lines 3-4" in result, result[:100])
     R.check("starts at line 3", "3: line3" in result, result)
     R.check("has line 4", "4: line4" in result, result)
     R.check("no line 5", "5: line5" not in result, result)
+
+    print("\n── _core_read: negative start, stop=0 (last N lines) ──")
+    result = await _core_read(FakeValves(), "sb-id", _client(),
+                              path="/home/daytona/workspace/big.py",
+                              start=-3, stop=0)
+    R.check("has line 8", "8: line8" in result, result)
+    R.check("has line 9", "9: line9" in result, result)
+    R.check("has line 10", "10: line10" in result, result)
+    R.check("no line 7", "7: line7" not in result, result)
+
+    print("\n── _core_read: negative start and stop ──")
+    result = await _core_read(FakeValves(), "sb-id", _client(),
+                              path="/home/daytona/workspace/big.py",
+                              start=-5, stop=-3)
+    R.check("has line 6", "6: line6" in result, result)
+    R.check("has line 7", "7: line7" in result, result)
+    R.check("no line 8", "8: line8" not in result, result)
+    R.check("no line 5", "5: line5" not in result, result)
+
+    print("\n── _core_read: start=0 clamps to 1 ──")
+    result = await _core_read(FakeValves(), "sb-id", _client(),
+                              path="/home/daytona/workspace/big.py",
+                              start=0, stop=3)
+    R.check("starts at line 1", "1: line1" in result, result)
+    R.check("has line 2", "2: line2" in result, result)
+    R.check("no line 3", "3: line3" not in result, result)
+
+    print("\n── _core_read: empty range (start > stop after resolve) ──")
+    result = await _core_read(FakeValves(), "sb-id", _client(),
+                              path="/home/daytona/workspace/big.py",
+                              start=5, stop=3)
+    R.check("header still shows total", "10 lines total" in result, result[:100])
+    R.check("no content lines", "1: line" not in result, result)
+
+    print("\n── _core_read: out of bounds ──")
+    result = await _core_read(FakeValves(), "sb-id", _client(),
+                              path="/home/daytona/workspace/big.py",
+                              start=999, stop=0)
+    R.check("header shows total", "10 lines total" in result, result[:100])
+    R.check("empty body", "999:" not in result, result)
 
 
 async def test_core_write_mock(R: Results):
@@ -1925,8 +1969,8 @@ async def test_tools_schema_parity(R: Results):
         ],
         "read": [
             ("path", "str", False, None),
-            ("offset", "int", True, 1),
-            ("limit", "int", True, 2000),
+            ("start", "int", True, 1),
+            ("stop", "int", True, 0),
         ],
         "glob": [
             ("pattern", "str", False, None),

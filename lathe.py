@@ -5,7 +5,7 @@ author_url: https://adamsmith.as
 description: Coding agent tools (lathe, bash, read, write, edit, glob, grep, interpret, delegate, onboard, expose, destroy) backed by per-user sandbox VMs with transparent lifecycle management.
 required_open_webui_version: 0.4.0
 requirements: httpx, httpx-ws, pydantic-ai-slim[openai], cachetools
-version: 0.21.0
+version: 0.22.0
 licence: MIT
 """
 
@@ -1055,12 +1055,16 @@ def _standard_tool(core_fn, *, emit_start: str, emit_done: str,
 
 
 async def _core_read(valves, sandbox_id: str, client: httpx.AsyncClient, *,
-                     path: str, offset: int = 1, limit: int = 2000) -> str:
+                     path: str, start: int = 1, stop: int = 0) -> str:
     """Read a file from the sandbox. Returns numbered lines.
+    Supports Python-style negative indexing: start=-10 reads from
+    10 lines before the end, stop=-3 stops 3 lines before the end.
+    All positive values are 1-indexed. stop is exclusive (half-open).
+    stop=0 (default) means end of file.
 
     :param path: Absolute path to the file.
-    :param offset: Starting line number (1-indexed, default: 1).
-    :param limit: Max lines to return (default: 2000).
+    :param start: First line to return (1-indexed). Negative counts from end. 0 is treated as 1.
+    :param stop: Line to stop before (exclusive, 1-indexed). Negative counts from end. 0 means end of file.
     """
     err = _require_abs_path(path)
     if err:
@@ -1072,8 +1076,31 @@ async def _core_read(valves, sandbox_id: str, client: httpx.AsyncClient, *,
     if lines and lines[-1] == "":
         lines = lines[:-1]
     total_lines = len(lines)
-    start_idx = max(0, offset - 1)
-    end_idx = start_idx + limit
+
+    # Resolve start to a 0-based index.
+    if start == 0:
+        start_idx = 0
+    elif start > 0:
+        start_idx = start - 1  # 1-indexed to 0-indexed
+    else:
+        start_idx = max(0, total_lines + start)
+
+    # Resolve stop to a 0-based index (exclusive).
+    if stop == 0:
+        end_idx = total_lines
+    elif stop > 0:
+        end_idx = stop - 1  # 1-indexed exclusive: stop=5 means up to line 4
+    else:
+        end_idx = max(0, total_lines + stop)
+
+    # Clamp to valid range.
+    start_idx = max(0, min(start_idx, total_lines))
+    end_idx = max(start_idx, min(end_idx, total_lines))
+
+    # Apply internal truncation cap (2000 lines).
+    if end_idx - start_idx > 2000:
+        end_idx = start_idx + 2000
+
     selected = lines[start_idx:end_idx]
     numbered = "\n".join(
         f"{start_idx + i + 1}: {line}"
@@ -1081,7 +1108,7 @@ async def _core_read(valves, sandbox_id: str, client: httpx.AsyncClient, *,
     )
     header = f"File: {path} ({total_lines} lines total)"
     if start_idx > 0 or end_idx < total_lines:
-        header += f", showing lines {start_idx + 1}-{min(end_idx, total_lines)}"
+        header += f", showing lines {start_idx + 1}-{end_idx}"
     return f"{header}\n{numbered}"
 
 
