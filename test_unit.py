@@ -1228,83 +1228,64 @@ async def test_core_edit_mock(R: Results):
 
 
 async def test_string_typed_params(R: Results):
-    """Regression test for #57: numeric/bool params arriving as strings.
+    """Strict type enforcement: wrong-type params are rejected at the boundary.
 
-    OWUI may serialize int-annotated params as JSON strings.  All _core_*
-    functions and hand-written Tools methods must coerce them before
-    doing arithmetic or boolean comparisons.
+    After fixing __annotations__ so OWUI generates correct JSON schemas,
+    we enforce types strictly: if OWUI (or the model) sends a string where
+    an int or bool is expected, _check_tool_params rejects it rather than
+    silently coercing.
     """
-    from lathe import _core_read, _core_edit
+    from lathe import _check_tool_params
 
-    class FakeValves:
-        daytona_api_key = "fake"
-        daytona_api_url = "https://fake.api"
-        daytona_proxy_url = "https://fake.proxy"
+    print("\n── strict type check: int params ──")
+    # Correct type passes
+    err = _check_tool_params({"offset": 3, "limit": 2}, {"offset": int, "limit": int})
+    R.check("correct int: no error", err is None, repr(err))
 
-    class FakeResponse:
-        def __init__(self, status_code=200, text=""):
-            self.status_code = status_code
-            self.text = text
-        def raise_for_status(self):
-            pass
+    # String where int expected: rejected
+    err = _check_tool_params({"offset": "3"}, {"offset": int})
+    R.check("string for int: rejected", err is not None, repr(err))
+    R.check("string for int: mentions param", "offset" in err, err)
+    R.check("string for int: mentions expected type", "int" in err, err)
 
-    class FakeClient:
-        def __init__(self, get_response):
-            self._get_response = get_response
-            self.post_calls = []
-        async def get(self, url, **kwargs):
-            return self._get_response
-        async def post(self, url, **kwargs):
-            self.post_calls.append({"url": url, "kwargs": kwargs})
-            return FakeResponse()
+    print("\n── strict type check: bool params ──")
+    # Correct type passes
+    err = _check_tool_params({"replace_all": True}, {"replace_all": bool})
+    R.check("correct bool: no error", err is None, repr(err))
+    err = _check_tool_params({"replace_all": False}, {"replace_all": bool})
+    R.check("correct bool False: no error", err is None, repr(err))
 
-    # ── _core_read: offset and limit as strings ──────────────────
-    print("\n── #57 regression: _core_read with string offset/limit ──")
-    content = "\n".join(f"line{i}" for i in range(1, 11)) + "\n"
-    client = FakeClient(FakeResponse(200, content))
-    result = await _core_read(FakeValves(), "sb-id", client,
-                              path="/home/daytona/workspace/big.py",
-                              offset="3", limit="2")
-    R.check("string offset/limit: no TypeError", "showing lines 3-4" in result, result[:100])
-    R.check("string offset/limit: correct range", "3: line3" in result, result)
-    R.check("string offset/limit: has line 4", "4: line4" in result, result)
-    R.check("string offset/limit: no line 5", "5: line5" not in result, result)
+    # String where bool expected: rejected
+    err = _check_tool_params({"replace_all": "true"}, {"replace_all": bool})
+    R.check("string 'true' for bool: rejected", err is not None, repr(err))
+    err = _check_tool_params({"replace_all": "false"}, {"replace_all": bool})
+    R.check("string 'false' for bool: rejected", err is not None, repr(err))
 
-    print("\n── #57 regression: _core_read with string limit only ──")
-    client = FakeClient(FakeResponse(200, content))
-    result = await _core_read(FakeValves(), "sb-id", client,
-                              path="/home/daytona/workspace/big.py",
-                              limit="3")
-    R.check("string limit only: shows lines", "1: line1" in result, result)
-    R.check("string limit only: stops at 3", "3: line3" in result, result)
-    R.check("string limit only: no line 4", "4: line4" not in result, result)
+    # int where bool expected: rejected. Even though bool is a subclass
+    # of int, isinstance(1, bool) is False — 1 is not a bool.
+    err = _check_tool_params({"replace_all": 1}, {"replace_all": bool})
+    R.check("int for bool: rejected", err is not None, repr(err))
 
-    # ── _core_edit: replace_all as string ────────────────────────
-    print("\n── #57 regression: _core_edit with string replace_all ──")
+    print("\n── strict type check: str params skipped ──")
+    # str params are always skipped (everything is at least a string)
+    err = _check_tool_params({"path": "/foo"}, {"path": str})
+    R.check("str param: no error", err is None, repr(err))
 
-    # "true" should behave as True
-    client = FakeClient(FakeResponse(200, "foo bar foo"))
-    result = await _core_edit(FakeValves(), "sb-id", client,
-                              path="/home/daytona/workspace/x.py",
-                              old_string="foo", new_string="baz",
-                              replace_all="true")
-    R.check("string 'true' replaces all", "2 occurrence" in result, result)
+    print("\n── strict type check: list params ──")
+    err = _check_tool_params({"files": ["a.py"]}, {"files": list})
+    R.check("correct list: no error", err is None, repr(err))
+    err = _check_tool_params({"files": "a.py"}, {"files": list})
+    R.check("string for list: rejected", err is not None, repr(err))
 
-    # "false" should behave as False (not truthy!)
-    client = FakeClient(FakeResponse(200, "foo bar foo"))
-    result = await _core_edit(FakeValves(), "sb-id", client,
-                              path="/home/daytona/workspace/x.py",
-                              old_string="foo", new_string="baz",
-                              replace_all="false")
-    R.check("string 'false' rejects ambiguous", "2 matches" in result, result)
+    print("\n── strict type check: missing params ignored ──")
+    err = _check_tool_params({}, {"offset": int})
+    R.check("missing param: no error", err is None, repr(err))
 
-    # "False" (capitalized) should also behave as False
-    client = FakeClient(FakeResponse(200, "foo bar foo"))
-    result = await _core_edit(FakeValves(), "sb-id", client,
-                              path="/home/daytona/workspace/x.py",
-                              old_string="foo", new_string="baz",
-                              replace_all="False")
-    R.check("string 'False' rejects ambiguous", "2 matches" in result, result)
+    print("\n── strict type check: garbage values ──")
+    err = _check_tool_params({"offset": "hello"}, {"offset": int})
+    R.check("garbage string for int: rejected", err is not None, repr(err))
+    err = _check_tool_params({"offset": [1, 2]}, {"offset": int})
+    R.check("list for int: rejected", err is not None, repr(err))
 
 
 async def test_delegate_bash_foreground(R: Results):

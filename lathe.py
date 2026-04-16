@@ -5,7 +5,7 @@ author_url: https://adamsmith.as
 description: Coding agent tools (lathe, bash, read, write, edit, glob, grep, interpret, delegate, onboard, expose, destroy) backed by per-user sandbox VMs with transparent lifecycle management.
 required_open_webui_version: 0.4.0
 requirements: httpx, httpx-ws, pydantic-ai-slim[openai], cachetools
-version: 0.20.0
+version: 0.21.0
 licence: MIT
 """
 
@@ -16,6 +16,7 @@ import json
 import re
 import textwrap
 import time
+import typing
 import urllib.parse
 import uuid
 
@@ -885,6 +886,29 @@ async def _run_sandbox_script(valves, sandbox_id: str, client: httpx.AsyncClient
 
 
 
+def _check_tool_params(kwargs: dict, annotations: dict) -> str | None:
+    """Strict type check for tool params at the wrapper boundary.
+
+    Returns an error string if any param has the wrong runtime type,
+    or None if all params are valid.  Only checks params that appear
+    in both kwargs and annotations.  Skips str params (everything
+    arrives as a string at minimum).
+    """
+    for name, expected_type in annotations.items():
+        if name not in kwargs or expected_type is str:
+            continue
+        value = kwargs[name]
+        # get_origin resolves list[str] -> list, etc.
+        base_type = typing.get_origin(expected_type) or expected_type
+        if not isinstance(value, base_type):
+            return (
+                f"Error: parameter '{name}' expected type "
+                f"{expected_type.__name__ if hasattr(expected_type, '__name__') else str(expected_type)}"
+                f", got {type(value).__name__}: {value!r}"
+            )
+    return None
+
+
 # Infrastructure params in _core_* signatures that are NOT tool params.
 # The _standard_tool factory skips these when building the OWUI-visible
 # method signature.
@@ -946,6 +970,12 @@ def _standard_tool(core_fn, *, emit_start: str, emit_done: str,
 
     # Names of tool params for extracting kwargs at call time
     tool_param_names = [p.name for p in tool_params]
+    # Annotation map for strict type checking at the boundary
+    tool_annotations = {
+        p.name: p.annotation
+        for p in tool_params
+        if p.annotation is not inspect.Parameter.empty
+    }
 
     async def _method(self, *args, **kwargs):
         # Bind positional + keyword args to the synthetic signature.
@@ -962,6 +992,11 @@ def _standard_tool(core_fn, *, emit_start: str, emit_done: str,
 
         # Remaining args are tool kwargs
         tool_kwargs = {k: ba[k] for k in tool_param_names if k in ba}
+
+        # Strict type check at the wrapper boundary.
+        type_err = _check_tool_params(tool_kwargs, tool_annotations)
+        if type_err:
+            return type_err
 
         async def _run(client):
             email = _get_email(__user__)
@@ -1027,9 +1062,6 @@ async def _core_read(valves, sandbox_id: str, client: httpx.AsyncClient, *,
     err = _require_abs_path(path)
     if err:
         return err
-    # Coerce numeric params: OWUI may deliver them as strings (#57).
-    offset = int(offset)
-    limit = int(limit)
     content = await _download_file(valves, sandbox_id, client, path)
     if content is None:
         return f"Error: File not found: {path}"
@@ -1083,10 +1115,6 @@ async def _core_edit(valves, sandbox_id: str, client: httpx.AsyncClient, *,
     :param new_string: Replacement text.
     :param replace_all: Replace all occurrences (default: false).
     """
-    # Coerce: OWUI may deliver params as strings (#57).  For bools,
-    # the string "false" is truthy, so we must parse it explicitly.
-    if isinstance(replace_all, str):
-        replace_all = replace_all.lower() not in ("false", "0", "no", "")
     err = _require_abs_path(path)
     if err:
         return err
@@ -1122,8 +1150,6 @@ async def _core_glob(valves, sandbox_id: str, client: httpx.AsyncClient, *,
     :param pattern: Comma-separated globs, !-prefix to exclude. Examples: '**/*.py', 'src/**/*.ts,!**/node_modules/**'.
     :param max_lines: Max output lines (default: 100).
     """
-    # Coerce numeric params: OWUI may deliver them as strings (#57).
-    max_lines = int(max_lines)
     clamped = max(1, min(500, max_lines))
     base_dir = "/home/daytona/workspace"
     script = (
@@ -1147,8 +1173,6 @@ async def _core_grep(valves, sandbox_id: str, client: httpx.AsyncClient, *,
     :param files: File scope as comma-separated globs (default: '**/*'). !-prefix to exclude.
     :param max_lines: Max output lines (default: 100).
     """
-    # Coerce numeric params: OWUI may deliver them as strings (#57).
-    max_lines = int(max_lines)
     clamped = max(1, min(500, max_lines))
     base_dir = "/home/daytona/workspace"
     script = (
@@ -1252,8 +1276,6 @@ async def _core_bash(valves, sandbox_id: str, client: httpx.AsyncClient, *,
     :param workdir: Working directory (default: /home/daytona/workspace).
     :param foreground_seconds: Seconds to wait before auto-backgrounding (default: 15). Use higher values for known-slow commands.
     """
-    # Coerce numeric params: OWUI may deliver them as strings (#57).
-    foreground_seconds = int(foreground_seconds)
     cmd_id = str(uuid.uuid4())
     cmd_dir = f"/tmp/cmd/{cmd_id}"
     log_path = f"{cmd_dir}/log"
@@ -1579,8 +1601,6 @@ async def _core_interpret(valves, sandbox_id: str, client: httpx.AsyncClient,
     :param code: Python code to execute. Top-level await is not supported.
     :param timeout: Max execution time in seconds (default: 120). Use 0 for no limit.
     """
-    # Coerce numeric params: OWUI may deliver them as strings (#57).
-    timeout = int(timeout)
     from httpx_ws import aconnect_ws, WebSocketDisconnect
 
     if not code.strip():
@@ -3379,6 +3399,14 @@ class Tools:
         __chat_id__: str = "",
         __event_emitter__=None,
     ) -> str:
+        # Strict type check at the wrapper boundary.
+        type_err = _check_tool_params(
+            {"foreground_seconds": foreground_seconds},
+            {"foreground_seconds": int},
+        )
+        if type_err:
+            return type_err
+
         async def _run(client):
             email = _get_email(__user__)
             sandbox_id, _sb_warning = await _ensure_sandbox(self.valves, email, client, __event_emitter__)
@@ -3398,9 +3426,8 @@ class Tools:
                 user_pairs = _parse_env_vars(raw_env)
 
             # Per-call override wins; 0 (default) falls back to Valve.
-            # Coerce: OWUI may deliver numeric params as strings (#57).
             fg_seconds = (
-                int(foreground_seconds) if int(foreground_seconds) > 0
+                foreground_seconds if foreground_seconds > 0
                 else self.valves.foreground_timeout_seconds
             )
 
@@ -3494,6 +3521,15 @@ class Tools:
         :param max_steps: Maximum inference calls the sub-agent may make (default: 10, max: 30).
         :param foreground_seconds: Seconds to wait before auto-backgrounding (default: 30, max: 300). Set 0 for immediate background (fire-and-forget). Omit or set -1 to use the default.
         """
+        # Strict type check at the wrapper boundary.
+        type_err = _check_tool_params(
+            {"context_files": context_files, "max_steps": max_steps,
+             "foreground_seconds": foreground_seconds},
+            {"context_files": list, "max_steps": int, "foreground_seconds": int},
+        )
+        if type_err:
+            return type_err
+
         async def _run(client):
             email = _get_email(__user__)
             sandbox_id, _sb_warning = await _ensure_sandbox(self.valves, email, client, __event_emitter__)
@@ -3585,9 +3621,6 @@ class Tools:
             user_message = _build_delegate_prompt(task, file_sections)
 
             # ── Create and run the agent ─────────────────────────────
-            # Coerce: OWUI may deliver numeric params as strings (#57).
-            max_steps = int(max_steps)
-            foreground_seconds = int(foreground_seconds)
             clamped_steps = max(1, min(30, max_steps))
 
             agent = Agent(
