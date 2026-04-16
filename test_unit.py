@@ -1921,7 +1921,7 @@ async def test_tools_schema_parity(R: Results):
         "bash": [
             ("command", "str", False, None),
             ("workdir", "str", True, "/home/daytona/workspace"),
-            ("foreground_seconds", "int", True, 0),
+            ("foreground_seconds", "int", True, -1),
         ],
         "read": [
             ("path", "str", False, None),

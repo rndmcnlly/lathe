@@ -13,6 +13,7 @@ import asyncio
 import inspect
 import io
 import json
+import logging
 import re
 import textwrap
 import time
@@ -24,6 +25,8 @@ import httpx
 from cachetools import LRUCache
 from pydantic import BaseModel, Field
 
+
+logger = logging.getLogger("lathe")
 
 # ── module-level helpers (invisible to OWUI tool discovery) ──────────
 #
@@ -1274,7 +1277,7 @@ async def _core_bash(valves, sandbox_id: str, client: httpx.AsyncClient, *,
 
     :param command: The bash command to execute.
     :param workdir: Working directory (default: /home/daytona/workspace).
-    :param foreground_seconds: Seconds to wait before auto-backgrounding (default: 15). Use higher values for known-slow commands.
+    :param foreground_seconds: Seconds to wait before auto-backgrounding. Omit or set -1 to use the server default. Set 0 for immediate background (fire-and-forget). Use higher positive values for known-slow commands.
     """
     cmd_id = str(uuid.uuid4())
     cmd_dir = f"/tmp/cmd/{cmd_id}"
@@ -1332,7 +1335,12 @@ async def _core_bash(valves, sandbox_id: str, client: httpx.AsyncClient, *,
     session_cmd_id = resp.json().get("cmdId", "")
 
     # ── Foreground polling window ────────────────────────────────
-    fg_timeout = max(1, min(300, foreground_seconds))
+    # 0 = immediate background (fire-and-forget).  Positive values
+    # are clamped to [1, 300].
+    if foreground_seconds <= 0:
+        fg_timeout = 0.01  # single poll iteration, then background
+    else:
+        fg_timeout = max(1, min(300, foreground_seconds))
     deadline = time.time() + fg_timeout
     poll_interval = 0.25
     last_status_at = time.time()
@@ -1471,14 +1479,14 @@ async def _poll_bg_bash(valves, sandbox_id: str, session_id: str,
                 )
                 if log_resp.status_code == 200:
                     tail = log_resp.text
-            except Exception:
-                pass  # best-effort
+            except Exception as e:
+                logger.debug("bg-poll: failed to fetch log tail: %s", e)
 
             notice = _format_bg_bash_notice(cmd_id, exit_code, elapsed, tail)
             _push_bg_notice(chat_state, chat_id, notice)
 
-        except Exception:
-            pass  # entire poller is best-effort, never propagate
+        except Exception as e:
+            logger.debug("bg-poll: poller failed: %s", e)
 
 
 # ── Code interpreter ─────────────────────────────────────────────────
@@ -1528,8 +1536,8 @@ async def _ensure_interpreter_context(
                 contexts = resp.json().get("contexts", [])
                 if any(c.get("id") == ctx_id for c in contexts):
                     return ctx_id, False
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("interpreter context probe failed: %s", e)
         # Context is gone (sandbox restarted, etc.)  Fall through to create.
 
     # Create a new context.
@@ -1853,8 +1861,8 @@ async def _chat_auto_init(
             data = resp.json()
             if data.get("exitCode") == 0 and data.get("result", "").strip():
                 parts.append(data["result"].strip())
-    except Exception:
-        pass  # non-fatal: snapshot is best-effort
+    except Exception as e:
+        logger.debug("auto-init: snapshot failed: %s", e)
 
     # ── Sandbox metadata from Daytona API ────────────────────────
     try:
@@ -1880,8 +1888,8 @@ async def _chat_auto_init(
                 meta_parts.append(f"region: {region}")
             if meta_parts:
                 parts.append("Sandbox: " + ", ".join(meta_parts))
-    except Exception:
-        pass  # non-fatal
+    except Exception as e:
+        logger.debug("auto-init: sandbox metadata fetch failed: %s", e)
 
     # ── User env var names (values never exposed) ────────────────
     try:
@@ -1892,8 +1900,8 @@ async def _chat_auto_init(
             if pairs:
                 names = ", ".join(k for k, _v in pairs)
                 parts.append(f"User env vars: {names}")
-    except Exception:
-        pass  # non-fatal
+    except Exception as e:
+        logger.debug("auto-init: env var parsing failed: %s", e)
 
     if len(parts) > 1:
         state = chat_state[chat_id]
@@ -2336,8 +2344,8 @@ async def _wait_for_toolbox(valves, sandbox_id: str, client: httpx.AsyncClient, 
                         timeout=10.0,
                     )
                     return
-        except (httpx.HTTPError, httpx.TimeoutException):
-            pass
+        except (httpx.HTTPError, httpx.TimeoutException) as e:
+            logger.debug("wait-for-toolbox: attempt %d failed: %s", attempt, e)
         await asyncio.sleep(1)
         if attempt == 2:
             await _emit(emitter, "Waiting for sandbox to become ready...")
@@ -3394,7 +3402,7 @@ class Tools:
         self,
         command: str,
         workdir: str = "/home/daytona/workspace",
-        foreground_seconds: int = 0,
+        foreground_seconds: int = -1,
         __user__: dict = {},
         __chat_id__: str = "",
         __event_emitter__=None,
@@ -3425,11 +3433,14 @@ class Tools:
                 raw_env = getattr(user_valves, "env_vars", "") or ""
                 user_pairs = _parse_env_vars(raw_env)
 
-            # Per-call override wins; 0 (default) falls back to Valve.
-            fg_seconds = (
-                foreground_seconds if foreground_seconds > 0
-                else self.valves.foreground_timeout_seconds
-            )
+            # Negative (default) falls back to the valve setting.
+            # 0 means immediate background (fire-and-forget), matching
+            # delegate() semantics.  Positive values are the foreground
+            # window in seconds.
+            if foreground_seconds < 0:
+                fg_seconds = self.valves.foreground_timeout_seconds
+            else:
+                fg_seconds = foreground_seconds
 
             # When the command auto-backgrounds, spawn a polling coroutine
             # to push a completion notice into the chat's message queue.
@@ -3675,8 +3686,8 @@ class Tools:
                         self.valves, sandbox_id, bg_client,
                         path=log_path, content="\n".join(log_lines) + "\n",
                     )
-                except Exception:
-                    pass  # best-effort log writes
+                except Exception as e:
+                    logger.debug("delegate: sidecar log write failed: %s", e)
 
             # ── The actual sub-agent execution coroutine ─────────────
             # This is separated so it can either run inline (foreground)
@@ -3818,8 +3829,8 @@ class Tools:
                             path=error_path, content=error_msg,
                         )
                         await _append_log(f"Error: {error_msg}")
-                    except Exception:
-                        pass  # best-effort error file write
+                    except Exception as e2:
+                        logger.debug("delegate: sidecar error write failed: %s", e2)
 
                 finally:
                     agent_done.set()
