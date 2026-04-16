@@ -1226,6 +1226,86 @@ async def test_core_edit_mock(R: Results):
     R.check("reports 2 replacements", "2 occurrence" in result, result)
 
 
+async def test_string_typed_params(R: Results):
+    """Regression test for #57: numeric/bool params arriving as strings.
+
+    OWUI may serialize int-annotated params as JSON strings.  All _core_*
+    functions and hand-written Tools methods must coerce them before
+    doing arithmetic or boolean comparisons.
+    """
+    from lathe import _core_read, _core_edit
+
+    class FakeValves:
+        daytona_api_key = "fake"
+        daytona_api_url = "https://fake.api"
+        daytona_proxy_url = "https://fake.proxy"
+
+    class FakeResponse:
+        def __init__(self, status_code=200, text=""):
+            self.status_code = status_code
+            self.text = text
+        def raise_for_status(self):
+            pass
+
+    class FakeClient:
+        def __init__(self, get_response):
+            self._get_response = get_response
+            self.post_calls = []
+        async def get(self, url, **kwargs):
+            return self._get_response
+        async def post(self, url, **kwargs):
+            self.post_calls.append({"url": url, "kwargs": kwargs})
+            return FakeResponse()
+
+    # ── _core_read: offset and limit as strings ──────────────────
+    print("\n── #57 regression: _core_read with string offset/limit ──")
+    content = "\n".join(f"line{i}" for i in range(1, 11)) + "\n"
+    client = FakeClient(FakeResponse(200, content))
+    result = await _core_read(FakeValves(), "sb-id", client,
+                              path="/home/daytona/workspace/big.py",
+                              offset="3", limit="2")
+    R.check("string offset/limit: no TypeError", "showing lines 3-4" in result, result[:100])
+    R.check("string offset/limit: correct range", "3: line3" in result, result)
+    R.check("string offset/limit: has line 4", "4: line4" in result, result)
+    R.check("string offset/limit: no line 5", "5: line5" not in result, result)
+
+    print("\n── #57 regression: _core_read with string limit only ──")
+    client = FakeClient(FakeResponse(200, content))
+    result = await _core_read(FakeValves(), "sb-id", client,
+                              path="/home/daytona/workspace/big.py",
+                              limit="3")
+    R.check("string limit only: shows lines", "1: line1" in result, result)
+    R.check("string limit only: stops at 3", "3: line3" in result, result)
+    R.check("string limit only: no line 4", "4: line4" not in result, result)
+
+    # ── _core_edit: replace_all as string ────────────────────────
+    print("\n── #57 regression: _core_edit with string replace_all ──")
+
+    # "true" should behave as True
+    client = FakeClient(FakeResponse(200, "foo bar foo"))
+    result = await _core_edit(FakeValves(), "sb-id", client,
+                              path="/home/daytona/workspace/x.py",
+                              old_string="foo", new_string="baz",
+                              replace_all="true")
+    R.check("string 'true' replaces all", "2 occurrence" in result, result)
+
+    # "false" should behave as False (not truthy!)
+    client = FakeClient(FakeResponse(200, "foo bar foo"))
+    result = await _core_edit(FakeValves(), "sb-id", client,
+                              path="/home/daytona/workspace/x.py",
+                              old_string="foo", new_string="baz",
+                              replace_all="false")
+    R.check("string 'false' rejects ambiguous", "2 matches" in result, result)
+
+    # "False" (capitalized) should also behave as False
+    client = FakeClient(FakeResponse(200, "foo bar foo"))
+    result = await _core_edit(FakeValves(), "sb-id", client,
+                              path="/home/daytona/workspace/x.py",
+                              old_string="foo", new_string="baz",
+                              replace_all="False")
+    R.check("string 'False' rejects ambiguous", "2 matches" in result, result)
+
+
 async def test_delegate_bash_foreground(R: Results):
     """Test that delegate bash uses a shorter foreground timeout."""
     from lathe import _DELEGATE_BASH_FOREGROUND_SECONDS
@@ -2026,6 +2106,7 @@ TESTS = {
     "core_read_mock": test_core_read_mock,
     "core_write_mock": test_core_write_mock,
     "core_edit_mock": test_core_edit_mock,
+    "string_typed_params": test_string_typed_params,
     "delegate_bash_foreground": test_delegate_bash_foreground,
     "format_delegate_background": test_format_delegate_background,
     "delegate_foreground_constant": test_delegate_foreground_constant,
