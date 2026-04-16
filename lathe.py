@@ -999,8 +999,16 @@ def _standard_tool(core_fn, *, emit_start: str, emit_done: str,
 
         return await _tool_context(__event_emitter__, _run)
 
-    # ── Set the correct signature and docstring ──────────────────────
+    # ── Set the correct signature, annotations, and docstring ────────
     _method.__signature__ = synth_sig
+    # OWUI uses get_type_hints() (which reads __annotations__) for the
+    # JSON schema type mapping, NOT inspect.signature().annotation.
+    # Without this, all _standard_tool params fall back to "string".
+    _method.__annotations__ = {
+        p.name: p.annotation
+        for p in synth_params
+        if p.annotation is not inspect.Parameter.empty and p.name != "self"
+    }
     _method.__doc__ = inspect.getdoc(core_fn) or ""
     _method.__name__ = core_fn.__name__.replace("_core_", "")
     _method.__qualname__ = f"Tools.{_method.__name__}"

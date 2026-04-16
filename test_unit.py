@@ -12,6 +12,7 @@ import sys
 import os
 import tempfile
 import time
+import typing
 
 sys.path.insert(0, os.path.dirname(__file__))
 
@@ -2085,6 +2086,32 @@ async def test_tools_schema_parity(R: Results):
         R.check(f"{method_name}: dunder params",
                 actual_dunders == expected_dunders,
                 f"expected {sorted(expected_dunders)}, got {sorted(actual_dunders)}")
+
+    # Verify get_type_hints() returns correct types for all tool params.
+    # OWUI uses get_type_hints() (not inspect.signature().annotation) to
+    # build the JSON schema sent to models.  If __annotations__ is missing,
+    # all params silently fall back to "string" in the schema.
+    print("\n── Tools schema parity: get_type_hints() ──")
+    for method_name, expected_params in EXPECTED.items():
+        if method_name not in public_methods:
+            continue
+        method = public_methods[method_name]
+        hints = typing.get_type_hints(method)
+        for exp_name, exp_type, _has_default, _default in expected_params:
+            hint = hints.get(exp_name)
+            if exp_type == "empty":
+                R.check(f"{method_name}.{exp_name}: type hint absent",
+                        hint is None,
+                        f"expected no hint, got {hint}")
+            else:
+                expected_cls = {"str": str, "int": int, "bool": bool,
+                                "list": list, "dict": dict}.get(exp_type)
+                # For parameterized generics like list[str], compare
+                # the origin type (list) rather than the full generic.
+                actual = typing.get_origin(hint) or hint
+                R.check(f"{method_name}.{exp_name}: type hint",
+                        actual == expected_cls,
+                        f"expected {expected_cls}, got {hint}")
 
 
 TESTS = {

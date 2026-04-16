@@ -92,9 +92,11 @@ To change tool behavior, edit the `_core_*` function. Both surfaces pick it up.
 
 ### `_standard_tool` factory
 
-`_standard_tool(core_fn, emit_start, emit_done, extra_core_kwargs)` builds a Tools class method from a `_core_*` function. It introspects the core function's signature to extract tool-visible parameters (skipping infrastructure params in `_CORE_INFRA_PARAMS`), constructs a synthetic `inspect.Signature` combining tool params + OWUI dunder params, and sets `__signature__` explicitly on the generated method. This is critical: OWUI uses `inspect.signature()` to build the JSON schema the model sees, and `functools.wraps` does NOT copy `__signature__`.
+`_standard_tool(core_fn, emit_start, emit_done, extra_core_kwargs)` builds a Tools class method from a `_core_*` function. It introspects the core function's signature to extract tool-visible parameters (skipping infrastructure params in `_CORE_INFRA_PARAMS`), constructs a synthetic `inspect.Signature` combining tool params + OWUI dunder params, and sets both `__signature__` and `__annotations__` explicitly on the generated method.
 
-The `tools_schema_parity` unit test locks in the known-good parameter names, types, defaults, and dunder params for every Tools method, catching silent schema breakage.
+**Both are critical.** OWUI's `convert_function_to_pydantic_model` uses `inspect.signature()` for parameter names and defaults, but `get_type_hints()` (which reads `__annotations__`) for **types**. Without `__annotations__`, all params silently fall back to `Any`, which Pydantic renders as `"type": "string"` in the JSON schema after OWUI's `clean_properties` fallback. `functools.wraps` copies `__annotations__` but does NOT copy `__signature__`, so both must be set manually on dynamically generated methods.
+
+The `tools_schema_parity` unit test locks in the known-good parameter names, types, defaults, dunder params, and `get_type_hints()` results for every Tools method, catching silent schema breakage.
 
 ### Docstring single source of truth
 
