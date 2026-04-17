@@ -669,6 +669,261 @@ async def test_grep_script(R: Results):
             shutil.rmtree(sibling)
 
 
+async def test_read_script(R: Results):
+    from lathe import _READ_SCRIPT
+
+    def run_read(path, start, stop):
+        """Exec the read script via subprocess, return stdout."""
+        script = (
+            _READ_SCRIPT
+            + f"\nprint(read_file({path!r}, {start!r}, {stop!r}))"
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            capture_output=True, text=True,
+        )
+        if result.returncode != 0:
+            return f"SCRIPT ERROR: {result.stderr}"
+        return result.stdout.rstrip("\n")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        def writef(name, content):
+            p = os.path.join(tmp, name)
+            with open(p, "w") as f:
+                f.write(content)
+            return p
+
+        # ── Basic read (all lines) ───────────────────────────────
+        print("\n── read_script: basic read ──")
+        p = writef("basic.txt", "line1\nline2\nline3\n")
+        out = run_read(p, 1, 0)
+        R.check("no script error", not out.startswith("SCRIPT ERROR"), out[:100])
+        R.check("has file header", "File:" in out and "3 lines total" in out, out[:80])
+        R.check("has line 1", "1: line1" in out, out)
+        R.check("has line 2", "2: line2" in out, out)
+        R.check("has line 3", "3: line3" in out, out)
+        R.check("no range annotation", "showing lines" not in out, out[:80])
+
+        # ── Positive start/stop ──────────────────────────────────
+        print("\n── read_script: positive start/stop ──")
+        p = writef("ten.txt", "\n".join(f"line{i}" for i in range(1, 11)) + "\n")
+        out = run_read(p, 3, 5)
+        R.check("range annotation present", "showing lines 3-4" in out, out[:100])
+        R.check("has line 3", "3: line3" in out, out)
+        R.check("has line 4", "4: line4" in out, out)
+        R.check("no line 5", "5: line5" not in out, out)
+
+        # ── Negative start (last N lines) ────────────────────────
+        print("\n── read_script: negative start ──")
+        out = run_read(p, -3, 0)
+        R.check("has line 8", "8: line8" in out, out)
+        R.check("has line 9", "9: line9" in out, out)
+        R.check("has line 10", "10: line10" in out, out)
+        R.check("no line 7", "7: line7" not in out, out)
+
+        # ── Negative start and stop ──────────────────────────────
+        print("\n── read_script: negative start and stop ──")
+        out = run_read(p, -5, -3)
+        R.check("has line 6", "6: line6" in out, out)
+        R.check("has line 7", "7: line7" in out, out)
+        R.check("no line 8", "8: line8" not in out, out)
+        R.check("no line 5", "5: line5" not in out, out)
+
+        # ── start=0 treated as 1 ─────────────────────────────────
+        print("\n── read_script: start=0 clamps to 1 ──")
+        out = run_read(p, 0, 3)
+        R.check("starts at line 1", "1: line1" in out, out)
+        R.check("no line 3", "3: line3" not in out, out)
+
+        # ── Empty range ───────────────────────────────────────────
+        print("\n── read_script: empty range ──")
+        out = run_read(p, 5, 3)
+        R.check("header shows total", "10 lines total" in out, out[:100])
+        R.check("no numbered lines", "1: line" not in out, out)
+
+        # ── File not found ────────────────────────────────────────
+        print("\n── read_script: file not found ──")
+        out = run_read("/nonexistent/path/file.txt", 1, 0)
+        R.check("reports not found", out.startswith("Error:") and "not found" in out.lower(), out[:80])
+
+        # ── File with special chars in path ───────────────────────
+        print("\n── read_script: special chars in path ──")
+        tricky = writef("it's a 'test'.txt", "hello\nworld\n")
+        out = run_read(tricky, 1, 0)
+        R.check("reads file with special path", "1: hello" in out, out)
+
+        # ── 2000-line cap ─────────────────────────────────────────
+        print("\n── read_script: 2000-line cap ──")
+        big = writef("big.txt", "\n".join(f"x{i}" for i in range(3000)) + "\n")
+        out = run_read(big, 1, 0)
+        line_count = out.count("\n")
+        R.check("capped at 2000 lines", line_count <= 2001, f"got {line_count} lines")
+
+
+async def test_write_script(R: Results):
+    from lathe import _WRITE_SCRIPT
+
+    def run_write(path, content):
+        """Exec the write script via subprocess, return stdout."""
+        script = (
+            _WRITE_SCRIPT
+            + f"\nprint(write_file({path!r}, {content!r}))"
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            capture_output=True, text=True,
+        )
+        if result.returncode != 0:
+            return f"SCRIPT ERROR: {result.stderr}"
+        return result.stdout.rstrip("\n")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        def readf(path):
+            with open(path) as f:
+                return f.read()
+
+        # ── Basic write ──────────────────────────────────────────
+        print("\n── write_script: basic write ──")
+        p = os.path.join(tmp, "basic.txt")
+        out = run_write(p, "hello\nworld\n")
+        R.check("no script error", not out.startswith("SCRIPT ERROR"), out[:100])
+        R.check("reports bytes", "12 bytes" in out, out)
+        R.check("reports lines", "2 lines" in out, out)
+        R.check("reports path", p in out, out)
+        R.check("file written", readf(p) == "hello\nworld\n", readf(p))
+
+        # ── Creates parent directories ────────────────────────────
+        print("\n── write_script: creates parents ──")
+        p = os.path.join(tmp, "a", "b", "c", "nested.py")
+        out = run_write(p, "x = 1\n")
+        R.check("nested write succeeds", "Wrote" in out, out)
+        R.check("nested file written", readf(p) == "x = 1\n", readf(p))
+
+        # ── Overwrites existing file ──────────────────────────────
+        print("\n── write_script: overwrites existing ──")
+        p = os.path.join(tmp, "over.txt")
+        run_write(p, "original\n")
+        out = run_write(p, "replaced\n")
+        R.check("overwrite succeeds", "Wrote" in out, out)
+        R.check("content replaced", readf(p) == "replaced\n", readf(p))
+
+        # ── Byte count is UTF-8 ───────────────────────────────────
+        print("\n── write_script: UTF-8 byte count ──")
+        p = os.path.join(tmp, "utf8.txt")
+        content = "café\n"  # 'é' is 2 bytes in UTF-8
+        out = run_write(p, content)
+        expected_bytes = len(content.encode("utf-8"))
+        R.check("byte count is UTF-8", str(expected_bytes) + " bytes" in out, out)
+
+        # ── Empty file ────────────────────────────────────────────
+        print("\n── write_script: empty file ──")
+        p = os.path.join(tmp, "empty.txt")
+        out = run_write(p, "")
+        R.check("empty write succeeds", "Wrote" in out, out)
+        R.check("empty file exists", os.path.exists(p), p)
+
+        # ── Content with special chars ────────────────────────────
+        print("\n── write_script: special chars in content ──")
+        p = os.path.join(tmp, "special.py")
+        content = "x = \"it's a \\\"test\\\"\"\n"
+        out = run_write(p, content)
+        R.check("special chars no script error",
+                not out.startswith("SCRIPT ERROR"), out[:100])
+        R.check("file content correct", readf(p) == content, readf(p))
+
+        # ── No trailing newline line count ────────────────────────
+        print("\n── write_script: no trailing newline ──")
+        p = os.path.join(tmp, "nonl.txt")
+        out = run_write(p, "a\nb\nc")
+        R.check("3 lines reported", "3 lines" in out, out)
+
+
+async def test_edit_script(R: Results):
+    from lathe import _EDIT_SCRIPT
+
+    def run_edit(path, old_string, new_string, replace_all):
+        """Exec the edit script via subprocess, return stdout."""
+        script = (
+            _EDIT_SCRIPT
+            + f"\nprint(edit_file({path!r}, {old_string!r}, {new_string!r}, {replace_all!r}))"
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            capture_output=True, text=True,
+        )
+        if result.returncode != 0:
+            return f"SCRIPT ERROR: {result.stderr}"
+        return result.stdout.rstrip("\n")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        def writef(name, content):
+            p = os.path.join(tmp, name)
+            with open(p, "w") as f:
+                f.write(content)
+            return p
+
+        def readf(path):
+            with open(path) as f:
+                return f.read()
+
+        # ── Single match succeeds ────────────────────────────────
+        print("\n── edit_script: single match ──")
+        p = writef("single.txt", "hello world\n")
+        out = run_edit(p, "hello", "goodbye", False)
+        R.check("reports 1 replacement", "Replaced 1 occurrence" in out, out)
+        R.check("file updated", readf(p) == "goodbye world\n", readf(p))
+
+        # ── No match returns error ───────────────────────────────
+        print("\n── edit_script: no match ──")
+        p = writef("nomatch.txt", "hello world\n")
+        out = run_edit(p, "ZZZNOMATCH", "x", False)
+        R.check("reports not found", out.startswith("Error:") and "not found" in out, out)
+        R.check("file unchanged", readf(p) == "hello world\n", readf(p))
+
+        # ── Ambiguous match without replace_all ─────────────────
+        print("\n── edit_script: ambiguous match ──")
+        p = writef("ambig.txt", "foo bar foo\n")
+        out = run_edit(p, "foo", "baz", False)
+        R.check("reports 2 matches", "2 matches" in out or "Found 2" in out, out)
+        R.check("suggests replace_all", "replace_all" in out, out)
+        R.check("file unchanged", readf(p) == "foo bar foo\n", readf(p))
+
+        # ── replace_all replaces all occurrences ─────────────────
+        print("\n── edit_script: replace_all ──")
+        p = writef("all.txt", "foo bar foo\n")
+        out = run_edit(p, "foo", "baz", True)
+        R.check("reports 2 replacements", "2 occurrence" in out, out)
+        R.check("both replaced", readf(p) == "baz bar baz\n", readf(p))
+
+        # ── File not found ────────────────────────────────────────
+        print("\n── edit_script: file not found ──")
+        out = run_edit("/nonexistent/path/x.txt", "a", "b", False)
+        R.check("reports not found", out.startswith("Error:") and "not found" in out.lower(), out)
+
+        # ── Multiline old/new strings ─────────────────────────────
+        print("\n── edit_script: multiline strings ──")
+        p = writef("multi.txt", "def foo():\n    pass\n\ndef bar():\n    pass\n")
+        out = run_edit(p, "def foo():\n    pass", "def foo():\n    return 42", False)
+        R.check("multiline replacement succeeds", "Replaced 1" in out, out)
+        R.check("new content present", "return 42" in readf(p), readf(p))
+
+        # ── Strings with special chars (quotes, backslashes) ─────
+        print("\n── edit_script: strings with special chars ──")
+        p = writef("special.txt", "it's a \"test\"\n")
+        out = run_edit(p, "it's a \"test\"", "it works", False)
+        R.check("special chars no script error",
+                not out.startswith("SCRIPT ERROR"), out[:100])
+        R.check("special chars replaced", "Replaced 1" in out, out)
+        R.check("file updated", readf(p) == "it works\n", readf(p))
+
+        # ── replace_all=False with multiple → error, file untouched ──
+        print("\n── edit_script: multiple + replace_all=False ──")
+        p = writef("multi2.txt", "x x x\n")
+        out = run_edit(p, "x", "y", False)
+        R.check("reports 3 matches", "3" in out and "match" in out, out)
+        R.check("file untouched", readf(p) == "x x x\n", readf(p))
+
+
 async def test_delegate_infrastructure(R: Results):
     from lathe import (
         _build_delegate_system_prompt, _DELEGATE_WITHHELD,
@@ -1051,9 +1306,14 @@ async def test_format_bash_result(R: Results):
 
 
 async def test_core_read_mock(R: Results):
-    """Test _core_read with a mock httpx client."""
+    """Test _core_read wrapper: path validation and correct sandbox dispatch.
+
+    Script correctness (line selection, header formatting, etc.) is covered
+    by test_read_script which execs _READ_SCRIPT directly via subprocess.
+    These mock tests verify the HTTP plumbing — that _core_read rejects
+    bad paths early and forwards the script result from /process/execute.
+    """
     from lathe import _core_read
-    import io as _io
 
     class FakeValves:
         daytona_api_key = "fake"
@@ -1061,102 +1321,56 @@ async def test_core_read_mock(R: Results):
         daytona_proxy_url = "https://fake.proxy"
 
     class FakeResponse:
-        def __init__(self, status_code, text=""):
+        def __init__(self, status_code=200, json_data=None):
             self.status_code = status_code
-            self.text = text
+            self._json = json_data or {}
+        def json(self):
+            return self._json
         def raise_for_status(self):
             if self.status_code >= 400:
                 raise Exception(f"HTTP {self.status_code}")
 
     class FakeClient:
-        def __init__(self, responses):
-            self._responses = responses
-            self._call_idx = 0
-        async def get(self, url, **kwargs):
-            resp = self._responses[self._call_idx]
-            self._call_idx += 1
-            return resp
+        def __init__(self, post_response=None):
+            self._post_resp = post_response
+            self.post_calls = []
+        async def post(self, url, **kwargs):
+            self.post_calls.append({"url": url, "kwargs": kwargs})
+            return self._post_resp
 
-    # Helper: 10-line file content for reuse
-    TEN_LINES = "\n".join(f"line{i}" for i in range(1, 11)) + "\n"
-
-    def _client(content=TEN_LINES):
-        return FakeClient([FakeResponse(200, content)])
-
-    print("\n── _core_read: relative path rejected ──")
-    result = await _core_read(FakeValves(), "sb-id", FakeClient([]),
+    print("\n── _core_read: relative path rejected before sandbox ──")
+    client = FakeClient()
+    result = await _core_read(FakeValves(), "sb-id", client,
                               path="relative/path.py")
     R.check("rejects relative path", "absolute path" in result, result[:80])
+    R.check("no HTTP calls made", len(client.post_calls) == 0,
+            f"expected 0, got {len(client.post_calls)}")
 
-    print("\n── _core_read: 404 handling ──")
-    client = FakeClient([FakeResponse(404)])
-    result = await _core_read(FakeValves(), "sb-id", client,
-                              path="/home/daytona/workspace/missing.py")
-    R.check("reports file not found", "File not found" in result, result)
-
-    print("\n── _core_read: normal file (defaults) ──")
-    content = "line1\nline2\nline3\n"
-    client = FakeClient([FakeResponse(200, content)])
+    print("\n── _core_read: dispatches to /process/execute ──")
+    client = FakeClient(FakeResponse(200, {"exitCode": 0, "result": "File: /p (3 lines total)\n1: a"}))
     result = await _core_read(FakeValves(), "sb-id", client,
                               path="/home/daytona/workspace/test.py")
-    R.check("has file header", "File: /home/daytona/workspace/test.py" in result, result[:80])
-    R.check("has total lines", "3 lines total" in result, result[:80])
-    R.check("has line numbers", "1: line1" in result, result)
-    R.check("has line 2", "2: line2" in result, result)
-    R.check("has line 3", "3: line3" in result, result)
+    R.check("made one POST call", len(client.post_calls) == 1,
+            f"got {len(client.post_calls)}")
+    R.check("called /process/execute",
+            "/process/execute" in client.post_calls[0]["url"],
+            client.post_calls[0]["url"])
+    R.check("returns script result", "File: /p" in result, result[:80])
 
-    print("\n── _core_read: positive start/stop ──")
-    result = await _core_read(FakeValves(), "sb-id", _client(),
-                              path="/home/daytona/workspace/big.py",
-                              start=3, stop=5)
-    R.check("shows correct range", "showing lines 3-4" in result, result[:100])
-    R.check("starts at line 3", "3: line3" in result, result)
-    R.check("has line 4", "4: line4" in result, result)
-    R.check("no line 5", "5: line5" not in result, result)
-
-    print("\n── _core_read: negative start, stop=0 (last N lines) ──")
-    result = await _core_read(FakeValves(), "sb-id", _client(),
-                              path="/home/daytona/workspace/big.py",
-                              start=-3, stop=0)
-    R.check("has line 8", "8: line8" in result, result)
-    R.check("has line 9", "9: line9" in result, result)
-    R.check("has line 10", "10: line10" in result, result)
-    R.check("no line 7", "7: line7" not in result, result)
-
-    print("\n── _core_read: negative start and stop ──")
-    result = await _core_read(FakeValves(), "sb-id", _client(),
-                              path="/home/daytona/workspace/big.py",
-                              start=-5, stop=-3)
-    R.check("has line 6", "6: line6" in result, result)
-    R.check("has line 7", "7: line7" in result, result)
-    R.check("no line 8", "8: line8" not in result, result)
-    R.check("no line 5", "5: line5" not in result, result)
-
-    print("\n── _core_read: start=0 clamps to 1 ──")
-    result = await _core_read(FakeValves(), "sb-id", _client(),
-                              path="/home/daytona/workspace/big.py",
-                              start=0, stop=3)
-    R.check("starts at line 1", "1: line1" in result, result)
-    R.check("has line 2", "2: line2" in result, result)
-    R.check("no line 3", "3: line3" not in result, result)
-
-    print("\n── _core_read: empty range (start > stop after resolve) ──")
-    result = await _core_read(FakeValves(), "sb-id", _client(),
-                              path="/home/daytona/workspace/big.py",
-                              start=5, stop=3)
-    R.check("header still shows total", "10 lines total" in result, result[:100])
-    R.check("no content lines", "1: line" not in result, result)
-
-    print("\n── _core_read: out of bounds ──")
-    result = await _core_read(FakeValves(), "sb-id", _client(),
-                              path="/home/daytona/workspace/big.py",
-                              start=999, stop=0)
-    R.check("header shows total", "10 lines total" in result, result[:100])
-    R.check("empty body", "999:" not in result, result)
+    print("\n── _core_read: script error propagated ──")
+    client = FakeClient(FakeResponse(200, {"exitCode": 1, "result": "Error: File not found: /missing.py"}))
+    result = await _core_read(FakeValves(), "sb-id", client,
+                              path="/missing.py")
+    R.check("propagates error", "Error:" in result, result[:80])
 
 
 async def test_core_write_mock(R: Results):
-    """Test _core_write with a mock httpx client."""
+    """Test _core_write wrapper: path validation and correct sandbox dispatch.
+
+    Script correctness (makedirs, byte counts, overwrite, etc.) is covered
+    by test_write_script which execs _WRITE_SCRIPT directly via subprocess.
+    These mock tests verify the HTTP plumbing.
+    """
     from lathe import _core_write
 
     class FakeValves:
@@ -1165,42 +1379,57 @@ async def test_core_write_mock(R: Results):
         daytona_proxy_url = "https://fake.proxy"
 
     class FakeResponse:
-        def __init__(self, status_code=200):
+        def __init__(self, status_code=200, json_data=None):
             self.status_code = status_code
+            self._json = json_data or {}
+        def json(self):
+            return self._json
         def raise_for_status(self):
-            pass
+            if self.status_code >= 400:
+                raise Exception(f"HTTP {self.status_code}")
 
     class FakeClient:
-        def __init__(self):
-            self.calls = []
+        def __init__(self, post_response=None):
+            self._post_resp = post_response
+            self.post_calls = []
         async def post(self, url, **kwargs):
-            self.calls.append({"url": url, "kwargs": kwargs})
-            return FakeResponse()
+            self.post_calls.append({"url": url, "kwargs": kwargs})
+            return self._post_resp
 
-    print("\n── _core_write: relative path rejected ──")
-    result = await _core_write(FakeValves(), "sb-id", FakeClient(),
+    print("\n── _core_write: relative path rejected before sandbox ──")
+    client = FakeClient()
+    result = await _core_write(FakeValves(), "sb-id", client,
                                path="relative.py", content="hello")
     R.check("rejects relative path", "absolute path" in result, result[:80])
+    R.check("no HTTP calls made", len(client.post_calls) == 0,
+            f"expected 0, got {len(client.post_calls)}")
 
-    print("\n── _core_write: creates parent and uploads ──")
-    client = FakeClient()
+    print("\n── _core_write: dispatches to /process/execute ──")
+    client = FakeClient(FakeResponse(200, {"exitCode": 0, "result": "Wrote 12 bytes (2 lines) to /home/daytona/workspace/sub/file.py"}))
     result = await _core_write(FakeValves(), "sb-id", client,
                                path="/home/daytona/workspace/sub/file.py",
                                content="hello\nworld\n")
-    R.check("reports bytes", "12 bytes" in result, result)
-    R.check("reports lines", "2 lines" in result, result)
-    R.check("reports path", "/home/daytona/workspace/sub/file.py" in result, result)
-    R.check("made 2 calls (mkdir + upload)", len(client.calls) == 2,
-            f"got {len(client.calls)} calls")
-    # First call should be folder creation
-    R.check("first call is folder", "/files/folder" in client.calls[0]["url"],
-            client.calls[0]["url"])
-    R.check("second call is upload", "/files/upload" in client.calls[1]["url"],
-            client.calls[1]["url"])
+    R.check("made one POST call", len(client.post_calls) == 1,
+            f"got {len(client.post_calls)}")
+    R.check("called /process/execute",
+            "/process/execute" in client.post_calls[0]["url"],
+            client.post_calls[0]["url"])
+    R.check("returns script result", "Wrote 12 bytes" in result, result[:80])
+
+    print("\n── _core_write: script error propagated ──")
+    client = FakeClient(FakeResponse(200, {"exitCode": 1, "result": "Error: Cannot create parent directory /bad: Permission denied"}))
+    result = await _core_write(FakeValves(), "sb-id", client,
+                               path="/bad/path/file.py", content="x")
+    R.check("propagates error", "Error:" in result, result[:80])
 
 
 async def test_core_edit_mock(R: Results):
-    """Test _core_edit with a mock httpx client."""
+    """Test _core_edit wrapper: path validation and correct sandbox dispatch.
+
+    Script correctness (match counting, file writes, replace_all, etc.) is
+    covered by test_edit_script which execs _EDIT_SCRIPT directly via
+    subprocess.  These mock tests verify the HTTP plumbing.
+    """
     from lathe import _core_edit
 
     class FakeValves:
@@ -1209,66 +1438,48 @@ async def test_core_edit_mock(R: Results):
         daytona_proxy_url = "https://fake.proxy"
 
     class FakeResponse:
-        def __init__(self, status_code=200, text=""):
+        def __init__(self, status_code=200, json_data=None):
             self.status_code = status_code
-            self.text = text
+            self._json = json_data or {}
+        def json(self):
+            return self._json
         def raise_for_status(self):
-            pass
+            if self.status_code >= 400:
+                raise Exception(f"HTTP {self.status_code}")
 
     class FakeClient:
-        def __init__(self, get_response):
-            self._get_response = get_response
+        def __init__(self, post_response=None):
+            self._post_resp = post_response
             self.post_calls = []
-        async def get(self, url, **kwargs):
-            return self._get_response
         async def post(self, url, **kwargs):
             self.post_calls.append({"url": url, "kwargs": kwargs})
-            return FakeResponse()
+            return self._post_resp
 
-    print("\n── _core_edit: relative path rejected ──")
-    result = await _core_edit(FakeValves(), "sb-id",
-                              FakeClient(FakeResponse(200, "")),
+    print("\n── _core_edit: relative path rejected before sandbox ──")
+    client = FakeClient()
+    result = await _core_edit(FakeValves(), "sb-id", client,
                               path="rel.py", old_string="a", new_string="b")
     R.check("rejects relative path", "absolute path" in result, result[:80])
+    R.check("no HTTP calls made", len(client.post_calls) == 0,
+            f"expected 0, got {len(client.post_calls)}")
 
-    print("\n── _core_edit: file not found ──")
-    result = await _core_edit(FakeValves(), "sb-id",
-                              FakeClient(FakeResponse(404)),
-                              path="/home/daytona/workspace/x.py",
-                              old_string="a", new_string="b")
-    R.check("reports not found", "File not found" in result, result)
-
-    print("\n── _core_edit: no match ──")
-    result = await _core_edit(FakeValves(), "sb-id",
-                              FakeClient(FakeResponse(200, "hello world")),
-                              path="/home/daytona/workspace/x.py",
-                              old_string="ZZZNOMATCH", new_string="b")
-    R.check("reports no match", "not found" in result, result)
-
-    print("\n── _core_edit: ambiguous match ──")
-    result = await _core_edit(FakeValves(), "sb-id",
-                              FakeClient(FakeResponse(200, "foo foo foo")),
-                              path="/home/daytona/workspace/x.py",
-                              old_string="foo", new_string="bar")
-    R.check("reports multiple matches", "3 matches" in result, result)
-    R.check("suggests replace_all", "replace_all" in result, result)
-
-    print("\n── _core_edit: single match succeeds ──")
-    client = FakeClient(FakeResponse(200, "hello world"))
+    print("\n── _core_edit: dispatches to /process/execute ──")
+    client = FakeClient(FakeResponse(200, {"exitCode": 0, "result": "Replaced 1 occurrence(s) in /home/daytona/workspace/x.py"}))
     result = await _core_edit(FakeValves(), "sb-id", client,
                               path="/home/daytona/workspace/x.py",
                               old_string="hello", new_string="goodbye")
-    R.check("reports success", "Replaced 1 occurrence" in result, result)
-    R.check("uploaded new content", len(client.post_calls) == 2,
-            f"got {len(client.post_calls)} calls (expect mkdir + upload)")
+    R.check("made one POST call", len(client.post_calls) == 1,
+            f"got {len(client.post_calls)}")
+    R.check("called /process/execute",
+            "/process/execute" in client.post_calls[0]["url"],
+            client.post_calls[0]["url"])
+    R.check("returns script result", "Replaced 1" in result, result[:80])
 
-    print("\n── _core_edit: replace_all ──")
-    client = FakeClient(FakeResponse(200, "foo bar foo"))
+    print("\n── _core_edit: script error propagated ──")
+    client = FakeClient(FakeResponse(200, {"exitCode": 1, "result": "Error: old_string not found in /x.py"}))
     result = await _core_edit(FakeValves(), "sb-id", client,
-                              path="/home/daytona/workspace/x.py",
-                              old_string="foo", new_string="baz",
-                              replace_all=True)
-    R.check("reports 2 replacements", "2 occurrence" in result, result)
+                              path="/x.py", old_string="NOMATCH", new_string="b")
+    R.check("propagates error", "Error:" in result, result[:80])
 
 
 async def test_string_typed_params(R: Results):
@@ -1635,6 +1846,8 @@ async def test_snapshot_script(R: Results):
 
     R.check("script references workspace",
             "/home/daytona/workspace" in _SNAPSHOT_SCRIPT)
+    R.check("script references volume",
+            "/home/daytona/volume" in _SNAPSHOT_SCRIPT)
     R.check("script uses os.listdir",
             "os.listdir" in _SNAPSHOT_SCRIPT)
     R.check("script checks uname",
@@ -2148,6 +2361,9 @@ TESTS = {
     "build_tool_catalog": test_build_tool_catalog,
     "glob_script": test_glob_script,
     "grep_script": test_grep_script,
+    "read_script": test_read_script,
+    "write_script": test_write_script,
+    "edit_script": test_edit_script,
     "delegate_infrastructure": test_delegate_infrastructure,
     "delegate_prompt_build": test_delegate_prompt_build,
     "delegate_tools_build": test_delegate_tools_build,

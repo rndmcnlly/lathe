@@ -800,6 +800,165 @@ def grep_hierarchy(base_dir, regex, files_pattern, max_lines):
 '''
 
 
+# ── read script (runs on sandbox) ───────────────────────────────────
+#
+# Executed on the sandbox via _run_sandbox_script so the file never
+# leaves the sandbox: line selection, numbering, and header formatting
+# all happen in-process next to the data.  Args are repr()-embedded at
+# call time so arbitrary path strings are safe.
+
+_READ_SCRIPT = r'''
+import os
+import sys
+
+
+def read_file(path, start, stop):
+    """Read a file and return numbered lines with a header.
+
+    start/stop follow the same semantics as _core_read:
+      - positive: 1-indexed, stop is exclusive
+      - negative: counts from end
+      - 0: start=1, stop=end
+    Internal cap: 2000 lines.
+    """
+    if not os.path.exists(path):
+        return f"Error: File not found: {path}"
+
+    try:
+        with open(path, "r", errors="replace") as f:
+            content = f.read()
+    except OSError as e:
+        return f"Error: Cannot read {path}: {e}"
+
+    lines = content.split("\n")
+    if lines and lines[-1] == "":
+        lines = lines[:-1]
+    total_lines = len(lines)
+
+    # Resolve start to 0-based index.
+    if start == 0:
+        start_idx = 0
+    elif start > 0:
+        start_idx = start - 1
+    else:
+        start_idx = max(0, total_lines + start)
+
+    # Resolve stop to 0-based exclusive index.
+    if stop == 0:
+        end_idx = total_lines
+    elif stop > 0:
+        end_idx = stop - 1
+    else:
+        end_idx = max(0, total_lines + stop)
+
+    # Clamp to valid range.
+    start_idx = max(0, min(start_idx, total_lines))
+    end_idx = max(start_idx, min(end_idx, total_lines))
+
+    # Cap at 2000 lines.
+    if end_idx - start_idx > 2000:
+        end_idx = start_idx + 2000
+
+    selected = lines[start_idx:end_idx]
+    numbered = "\n".join(
+        f"{start_idx + i + 1}: {line}"
+        for i, line in enumerate(selected)
+    )
+    header = f"File: {path} ({total_lines} lines total)"
+    if start_idx > 0 or end_idx < total_lines:
+        header += f", showing lines {start_idx + 1}-{end_idx}"
+    return f"{header}\n{numbered}"
+'''
+
+
+# ── write script (runs on sandbox) ───────────────────────────────────
+#
+# Receives path and content as repr()-embedded Python literals.
+# Creates parent directories, writes the file, and reports byte/line
+# counts.  Content is bounded by model output token limits so size is
+# not a practical concern.
+
+_WRITE_SCRIPT = r'''
+import os
+
+
+def write_file(path, content):
+    """Write content to path, creating parent directories as needed.
+
+    Returns a one-line result string on success or an error string
+    starting with "Error:".
+    """
+    parent = os.path.dirname(path)
+    if parent:
+        try:
+            os.makedirs(parent, exist_ok=True)
+        except OSError as e:
+            return f"Error: Cannot create parent directory {parent}: {e}"
+
+    try:
+        with open(path, "w") as f:
+            f.write(content)
+    except OSError as e:
+        return f"Error: Cannot write {path}: {e}"
+
+    n_bytes = len(content.encode("utf-8"))
+    n_lines = content.count("\n") + (0 if content.endswith("\n") else 1)
+    return f"Wrote {n_bytes} bytes ({n_lines} lines) to {path}"
+'''
+
+
+# ── edit script (runs on sandbox) ────────────────────────────────────
+#
+# Performs string replacement entirely on the sandbox, avoiding a full
+# round-trip download+upload of the file contents.  Args are
+# repr()-embedded at call time.
+
+_EDIT_SCRIPT = r'''
+import os
+
+
+def edit_file(path, old_string, new_string, replace_all):
+    """Edit a file by exact string replacement.
+
+    Returns a one-line result string on success or an error string
+    starting with "Error:".
+    """
+    if not os.path.exists(path):
+        return f"Error: File not found: {path}"
+
+    try:
+        with open(path, "r", errors="replace") as f:
+            content = f.read()
+    except OSError as e:
+        return f"Error: Cannot read {path}: {e}"
+
+    count = content.count(old_string)
+    if count == 0:
+        return f"Error: old_string not found in {path}"
+    if count > 1 and not replace_all:
+        return (
+            f"Error: Found {count} matches for old_string in {path}. "
+            f"Provide more surrounding context to identify a unique match, "
+            f"or set replace_all=true to replace all occurrences."
+        )
+
+    if replace_all:
+        new_content = content.replace(old_string, new_string)
+        replaced = count
+    else:
+        new_content = content.replace(old_string, new_string, 1)
+        replaced = 1
+
+    try:
+        with open(path, "w") as f:
+            f.write(new_content)
+    except OSError as e:
+        return f"Error: Cannot write {path}: {e}"
+
+    return f"Replaced {replaced} occurrence(s) in {path}"
+'''
+
+
 # ── shared Daytona I/O helpers ───────────────────────────────────────
 #
 # Thin wrappers over the Daytona toolbox API endpoints that multiple
@@ -1069,47 +1228,13 @@ async def _core_read(valves, sandbox_id: str, client: httpx.AsyncClient, *,
     err = _require_abs_path(path)
     if err:
         return err
-    content = await _download_file(valves, sandbox_id, client, path)
-    if content is None:
-        return f"Error: File not found: {path}"
-    lines = content.split("\n")
-    if lines and lines[-1] == "":
-        lines = lines[:-1]
-    total_lines = len(lines)
-
-    # Resolve start to a 0-based index.
-    if start == 0:
-        start_idx = 0
-    elif start > 0:
-        start_idx = start - 1  # 1-indexed to 0-indexed
-    else:
-        start_idx = max(0, total_lines + start)
-
-    # Resolve stop to a 0-based index (exclusive).
-    if stop == 0:
-        end_idx = total_lines
-    elif stop > 0:
-        end_idx = stop - 1  # 1-indexed exclusive: stop=5 means up to line 4
-    else:
-        end_idx = max(0, total_lines + stop)
-
-    # Clamp to valid range.
-    start_idx = max(0, min(start_idx, total_lines))
-    end_idx = max(start_idx, min(end_idx, total_lines))
-
-    # Apply internal truncation cap (2000 lines).
-    if end_idx - start_idx > 2000:
-        end_idx = start_idx + 2000
-
-    selected = lines[start_idx:end_idx]
-    numbered = "\n".join(
-        f"{start_idx + i + 1}: {line}"
-        for i, line in enumerate(selected)
+    script = (
+        _READ_SCRIPT
+        + f"\nprint(read_file({path!r}, {start!r}, {stop!r}))"
     )
-    header = f"File: {path} ({total_lines} lines total)"
-    if start_idx > 0 or end_idx < total_lines:
-        header += f", showing lines {start_idx + 1}-{end_idx}"
-    return f"{header}\n{numbered}"
+    return await _run_sandbox_script(
+        valves, sandbox_id, client, script, error_prefix="read script failed",
+    )
 
 
 async def _core_write(valves, sandbox_id: str, client: httpx.AsyncClient, *,
@@ -1128,11 +1253,13 @@ async def _core_write(valves, sandbox_id: str, client: httpx.AsyncClient, *,
     err = _require_abs_path(path)
     if err:
         return err
-    content_bytes = content.encode("utf-8")
-    await _upload_file(valves, sandbox_id, client, path, content_bytes)
-    n_bytes = len(content_bytes)
-    n_lines = content.count("\n") + (0 if content.endswith("\n") else 1)
-    return f"Wrote {n_bytes} bytes ({n_lines} lines) to {path}"
+    script = (
+        _WRITE_SCRIPT
+        + f"\nprint(write_file({path!r}, {content!r}))"
+    )
+    return await _run_sandbox_script(
+        valves, sandbox_id, client, script, error_prefix="write script failed",
+    )
 
 
 async def _core_edit(valves, sandbox_id: str, client: httpx.AsyncClient, *,
@@ -1148,26 +1275,13 @@ async def _core_edit(valves, sandbox_id: str, client: httpx.AsyncClient, *,
     err = _require_abs_path(path)
     if err:
         return err
-    content = await _download_file(valves, sandbox_id, client, path)
-    if content is None:
-        return f"Error: File not found: {path}"
-    count = content.count(old_string)
-    if count == 0:
-        return f"Error: old_string not found in {path}"
-    if count > 1 and not replace_all:
-        return (
-            f"Error: Found {count} matches for old_string in {path}. "
-            f"Provide more surrounding context to identify a unique match, "
-            f"or set replace_all=true to replace all occurrences."
-        )
-    if replace_all:
-        new_content = content.replace(old_string, new_string)
-    else:
-        new_content = content.replace(old_string, new_string, 1)
-    content_bytes = new_content.encode("utf-8")
-    await _upload_file(valves, sandbox_id, client, path, content_bytes)
-    replaced = count if replace_all else 1
-    return f"Replaced {replaced} occurrence(s) in {path}"
+    script = (
+        _EDIT_SCRIPT
+        + f"\nprint(edit_file({path!r}, {old_string!r}, {new_string!r}, {replace_all!r}))"
+    )
+    return await _run_sandbox_script(
+        valves, sandbox_id, client, script, error_prefix="edit script failed",
+    )
 
 
 async def _core_glob(valves, sandbox_id: str, client: httpx.AsyncClient, *,
@@ -1824,19 +1938,19 @@ def _build_onboard_script(project_path: str) -> str:
 _SNAPSHOT_SCRIPT = (
     "import subprocess, os\n"
     + textwrap.dedent("""\
-    BASE = "/home/daytona/workspace"
     sections = []
 
-    # ── Workspace listing (flat, one level) ──────────────────────
-    if os.path.isdir(BASE):
-        entries = sorted(os.listdir(BASE))
-        lines = []
-        for e in entries:
-            full = os.path.join(BASE, e)
-            lines.append(full + "/" if os.path.isdir(full) else full)
-        if lines:
-            sections.append("Workspace:\\n" + "\\n".join(lines))
-    
+    # ── Directory listing (flat, one level) ──────────────────────
+    for label, path in [("Workspace", "/home/daytona/workspace"),
+                        ("Volume", "/home/daytona/volume")]:
+        if os.path.isdir(path):
+            entries = sorted(os.listdir(path))
+            lines = []
+            for e in entries:
+                full = os.path.join(path, e)
+                lines.append(full + "/" if os.path.isdir(full) else full)
+            if lines:
+                sections.append(label + ":\\n" + "\\n".join(lines))
 
     # ── System info ──────────────────────────────────────────────
     info_lines = []

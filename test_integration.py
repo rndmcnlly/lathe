@@ -141,10 +141,10 @@ async def test_int_write_read_edit(R: Results, tools: Tools, user: dict):
 
     # Independent reads
     async def t_offset():
-        print("\n── read: offset and limit ──")
-        r = await tools.read("/home/daytona/workspace/test_file.txt", offset=2, limit=1, **ctx)
-        R.check("offset/limit works", "2: line two" in r, r[:200])
-        R.check("respects limit", "line three" not in r, r[:200])
+        print("\n── read: start/stop ──")
+        r = await tools.read("/home/daytona/workspace/test_file.txt", start=2, stop=3, **ctx)
+        R.check("start/stop works", "2: line two" in r, r[:200])
+        R.check("respects stop", "line three" not in r, r[:200])
 
     async def t_notfound():
         print("\n── read: file not found ──")
@@ -501,27 +501,28 @@ async def test_int_expose(R: Results, tools: Tools, user: dict):
 
 async def test_int_destroy(R: Results, tools: Tools, user: dict):
     ctx = dict(__user__=user, __event_emitter__=mock_emitter)
-    from lathe import _headers
 
-    print("\n── destroy: safety guard (confirm=false) ──")
+    async def confirming_event_call(data):
+        """Mock __event_call__ that always confirms."""
+        return True
+
+    ctx_confirm = dict(**ctx, __event_call__=confirming_event_call)
+
+    print("\n── destroy: safety guard (no event_call) ──")
     result = await tools.destroy(**ctx)
-    R.check("default confirm=false aborts", "aborted" in result.lower(), result[:200])
-    R.check("abort message mentions confirm", "confirm" in result.lower(), result[:200])
-
-    result = await tools.destroy(confirm=False, **ctx)
-    R.check("explicit confirm=false aborts", "aborted" in result.lower(), result[:200])
+    R.check("no event_call aborts", "confirm" in result.lower(), result[:200])
 
     # Verify sandbox still exists after abort
     result = await tools.bash("echo still_alive", **ctx)
     R.check("sandbox survives abort", "still_alive" in result, result[:200])
 
     print("\n── destroy: confirmed destruction ──")
-    result = await tools.destroy(confirm=True, **ctx)
+    result = await tools.destroy(**ctx_confirm)
     R.check("destroy reports success", "Destroyed" in result and "1 sandbox" in result, result[:200])
     R.check("destroy mentions volume intact", "intact" in result.lower(), result[:200])
 
     print("\n── destroy: no sandbox to destroy ──")
-    result = await tools.destroy(confirm=True, **ctx)
+    result = await tools.destroy(**ctx_confirm)
     R.check("destroy with nothing reports no sandbox", "No sandbox found" in result, result[:200])
 
     print("\n── destroy: next tool call creates fresh sandbox ──")
@@ -529,10 +530,7 @@ async def test_int_destroy(R: Results, tools: Tools, user: dict):
     R.check("fresh sandbox works", "reborn" in result, result[:200])
 
     print("\n── final cleanup: destroy reborn sandbox ──")
-    result = await tools.destroy(
-        confirm=True,
-        **ctx,
-    )
+    result = await tools.destroy(**ctx_confirm)
     R.check("final destroy succeeds", "Destroyed" in result, result[:200])
 
 
