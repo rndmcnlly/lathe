@@ -2551,7 +2551,7 @@ async def _ensure_sandbox(valves, email: str, client: httpx.AsyncClient, emitter
                 "labels": {label_key: email},
                 "autoStopInterval": valves.auto_stop_minutes,
                 "autoArchiveInterval": valves.auto_archive_minutes,
-                "autoDeleteInterval": -1,
+                "autoDeleteInterval": valves.auto_delete_minutes,
                 "volumes": [
                     {
                         "volumeId": volume_id,
@@ -2672,6 +2672,10 @@ class Tools:
         auto_archive_minutes: int = Field(
             60,
             description="Minutes after stop before sandbox archives",
+        )
+        auto_delete_minutes: int = Field(
+            -1,
+            description="Minutes after archive before sandbox is permanently deleted (-1 = never). Example: 129600 = 90 days.",
         )
         sandbox_language: str = Field(
             "python",
