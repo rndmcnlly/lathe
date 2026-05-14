@@ -23,7 +23,11 @@ import { CANVAS, TIMING } from "./src/design";
 // ── Config ────────────────────────────────────────────────────────
 
 const VOICE_ID = "1f7zwaddjtlht0nw02oa"; // Adam's cloned voice
-const MODEL = "ResembleAI/chatterbox-turbo";
+// chatterbox-multilingual: same price ($1/M chars), same voice cloning, 23 languages.
+// Switched from chatterbox-turbo on 2026-05-14 after observing extended degraded
+// availability on turbo (requests hanging >30s for both preset and cloned voices)
+// while multilingual responded normally.
+const MODEL = "ResembleAI/chatterbox-multilingual";
 const API_URL = "https://api.deepinfra.com/v1/openai/audio/speech";
 const TIMEOUT_MS = 90_000;
 const MAX_RETRIES = 6;
@@ -89,7 +93,7 @@ async function renderTTS(force: boolean): Promise<Record<string, ManifestEntry>>
   for (const { id, narration } of narrations) {
     const filename = `${id}.mp3`;
     const filepath = join(AUDIO_DIR, filename);
-    const h = hash(narration);
+    const h = hash(`${MODEL}:${normalizeForTTS(narration)}`);
     newCache[id] = h;
 
     // Cache hit
