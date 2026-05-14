@@ -26,7 +26,9 @@ const VOICE_ID = "1f7zwaddjtlht0nw02oa"; // Adam's cloned voice
 const MODEL = "ResembleAI/chatterbox-turbo";
 const API_URL = "https://api.deepinfra.com/v1/openai/audio/speech";
 const TIMEOUT_MS = 90_000;
-const MAX_RETRIES = 3;
+const MAX_RETRIES = 6;
+const BACKOFF_BASE_SEC = 5;
+const BACKOFF_MAX_SEC = 60;
 
 const ROOT = dirname(import.meta.url.replace("file://", ""));
 const AUDIO_DIR = join(ROOT, "public", "audio");
@@ -109,6 +111,7 @@ async function renderTTS(force: boolean): Promise<Record<string, ManifestEntry>>
     let success = false;
 
     for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+      let retryAfterSec: number | null = null;
       try {
         const controller = new AbortController();
         const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
@@ -129,7 +132,27 @@ async function renderTTS(force: boolean): Promise<Record<string, ManifestEntry>>
         });
         clearTimeout(timer);
 
-        if (!resp.ok) throw new Error(`HTTP ${resp.status}: ${await resp.text()}`);
+        if (!resp.ok) {
+          const body = await resp.text();
+          // Honor Retry-After on 429/503 (seconds or HTTP-date)
+          if (resp.status === 429 || resp.status === 503) {
+            const ra = resp.headers.get("retry-after");
+            if (ra) {
+              const n = Number(ra);
+              if (Number.isFinite(n)) {
+                retryAfterSec = n;
+              } else {
+                const t = Date.parse(ra);
+                if (!Number.isNaN(t)) retryAfterSec = Math.max(0, (t - Date.now()) / 1000);
+              }
+            }
+          }
+          // Don't retry client errors except rate-limiting; auth/quota/bad-request won't fix themselves
+          if (resp.status >= 400 && resp.status < 500 && resp.status !== 429) {
+            throw new Error(`HTTP ${resp.status} (non-retryable): ${body}`);
+          }
+          throw new Error(`HTTP ${resp.status}: ${body}`);
+        }
 
         const buf = Buffer.from(await resp.arrayBuffer());
         writeFileSync(filepath, buf);
@@ -142,7 +165,16 @@ async function renderTTS(force: boolean): Promise<Record<string, ManifestEntry>>
         success = true;
         break;
       } catch (err) {
-        const wait = 2 ** (attempt + 1);
+        // Auth, quota, bad-request errors won't recover — fail fast
+        if (err instanceof Error && err.message.includes("(non-retryable)")) {
+          console.log(`  [abort] ${id}: ${err.message}`);
+          throw err;
+        }
+        if (attempt === MAX_RETRIES - 1) break; // no point waiting after the last try
+        // Capped exponential with ±50% jitter, or server-suggested retry-after
+        const exp = Math.min(BACKOFF_MAX_SEC, BACKOFF_BASE_SEC * 2 ** attempt);
+        const base = retryAfterSec ?? exp;
+        const wait = Math.round(base * (0.5 + Math.random()));
         console.log(`  [retry ${attempt + 1}/${MAX_RETRIES}] ${id}: ${err}, waiting ${wait}s`);
         await new Promise((r) => setTimeout(r, wait * 1000));
       }
