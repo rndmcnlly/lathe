@@ -5,7 +5,7 @@ author_url: https://adamsmith.as
 description: Coding agent tools (lathe, bash, read, write, edit, glob, grep, interpret, delegate, onboard, expose, destroy) backed by per-user sandbox VMs with transparent lifecycle management.
 required_open_webui_version: 0.4.0
 requirements: httpx, httpx-ws, pydantic-ai-slim[openai], cachetools
-version: 0.23.0
+version: 0.23.1
 licence: MIT
 """
 
@@ -74,6 +74,26 @@ def _api(valves, path: str) -> str:
 
 def _toolbox(valves, sandbox_id: str, path: str) -> str:
     return f"{valves.daytona_proxy_url.rstrip('/')}/{sandbox_id}{path}"
+
+
+def _extract_sandbox_list(payload) -> list:
+    """Tolerate both legacy and post-2026-05-24 shapes for GET /api/sandbox.
+
+    Legacy (≤ May 24, 2026): a flat JSON array of sandbox objects.
+    New (cursor pagination): {"items": [...], "cursor": "..."} (or similar).
+    Lathe filters by label client-side and expects 0–1 matches per user, so
+    the default page size is plenty; we don't paginate further. If a future
+    deployment ever has >page_size sandboxes sharing the label prefix, this
+    would silently return only the first page — acceptable given the design
+    invariant of one sandbox per user.
+    """
+    if payload is None:
+        return []
+    if isinstance(payload, list):
+        return payload
+    if isinstance(payload, dict):
+        return payload.get("items") or []
+    return []
 
 
 async def _emit(emitter, description: str, done: bool = False):
@@ -2524,7 +2544,7 @@ async def _ensure_sandbox(valves, email: str, client: httpx.AsyncClient, emitter
         timeout=30.0,
     )
     resp.raise_for_status()
-    sandboxes = resp.json() or []
+    sandboxes = _extract_sandbox_list(resp.json())
 
     matches = [s for s in sandboxes if s.get("labels", {}).get(label_key) == email]
 
@@ -3447,7 +3467,7 @@ class Tools:
                     timeout=30.0,
                 )
                 resp.raise_for_status()
-                sandboxes = resp.json() or []
+                sandboxes = _extract_sandbox_list(resp.json())
                 matches = [
                     s for s in sandboxes
                     if s.get("labels", {}).get(label_key) == email
@@ -3480,7 +3500,7 @@ class Tools:
                         timeout=30.0,
                     )
                     remaining = [
-                        s for s in (resp.json() or [])
+                        s for s in _extract_sandbox_list(resp.json())
                         if s.get("labels", {}).get(label_key) == email
                     ]
                     if not remaining:
