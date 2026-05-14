@@ -5,7 +5,7 @@ author_url: https://adamsmith.as
 description: Coding agent tools (lathe, bash, read, write, edit, glob, grep, interpret, delegate, onboard, expose, destroy) backed by per-user sandbox VMs with transparent lifecycle management.
 required_open_webui_version: 0.4.0
 requirements: httpx, httpx-ws, pydantic-ai-slim[openai], cachetools
-version: 0.22.0
+version: 0.23.0
 licence: MIT
 """
 
@@ -2105,8 +2105,12 @@ def _build_delegate_prompt(task: str, file_sections: list[str]) -> str:
 
 
 
-def _build_delegate_system_prompt(max_steps: int) -> str:
+def _build_delegate_system_prompt(max_steps: int, *, has_volume: bool = True) -> str:
     """Build the delegate system prompt, embedding the step budget."""
+    volume_line = (
+        "- /home/daytona/volume is persistent storage that survives sandbox destruction.\n"
+        if has_volume else ""
+    )
     return textwrap.dedent(f"""\
         You are a focused sub-agent with direct access to a Linux sandbox.
         You have been delegated a specific task by the calling agent.
@@ -2142,7 +2146,7 @@ def _build_delegate_system_prompt(max_steps: int) -> str:
         - Do not repeat the task description back. Jump straight into working.
         - All file paths must be absolute (e.g. /home/daytona/workspace/file.py).
         - The default working directory is /home/daytona/workspace.
-        - /home/daytona/volume is persistent storage that survives sandbox destruction.
+        {volume_line}\
         - Commands are non-interactive. Use -y flags where needed.
         - You cannot expose URLs or interact with the user. Focus on the sandbox.
         - If you encounter an error, try to recover or work around it. Report what
@@ -2536,29 +2540,28 @@ async def _ensure_sandbox(valves, email: str, client: httpx.AsyncClient, emitter
     warning: str | None = None
 
     if sandbox is None:
-        # 2. Get or create a persistent volume for this user
-        volume_name = f"{label_key}/{email}"
-        volume_id = await _ensure_volume(valves, volume_name, client)
+        # 2. Optionally get or create a persistent volume for this user
+        create_json: dict = {
+            "language": valves.sandbox_language,
+            "name": f"{label_key}/{email}",
+            "labels": {label_key: email},
+            "autoStopInterval": valves.auto_stop_minutes,
+            "autoArchiveInterval": valves.auto_archive_minutes,
+            "autoDeleteInterval": valves.auto_delete_minutes,
+        }
+        if valves.persistent_volume:
+            volume_name = f"{label_key}/{email}"
+            volume_id = await _ensure_volume(valves, volume_name, client)
+            create_json["volumes"] = [
+                {"volumeId": volume_id, "mountPath": VOLUME_MOUNT_PATH}
+            ]
 
-        # 3. Create new sandbox with volume mounted
+        # 3. Create new sandbox (with or without volume)
         await _emit(emitter, "Preparing sandbox...")
         resp = await client.post(
             _api(valves, "/sandbox"),
             headers=_headers(valves),
-            json={
-                "language": valves.sandbox_language,
-                "name": f"{label_key}/{email}",
-                "labels": {label_key: email},
-                "autoStopInterval": valves.auto_stop_minutes,
-                "autoArchiveInterval": valves.auto_archive_minutes,
-                "autoDeleteInterval": valves.auto_delete_minutes,
-                "volumes": [
-                    {
-                        "volumeId": volume_id,
-                        "mountPath": VOLUME_MOUNT_PATH,
-                    }
-                ],
-            },
+            json=create_json,
             timeout=30.0,
         )
         resp.raise_for_status()
@@ -2676,6 +2679,10 @@ class Tools:
         auto_delete_minutes: int = Field(
             -1,
             description="Minutes after archive before sandbox is permanently deleted (-1 = never). Example: 129600 = 90 days.",
+        )
+        persistent_volume: bool = Field(
+            True,
+            description="Mount a persistent S3/FUSE volume at /home/daytona/volume. Disable for deployments with limited data retention.",
         )
         sandbox_language: str = Field(
             "python",
@@ -3186,8 +3193,7 @@ class Tools:
             - One sandbox per user, identified by email. The sandbox starts,
               stops, and recovers automatically — you never manage lifecycle.
             - The default working directory is /home/daytona/workspace.
-            - /home/daytona/volume is S3/FUSE-backed persistent storage that
-              survives sandbox destruction.
+            {volume_note}\
             - The sandbox auto-stops after a configurable idle timeout and
               auto-archives after a further interval. Any tool call transparently
               restarts it. The filesystem (including installed packages and user
@@ -3298,7 +3304,7 @@ class Tools:
               to fire-and-forget for parallel agent teams.
             - expose() URLs expire after ~1 hour (call expose again for a fresh URL). The sandbox itself stops on
               idle (~15 min default), killing servers.
-            - destroy() prompts for user confirmation via a dialog before proceeding. Irreversible. The volume is preserved.
+            - destroy() prompts for user confirmation via a dialog before proceeding. Irreversible.{destroy_volume_note}
             - **Network egress may be restricted.** Depending on the admin's
               Daytona tier, the sandbox may only reach a curated allowlist of
               hosts (package registries, git hosts, CDNs, AI APIs, etc.).
@@ -3344,6 +3350,16 @@ class Tools:
             content = self._MANPAGES[manpage]
             if "{tool_catalog}" in content:
                 content = content.format(tool_catalog=tool_catalog)
+            volume_note = (
+                "- /home/daytona/volume is S3/FUSE-backed persistent storage that\n"
+                "              survives sandbox destruction.\n            "
+                if self.valves.persistent_volume else ""
+            )
+            destroy_volume_note = (
+                " The volume is preserved." if self.valves.persistent_volume else ""
+            )
+            content = content.replace("{volume_note}", volume_note)
+            content = content.replace("{destroy_volume_note}", destroy_volume_note)
             await _emit(__event_emitter__, f"Manual page: {manpage}", done=True)
             return content
 
@@ -3379,19 +3395,24 @@ class Tools:
         """
         Permanently destroy the sandbox VM. Irreversible.
         Prompts the user for confirmation before proceeding.
-        Persistent volume data is preserved and will reappear in the next sandbox.
+        If a persistent volume is attached, its data is preserved and will reappear in the next sandbox.
         """
         # Gate on real human consent via OWUI's confirmation dialog.
+        has_volume = self.valves.persistent_volume
         if __event_call__:
+            message = (
+                "This will permanently destroy the sandbox VM and "
+                "all its contents. Persistent volume data is preserved. "
+                "This action cannot be undone."
+                if has_volume else
+                "This will permanently destroy the sandbox VM and "
+                "all its contents. This action cannot be undone."
+            )
             confirmed = await __event_call__({
                 "type": "confirmation",
                 "data": {
                     "title": "Destroy sandbox?",
-                    "message": (
-                        "This will permanently destroy the sandbox VM and "
-                        "all its contents. Persistent volume data is preserved. "
-                        "This action cannot be undone."
-                    ),
+                    "message": message,
                 },
             })
             if not confirmed:
@@ -3467,10 +3488,15 @@ class Tools:
 
                 await _emit(__event_emitter__, "Sandbox destroyed", done=True)
                 ids = ", ".join(d[:12] for d in deleted)
+                if has_volume:
+                    return (
+                        f"Destroyed {len(deleted)} sandbox(es) ({ids})."
+                        f" Your persistent files in {VOLUME_MOUNT_PATH} are intact"
+                        f" and will reappear in your next sandbox."
+                        f" A fresh sandbox will be created on the next tool call."
+                    )
                 return (
                     f"Destroyed {len(deleted)} sandbox(es) ({ids})."
-                    f" Your persistent files in {VOLUME_MOUNT_PATH} are intact"
-                    f" and will reappear in your next sandbox."
                     f" A fresh sandbox will be created on the next tool call."
                 )
 
@@ -3781,7 +3807,7 @@ class Tools:
 
             agent = Agent(
                 model,
-                system_prompt=_build_delegate_system_prompt(clamped_steps),
+                system_prompt=_build_delegate_system_prompt(clamped_steps, has_volume=self.valves.persistent_volume),
                 tools=tools,
                 output_type=str,
             )

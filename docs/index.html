@@ -325,6 +325,43 @@
     </p>
 </div>
 
+<!-- ── Data Retention ──────────────────────────────── -->
+<div class="section">
+    <div class="section-label">Data Retention</div>
+    <h2 class="section-title">Controlled sandbox and volume lifecycle</h2>
+    <p>
+        By default, sandboxes and their persistent volumes live forever. A user's
+        files, installed packages, and volume data accumulate indefinitely across
+        conversations. For many deployments this is ideal: users build up a
+        working environment over weeks or months.
+    </p>
+    <p>
+        For deployments with organizational data retention policies, admins have
+        two levers:
+    </p>
+    <ul class="limit-list">
+        <li>
+            <strong>Auto-delete interval.</strong> Set <code>auto_delete_minutes</code>
+            to automatically destroy inactive sandboxes after a specified period
+            (e.g. 129600 = 90 days). The sandbox VM and its non-volume filesystem
+            are permanently removed; a fresh sandbox is created transparently on
+            the next tool call.
+        </li>
+        <li>
+            <strong>Disable persistent volumes.</strong> Set <code>persistent_volume</code>
+            to <code>false</code> to stop provisioning S3-backed volumes for new
+            sandboxes. Without a volume, all user data lives on the sandbox
+            filesystem and is subject to the auto-delete interval. Existing
+            sandboxes that already have a volume are unaffected by this toggle.
+        </li>
+    </ul>
+    <p>
+        Together, these settings let admins run Lathe in a mode where no user data
+        persists beyond a defined window, supporting compliance requirements
+        without any change to the user or model experience.
+    </p>
+</div>
+
 <!-- ── Configuration ──────────────────────────────── -->
 <div class="section">
     <div class="section-label">Configuration</div>

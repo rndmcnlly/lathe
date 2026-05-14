@@ -1017,6 +1017,37 @@ async def test_delegate_infrastructure(R: Results):
                     f"params: {param_names}")
 
 
+async def test_persistent_volume_valve(R: Results):
+    """Test persistent_volume valve controls volume-related messaging."""
+    from lathe import Tools, _build_delegate_system_prompt
+
+    print("\n── persistent_volume valve: default ──")
+    tools = Tools()
+    R.check("valve exists", hasattr(tools.valves, "persistent_volume"))
+    R.check("valve defaults to True", tools.valves.persistent_volume is True)
+
+    print("\n── persistent_volume valve: delegate system prompt ──")
+    prompt_with = _build_delegate_system_prompt(10, has_volume=True)
+    prompt_without = _build_delegate_system_prompt(10, has_volume=False)
+    R.check("volume line present when has_volume=True",
+            "/home/daytona/volume" in prompt_with)
+    R.check("volume line absent when has_volume=False",
+            "/home/daytona/volume" not in prompt_without)
+    # Both should still mention the workspace
+    R.check("workspace present regardless (True)",
+            "/home/daytona/workspace" in prompt_with)
+    R.check("workspace present regardless (False)",
+            "/home/daytona/workspace" in prompt_without)
+
+    print("\n── persistent_volume valve: manpage substitution ──")
+    # Simulate what lathe() does with the overview manpage
+    overview = tools._MANPAGES["overview"]
+    R.check("overview has volume_note placeholder",
+            "{volume_note}" in overview)
+    R.check("overview has destroy_volume_note placeholder",
+            "{destroy_volume_note}" in overview)
+
+
 async def test_delegate_prompt_build(R: Results):
     """Test _build_delegate_prompt assembles the sub-agent prompt correctly."""
     from lathe import _build_delegate_prompt
@@ -2365,6 +2396,7 @@ TESTS = {
     "write_script": test_write_script,
     "edit_script": test_edit_script,
     "delegate_infrastructure": test_delegate_infrastructure,
+    "persistent_volume_valve": test_persistent_volume_valve,
     "delegate_prompt_build": test_delegate_prompt_build,
     "delegate_tools_build": test_delegate_tools_build,
     "build_bash_script": test_build_bash_script,
