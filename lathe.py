@@ -2762,14 +2762,13 @@ class Tools:
     #   tool docstrings can then be further scrunched by adding
     #   breadcrumbs like 'see lathe(manpage="bash") for details'.
 
-    # WARNING: Manpage strings are NOT passed through str.format()
-    # unconditionally.  Only pages containing the literal placeholder
-    # "{tool_catalog}" are formatted (see the lathe() method).  This
-    # means shell snippets with curly braces (${VAR}, {sh,pid,log,exit},
-    # {"key":"value"}, etc.) are safe in all other pages.  If you add a
-    # new dynamic placeholder, gate the .format() call on its presence
-    # rather than calling .format() on every page — otherwise any page
-    # with literal braces will blow up with a KeyError at runtime.
+    # Manpage strings are interpolated via plain str.replace() in the
+    # lathe() method, NOT str.format().  Known placeholders today:
+    # {tool_catalog}, {volume_note}, {destroy_volume_note}.  Unknown
+    # placeholders pass through unchanged (no KeyError), and literal
+    # braces in shell/JSON/regex snippets (${VAR}, {sh,pid,log,exit},
+    # {"key":"value"}, {n,m}) are always safe.  If you add a new dynamic
+    # placeholder, register a corresponding .replace() call in lathe().
     _MANPAGES: dict[str, str] = {
         "egress": textwrap.dedent("""\
             # Lathe — Egress Restrictions
@@ -2857,7 +2856,7 @@ class Tools:
             **Poll until done (bounded):**
             ```
             for i in 1 2 3 4 5; do
-              test -f $CMD/exit && {{ cat $CMD/exit; break; }} || sleep 2
+              test -f $CMD/exit && { cat $CMD/exit; break; } || sleep 2
             done
             test -f $CMD/exit || echo STILL_RUNNING
             ```
@@ -3320,7 +3319,7 @@ class Tools:
               replace_all=true.
             - delegate() auto-backgrounds after ~30 seconds (configurable via
               foreground_seconds). Backgrounded delegates write to
-              /tmp/delegate/<id>/{{log,result,error,usage}}. Use foreground_seconds=0
+              /tmp/delegate/<id>/{log,result,error,usage}. Use foreground_seconds=0
               to fire-and-forget for parallel agent teams.
             - expose() URLs expire after ~1 hour (call expose again for a fresh URL). The sandbox itself stops on
               idle (~15 min default), killing servers.
@@ -3368,8 +3367,6 @@ class Tools:
 
         if manpage in self._MANPAGES:
             content = self._MANPAGES[manpage]
-            if "{tool_catalog}" in content:
-                content = content.format(tool_catalog=tool_catalog)
             volume_note = (
                 "- /home/daytona/volume is S3/FUSE-backed persistent storage that\n"
                 "              survives sandbox destruction.\n            "
@@ -3378,6 +3375,11 @@ class Tools:
             destroy_volume_note = (
                 " The volume is preserved." if self.valves.persistent_volume else ""
             )
+            # Use .replace() rather than .format() so manpages with literal
+            # braces (e.g. shell snippets like ${VAR}, regex {n,m}) don't blow
+            # up with KeyError, and so missing placeholders are silently
+            # tolerated rather than fatal.
+            content = content.replace("{tool_catalog}", tool_catalog)
             content = content.replace("{volume_note}", volume_note)
             content = content.replace("{destroy_volume_note}", destroy_volume_note)
             await _emit(__event_emitter__, f"Manual page: {manpage}", done=True)

@@ -1048,6 +1048,104 @@ async def test_persistent_volume_valve(R: Results):
             "{destroy_volume_note}" in overview)
 
 
+async def test_manpage_rendering(R: Results):
+    """Regression: every rendered manpage must be substantial and have all
+    placeholders resolved.
+
+    This class of bug recurs.  We've shipped at least once where
+    lathe(manpage="overview") returned the 14-character KeyError repr
+    "'volume_note'" because str.format() couldn't find a placeholder.
+    The test below would have caught that immediately: any non-trivial
+    length floor (say, 500 chars) would have failed for the broken
+    output, and the placeholder check would have failed independently.
+    """
+    from lathe import Tools
+
+    # Floor chosen to be (a) far above any plausible error message
+    # (KeyError reprs, "Error: ..." strings) and (b) far below the
+    # smallest legitimate manpage so we don't have to revisit it on
+    # every edit.
+    MIN_MANPAGE_LEN = 500
+    KNOWN_PLACEHOLDERS = ("{volume_note}", "{destroy_volume_note}", "{tool_catalog}")
+
+    print("\n── manpage rendering: every page non-trivial in length ──")
+    for has_volume in (True, False):
+        t = Tools()
+        t.valves.persistent_volume = has_volume
+        for page in sorted(t._MANPAGES.keys()):
+            label = f"{page!r} (persistent_volume={has_volume})"
+            result = await t.lathe(manpage=page)
+            R.check(
+                f"manpage {label} returns a string",
+                isinstance(result, str),
+                f"got {type(result).__name__}: {result!r}",
+            )
+            R.check(
+                f"manpage {label} length >= {MIN_MANPAGE_LEN}",
+                len(result) >= MIN_MANPAGE_LEN,
+                f"got {len(result)} chars: {result[:300]!r}",
+            )
+            R.check(
+                f"manpage {label} not an error message",
+                not result.startswith("Error:")
+                and not result.startswith("API error:"),
+                result[:300],
+            )
+            for ph in KNOWN_PLACEHOLDERS:
+                R.check(
+                    f"manpage {label} resolves {ph}",
+                    ph not in result,
+                    result[:500],
+                )
+
+    print("\n── manpage rendering: overview specifics ──")
+    for has_volume in (True, False):
+        t = Tools()
+        t.valves.persistent_volume = has_volume
+        result = await t.lathe(manpage="overview")
+        label = f"persistent_volume={has_volume}"
+        R.check(
+            f"overview includes tool catalog entries ({label})",
+            "bash(" in result and "delegate(" in result,
+            result[:500],
+        )
+        if has_volume:
+            R.check(
+                "volume note appears when persistent_volume=True",
+                "/home/daytona/volume" in result,
+                result[:1000],
+            )
+        else:
+            R.check(
+                "volume note absent when persistent_volume=False",
+                "/home/daytona/volume" not in result,
+                result[:1000],
+            )
+
+    print("\n── manpage rendering: version page ──")
+    t = Tools()
+    ver = await t.lathe(manpage="version")
+    R.check(
+        "version page mentions Lathe",
+        "Lathe" in ver,
+        ver,
+    )
+
+    print("\n── manpage rendering: unknown manpage returns index ──")
+    t = Tools()
+    unknown = await t.lathe(manpage="not-a-real-page-xyz")
+    R.check(
+        "unknown manpage names the missing page",
+        "not-a-real-page-xyz" in unknown,
+        unknown[:300],
+    )
+    R.check(
+        "unknown manpage suggests overview",
+        "overview" in unknown,
+        unknown[:300],
+    )
+
+
 async def test_delegate_prompt_build(R: Results):
     """Test _build_delegate_prompt assembles the sub-agent prompt correctly."""
     from lathe import _build_delegate_prompt
@@ -2397,6 +2495,7 @@ TESTS = {
     "edit_script": test_edit_script,
     "delegate_infrastructure": test_delegate_infrastructure,
     "persistent_volume_valve": test_persistent_volume_valve,
+    "manpage_rendering": test_manpage_rendering,
     "delegate_prompt_build": test_delegate_prompt_build,
     "delegate_tools_build": test_delegate_tools_build,
     "build_bash_script": test_build_bash_script,
