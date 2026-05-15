@@ -23,11 +23,11 @@ import { CANVAS, TIMING } from "./src/design";
 // ── Config ────────────────────────────────────────────────────────
 
 const VOICE_ID = "1f7zwaddjtlht0nw02oa"; // Adam's cloned voice
-// chatterbox-multilingual: same price ($1/M chars), same voice cloning, 23 languages.
-// Switched from chatterbox-turbo on 2026-05-14 after observing extended degraded
-// availability on turbo (requests hanging >30s for both preset and cloned voices)
-// while multilingual responded normally.
-const MODEL = "ResembleAI/chatterbox-multilingual";
+// Reverted to chatterbox-turbo on 2026-05-15 after confirming the provider had
+// recovered (curl spot-check: 200 OK, ~3.8s). The brief switch to multilingual
+// on 2026-05-14 was a workaround for a transient outage; turbo's English voice
+// quality is preferred.
+const MODEL = "ResembleAI/chatterbox-turbo";
 const API_URL = "https://api.deepinfra.com/v1/openai/audio/speech";
 const TIMEOUT_MS = 90_000;
 const MAX_RETRIES = 6;
