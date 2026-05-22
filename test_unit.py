@@ -2438,7 +2438,7 @@ async def test_tools_schema_parity(R: Results):
         "write": {"__user__", "__chat_id__", "__event_emitter__"},
         "edit": {"__user__", "__chat_id__", "__event_emitter__"},
         "interpret": {"__user__", "__chat_id__", "__event_emitter__"},
-        "delegate": {"__user__", "__chat_id__", "__event_emitter__", "__model__", "__request__"},
+        "delegate": {"__user__", "__chat_id__", "__event_emitter__", "__metadata__", "__model__", "__request__"},
         "expose": {"__user__", "__chat_id__", "__event_emitter__"},
     }
     for method_name, expected_dunders in DUNDER_EXPECTATIONS.items():

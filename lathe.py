@@ -2097,6 +2097,62 @@ async def _ensure_chat_init(
 _DELEGATE_FOREGROUND_SECONDS = 30
 
 
+class _ChatIdInjectingTransport(httpx.AsyncBaseTransport):
+    """Wraps an httpx transport to inject `chat_id` into JSON request bodies
+    sent to OWUI's /api/chat/completions, working around an OWUI 0.9.5 bug
+    (open-webui#24550, fix in #24556) where get_event_emitter() crashes with
+    `AttributeError: 'NoneType' object has no attribute 'startswith'` when
+    the request body has no chat_id key.
+
+    Only mutates POST requests to a chat-completions path with a JSON body
+    that lacks a non-null chat_id. Leaves all other requests untouched.
+    """
+
+    def __init__(self, inner: httpx.AsyncBaseTransport, chat_id: str):
+        self._inner = inner
+        self._chat_id = chat_id
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        try:
+            path = request.url.path or ""
+            if (
+                request.method == "POST"
+                and path.endswith("/chat/completions")
+                and "application/json" in (request.headers.get("content-type") or "")
+            ):
+                raw = request.content
+                if raw:
+                    body = json.loads(raw)
+                    if isinstance(body, dict) and not body.get("chat_id"):
+                        body["chat_id"] = self._chat_id
+                        new_bytes = json.dumps(body).encode("utf-8")
+                        new_headers = list(request.headers.raw)
+                        # Replace content-length with the new size; httpx
+                        # uses lowercase header names internally.
+                        new_headers = [
+                            (k, v) for (k, v) in new_headers
+                            if k.lower() != b"content-length"
+                        ]
+                        new_headers.append((b"content-length", str(len(new_bytes)).encode("ascii")))
+                        request = httpx.Request(
+                            method=request.method,
+                            url=request.url,
+                            headers=new_headers,
+                            content=new_bytes,
+                            extensions=request.extensions,
+                        )
+        except Exception as e:
+            # Never let body mutation break the request: log and pass
+            # through unmodified. The original 400 will surface and be
+            # diagnosable upstream.
+            logger.debug("ChatIdInjectingTransport: passthrough due to %s: %s",
+                         type(e).__name__, e)
+        return await self._inner.handle_async_request(request)
+
+    async def aclose(self) -> None:
+        await self._inner.aclose()
+
+
 
 
 
@@ -3709,6 +3765,7 @@ class Tools:
         foreground_seconds: int = -1,
         __user__: dict = {},
         __chat_id__: str = "",
+        __metadata__: dict = {},
         __model__: dict = {},
         __request__=None,
         __event_emitter__=None,
@@ -3748,7 +3805,15 @@ class Tools:
             if __request__ is None:
                 return "Error: delegate() requires the OWUI request context (__request__). This tool only works inside Open WebUI."
 
-            model_id = __model__.get("id", "")
+            # OWUI dispatch quirk: __model__["id"] is not always the
+            # user-selected model. In multi-model chats and certain tool-
+            # invocation paths, __model__ has been observed to carry a
+            # different model than the one the user picked, while
+            # __metadata__["model"]["id"] reliably reflects the actual
+            # selection. Prefer metadata; fall back to __model__.
+            metadata_model = __metadata__.get("model") if isinstance(__metadata__, dict) else None
+            metadata_model_id = metadata_model.get("id") if isinstance(metadata_model, dict) else None
+            model_id = metadata_model_id or __model__.get("id", "")
             if not model_id:
                 return "Error: delegate() could not determine the current model ID."
 
@@ -3765,8 +3830,27 @@ class Tools:
             # models (which have custom routing like Anthropic caching).
             # The /openai/chat/completions endpoint only knows about raw
             # connection models and cannot route pipe models.
+            #
+            # OWUI 0.9.5 bug workaround (open-webui#24550, fix in #24556,
+            # discussion #24720): /api/chat/completions crashes with
+            #   "'NoneType' object has no attribute 'startswith'"
+            # when the request body has no chat_id, because
+            # get_event_emitter() does .get('chat_id', '').startswith(...)
+            # and dict.get returns None (not '') when the key is present
+            # with an explicit None value. Browser UI always supplies
+            # chat_id; pydantic-ai's OpenAI client does not.
+            #
+            # We wrap the ASGI transport so JSON-bodied requests to
+            # /api/chat/completions get a chat_id key injected before
+            # OWUI sees it. We use the parent chat_id when available so
+            # the sub-agent's events are conceptually attached to the
+            # same chat the user is watching; otherwise we synthesize a
+            # local-scoped id (no message_id is sent, so OWUI's DB
+            # update branch in get_event_emitter is short-circuited).
             app = __request__.app
-            transport = httpx.ASGITransport(app=app)
+            base_transport = httpx.ASGITransport(app=app)
+            injected_chat_id = __chat_id__ or "lathe-delegate-local"
+            transport = _ChatIdInjectingTransport(base_transport, injected_chat_id)
             inner_client = httpx.AsyncClient(transport=transport, base_url="http://localhost")
 
             from pydantic_ai import Agent, UsageLimits
