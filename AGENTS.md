@@ -47,6 +47,13 @@ Rather than coercing bad types leniently (which silently masks upstream bugs), l
 
 The `string_typed_params` unit test verifies that `_check_tool_params` rejects wrong types (string for int, string for bool, etc.) and accepts correct types.
 
+### Annotations arrive stringized (PEP 563)
+
+OWUI's tool loader (`open_webui/utils/plugin.py`) has `from __future__ import annotations` and execs tool source with a bare `exec()`, which **inherits the caller's `__future__` flags**. So lathe's module compiles under PEP 563: `inspect.signature(core_fn).parameters[...].annotation` returns the **string** `'int'`, not the class `int`. Feeding that to `isinstance()` raises `isinstance() arg 2 must be a type, a tuple of types, or a union` (the prod bug fixed in 0.23.2: every typed-param tool crashed; `bash` survived only because it passes a literal `int`).
+
+Rule: **never trust raw signature annotations at runtime.** Resolve via `typing.get_type_hints(fn)` (which resolves the strings back to real classes against module globals), as `_standard_tool` now does for both `tool_annotations` and `__annotations__`. `_check_tool_params` also guards: a non-`type` `base_type` is skipped, never passed to `isinstance()`. This only reproduces under OWUI's loader, not a normal file import or top-level `exec` — verify fixes inside the OWUI process (or simulate with `from __future__ import annotations` + `exec`), not just offline. The `string_future_annotations_loading` unit test locks this in.
+
+
 ## Cold-start bootstrap
 
 The runtime agent must bootstrap from a blank Daytona sandbox. Recipes live in `lathe(manpage="recipes")`. Constraints: egress-allowlisted hosts only, no hardcoded version URLs (resolve via GitHub API), install to `/tmp`, x86_64 Linux (`*-musl` static builds preferred).

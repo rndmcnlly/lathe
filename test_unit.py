@@ -1671,6 +1671,84 @@ async def test_string_typed_params(R: Results):
     err = _check_tool_params({"offset": [1, 2]}, {"offset": int})
     R.check("list for int: rejected", err is not None, repr(err))
 
+    print("\n── defensive: stringized/unresolved annotations degrade to skip ──")
+    # Under OWUI's loader, exec() inherits plugin.py's `from __future__
+    # import annotations`, so a raw signature annotation can arrive as the
+    # STRING 'int' instead of the class int.  A naive isinstance(value,
+    # 'int') raises "arg 2 must be a type".  The guard must skip such
+    # unresolved annotations rather than crash. (_standard_tool resolves via
+    # get_type_hints, but the guard is the last line of defense.)
+    err = _check_tool_params({"start": 1}, {"start": "int"})
+    R.check("stringized 'int' annotation: no crash, skipped", err is None, repr(err))
+    err = _check_tool_params({"replace_all": True}, {"replace_all": "bool"})
+    R.check("stringized 'bool' annotation: no crash, skipped", err is None, repr(err))
+    err = _check_tool_params({"start": "not-an-int"}, {"start": "int"})
+    R.check("stringized annotation can't validate, but never crashes", err is None, repr(err))
+
+
+async def test_string_future_annotations_loading(R: Results):
+    """Reproduce OWUI's loader: exec under `from __future__ import
+    annotations` stringizes signature annotations.  _standard_tool must
+    still produce real-class tool_annotations (via get_type_hints), so the
+    type check at the boundary never hits the isinstance() crash.
+
+    This is the regression test for the prod bug where read/grep/glob/write
+    returned "isinstance() arg 2 must be a type, a tuple of types, or a
+    union": OWUI's plugin loader has `from __future__ import annotations`,
+    and exec() inherits the caller's __future__ flags, so the tool source
+    compiled with PEP 563 semantics.
+    """
+    import inspect
+    import typing
+
+    print("\n── OWUI future-annotations loading ──")
+
+    # Compile a module that mirrors lathe's _standard_tool construction,
+    # under future-annotations semantics (dont_inherit ensures the flag is
+    # on regardless of this test file's own __future__ state).
+    src = (
+        "from __future__ import annotations\n"
+        "import inspect, typing\n"
+        "def _core(valves, sandbox_id, client, *, path: str, start: int = 1) -> str:\n"
+        "    return ''\n"
+        "_CORE_INFRA = {'valves', 'sandbox_id', 'client'}\n"
+        "sig = inspect.signature(_core)\n"
+        "raw = {n: p.annotation for n, p in sig.parameters.items()\n"
+        "       if n not in _CORE_INFRA and p.annotation is not inspect.Parameter.empty}\n"
+        "hints = typing.get_type_hints(_core)\n"
+        "resolved = {n: hints.get(n, raw[n]) for n in raw}\n"
+    )
+    code = compile(src, "<owui_tool>", "exec", dont_inherit=True)
+    ns: dict = {}
+    exec(code, ns)
+
+    raw = ns["raw"]
+    resolved = ns["resolved"]
+
+    # Under future-annotations, the raw signature annotation is the STRING.
+    R.check(
+        "raw signature annotation is stringized",
+        raw["start"] == "int" and isinstance(raw["start"], str),
+        repr(raw),
+    )
+    # get_type_hints resolves it back to the real class.
+    R.check(
+        "get_type_hints resolves to real class",
+        resolved["start"] is int and resolved["path"] is str,
+        repr(resolved),
+    )
+
+    # The fix: _check_tool_params over the RESOLVED map works; over the RAW
+    # (stringized) map it must NOT crash (defensive guard).
+    from lathe import _check_tool_params
+
+    err = _check_tool_params({"start": 1}, resolved)
+    R.check("resolved map: valid int passes", err is None, repr(err))
+    err = _check_tool_params({"start": "3"}, resolved)
+    R.check("resolved map: string for int rejected", err is not None, repr(err))
+    err = _check_tool_params({"start": 1}, raw)
+    R.check("raw stringized map: no crash", err is None, repr(err))
+
 
 async def test_delegate_bash_foreground(R: Results):
     """Test that delegate bash uses a shorter foreground timeout."""
@@ -2504,6 +2582,7 @@ TESTS = {
     "core_write_mock": test_core_write_mock,
     "core_edit_mock": test_core_edit_mock,
     "string_typed_params": test_string_typed_params,
+    "string_future_annotations_loading": test_string_future_annotations_loading,
     "delegate_bash_foreground": test_delegate_bash_foreground,
     "format_delegate_background": test_format_delegate_background,
     "delegate_foreground_constant": test_delegate_foreground_constant,

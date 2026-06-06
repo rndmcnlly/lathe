@@ -5,7 +5,7 @@ author_url: https://adamsmith.as
 description: Coding agent tools (lathe, bash, read, write, edit, glob, grep, interpret, delegate, onboard, expose, destroy) backed by per-user sandbox VMs with transparent lifecycle management.
 required_open_webui_version: 0.4.0
 requirements: httpx, httpx-ws, pydantic-ai-slim[openai], cachetools
-version: 0.23.1
+version: 0.23.2
 licence: MIT
 """
 
@@ -1082,6 +1082,13 @@ def _check_tool_params(kwargs: dict, annotations: dict) -> str | None:
         value = kwargs[name]
         # get_origin resolves list[str] -> list, etc.
         base_type = typing.get_origin(expected_type) or expected_type
+        # Defensive: under OWUI's loader, annotations may arrive stringized
+        # (PEP 563) or otherwise unresolved.  A non-type base_type would make
+        # isinstance() raise "arg 2 must be a type".  Skip rather than crash:
+        # callers (_standard_tool) now resolve via get_type_hints, but a
+        # hand-written caller could still pass an unresolved annotation.
+        if not isinstance(base_type, type):
+            continue
         if not isinstance(value, base_type):
             return (
                 f"Error: parameter '{name}' expected type "
@@ -1152,11 +1159,22 @@ def _standard_tool(core_fn, *, emit_start: str, emit_done: str,
 
     # Names of tool params for extracting kwargs at call time
     tool_param_names = [p.name for p in tool_params]
-    # Annotation map for strict type checking at the boundary
+    # Annotation map for strict type checking at the boundary.
+    #
+    # We resolve via get_type_hints(core_fn), NOT the raw
+    # inspect.Parameter.annotation, because OWUI's tool loader
+    # (open_webui.utils.plugin.load_tool_module_by_id) execs tool source
+    # from within a module that has `from __future__ import annotations`.
+    # exec() inherits the caller's __future__ flags, so PEP 563 stringized
+    # annotations are in effect: raw signature annotations come back as the
+    # STRING 'int', not the class int, which would make _check_tool_params'
+    # isinstance() raise "arg 2 must be a type".  get_type_hints() resolves
+    # those strings back to real classes against the module globals.
+    _core_hints = typing.get_type_hints(core_fn)
     tool_annotations = {
-        p.name: p.annotation
+        p.name: _core_hints.get(p.name, p.annotation)
         for p in tool_params
-        if p.annotation is not inspect.Parameter.empty
+        if p.name in _core_hints or p.annotation is not inspect.Parameter.empty
     }
 
     async def _method(self, *args, **kwargs):
@@ -1221,8 +1239,11 @@ def _standard_tool(core_fn, *, emit_start: str, emit_done: str,
     # OWUI uses get_type_hints() (which reads __annotations__) for the
     # JSON schema type mapping, NOT inspect.signature().annotation.
     # Without this, all _standard_tool params fall back to "string".
+    # Use resolved hints (see tool_annotations above): under OWUI's loader
+    # the synth_param annotations are stringized (PEP 563), so prefer the
+    # get_type_hints()-resolved class where available.
     _method.__annotations__ = {
-        p.name: p.annotation
+        p.name: _core_hints.get(p.name, p.annotation)
         for p in synth_params
         if p.annotation is not inspect.Parameter.empty and p.name != "self"
     }
