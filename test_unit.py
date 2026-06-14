@@ -87,6 +87,56 @@ async def test_parse_env_vars(R: Results):
         R.check("array error mentions object", "object" in str(e), str(e))
 
 
+async def test_parse_create_overrides(R: Results):
+    from lathe import _parse_create_overrides, _PROTECTED_CREATE_KEYS, Tools
+
+    print("\n── _parse_create_overrides: empty / default ──")
+    R.check("empty string returns {}", _parse_create_overrides("") == {}, str(_parse_create_overrides("")))
+    R.check("bare {} returns {}", _parse_create_overrides("{}") == {}, str(_parse_create_overrides("{}")))
+    R.check("whitespace only returns {}", _parse_create_overrides("   ") == {})
+
+    print("\n── _parse_create_overrides: valid shape args ──")
+    out = _parse_create_overrides('{"cpu":2,"memory":4,"disk":20,"snapshot":"my-snap","target":"us"}')
+    R.check("cpu parsed as int", out.get("cpu") == 2, str(out))
+    R.check("memory parsed", out.get("memory") == 4, str(out))
+    R.check("snapshot parsed", out.get("snapshot") == "my-snap", str(out))
+    R.check("target parsed", out.get("target") == "us", str(out))
+
+    print("\n── _parse_create_overrides: protected keys rejected ──")
+    for key in ("name", "labels", "volumes"):
+        try:
+            _parse_create_overrides('{"%s":"x"}' % key)
+            R.check(f"{key} rejected", False, "no exception raised")
+        except ValueError as e:
+            R.check(f"{key} rejected", True)
+            R.check(f"error names {key}", key in str(e), str(e))
+
+    print("\n── _parse_create_overrides: invalid input raises ──")
+    try:
+        _parse_create_overrides("not json")
+        R.check("garbage raises", False, "no exception")
+    except ValueError as e:
+        R.check("garbage raises", True)
+        R.check("garbage mentions JSON", "JSON" in str(e), str(e))
+    try:
+        _parse_create_overrides('["a","b"]')
+        R.check("array raises", False, "no exception")
+    except ValueError as e:
+        R.check("array raises", True)
+        R.check("array mentions object", "object" in str(e), str(e))
+
+    print("\n── _PROTECTED_CREATE_KEYS contents ──")
+    R.check("protects name/labels/volumes",
+            _PROTECTED_CREATE_KEYS == frozenset({"name", "labels", "volumes"}),
+            str(_PROTECTED_CREATE_KEYS))
+
+    print("\n── new valves exist with safe defaults ──")
+    v = Tools().valves
+    R.check("auto_create_sandbox defaults True", v.auto_create_sandbox is True)
+    R.check("sandbox_missing_message defaults empty", v.sandbox_missing_message == "")
+    R.check("sandbox_create_overrides defaults {}", v.sandbox_create_overrides == "{}")
+
+
 async def test_onboard_script(R: Results):
     from lathe import _build_onboard_script
 
@@ -2561,6 +2611,7 @@ async def test_tools_schema_parity(R: Results):
 
 TESTS = {
     "parse_env_vars": test_parse_env_vars,
+    "parse_create_overrides": test_parse_create_overrides,
     "onboard_script": test_onboard_script,
     "truncate": test_truncate,
     "shell_quote": test_shell_quote,

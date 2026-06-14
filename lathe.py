@@ -5,7 +5,7 @@ author_url: https://adamsmith.as
 description: Coding agent tools (lathe, bash, read, write, edit, glob, grep, interpret, delegate, onboard, expose, destroy) backed by per-user sandbox VMs with transparent lifecycle management.
 required_open_webui_version: 0.4.0
 requirements: httpx, httpx-ws, pydantic-ai-slim[openai], cachetools
-version: 0.23.2
+version: 0.24.0
 licence: MIT
 """
 
@@ -254,6 +254,47 @@ def _parse_env_vars(env_vars: str) -> list[tuple[str, str]]:
             f"{', '.join(skipped)}. Keys must match [A-Za-z_][A-Za-z0-9_]*."
         )
     return pairs
+
+
+# Keys lathe manages itself; admin create-overrides may not clobber them.
+# - name/labels: the per-user lookup invariant (one sandbox per email).
+# - volumes: managed by the persistent_volume valve and _ensure_volume.
+_PROTECTED_CREATE_KEYS = frozenset({"name", "labels", "volumes"})
+
+
+def _parse_create_overrides(raw: str) -> dict:
+    """Parse the sandbox_create_overrides valve into a dict of create args.
+
+    Expects a JSON object, e.g. '{"cpu":2,"memory":4,"snapshot":"my-snap"}'.
+    Returns {} on empty input (not an error). Raises ValueError on malformed
+    input or on any attempt to override a lathe-managed key, so the caller
+    can surface it to the agent.
+    """
+    s = raw.strip()
+    if not s or s == "{}":
+        return {}
+    try:
+        overrides = json.loads(s)
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise ValueError(
+            f"Valves sandbox_create_overrides is not valid JSON: {exc}. "
+            f"Fix the sandbox_create_overrides field in Tool settings (it should "
+            f'look like {{"cpu":2,"memory":4}}) and retry.'
+        ) from exc
+    if not isinstance(overrides, dict):
+        raise ValueError(
+            f"Valves sandbox_create_overrides must be a JSON object, got "
+            f"{type(overrides).__name__}. Expected something like "
+            f'{{"cpu":2,"memory":4,"snapshot":"my-snapshot"}}.'
+        )
+    clobbered = _PROTECTED_CREATE_KEYS & overrides.keys()
+    if clobbered:
+        raise ValueError(
+            f"Valves sandbox_create_overrides may not set lathe-managed keys: "
+            f"{', '.join(sorted(clobbered))}. These are derived per user "
+            f"(name/labels) or controlled by the persistent_volume valve (volumes)."
+        )
+    return overrides
 
 
 def _get_email(user: dict) -> str:
@@ -2637,14 +2678,30 @@ async def _ensure_sandbox(valves, email: str, client: httpx.AsyncClient, emitter
     warning: str | None = None
 
     if sandbox is None:
-        # 2. Optionally get or create a persistent volume for this user
+        if not valves.auto_create_sandbox:
+            msg = valves.sandbox_missing_message.strip()
+            raise RuntimeError(
+                msg or (
+                    f"No sandbox exists for {email} and automatic creation is "
+                    f"disabled on this deployment. A sandbox must be provisioned "
+                    f"separately before lathe's tools can be used."
+                )
+            )
+
+        # 2. Build the create request. Admin overrides layer over lathe's
+        # tunable defaults (language, autoStop/Archive/Delete); the
+        # structural keys (name/labels/volumes) are forced last so a
+        # misconfigured override can never break the per-user lookup
+        # invariant. _parse_create_overrides already rejects those keys,
+        # but forcing them here is belt-and-suspenders.
+        overrides = _parse_create_overrides(valves.sandbox_create_overrides)
         create_json: dict = {
-            "language": valves.sandbox_language,
-            "name": f"{label_key}/{email}",
-            "labels": {label_key: email},
             "autoStopInterval": valves.auto_stop_minutes,
             "autoArchiveInterval": valves.auto_archive_minutes,
             "autoDeleteInterval": valves.auto_delete_minutes,
+            **overrides,
+            "name": f"{label_key}/{email}",
+            "labels": {label_key: email},
         }
         if valves.persistent_volume:
             volume_name = f"{label_key}/{email}"
@@ -2781,9 +2838,32 @@ class Tools:
             True,
             description="Mount a persistent S3/FUSE volume at /home/daytona/volume. Disable for deployments with limited data retention.",
         )
-        sandbox_language: str = Field(
-            "python",
-            description="Default language runtime (python, typescript, javascript)",
+        auto_create_sandbox: bool = Field(
+            True,
+            description=(
+                "Automatically create a sandbox when none exists for the user. "
+                "Disable for deployments where sandboxes are provisioned by another "
+                "system; the agent then receives sandbox_missing_message instead."
+            ),
+        )
+        sandbox_missing_message: str = Field(
+            "",
+            description=(
+                "Message returned to the agent when no sandbox exists and "
+                "auto_create_sandbox is disabled. Use it to give site-specific "
+                "setup advice (e.g. a URL to provision a sandbox). Empty falls "
+                "back to a generic message."
+            ),
+        )
+        sandbox_create_overrides: str = Field(
+            "{}",
+            description=(
+                "JSON object of extra arguments merged into the Daytona sandbox "
+                "create request, e.g. "
+                '{"cpu":2,"memory":4,"disk":20,"snapshot":"my-snapshot","target":"us"}. '
+                "Resource fields (cpu/memory/disk) are integers in cores/GB. "
+                "Cannot override name, labels, or volumes (managed by lathe)."
+            ),
         )
         foreground_timeout_seconds: int = Field(
             30,

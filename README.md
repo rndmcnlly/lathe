@@ -54,8 +54,36 @@ To update an existing installation, use the `/api/v1/tools/id/lathe/update` endp
 | `deployment_label` | *(empty, must configure)* | Label key for sandbox tagging (e.g. `chat.example.com`) |
 | `auto_stop_minutes` | `15` | Idle timeout before sandbox stops |
 | `auto_archive_minutes` | `60` | Minutes after stop before sandbox archives |
-| `sandbox_language` | `python` | Default sandbox runtime |
+| `auto_delete_minutes` | `-1` | Minutes after archive before permanent deletion (`-1` = never) |
+| `persistent_volume` | `true` | Mount a persistent S3/FUSE volume at `/home/daytona/volume` |
+| `auto_create_sandbox` | `true` | Auto-create a sandbox when none exists. Disable when sandboxes are provisioned externally |
+| `sandbox_missing_message` | *(empty)* | Message shown to the agent when no sandbox exists and `auto_create_sandbox` is off |
+| `sandbox_create_overrides` | `{}` | JSON of extra Daytona create args (see below) |
 | `foreground_timeout_seconds` | `30` | Seconds to wait for a bash command before auto-backgrounding (1–300) |
+
+### Sandbox shape (`sandbox_create_overrides`)
+
+`sandbox_create_overrides` is a JSON object merged into the Daytona sandbox
+create request, letting you control sandbox shape without a valve per field:
+
+```json
+{"cpu": 2, "memory": 4, "disk": 20, "snapshot": "my-snapshot", "target": "us"}
+```
+
+Resource fields (`cpu`, `memory`, `disk`, `gpu`) are integers in cores / GB /
+units; `snapshot` selects the base image; `target` picks a region. Any field
+the Daytona [`POST /sandbox`](https://www.daytona.io/docs/en/tools/api/) body
+accepts works here. The keys `name`, `labels`, and `volumes` are managed by
+lathe (per-user lookup invariant and the `persistent_volume` valve) and are
+rejected with a clear error if you try to set them.
+
+### Externally provisioned sandboxes (`auto_create_sandbox`)
+
+If another system shapes and provisions sandboxes (e.g. giving different users
+different sandboxes), set `auto_create_sandbox` to `false`. When the agent then
+finds no sandbox for the user, it receives `sandbox_missing_message` instead of
+a freshly created one. Use that message to point users at your provisioning
+flow, e.g. *"Visit https://example.com/setup to create your sandbox first."*
 
 ## UserValves (per-user configuration)
 
