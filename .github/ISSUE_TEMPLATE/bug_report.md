@@ -22,7 +22,7 @@ assignees: ''
 <!-- Fresh = just created or destroyed-then-recreated. Pre-existing = had prior state. -->
 
 **Relevant valve/settings changes** (if any):
-<!-- e.g. sandbox_language, auto_stop_minutes, env_vars, custom daytona_api_url -->
+<!-- e.g. sandbox_create_overrides, auto_stop_minutes, env_vars, custom daytona_api_url -->
 
 **Additional context:**
 <!-- Screenshots, conversation exports, model name, anything else that helps. -->

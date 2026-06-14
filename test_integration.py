@@ -389,7 +389,7 @@ async def test_int_env_vars(R: Results, tools: Tools, user: dict):
 async def test_int_ensure_sandbox(R: Results, tools: Tools, user: dict):
     import httpx
     import json as _json
-    from lathe import _headers, _ensure_sandbox
+    from lathe import _headers, _ensure_sandbox, _extract_sandbox_list
 
     async with httpx.AsyncClient(timeout=30.0) as client:
         print("\n── _ensure_sandbox: empty deployment_label guard ──")
@@ -412,7 +412,6 @@ async def test_int_ensure_sandbox(R: Results, tools: Tools, user: dict):
             f"{tools.valves.daytona_api_url}/sandbox",
             headers=_headers(tools.valves),
             json={
-                "language": tools.valves.sandbox_language,
                 "name": f"test-harness/{TEST_EMAIL}-duplicate",
                 "labels": {"test-harness": TEST_EMAIL},
                 "autoStopInterval": tools.valves.auto_stop_minutes,
@@ -424,13 +423,27 @@ async def test_int_ensure_sandbox(R: Results, tools: Tools, user: dict):
         duplicate_id = resp.json()["id"]
         print(f"  Created duplicate sandbox {duplicate_id[:12]}...")
 
-        try:
-            await _ensure_sandbox(tools.valves, TEST_EMAIL, client, emitter=mock_emitter)
-            R.check("duplicate raises RuntimeError", False, "no exception raised")
-        except RuntimeError as e:
-            msg = str(e)
-            R.check("duplicate raises RuntimeError", "Found 2 sandboxes" in msg, msg[:200])
-            R.check("duplicate error lists sandbox ids", duplicate_id[:12] in msg, msg[:200])
+        # The Daytona list endpoint is eventually consistent: the freshly
+        # created duplicate may not appear in the next GET immediately. Poll
+        # _ensure_sandbox until it sees both sandboxes and raises (or give up).
+        raised_msg = None
+        for _attempt in range(15):
+            try:
+                await _ensure_sandbox(tools.valves, TEST_EMAIL, client, emitter=mock_emitter)
+            except RuntimeError as e:
+                raised_msg = str(e)
+                break
+            await asyncio.sleep(1)
+        R.check(
+            "duplicate raises RuntimeError",
+            raised_msg is not None and "Found 2 sandboxes" in raised_msg,
+            (raised_msg or "no exception raised")[:200],
+        )
+        R.check(
+            "duplicate error lists sandbox ids",
+            raised_msg is not None and duplicate_id[:12] in raised_msg,
+            (raised_msg or "no exception raised")[:200],
+        )
 
         print(f"  Deleting duplicate sandbox {duplicate_id[:12]}...")
         resp = await client.delete(
@@ -448,7 +461,7 @@ async def test_int_ensure_sandbox(R: Results, tools: Tools, user: dict):
                 headers=_headers(tools.valves),
             )
             remaining = [
-                s for s in (resp.json() or [])
+                s for s in _extract_sandbox_list(resp.json())
                 if s.get("labels", {}).get("test-harness") == TEST_EMAIL
             ]
             if len(remaining) <= 1:
