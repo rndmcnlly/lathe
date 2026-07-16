@@ -4,8 +4,8 @@ author: Adam Smith
 author_url: https://adamsmith.as
 description: Coding agent tools (lathe, bash, read, write, edit, glob, grep, interpret, delegate, onboard, expose, destroy) backed by per-user sandbox VMs with transparent lifecycle management.
 required_open_webui_version: 0.4.0
-requirements: httpx, httpx-ws, pydantic-ai-slim[openai], cachetools
-version: 0.24.0
+requirements: httpx, httpx-ws, pydantic-ai-slim[openai]~=1.60, cachetools
+version: 0.24.1
 licence: MIT
 """
 
@@ -207,6 +207,19 @@ def _format_bg_delegate_notice(delegate_id: str, elapsed: int,
         else:
             lines.append("(no result text)")
     return "\n".join(lines)
+
+
+def _unwrap_delegate_exception(exc: Exception) -> Exception:
+    """Recover an exception masked by pydantic-ai's old async cleanup bug."""
+    cleanup_exc = exc.__context__
+    if (
+        isinstance(exc, RuntimeError)
+        and str(exc) == "async generator raised StopAsyncIteration"
+        and isinstance(cleanup_exc, StopAsyncIteration)
+        and isinstance(cleanup_exc.__context__, Exception)
+    ):
+        return cleanup_exc.__context__
+    return exc
 
 
 def _shell_quote(s: str) -> str:
@@ -4179,8 +4192,9 @@ class Tools:
                     })
 
                 except Exception as e:
-                    error_type = type(e).__name__
-                    error_detail = str(e)
+                    root_error = _unwrap_delegate_exception(e)
+                    error_type = type(root_error).__name__
+                    error_detail = str(root_error)
                     # Detect provider-level failures (malformed upstream responses)
                     # and surface a concise, actionable message instead of raw
                     # pydantic validation noise.

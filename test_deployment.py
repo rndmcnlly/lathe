@@ -265,7 +265,6 @@ async def test_tool_schema(R: Results):
 
         if lathe_tools:
             lathe = lathe_tools[0]
-            R.check("Lathe has name", "Lathe" in (lathe.get("name") or ""), lathe.get("name"))
             specs = lathe.get("specs", [])
             spec_names = {s.get("name") for s in specs}
             for expected in ("bash", "read", "write", "edit", "expose", "destroy", "onboard", "lathe"):

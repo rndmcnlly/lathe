@@ -594,7 +594,7 @@ wheels = [
 
 [[package]]
 name = "lathe"
-version = "0.23.2"
+version = "0.24.1"
 source = { virtual = "." }
 dependencies = [
     { name = "aiohttp" },
@@ -614,7 +614,7 @@ requires-dist = [
     { name = "httpx" },
     { name = "httpx-ws" },
     { name = "pydantic" },
-    { name = "pydantic-ai-slim", extras = ["openai"] },
+    { name = "pydantic-ai-slim", extras = ["openai"], specifier = "~=1.60" },
     { name = "python-dotenv" },
     { name = "python-socketio", extras = ["asyncio-client"] },
 ]

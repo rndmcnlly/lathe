@@ -1067,6 +1067,44 @@ async def test_delegate_infrastructure(R: Results):
                     f"params: {param_names}")
 
 
+async def test_delegate_exception_unwrapping(R: Results):
+    """Recover only the known pydantic-ai cleanup masking chain."""
+    from lathe import _unwrap_delegate_exception
+
+    print("\n── delegate exception: known cleanup chain ──")
+    original = ConnectionError("model request timed out")
+    cleanup = StopAsyncIteration()
+    cleanup.__context__ = original
+    masked = RuntimeError("async generator raised StopAsyncIteration")
+    masked.__context__ = cleanup
+    R.check("known chain returns original",
+            _unwrap_delegate_exception(masked) is original)
+
+    print("\n── delegate exception: unrelated chains ──")
+    unrelated = RuntimeError("different runtime failure")
+    unrelated.__context__ = cleanup
+    R.check("different RuntimeError remains intact",
+            _unwrap_delegate_exception(unrelated) is unrelated)
+
+    matching_message_only = RuntimeError("async generator raised StopAsyncIteration")
+    matching_message_only.__context__ = ValueError("not a cleanup artifact")
+    R.check("wrong context type remains intact",
+            _unwrap_delegate_exception(matching_message_only) is matching_message_only)
+
+    print("\n── delegate exception: dependency floor ──")
+    from pathlib import Path
+    import tomllib
+
+    root = Path(__file__).parent
+    module_source = (root / "lathe.py").read_text()
+    project = tomllib.loads((root / "pyproject.toml").read_text())
+    requirement = "pydantic-ai-slim[openai]~=1.60"
+    R.check("tool metadata has fixed-version floor",
+            f"requirements: httpx, httpx-ws, {requirement}, cachetools" in module_source)
+    R.check("project metadata has fixed-version floor",
+            requirement in project["project"]["dependencies"])
+
+
 async def test_persistent_volume_valve(R: Results):
     """Test persistent_volume valve controls volume-related messaging."""
     from lathe import Tools, _build_delegate_system_prompt
@@ -2623,6 +2661,7 @@ TESTS = {
     "write_script": test_write_script,
     "edit_script": test_edit_script,
     "delegate_infrastructure": test_delegate_infrastructure,
+    "delegate_exception_unwrapping": test_delegate_exception_unwrapping,
     "persistent_volume_valve": test_persistent_volume_valve,
     "manpage_rendering": test_manpage_rendering,
     "delegate_prompt_build": test_delegate_prompt_build,
