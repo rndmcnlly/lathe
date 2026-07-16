@@ -14,7 +14,7 @@ No OWUI internals are touched. The toolkit does not import `open_webui.*`, does 
 
 - **Per-user sandbox isolation** — Each OWUI user gets exactly one sandbox, identified by their email address. Users cannot access each other's sandboxes.
 - **Deployment label scoping** — Sandboxes are tagged with a `deployment_label` (e.g. `chat.example.com`), so multiple OWUI instances sharing a Daytona account do not collide.
-- **User secrets** — The `env_vars` UserValve is a password field (masked in UI). Values are injected into shell commands but never shown to the model. Pair with system prompts that reference variable names without values.
+- **User secrets** — The `env_vars` UserValve is a password field (masked in UI), but its values are deliberately entrusted to the model through every `bash` command it can invoke. The model can read command environments and should be treated as able to disclose or misuse these credentials. Use narrowly scoped, revocable credentials only.
 - **Destroy confirmation guard** — The `destroy` tool requires an explicit `confirm=true` parameter to prevent accidental deletion.
 - **No model prompt modification** — Lathe does not inject system prompts or alter model behavior. It only exposes tools.
 

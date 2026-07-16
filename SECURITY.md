@@ -23,7 +23,7 @@ I'll acknowledge receipt within 48 hours and aim to resolve confirmed vulnerabil
 Lathe is a toolkit that runs inside an Open WebUI server process and makes API calls to Daytona's sandbox infrastructure. Security-relevant areas include:
 
 - **Sandbox isolation** — each user gets one sandbox, identified by email. Cross-user access would be a critical issue.
-- **Secret handling** — the `env_vars` UserValve injects secrets into shell commands without exposing them to the model. Leakage of these values to the model context or other users would be a critical issue.
+- **Secret handling** — the `env_vars` UserValve gives credentials to every model-controlled shell command, including delegate commands. These values are masked in the OWUI settings UI but are not hidden from the model, which can read its command environment. Treat them as credentials entrusted to the model and use narrowly scoped, revocable tokens. Cross-user disclosure or retention outside the ephemeral command lifetime would be a critical issue.
 - **API key exposure** — the Daytona API key is an admin Valve. If a model or user could extract it, they'd have control over all sandboxes.
 - **Sandbox escape** — Lathe executes arbitrary commands inside Daytona sandboxes. This is by design. A vulnerability would be if sandbox commands could affect the OWUI host server or other users' sandboxes.
 

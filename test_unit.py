@@ -1442,83 +1442,103 @@ async def test_delegate_tools_build(R: Results):
 
 
 async def test_build_bash_script(R: Results):
-    from lathe import _build_bash_script
+    from lathe import _BASH_LOG_RELAY, _BASH_LOG_MAX_BYTES, _build_bash_script
 
     print("\n── _build_bash_script: basic structure ──")
-    script = _build_bash_script("echo hello", [], "/tmp/cmd/test/pid", "/tmp/cmd/test/log")
+    script = _build_bash_script("echo hello", [], "/dev/shm/lathe/cmd/test/pid", "/dev/shm/lathe/cmd/test/log")
     R.check("starts with shebang", script.startswith("#!/usr/bin/env bash\n"), script[:30])
     R.check("has set -e", "set -e -o pipefail" in script, script[:100])
     R.check("has DEBIAN_FRONTEND", "DEBIAN_FRONTEND=noninteractive" in script, "missing env")
-    R.check("writes PID", "/tmp/cmd/test/pid" in script, "missing PID path")
-    R.check("tees to log", "/tmp/cmd/test/log" in script, "missing log path")
+    R.check("writes PID", "/dev/shm/lathe/cmd/test/pid" in script, "missing PID path")
+    R.check("relays to log", "/dev/shm/lathe/cmd/test/log" in script, "missing log path")
+    R.check("does not use tee", "tee " not in script, script)
+    R.check("sets log cap", str(_BASH_LOG_MAX_BYTES) in script, script)
     R.check("has command", "echo hello" in script, "missing command")
     R.check("ends with newline", script.endswith("\n"), "should end with newline")
 
     print("\n── _build_bash_script: user env vars ──")
     script = _build_bash_script("ls", [("FOO", "bar"), ("SECRET", "it's a \"test\"")],
-                                "/tmp/cmd/x/pid", "/tmp/cmd/x/log")
+                                "/dev/shm/lathe/cmd/x/pid", "/dev/shm/lathe/cmd/x/log")
     R.check("exports FOO", "export FOO='bar'" in script, script[:300])
     R.check("exports SECRET with quoting", "export SECRET=" in script, script[:300])
     # The value should be shell-quoted
     R.check("SECRET value quoted", "'it'\\''s a \"test\"'" in script, script[:300])
 
     print("\n── _build_bash_script: no env vars ──")
-    script = _build_bash_script("pwd", [], "/tmp/cmd/y/pid", "/tmp/cmd/y/log")
+    script = _build_bash_script("pwd", [], "/dev/shm/lathe/cmd/y/pid", "/dev/shm/lathe/cmd/y/log")
     R.check("no export lines", "export FOO" not in script, "should have no user exports")
     R.check("still has CI=true", "CI=true" in script, "missing CI env")
+
+    print("\n── _BASH_LOG_RELAY: bounded capture preserves command output ──")
+    with tempfile.TemporaryDirectory() as temp_dir:
+        log_path = os.path.join(temp_dir, "log")
+        payload = b"x" * 256
+        relay = subprocess.run(
+            [sys.executable, "-c", _BASH_LOG_RELAY, log_path, "128"],
+            input=payload, capture_output=True, check=True,
+        )
+        with open(log_path, "rb") as f:
+            log = f.read()
+    R.check("relay passes complete output through", relay.stdout == payload, repr(relay.stdout))
+    R.check("relay caps log bytes", len(log) <= 128, f"got {len(log)} bytes")
+    R.check("relay marks truncation in log", b"log capture truncated" in log, repr(log))
+    R.check("relay marks truncation in output", b"log capture truncated" in relay.stderr, repr(relay.stderr))
+
+
+async def test_sidecar_paths(R: Results):
+    from lathe import (
+        _DURABLE_ROOT, _EPHEMERAL_ROOT, _bash_sidecar_dir,
+        _delegate_sidecar_dir, _onboard_script_path,
+    )
+
+    print("\n── sidecar paths: storage intent is explicit ──")
+    R.check("ephemeral root is tmpfs", _EPHEMERAL_ROOT == "/dev/shm/lathe", _EPHEMERAL_ROOT)
+    R.check("durable root is namespaced tmp", _DURABLE_ROOT == "/tmp/lathe", _DURABLE_ROOT)
+    R.check("bash path uses ephemeral root", _bash_sidecar_dir("abc") == "/dev/shm/lathe/cmd/abc", _bash_sidecar_dir("abc"))
+    R.check("delegate path uses ephemeral root", _delegate_sidecar_dir("abc") == "/dev/shm/lathe/delegate/abc", _delegate_sidecar_dir("abc"))
+    R.check("onboard path uses ephemeral root", _onboard_script_path("abc") == "/dev/shm/lathe/onboard/abc.py", _onboard_script_path("abc"))
 
 
 async def test_format_bash_result(R: Results):
     from lathe import _format_bash_result, _MAX_BYTES
 
     print("\n── _format_bash_result: successful command ──")
-    result = _format_bash_result("hello world", 0, False, {})
+    result = _format_bash_result("hello world", 0)
     R.check("returns output", result == "hello world", result)
 
     print("\n── _format_bash_result: non-zero exit code ──")
-    result = _format_bash_result("some error", 1, False, {})
+    result = _format_bash_result("some error", 1)
     R.check("prepends exit code", result.startswith("Exit code: 1\n"), result[:30])
     R.check("includes output", "some error" in result, result)
 
     print("\n── _format_bash_result: empty output ──")
-    result = _format_bash_result("", 0, False, {})
+    result = _format_bash_result("", 0)
     R.check("empty becomes (no output)", result == "(no output)", result)
 
-    result = _format_bash_result("   \n  ", 0, False, {})
+    result = _format_bash_result("   \n  ", 0)
     R.check("whitespace-only becomes (no output)", result == "(no output)", result)
 
-    print("\n── _format_bash_result: truncated with spill path ──")
-    meta = {
-        "total_lines": 5000,
-        "total_bytes": 200000,
-        "shown_start_line": 3001,
-        "shown_end_line": 5000,
-        "truncated_by": "lines",
-    }
-    result = _format_bash_result("tail content", 0, True, meta, spill_path="/tmp/cmd/abc/log")
-    R.check("has truncation notice", "[Showing lines" in result, result[-100:])
-    R.check("mentions spill path", "/tmp/cmd/abc/log" in result, result[-100:])
-
-    print("\n── _format_bash_result: truncated by bytes ──")
-    meta["truncated_by"] = "bytes"
-    result = _format_bash_result("tail content", 0, True, meta, spill_path="/tmp/cmd/abc/log")
-    R.check("mentions byte limit", "limit" in result, result[-150:])
+    print("\n── _format_bash_result: truncated output has no retained spill path ──")
+    result = _format_bash_result("tail content", 0)
+    R.check("returns truncated tail", result == "tail content", result)
 
     print("\n── _format_bash_result: backgrounded command ──")
-    result = _format_bash_result("partial output", None, False, {},
-                                 background_info={"elapsed": 30, "cmd_id": "abc-123"})
+    result = _format_bash_result(
+        "partial output", None, background_info={"elapsed": 30, "cmd_id": "abc-123"},
+    )
     R.check("has backgrounded notice", "Backgrounded after 30s" in result, result)
     R.check("has CMD id", "CMD=abc-123" in result, result)
-    R.check("has sidecar refs", "/tmp/cmd/$CMD/" in result, result)
+    R.check("has sidecar refs", "/dev/shm/lathe/cmd/$CMD/" in result, result)
     R.check("mentions manpage", "lathe(manpage=" in result, result)
 
     print("\n── _format_bash_result: backgrounded with empty output ──")
-    result = _format_bash_result("", None, False, {},
-                                 background_info={"elapsed": 5, "cmd_id": "xyz"})
+    result = _format_bash_result(
+        "", None, background_info={"elapsed": 5, "cmd_id": "xyz"},
+    )
     R.check("empty becomes (no output yet)", "(no output yet)" in result, result[:30])
 
     print("\n── _format_bash_result: exit code 0 not shown ──")
-    result = _format_bash_result("ok", 0, False, {})
+    result = _format_bash_result("ok", 0)
     R.check("exit code 0 not prepended", not result.startswith("Exit code:"), result[:20])
 
 
@@ -1857,7 +1877,7 @@ async def test_format_delegate_background(R: Results):
     result = _format_delegate_background("abc-123", 30, "Sub-agent thinking... (1/10)")
     R.check("has backgrounded notice", "Backgrounded after 30s" in result, result[:100])
     R.check("has DELEGATE id", "DELEGATE=abc-123" in result, result)
-    R.check("has sidecar refs", "/tmp/delegate/$DELEGATE/" in result, result)
+    R.check("has sidecar refs", "/dev/shm/lathe/delegate/$DELEGATE/" in result, result)
     R.check("has log preview", "Sub-agent thinking" in result, result)
     R.check("mentions manpage", "lathe(manpage=" in result, result)
 
@@ -2816,6 +2836,7 @@ TESTS = {
     "delegate_prompt_build": test_delegate_prompt_build,
     "delegate_tools_build": test_delegate_tools_build,
     "build_bash_script": test_build_bash_script,
+    "sidecar_paths": test_sidecar_paths,
     "format_bash_result": test_format_bash_result,
     "core_read_mock": test_core_read_mock,
     "core_write_mock": test_core_write_mock,

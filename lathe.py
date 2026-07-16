@@ -5,7 +5,7 @@ author_url: https://adamsmith.as
 description: Coding agent tools (lathe, bash, read, write, edit, glob, grep, interpret, delegate, onboard, expose, destroy) backed by per-user sandbox VMs with transparent lifecycle management.
 required_open_webui_version: 0.4.0
 requirements: httpx, httpx-ws, pydantic-ai-slim[openai]~=1.60, cachetools
-version: 0.24.2
+version: 0.24.3
 licence: MIT
 """
 
@@ -258,6 +258,26 @@ def _shell_quote(s: str) -> str:
     return "'" + s.replace("'", "'\\''") + "'"
 
 
+_EPHEMERAL_ROOT = "/dev/shm/lathe"
+_DURABLE_ROOT = "/tmp/lathe"
+_BASH_LOG_MAX_BYTES = 1024 * 1024
+
+
+def _bash_sidecar_dir(cmd_id: str) -> str:
+    """Return the tmpfs directory for one bash invocation."""
+    return f"{_EPHEMERAL_ROOT}/cmd/{cmd_id}"
+
+
+def _delegate_sidecar_dir(delegate_id: str) -> str:
+    """Return the tmpfs directory for one delegate invocation."""
+    return f"{_EPHEMERAL_ROOT}/delegate/{delegate_id}"
+
+
+def _onboard_script_path(script_id: str) -> str:
+    """Return the tmpfs path for one generated onboarding script."""
+    return f"{_EPHEMERAL_ROOT}/onboard/{script_id}.py"
+
+
 def _parse_env_vars(env_vars: str) -> list[tuple[str, str]]:
     """Parse a JSON object string into (key, value) pairs.
 
@@ -415,16 +435,6 @@ def _truncate_tail(text: str) -> tuple[str, bool, dict]:
         "truncated_by": truncated_by,
     }
     return output, True, meta
-
-
-def _human_size(n: int) -> str:
-    """Format byte count as human-readable string."""
-    b = float(n)
-    for unit in ("B", "KB", "MB", "GB"):
-        if b < 1024:
-            return f"{b:,.0f} {unit}" if unit == "B" else f"{b:,.1f} {unit}"
-        b /= 1024
-    return f"{b:,.1f} TB"
 
 
 # ── shared glob infrastructure (runs on sandbox) ────────────────────
@@ -1111,6 +1121,21 @@ async def _download_file(valves, sandbox_id: str, client: httpx.AsyncClient,
     return resp.text
 
 
+async def _remove_sandbox_path(valves, sandbox_id: str, client: httpx.AsyncClient,
+                               path: str) -> None:
+    """Best-effort removal of an ephemeral sandbox path after consumption."""
+    try:
+        resp = await client.post(
+            _toolbox(valves, sandbox_id, "/process/execute"),
+            headers=_headers(valves),
+            json={"command": f"rm -rf -- {_shell_quote(path)}", "timeout": 5000},
+            timeout=15.0,
+        )
+        resp.raise_for_status()
+    except Exception as exc:
+        logger.debug("sidecar cleanup failed for %s: %s", path, exc)
+
+
 async def _run_sandbox_script(valves, sandbox_id: str, client: httpx.AsyncClient,
                               script: str, *, error_prefix: str,
                               timeout_ms: int = 30000,
@@ -1458,9 +1483,46 @@ async def _core_grep(valves, sandbox_id: str, client: httpx.AsyncClient, *,
 # ── bash core (session + sidecar protocol) ──────────────────────────
 
 
+_BASH_LOG_RELAY = r'''import sys
+
+path, limit = sys.argv[1], int(sys.argv[2])
+marker = b"\n[Lathe: log capture truncated; full output remains in the command session.]\n"
+remaining = limit - len(marker)
+truncated = False
+
+try:
+    log = open(path, "wb")
+except OSError as exc:
+    log = None
+    sys.stderr.write(f"[Lathe: log capture unavailable: {exc}]\n")
+
+with log or open("/dev/null", "wb") as destination:
+    while chunk := sys.stdin.buffer.read(65536):
+        try:
+            sys.stdout.buffer.write(chunk)
+            sys.stdout.buffer.flush()
+        except BrokenPipeError:
+            pass
+        if log is None or truncated:
+            continue
+        try:
+            if len(chunk) <= remaining:
+                destination.write(chunk)
+                remaining -= len(chunk)
+            else:
+                destination.write(chunk[:remaining])
+                destination.write(marker)
+                destination.flush()
+                truncated = True
+                sys.stderr.write(marker.decode())
+        except OSError as exc:
+            truncated = True
+            sys.stderr.write(f"[Lathe: log capture stopped: {exc}]\n")
+'''
+
 def _build_bash_script(command: str, user_pairs: list[tuple[str, str]],
                        pid_path: str, log_path: str) -> str:
-    """Build the bash wrapper script with sidecar file setup."""
+    """Build a wrapper with bounded, failure-tolerant sidecar logging."""
     user_env_lines = "".join(
         f"export {k}={_shell_quote(v)}\n" for k, v in user_pairs
     )
@@ -1474,15 +1536,16 @@ def _build_bash_script(command: str, user_pairs: list[tuple[str, str]],
         "CI=true\n"
         + user_env_lines
         + f"echo $BASHPID > {_shell_quote(pid_path)}\n"
-        + f"exec > >(tee {_shell_quote(log_path)}) 2>&1\n"
+        + (
+            f"exec > >(python3 -c {_shell_quote(_BASH_LOG_RELAY)} "
+            f"{_shell_quote(log_path)} {_BASH_LOG_MAX_BYTES}) 2>&1\n"
+        )
         + command
         + "\n"
     )
 
 
 def _format_bash_result(output: str, exit_code: int | None,
-                        was_truncated: bool, meta: dict,
-                        spill_path: str | None = None,
                         background_info: dict | None = None) -> str:
     """Format bash output for return to the caller."""
     if background_info is not None:
@@ -1494,7 +1557,7 @@ def _format_bash_result(output: str, exit_code: int | None,
         bg_notice = (
             f"\n\n[Backgrounded after {elapsed}s — command is still running]\n"
             f"CMD={cmd_id}\n"
-            f"Ref /tmp/cmd/$CMD/{{sh,pid,log,exit}}\n"
+            f"Ref {_EPHEMERAL_ROOT}/cmd/$CMD/{{sh,pid,log,exit}}\n"
             f"See lathe(manpage=\"background\") for peek/poll/kill recipes.\n"
             f"Tell the user the command is running. Don't poll until they ask or "
             f"you have a concrete reason to expect completion."
@@ -1507,24 +1570,6 @@ def _format_bash_result(output: str, exit_code: int | None,
 
     if not output.strip():
         output = "(no output)"
-
-    if was_truncated and spill_path:
-        start = meta["shown_start_line"]
-        end = meta["shown_end_line"]
-        total = meta["total_lines"]
-        total_size = _human_size(meta["total_bytes"])
-        if meta["truncated_by"] == "lines":
-            notice = (
-                f"\n\n[Showing lines {start}-{end} of {total}. "
-                f"Full output ({total_size}): {spill_path}]"
-            )
-        else:
-            notice = (
-                f"\n\n[Showing lines {start}-{end} of {total} "
-                f"({_human_size(_MAX_BYTES)} limit, full output is {total_size}). "
-                f"Full output: {spill_path}]"
-            )
-        output += notice
 
     return output
 
@@ -1548,7 +1593,7 @@ async def _core_bash(valves, sandbox_id: str, client: httpx.AsyncClient, *,
     :param foreground_seconds: Seconds to wait before auto-backgrounding. Omit or set -1 to use the server default. Set 0 for immediate background (fire-and-forget). Use higher positive values for known-slow commands.
     """
     cmd_id = str(uuid.uuid4())
-    cmd_dir = f"/tmp/cmd/{cmd_id}"
+    cmd_dir = _bash_sidecar_dir(cmd_id)
     log_path = f"{cmd_dir}/log"
     pid_path = f"{cmd_dir}/pid"
     exit_path = f"{cmd_dir}/exit"
@@ -1665,7 +1710,7 @@ async def _core_bash(valves, sandbox_id: str, client: httpx.AsyncClient, *,
     )
     result = logs_resp.text if logs_resp.status_code == 200 else ""
 
-    output, was_truncated, meta = _truncate_tail(result)
+    output, _, _ = _truncate_tail(result)
 
     if not finished:
         elapsed = int(time.time() - (deadline - fg_timeout))
@@ -1674,16 +1719,14 @@ async def _core_bash(valves, sandbox_id: str, client: httpx.AsyncClient, *,
                           session_cmd_id=session_cmd_id, cmd_id=cmd_id,
                           start_time=deadline - fg_timeout)
         return _format_bash_result(
-            output, exit_code, was_truncated, meta,
+            output, exit_code,
             background_info={"elapsed": elapsed, "cmd_id": cmd_id},
         )
 
     # Command finished within foreground window
-    spill_path = log_path if was_truncated else None
-    return _format_bash_result(
-        output, exit_code, was_truncated, meta,
-        spill_path=spill_path,
-    )
+    result = _format_bash_result(output, exit_code)
+    await _remove_sandbox_path(valves, sandbox_id, client, cmd_dir)
+    return result
 
 
 # ── Background bash completion polling ───────────────────────────────
@@ -1752,6 +1795,9 @@ async def _poll_bg_bash(valves, sandbox_id: str, session_id: str,
 
             notice = _format_bg_bash_notice(cmd_id, exit_code, elapsed, tail)
             _push_bg_notice(chat_state, chat_id, notice)
+            await _remove_sandbox_path(
+                valves, sandbox_id, poll_client, _bash_sidecar_dir(cmd_id),
+            )
 
         except Exception as e:
             logger.debug("bg-poll: poller failed: %s", e)
@@ -2159,7 +2205,7 @@ async def _chat_auto_init(
     except Exception as e:
         logger.debug("auto-init: sandbox metadata fetch failed: %s", e)
 
-    # ── User env var names (values never exposed) ────────────────
+    # ── User env var names for auto-init (values stay out of this message) ──
     try:
         user_valves = user.get("valves")
         if user_valves:
@@ -2272,7 +2318,7 @@ def _format_delegate_background(delegate_id: str, elapsed: int, log_preview: str
         f"{log_preview}\n\n"
         f"[Backgrounded after {elapsed}s — sub-agent is still running]\n"
         f"DELEGATE={did}\n"
-        f"Ref /tmp/delegate/$DELEGATE/{{task,log,result,error,usage}}\n"
+        f"Ref {_EPHEMERAL_ROOT}/delegate/$DELEGATE/{{task,log,result,error,usage}}\n"
         f"See lathe(manpage=\"delegate\") for background monitoring recipes.\n"
         f"Tell the user the delegate is running. Don't poll until they ask or "
         f"you have a concrete reason to expect completion."
@@ -2543,42 +2589,42 @@ VOLUME_MOUNT_PATH = "/home/daytona/volume"
 
 # ── Service fast-path constants ──────────────────────────────────────
 
-_DUFS_BIN = "/tmp/dufs"
+_DUFS_BIN = f"{_DURABLE_ROOT}/dufs"
 _DUFS_PORT = 5000  # dufs default
 _DUFS_ROOT = "/home/daytona/workspace"
 
 # Single idempotent script: install if missing, start if not listening.
 # Exit 0 = ready (prints READY); non-zero = install or start failed.
 _DUFS_ENSURE_SCRIPT = (
-    f'set -e; '
+    f'set -e; mkdir -p {_DURABLE_ROOT}; '
     f'if ! test -x {_DUFS_BIN}; then '
     f'  TAG=$(curl -sf https://api.github.com/repos/sigoden/dufs/releases/latest '
     f'    | python3 -c "import sys,json; print(json.load(sys.stdin)[\'tag_name\'])") '
     f'  && curl -sL "https://github.com/sigoden/dufs/releases/download/${{TAG}}/'
     f'dufs-${{TAG}}-x86_64-unknown-linux-musl.tar.gz" '
-    f'  | tar xz -C /tmp && chmod +x {_DUFS_BIN}; '
+    f'  | tar xz -C {_DURABLE_ROOT} && chmod +x {_DUFS_BIN}; '
     f'fi; '
     f'if ! ss -tlnp | grep -q ":{_DUFS_PORT} "; then '
-    f'  nohup {_DUFS_BIN} {_DUFS_ROOT} --allow-all > /tmp/dufs.log 2>&1 & '
+    f'  nohup {_DUFS_BIN} {_DUFS_ROOT} --allow-all > {_DURABLE_ROOT}/dufs.log 2>&1 & '
     f'  sleep 0.5; '
     f'fi; '
     f'PID=$(ss -tlnp | grep ":{_DUFS_PORT} " | grep -o "pid=[0-9]*" | head -1 | cut -d= -f2); '
     f'echo "READY PID=$PID"'
 )
 
-_CS_BIN = "/tmp/code-server/bin/code-server"
+_CS_BIN = f"{_DURABLE_ROOT}/code-server/bin/code-server"
 _CS_PORT = 8080
 _CS_ROOT = "/home/daytona/workspace"
 
 _CS_ENSURE_SCRIPT = (
-    f'set -e; '
+    f'set -e; mkdir -p {_DURABLE_ROOT}; '
     f'if ! test -x {_CS_BIN}; then '
     f'  curl -fsSL https://code-server.dev/install.sh '
-    f'  | sh -s -- --method=standalone --prefix=/tmp/code-server; '
+    f'  | sh -s -- --method=standalone --prefix={_DURABLE_ROOT}/code-server; '
     f'fi; '
     f'if ! ss -tlnp | grep -q ":{_CS_PORT} "; then '
     f'  nohup {_CS_BIN} --bind-addr 0.0.0.0:{_CS_PORT} --auth none {_CS_ROOT} '
-    f'  > /tmp/code-server.log 2>&1 & '
+    f'  > {_DURABLE_ROOT}/code-server.log 2>&1 & '
     f'  sleep 1; '
     f'fi; '
     f'PID=$(ss -tlnp | grep ":{_CS_PORT} " | grep -o "pid=[0-9]*" | head -1 | cut -d= -f2); '
@@ -2923,7 +2969,7 @@ class Tools:
             description=(
                 'Environment variables injected into every bash command. '
                 'JSON object mapping variable names to values, e.g. {"MY_TOKEN":"abc123","FOO":"bar"}. '
-                "Values are shell-quoted before injection and never shown to the model."
+                "Values are shell-quoted before injection and entrusted to the model-controlled shell."
             ),
             json_schema_extra={"input": {"type": "password"}},
         )
@@ -3033,12 +3079,12 @@ class Tools:
             When bash() auto-backgrounds a command, it returns a descriptor with
             two paths:
 
-              CMD=/tmp/cmd/<id>   — the job's sidecar directory
-              PID=/tmp/cmd/<id>/pid — process ID file
+              CMD=/dev/shm/lathe/cmd/<id>   — the job's sidecar directory
+              PID=/dev/shm/lathe/cmd/<id>/pid — process ID file
 
             ## Sidecar files
 
-            Where CMD=/tmp/cmd/<id>:
+            Where CMD=/dev/shm/lathe/cmd/<id>:
 
               CMD/sh    — the full wrapper script that was executed
               CMD/pid   — PID of the bash process (written before exec)
@@ -3048,6 +3094,8 @@ class Tools:
             Absence of CMD/exit means the process is still running *or* the
             sandbox was restarted (in which case the PID is stale). To
             distinguish the two, check whether the PID is still alive.
+            Sidecars are removed after Lathe has collected a completed job's
+            result; inspect them while the job is running.
 
             ## Recipes
 
@@ -3147,8 +3195,8 @@ class Tools:
             # Lathe — Recipes
 
             Tested scripts for bootstrapping common tools from a cold sandbox.
-            These tools live in /tmp and survive sandbox stop/restart but not
-            destroy(). If /tmp/dufs or /tmp/code-server is missing, re-run the
+            These tools live in /tmp/lathe and survive sandbox stop/restart but not
+            destroy(). If /tmp/lathe/dufs or /tmp/lathe/code-server is missing, re-run the
             install script.
 
             ## File browser — dufs
@@ -3169,7 +3217,7 @@ class Tools:
             **Custom directory or read-only access:**
             For non-default configurations, install and start dufs manually:
             ```
-            nohup /tmp/dufs /home/daytona/workspace/output --allow-all &
+            nohup /tmp/lathe/dufs /home/daytona/workspace/output --allow-all &
             ```
             Then call expose(target="http:5000").
 
@@ -3189,7 +3237,7 @@ class Tools:
             **Custom configuration:**
             For non-default settings, install and start code-server manually:
             ```
-            nohup /tmp/code-server/bin/code-server --bind-addr 0.0.0.0:8080 --auth none /home/daytona/workspace &
+            nohup /tmp/lathe/code-server/bin/code-server --bind-addr 0.0.0.0:8080 --auth none /home/daytona/workspace &
             ```
             Then call expose(target="http:8080").
             """),
@@ -3221,7 +3269,7 @@ class Tools:
 
             ### Sidecar files
 
-            Where DELEGATE=/tmp/delegate/<id>:
+            Where DELEGATE=/dev/shm/lathe/delegate/<id>:
 
               DELEGATE/task    — the original task description
               DELEGATE/log     — timestamped progress entries (live)
@@ -3231,6 +3279,8 @@ class Tools:
 
             DELEGATE/result or DELEGATE/error appears when the sub-agent
             finishes. Absence of both means it's still running.
+            Sidecars are removed after Lathe has collected completion, so
+            inspect them while the delegation is running.
 
             ### Monitoring recipes
 
@@ -3514,15 +3564,15 @@ class Tools:
               benefit and risks tripping the foreground timeout on the wait builtin,
               producing an alarming background descriptor even when the real work
               is already done.
-            - bash() output is truncated to the last 2000 lines / 50 KB. If
-              truncated, the full output is available in the log file at
-              /tmp/cmd/<id>/log — use read() to inspect specific sections.
+            - bash() output is truncated to the last 2000 lines / 50 KB.
+              While a backgrounded command runs, its bounded live log is at
+              /dev/shm/lathe/cmd/<id>/log.
             - edit() requires an exact string match (including whitespace). If
               the match is ambiguous, provide more surrounding context or use
               replace_all=true.
             - delegate() auto-backgrounds after ~30 seconds (configurable via
               foreground_seconds). Backgrounded delegates write to
-              /tmp/delegate/<id>/{log,result,error,usage}. Use foreground_seconds=0
+              /dev/shm/lathe/delegate/<id>/{log,result,error,usage}. Use foreground_seconds=0
               to fire-and-forget for parallel agent teams.
             - expose() URLs expire after ~1 hour (call expose again for a fresh URL). The sandbox itself stops on
               idle (~15 min default), killing servers.
@@ -3768,35 +3818,38 @@ class Tools:
             p = p.rstrip("/")
             script = _build_onboard_script(p)
 
-            # Write script to temp file and execute it
-            script_path = f"/tmp/_onboard_{uuid.uuid4()}.py"
-            await _upload_file(
-                self.valves, sandbox_id, client,
-                script_path, script.encode("utf-8"),
-            )
+            # The generated script is needed only for this invocation.
+            script_path = _onboard_script_path(str(uuid.uuid4()))
+            try:
+                await _upload_file(
+                    self.valves, sandbox_id, client,
+                    script_path, script.encode("utf-8"),
+                )
 
-            resp = await client.post(
-                _toolbox(self.valves, sandbox_id, "/process/execute"),
-                headers=_headers(self.valves),
-                json={
-                    "command": f"python3 {script_path}",
-                    "timeout": 30000,
-                },
-                timeout=60.0,
-            )
-            resp.raise_for_status()
-            data = resp.json()
+                resp = await client.post(
+                    _toolbox(self.valves, sandbox_id, "/process/execute"),
+                    headers=_headers(self.valves),
+                    json={
+                        "command": f"python3 {script_path}",
+                        "timeout": 30000,
+                    },
+                    timeout=60.0,
+                )
+                resp.raise_for_status()
+                data = resp.json()
 
-            result = data.get("result", "")
-            exit_code = data.get("exitCode", -1)
+                result = data.get("result", "")
+                exit_code = data.get("exitCode", -1)
 
-            if exit_code != 0:
-                await _emit(__event_emitter__, "Error loading context", done=True)
-                return f"Error: onboard script failed (exit {exit_code}): {result[:500]}"
+                if exit_code != 0:
+                    await _emit(__event_emitter__, "Error loading context", done=True)
+                    return f"Error: onboard script failed (exit {exit_code}): {result[:500]}"
 
-            await _emit(__event_emitter__, "Project context loaded", done=True)
-            messages = _drain_harness_messages(self._chat_state, __chat_id__, _sb_warning)
-            return _prepend_harness_messages(result if result else "(empty project context)", messages)
+                await _emit(__event_emitter__, "Project context loaded", done=True)
+                messages = _drain_harness_messages(self._chat_state, __chat_id__, _sb_warning)
+                return _prepend_harness_messages(result if result else "(empty project context)", messages)
+            finally:
+                await _remove_sandbox_path(self.valves, sandbox_id, client, script_path)
 
         return await _tool_context(__event_emitter__, _run)
 
@@ -4073,7 +4126,7 @@ class Tools:
 
             # ── Sidecar directory on the sandbox ─────────────────────
             delegate_id = str(uuid.uuid4())
-            delegate_dir = f"/tmp/delegate/{delegate_id}"
+            delegate_dir = _delegate_sidecar_dir(delegate_id)
             log_path = f"{delegate_dir}/log"
             result_path = f"{delegate_dir}/result"
             error_path = f"{delegate_dir}/error"
@@ -4277,6 +4330,9 @@ class Tools:
                             error=agent_result.get("error"),
                         )
                         _push_bg_notice(self._chat_state, __chat_id__, notice)
+                    await _remove_sandbox_path(
+                        self.valves, sandbox_id, bg_client, delegate_dir,
+                    )
                     await inner_client.aclose()
                     await bg_client.aclose()
 

@@ -278,27 +278,15 @@ async def test_int_truncation(R: Results, tools: Tools, user: dict):
     ctx = dict(__user__=user, __event_emitter__=mock_emitter)
     import re
 
-    print("\n── bash: output truncation with log file ──")
+    print("\n── bash: output truncation ──")
     result = await tools.bash(
         "for i in $(seq 1 3000); do echo \"output line $i\"; done",
         **ctx,
     )
     R.check("truncated output has notice", "[Showing lines" in result, result[-200:])
-    R.check("notice mentions log file", "/tmp/cmd/" in result, result[-200:])
     R.check("last line present in output", "output line 3000" in result, result[-200:])
     R.check("first line NOT in truncated output", "output line 1\n" not in result, "line 1 should be truncated away")
-
-    spill_match = re.search(r"/tmp/cmd/[0-9a-f-]+/log", result)
-    if spill_match:
-        spill_path = spill_match.group(0)
-        verify, head_result = await asyncio.gather(
-            tools.bash(f"wc -l < {spill_path}", **ctx),
-            tools.bash(f"head -n 3 {spill_path}", **ctx),
-        )
-        R.check("log file has all 3000 lines", "3000" in verify, verify.strip())
-        R.check("can retrieve early lines from log file", "output line 1" in head_result, head_result[:100])
-    else:
-        R.check("log file path found in notice", False, "no path match found")
+    R.check("foreground sidecar is not retained", "/dev/shm/lathe/cmd/" not in result, result[-200:])
 
     print("\n── bash: small output NOT truncated ──")
     result = await tools.bash("echo hello", **ctx)
@@ -324,7 +312,7 @@ async def test_int_bash_backgrounding(R: Results, tools: Tools, user: dict):
     # actually finishes (observable via a second bash call)
     cmd_match = re.search(r"CMD=([0-9a-f-]{36})", bg_result)
     if cmd_match:
-        bg_cmd_dir = f"/tmp/cmd/{cmd_match.group(1)}"
+        bg_cmd_dir = f"/dev/shm/lathe/cmd/{cmd_match.group(1)}"
 
         # Wait for the backgrounded command to finish, then check its log
         wait_result = await tools.bash(

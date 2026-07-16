@@ -269,7 +269,7 @@
         </li>
         <li>
             <span class="recipe-label">Provide credentials</span>
-            <span class="recipe-desc">Set <code>env_vars</code> in your user settings (e.g. <code>{"GITHUB_TOKEN":"ghp_..."}</code>). Every bash command gets them; the model never sees the values.</span>
+            <span class="recipe-desc">Set <code>env_vars</code> in your user settings (e.g. <code>{"GITHUB_TOKEN":"ghp_..."}</code>). Every bash command gets them, so use only narrowly scoped, revocable credentials you entrust to the model.</span>
         </li>
         <li>
             <span class="recipe-label">Go hands-on</span>
@@ -373,7 +373,7 @@
     <div class="terminal-box"><span class="comment"># In Open WebUI &rarr; Settings &rarr; Tools &rarr; Lathe &rarr; env_vars:</span>
 {"GITHUB_TOKEN": "ghp_...", "OPENAI_API_KEY": "sk-..."}</div>
     <p>
-        Values are never shown to the model. They're exported in the shell preamble
+        Values are exported in the shell preamble, so they are entrusted to the model-controlled shell.
         with single-quoted values to prevent expansion.
     </p>
 </div>
