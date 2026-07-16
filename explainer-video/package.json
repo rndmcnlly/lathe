@@ -4,19 +4,18 @@
   "private": true,
   "scripts": {
     "start": "npx remotion studio",
+    "check": "npx tsx check.ts",
     "build": "npx tsx build.ts",
     "build:tts": "npx tsx build.ts --tts-only",
     "build:force": "npx tsx build.ts --force-tts"
   },
   "dependencies": {
-    "@remotion/cli": "^4.0.0",
-    "@remotion/google-fonts": "4.0.438",
-    "@remotion/media-utils": "^4.0.0",
-    "@remotion/transitions": "^4.0.0",
+    "@remotion/cli": "4.0.490",
+    "@remotion/google-fonts": "4.0.490",
     "music-metadata": "^11.12.3",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
-    "remotion": "^4.0.0",
+    "remotion": "4.0.490",
     "tsx": "^4.21.0"
   },
   "devDependencies": {

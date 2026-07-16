@@ -33,7 +33,16 @@ try {
 const OWUI_URL = (process.env.DEMO_OWUI_URL || "").replace(/\/+$/, "");
 const EMAIL = process.env.DEMO_EMAIL;
 const PASS = process.env.DEMO_PASS;
-if (!OWUI_URL || !EMAIL || !PASS) { console.error("Set DEMO_OWUI_URL, DEMO_EMAIL, and DEMO_PASS"); process.exit(1); }
+const MODEL = process.env.DEMO_MODEL;
+if (!OWUI_URL || !EMAIL || !PASS || !MODEL) {
+  console.error("Set DEMO_OWUI_URL, DEMO_EMAIL, DEMO_PASS, and DEMO_MODEL");
+  process.exit(1);
+}
+const CHAT_URL = `${OWUI_URL}/?model=${encodeURIComponent(MODEL)}`;
+const ALLOWED_PROXY_DOMAINS = (process.env.DEMO_PROXY_DOMAINS || "proxy.app.daytona.io,proxy.daytona.work")
+  .split(",")
+  .map((domain) => domain.trim().toLowerCase())
+  .filter(Boolean);
 
 const VIEWPORT = { width: 1280, height: 720 };
 
@@ -169,14 +178,25 @@ async function highlight(page, selector, durationMs = 1500) {
 // We extract the real URL from the DOM to navigate to it.
 
 async function findExposeUrl(page) {
-  return await page.evaluate(() => {
-    const PROXY_RE = /https:\/\/\d+-[\w.-]+(?:daytonaproxy|proxy\.app\.daytona)[^\s)"']*/;
-    for (const a of document.querySelectorAll("a[href]")) {
-      const href = a.getAttribute("href") || "";
-      if (PROXY_RE.test(href)) return href;
+  const hrefs = await page.evaluate(() =>
+    [...document.querySelectorAll("a[href]")].map((a) => a.getAttribute("href") || ""),
+  );
+  for (const href of hrefs) {
+    let url;
+    try {
+      url = new URL(href);
+    } catch {
+      continue;
     }
-    return null;
-  });
+    const hostname = url.hostname.toLowerCase();
+    const trusted = ALLOWED_PROXY_DOMAINS.some(
+      (domain) => hostname === domain || hostname.endsWith(`.${domain}`),
+    );
+    if (trusted && url.protocol === "https:" && !url.username && !url.password) {
+      return url.href;
+    }
+  }
+  return null;
 }
 
 // ── Chat interaction helpers ────────────────────────────────────────
@@ -237,7 +257,7 @@ async function waitForResponse(page, { timeoutMs = 180000, stableMs = 5000 } = {
   log("waitForResponse", generationStarted
     ? `Generation started (${((Date.now() - startTime) / 1000).toFixed(1)}s)`
     : `Timed out waiting for generation to start`);
-  if (!generationStarted) return;
+  if (!generationStarted) throw new Error(`Generation did not start within ${timeoutMs}ms`);
 
   // Phase 2: wait for generation to end (stable idle)
   let stableCount = 0;
@@ -266,6 +286,7 @@ async function waitForResponse(page, { timeoutMs = 180000, stableMs = 5000 } = {
     await page.waitForTimeout(1000);
   }
   log("waitForResponse", `Timed out after ${((Date.now() - startTime) / 1000).toFixed(0)}s`);
+  throw new Error(`Generation did not complete within ${timeoutMs}ms`);
 }
 
 // ── Chat scrolling ──────────────────────────────────────────────────
@@ -334,14 +355,15 @@ if (loginPage.url().includes("/auth")) {
 // Extract auth token from localStorage (OWUI stores JWT there, not in cookies)
 const token = await loginPage.evaluate(() => localStorage.getItem("token"));
 const cookies = await loginContext.cookies();
-log("login", `Token: ${token ? token.slice(0, 20) + "..." : "null"}`);
+log("login", token ? "Authentication token acquired" : "Authentication token missing");
+if (!token) throw new Error("Open WebUI login did not produce an authentication token");
 
 // ── Pre-warm: wake the sandbox before recording starts ──────────
 // Send a trivial Lathe-triggering message in the unrecorded browser
 // so the VM is hot by the time the recorded session begins.
 log("prewarm", "Waking sandbox...");
 try {
-  await loginPage.goto(`${OWUI_URL}/`);
+  await loginPage.goto(CHAT_URL);
   await loginPage.waitForLoadState("networkidle").catch(() => {});
   await loginPage.waitForTimeout(500);
 
@@ -425,7 +447,7 @@ await page.evaluate((t) => { if (t) localStorage.setItem("token", t); }, token);
 let chatUrl = null;
 
 try {
-  await page.goto(`${OWUI_URL}/`);
+  await page.goto(CHAT_URL);
   await page.waitForLoadState("networkidle").catch(() => {});
   await suppressTooltips(page);
   await injectCursor(page);
@@ -535,7 +557,7 @@ try {
   const exposeUrl = await findExposeUrl(page);
 
   if (exposeUrl) {
-    log("beat7", `Found URL: ${exposeUrl}`);
+    log("beat7", `Found trusted expose URL on ${new URL(exposeUrl).hostname}`);
 
     // Tag the link so the cursor can target it, then scroll it into view
     await page.evaluate((url) => {

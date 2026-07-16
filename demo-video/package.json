@@ -7,6 +7,6 @@
     "capture": "node capture.mjs"
   },
   "dependencies": {
-    "playwright": "^1.50.0"
+    "playwright": "1.61.1"
   }
 }

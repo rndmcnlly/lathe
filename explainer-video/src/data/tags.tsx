@@ -241,37 +241,28 @@ export function toComposition(
   fps: number,
 ): { element: React.ReactNode; totalFrames: number } {
   const slides = walkSlides(tree);
-  let currentFrame = 0;
+  const timeline = extractTimeline(tree, manifest, fps);
+  const timingById = new Map(
+    timeline.parts.flatMap((part) => part.slides).map((slide) => [slide.id, slide]),
+  );
   const sequences: React.ReactNode[] = [];
 
-  slides.forEach((slide, i) => {
-    const isSection = slide.section && i > 0;
-    const leadIn = isSection ? TIMING.SECTION_LEAD_IN : TIMING.SLIDE_LEAD_IN;
-    const tail = isSection ? TIMING.SECTION_TAIL : TIMING.SLIDE_TAIL;
-
-    // Audio duration in frames
-    let audioFrames: number;
-    if (manifest[slide.id]) {
-      audioFrames = Math.ceil((manifest[slide.id].durationMs / 1000) * fps);
-    } else {
-      // Fallback: estimate from word count
-      const words = slide.narration.split(/\s+/).length;
-      audioFrames = Math.ceil(((words / 150) * 60) * fps);
-    }
-
-    const totalDuration = leadIn + audioFrames + tail;
-    const slideStart = currentFrame;
-    currentFrame += totalDuration;
+  slides.forEach((slide) => {
+    const timing = timingById.get(slide.id);
+    if (!timing) throw new Error(`Missing timeline entry for slide "${slide.id}"`);
+    const audioFrames = manifest[slide.id]
+      ? Math.ceil((manifest[slide.id].durationMs / 1000) * fps)
+      : 0;
 
     const hasAudio = !!manifest[slide.id];
 
     sequences.push(
-      <Sequence key={slide.id} from={slideStart} durationInFrames={totalDuration} premountFor={fps}>
+      <Sequence key={slide.id} from={timing.globalStart} durationInFrames={timing.duration} premountFor={fps}>
         <SlideContainer partId={slide.partId}>
           {renderVisual(slide.visualElement, slide.partId)}
         </SlideContainer>
         {hasAudio && (
-          <Sequence from={leadIn} durationInFrames={audioFrames}>
+          <Sequence from={timing.leadIn} durationInFrames={audioFrames}>
             <Audio src={staticFile(`audio/${manifest[slide.id].file}`)} />
           </Sequence>
         )}
@@ -279,7 +270,7 @@ export function toComposition(
     );
   });
 
-  return { element: <>{sequences}</>, totalFrames: currentFrame };
+  return { element: <>{sequences}</>, totalFrames: timeline.totalFrames };
 }
 
 // ── Walker 3: extractTimeline (for ProgressBar) ──────────────────
@@ -290,6 +281,7 @@ export type TimelineSlide = {
   slideIndex: number;
   globalStart: number;
   duration: number;
+  leadIn: number;
   section: boolean;
 };
 
@@ -332,7 +324,7 @@ export function extractTimeline(
     }
 
     const slideIndex = currentPart!.slides.length;
-    const isSection = slide.section && slideIndex > 0;
+    const isSection = slide.section && i > 0;
     const leadIn = isSection ? TIMING.SECTION_LEAD_IN : TIMING.SLIDE_LEAD_IN;
     const tail = isSection ? TIMING.SECTION_TAIL : TIMING.SLIDE_TAIL;
 
@@ -352,6 +344,7 @@ export function extractTimeline(
       slideIndex,
       globalStart: globalFrame,
       duration: totalDuration,
+      leadIn,
       section: slide.section,
     });
 
@@ -374,20 +367,5 @@ export function extractTimeline(
 
 // Compute total frames without building React elements (for Composition registration)
 export function getTotalFrames(tree: React.ReactElement, manifest: Manifest, fps: number): number {
-  const slides = walkSlides(tree);
-  let total = 0;
-  slides.forEach((slide, i) => {
-    const isSection = slide.section && i > 0;
-    const leadIn = isSection ? TIMING.SECTION_LEAD_IN : TIMING.SLIDE_LEAD_IN;
-    const tail = isSection ? TIMING.SECTION_TAIL : TIMING.SLIDE_TAIL;
-    let audioFrames: number;
-    if (manifest[slide.id]) {
-      audioFrames = Math.ceil((manifest[slide.id].durationMs / 1000) * fps);
-    } else {
-      const words = slide.narration.split(/\s+/).length;
-      audioFrames = Math.ceil(((words / 150) * 60) * fps);
-    }
-    total += leadIn + audioFrames + tail;
-  });
-  return total;
+  return extractTimeline(tree, manifest, fps).totalFrames;
 }

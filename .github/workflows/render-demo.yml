@@ -3,21 +3,28 @@ name: Render demo video
 on:
   push:
     paths:
+      - 'lathe.py'
       - 'demo-video/**'
       - '.github/workflows/render-demo.yml'
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: demo-video-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   capture:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 25
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
 
-      - uses: actions/setup-node@v5
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
         with:
           node-version: 22
 
@@ -27,7 +34,7 @@ jobs:
 
       - name: Install Playwright Chromium
         working-directory: demo-video
-        run: npx playwright install chromium
+        run: npx playwright install --with-deps chromium
 
       - name: Run capture
         working-directory: demo-video
@@ -35,21 +42,38 @@ jobs:
           DEMO_OWUI_URL: ${{ secrets.DEMO_OWUI_URL }}
           DEMO_EMAIL: ${{ secrets.DEMO_EMAIL }}
           DEMO_PASS: ${{ secrets.DEMO_PASS }}
+          DEMO_MODEL: ${{ secrets.DEMO_MODEL }}
         run: node capture.mjs
 
-      - name: Upload to demo-video-latest release
+      - name: Upload rendered artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: demo-video-${{ github.sha }}
+          path: demo-video/out/demo.webm
+          if-no-files-found: error
+          retention-days: 30
+
+  publish:
+    needs: capture
+    if: github.ref_name == github.event.repository.default_branch
+    runs-on: ubuntu-latest
+    concurrency:
+      group: demo-video-publication
+      cancel-in-progress: false
+    permissions:
+      contents: write
+    steps:
+      - name: Download rendered artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: demo-video-${{ github.sha }}
+          path: release
+
+      - name: Publish latest release asset
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
         run: |
-          # Delete existing asset if present
-          gh release view demo-video-latest --json assets -q '.assets[].name' 2>/dev/null | while read name; do
-            gh release delete-asset demo-video-latest "$name" --yes || true
-          done
-          # Create release if it doesn't exist
-          gh release create demo-video-latest --title "Demo Video (latest)" \
-            --notes "Auto-captured Playwright demo session. Updated on every push." \
-            --latest=false 2>/dev/null || true
-          # Upload
-          gh release upload demo-video-latest \
-            demo-video/out/demo.webm \
-            --clobber
+          if ! gh release view demo-video-latest >/dev/null 2>&1; then
+            gh release create demo-video-latest --title "Demo Video (latest)" --notes "Auto-captured Playwright demo session." --latest=false
+          fi
+          gh release upload demo-video-latest release/demo.webm --clobber

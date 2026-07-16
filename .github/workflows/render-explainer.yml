@@ -5,19 +5,31 @@ on:
     paths:
       - 'explainer-video/**'
       - '.github/workflows/render-explainer.yml'
+  workflow_run:
+    workflows: ['Render demo video']
+    types: [completed]
   workflow_dispatch:
 
 permissions:
-  contents: write
+  actions: read
+  contents: read
+
+concurrency:
+  group: explainer-video-${{ github.event.workflow_run.head_sha || github.sha }}
+  cancel-in-progress: true
 
 jobs:
   render:
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 35
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+          persist-credentials: false
 
-      - uses: actions/setup-node@v5
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
         with:
           node-version: 22
 
@@ -25,36 +37,65 @@ jobs:
         working-directory: explainer-video
         run: npm ci
 
+      - name: Check timeline consistency
+        working-directory: explainer-video
+        run: npm run check
+
       - name: Cache TTS audio
-        uses: actions/cache@v5
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
         with:
           path: explainer-video/public/audio
-          key: tts-${{ hashFiles('explainer-video/src/data/script.tsx') }}
+          key: tts-${{ hashFiles('explainer-video/build.ts', 'explainer-video/package-lock.json', 'explainer-video/src/data/script.tsx') }}
           restore-keys: tts-
 
-      - name: Render TTS audio + MP4
+      - name: Download demo from triggering capture
+        if: github.event_name == 'workflow_run'
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: demo-video-${{ github.event.workflow_run.head_sha }}
+          path: explainer-video/public/images
+          github-token: ${{ github.token }}
+          run-id: ${{ github.event.workflow_run.id }}
+
+      - name: Render TTS audio, captions, and MP4
         working-directory: explainer-video
         env:
           DEEPINFRA_TOKEN: ${{ secrets.DEEPINFRA_TOKEN }}
-        run: |
-          mkdir -p ~/.tokens
-          echo "$DEEPINFRA_TOKEN" > ~/.tokens/deepinfra
-          npm run build
+        run: npm run build
 
-      - name: Upload to explainer-video-latest release
+      - name: Upload rendered artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: explainer-video-${{ github.event.workflow_run.head_sha || github.sha }}
+          path: |
+            explainer-video/out/lathe-explainer.mp4
+            explainer-video/out/lathe-explainer.vtt
+          if-no-files-found: error
+          retention-days: 30
+
+  publish:
+    needs: render
+    if: >-
+      (github.event_name == 'workflow_run' && github.event.workflow_run.head_branch == github.event.repository.default_branch) ||
+      (github.event_name != 'workflow_run' && github.ref_name == github.event.repository.default_branch)
+    runs-on: ubuntu-latest
+    concurrency:
+      group: explainer-video-publication
+      cancel-in-progress: false
+    permissions:
+      contents: write
+    steps:
+      - name: Download rendered artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: explainer-video-${{ github.event.workflow_run.head_sha || github.sha }}
+          path: release
+
+      - name: Publish latest release assets
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
         run: |
-          # Delete existing asset if present
-          gh release view explainer-video-latest --json assets -q '.assets[].name' 2>/dev/null | while read name; do
-            gh release delete-asset explainer-video-latest "$name" --yes || true
-          done
-          # Create release if it doesn't exist
-          gh release create explainer-video-latest --title "Explainer Video (latest)" \
-            --notes "Auto-rendered from explainer-video/ source. Updated on every push." \
-            --latest=false 2>/dev/null || true
-          # Upload
-          gh release upload explainer-video-latest \
-            explainer-video/out/lathe-explainer.mp4 \
-            explainer-video/out/lathe-explainer.vtt \
-            --clobber
+          if ! gh release view explainer-video-latest >/dev/null 2>&1; then
+            gh release create explainer-video-latest --title "Explainer Video (latest)" --notes "Auto-rendered from explainer-video source." --latest=false
+          fi
+          gh release upload explainer-video-latest release/lathe-explainer.mp4 release/lathe-explainer.vtt --clobber
