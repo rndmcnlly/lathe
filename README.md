@@ -6,7 +6,7 @@ A single-file Open WebUI toolkit that gives any model a coding agent's tool surf
 
 ## What it does to your instance
 
-Lathe registers eleven tools that models can call in [Native function calling mode](https://docs.openwebui.com/features/extensibility/plugin/tools/). When a user's model calls a tool, Lathe creates, starts, or resumes a cloud sandbox VM via the Daytona control plane and toolbox APIs. All sandbox operations go outbound from your OWUI server.
+Lathe registers thirteen tools that models can call in [Native function calling mode](https://docs.openwebui.com/features/extensibility/plugin/tools/). When a user's model calls a tool, Lathe creates, starts, or resumes a cloud sandbox VM via the Daytona control plane and toolbox APIs. All sandbox operations go outbound from your OWUI server.
 
 No OWUI internals are touched. The toolkit does not import `open_webui.*`, does not use OWUI file storage, and does not modify models, prompts, users, or other configuration. Its runtime dependencies are `httpx` and `pydantic-ai-slim[openai]`.
 
@@ -15,7 +15,7 @@ No OWUI internals are touched. The toolkit does not import `open_webui.*`, does 
 - **Per-user sandbox isolation** — Each OWUI user gets exactly one sandbox, identified by their email address. Users cannot access each other's sandboxes.
 - **Deployment label scoping** — Sandboxes are tagged with a `deployment_label` (e.g. `chat.example.com`), so multiple OWUI instances sharing a Daytona account do not collide.
 - **User secrets** — The `env_vars` UserValve is a password field (masked in UI), but its values are deliberately entrusted to the model through every `bash` command it can invoke. The model can read command environments and should be treated as able to disclose or misuse these credentials. Use narrowly scoped, revocable credentials only.
-- **Destroy confirmation guard** — The `destroy` tool requires an explicit `confirm=true` parameter to prevent accidental deletion.
+- **Destroy confirmation guard** — The `destroy` tool requires confirmation through Open WebUI's interactive confirmation dialog.
 - **No model prompt modification** — Lathe does not inject system prompts or alter model behavior. It only exposes tools.
 
 ## Requirements
@@ -98,22 +98,30 @@ flow, e.g. *"Visit https://example.com/setup to create your sandbox first."*
 | `lathe(manpage)` | Agent-facing manual system — orientation, recipes, troubleshooting |
 | `onboard(path)` | Load project context (AGENTS.md + skill catalog) |
 | `bash(command, workdir, foreground_seconds)` | Execute shell commands (auto-backgrounds after ~30s, output truncated to last 2000 lines / 50 KB) |
-| `read(path, offset, limit)` | Read file with line numbers |
+| `read(path, start, stop)` | Read file with line numbers; supports positive and negative half-open ranges |
 | `write(path, content)` | Write/create file (auto-creates parent dirs) |
 | `edit(path, old_string, new_string, replace_all)` | Exact string replacement |
 | `glob(pattern, max_lines)` | Search for files by glob pattern (hierarchical output, collapsed directories) |
 | `grep(pattern, files, max_lines)` | Search file contents by regex (grouped by file with line numbers) |
-| `delegate(task, context_files, max_steps)` | Dispatch a sub-agent to perform a multi-step task autonomously |
+| `interpret(code, timeout)` | Run Python in a conversation-scoped persistent interpreter |
+| `delegate(task, context_files, max_steps, foreground_seconds)` | Dispatch a sub-agent to perform a multi-step task autonomously |
 | `expose(target)` | Expose a sandbox service — `"http:5000"` for a public HTTPS URL, `"ssh"` for a time-limited SSH command |
-| `destroy(confirm)` | Permanently delete the sandbox (requires `confirm=true`) |
+| `handoff()` | Prepare instructions for continuing work in a fresh conversation |
+| `destroy()` | Permanently delete the sandbox after interactive confirmation |
 
 ## Testing
 
 ```bash
-uv run python test_unit.py                   # no sandbox needed (~0.7s)
+uv run python test_unit.py                   # no sandbox needed (~2s)
 uv run python test_integration.py            # needs DAYTONA_API_KEY in .env
-uv run python test_deployment.py [--verbose] # needs OWUI_URL, OWUI_TOKEN, OWUI_MODEL in .env
+uv run python test_deployment.py [--verbose] # also needs OWUI_URL, OWUI_TOKEN, OWUI_MODEL
 ```
+
+The tiers cover different boundaries:
+
+- `test_unit.py` checks deterministic helpers, generated sandbox scripts, wrapper schemas, and mocked state machines. `--extended` adds lower-signal prose, constant, and scheduling diagnostics for targeted investigations.
+- `test_integration.py` calls `Tools` directly against an isolated Daytona identity. It verifies core tool roundtrips, background notices, lifecycle policy, and persistent-volume survival. Cleanup runs even after scenario failures.
+- `test_deployment.py` deploys local `lathe.py` to the isolated OWUI toolkit ID `lathe_test`, never `lathe`. It configures a separate Daytona label with persistent volumes disabled, checks exact source and complete loaded schema parity, then exercises model-mediated `bash`, `write`, `read`, `interpret`, and `delegate` dispatch. Use `--no-deploy` to test an already staged copy, or `LATHE_TEST_TOOL_ID` to choose another staging ID.
 
 ## Files
 

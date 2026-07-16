@@ -1,97 +1,217 @@
 #!/usr/bin/env python3
-"""
-Deployment tests for lathe.py — exercises the full tool execution pipeline
-against a live Open WebUI instance via Socket.IO.
+"""Open WebUI loader and dispatch tests using an isolated toolkit ID.
 
-Connects to the OWUI Socket.IO endpoint, sends chat completions with
-tool_ids=["lathe"], and verifies that tool calls are executed server-side
-and produce expected results.  Each test uses a local: prefixed chat_id
-so OWUI treats it as a temporary chat — nothing is persisted to the database.
+By default this suite deploys the exact local ``lathe.py`` as ``lathe_test``.
+It never updates or invokes the production ``lathe`` toolkit. The staging
+toolkit uses a distinct Daytona deployment label and persistent volumes are
+disabled, so its sandboxes are also isolated and disposable.
 
 Usage:
-    uv run python test_deployment.py                  # run all tests
-    uv run python test_deployment.py --list           # list available tests
-    uv run python test_deployment.py bash_execution   # specific test
-    uv run python test_deployment.py --verbose        # show all socket.io events
+    uv run python test_deployment.py
+    uv run python test_deployment.py --no-deploy
+    uv run python test_deployment.py --verbose
 
-Requires OWUI_URL, OWUI_TOKEN, and OWUI_MODEL in .env (or environment).
+Requires ``OWUI_URL``, ``OWUI_TOKEN``, ``OWUI_MODEL``, and
+``DAYTONA_API_KEY`` in the environment or ``.env``.
 """
 
 import asyncio
+import hashlib
 import json
 import os
+from pathlib import Path
 import sys
 import time
 import uuid
 
-from dotenv import load_dotenv
 import httpx
 import socketio
+from dotenv import load_dotenv
+
 
 load_dotenv()
 
 OWUI_BASE = os.environ.get("OWUI_URL", "").rstrip("/")
 OWUI_TOKEN = os.environ.get("OWUI_TOKEN", "")
 MODEL = os.environ.get("OWUI_MODEL", "")
+DAYTONA_API_KEY = os.environ.get("DAYTONA_API_KEY", "")
+TOOL_ID = os.environ.get("LATHE_TEST_TOOL_ID", "lathe_test")
+DEPLOYMENT_LABEL = "lathe-owui-deployment-test"
+SOURCE_PATH = Path(__file__).with_name("lathe.py")
 VERBOSE = False
 
 
-# ── Test result tracking ─────────────────────────────────────────────
+EXPECTED_SCHEMA = {
+    "lathe": {"manpage": ("string", False, "overview")},
+    "handoff": {},
+    "destroy": {},
+    "onboard": {"path": ("string", True, None)},
+    "bash": {
+        "command": ("string", True, None),
+        "workdir": ("string", False, "/home/daytona/workspace"),
+        "foreground_seconds": ("integer", False, -1),
+    },
+    "read": {
+        "path": ("string", True, None),
+        "start": ("integer", False, 1),
+        "stop": ("integer", False, 0),
+    },
+    "write": {
+        "path": ("string", True, None),
+        "content": ("string", True, None),
+    },
+    "edit": {
+        "path": ("string", True, None),
+        "old_string": ("string", True, None),
+        "new_string": ("string", True, None),
+        "replace_all": ("boolean", False, False),
+    },
+    "glob": {
+        "pattern": ("string", True, None),
+        "max_lines": ("integer", False, 100),
+    },
+    "grep": {
+        "pattern": ("string", True, None),
+        "files": ("string", False, "**/*"),
+        "max_lines": ("integer", False, 100),
+    },
+    "interpret": {
+        "code": ("string", True, None),
+        "timeout": ("integer", False, 120),
+    },
+    "delegate": {
+        "task": ("string", True, None),
+        "context_files": ("array", False, []),
+        "max_steps": ("integer", False, 10),
+        "foreground_seconds": ("integer", False, -1),
+    },
+    "expose": {"target": ("string", True, None)},
+}
+
+
+def auth_headers():
+    return {"Authorization": f"Bearer {OWUI_TOKEN}", "Content-Type": "application/json"}
+
+
+def require(condition, detail):
+    if not condition:
+        raise AssertionError(detail)
+
 
 class Results:
     def __init__(self):
-        self.passed = 0
+        self.scenarios = 0
         self.failed = 0
-        self._failure_diagnostics: list[dict] = []
 
-    def check(self, name, condition, detail=""):
-        if condition:
+    async def run(self, name, fn):
+        self.scenarios += 1
+        print(f"\n-- {name} --")
+        try:
+            await fn()
             print(f"  PASS: {name}")
-            self.passed += 1
-        else:
-            print(f"  FAIL: {name} — {detail}")
+        except Exception as exc:
             self.failed += 1
-
-    def dump_on_failure(self, label: str, events: list[dict]):
-        """Store events to dump if any checks in this test fail."""
-        self._failure_diagnostics.append({"label": label, "events": events})
-
-    def flush_diagnostics(self, had_failures_before: int):
-        """If new failures occurred, dump stored diagnostics."""
-        if self.failed > had_failures_before:
-            for diag in self._failure_diagnostics:
-                print(f"\n  ── diagnostic dump: {diag['label']} ({len(diag['events'])} events) ──")
-                for ev in diag["events"]:
-                    print(f"    {ev['event']}: {str(ev.get('data', ''))[:200]}")
-        self._failure_diagnostics.clear()
+            print(f"  FAIL: {name}: {type(exc).__name__}: {exc}")
 
 
-# ── OWUI Socket.IO client ───────────────────────────────────────────
+async def deploy_staging_tool():
+    source = SOURCE_PATH.read_text()
+    payload = {
+        "id": TOOL_ID,
+        "name": "Lathe Test",
+        "content": source,
+        "meta": {"description": "Ephemeral deployment-test copy of Lathe"},
+    }
+    async with httpx.AsyncClient() as client:
+        response = await client.get(
+            f"{OWUI_BASE}/api/v1/tools/id/{TOOL_ID}",
+            headers=auth_headers(),
+            timeout=30,
+        )
+        if response.status_code == 404:
+            response = await client.post(
+                f"{OWUI_BASE}/api/v1/tools/create",
+                headers=auth_headers(),
+                json=payload,
+                timeout=120,
+            )
+        else:
+            response.raise_for_status()
+            response = await client.post(
+                f"{OWUI_BASE}/api/v1/tools/id/{TOOL_ID}/update",
+                headers=auth_headers(),
+                json=payload,
+                timeout=120,
+            )
+        response.raise_for_status()
+
+        valves = {
+            "daytona_api_key": DAYTONA_API_KEY,
+            "daytona_api_url": "https://app.daytona.io/api",
+            "daytona_proxy_url": "https://proxy.app.daytona.io/toolbox",
+            "deployment_label": DEPLOYMENT_LABEL,
+            "auto_stop_minutes": 15,
+            "auto_archive_minutes": 60,
+            "auto_delete_minutes": 60,
+            "persistent_volume": False,
+            "auto_create_sandbox": True,
+            "sandbox_missing_message": "",
+            "sandbox_create_overrides": "{}",
+            "foreground_timeout_seconds": 30,
+        }
+        response = await client.post(
+            f"{OWUI_BASE}/api/v1/tools/id/{TOOL_ID}/valves/update",
+            headers=auth_headers(),
+            json=valves,
+            timeout=30,
+        )
+        response.raise_for_status()
+
+
+async def fetch_staging_tool():
+    async with httpx.AsyncClient() as client:
+        response = await client.get(
+            f"{OWUI_BASE}/api/v1/tools/id/{TOOL_ID}",
+            headers=auth_headers(),
+            timeout=30,
+        )
+        response.raise_for_status()
+        return response.json()
+
+
+async def cleanup_test_sandboxes():
+    """Delete only sandboxes carrying the staging deployment-label key."""
+    headers = {
+        "Authorization": f"Bearer {DAYTONA_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    async with httpx.AsyncClient() as client:
+        response = await client.get(
+            "https://app.daytona.io/api/sandbox",
+            headers=headers,
+            timeout=30,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        sandboxes = payload if isinstance(payload, list) else payload.get("items", [])
+        for sandbox in sandboxes:
+            if DEPLOYMENT_LABEL not in sandbox.get("labels", {}):
+                continue
+            response = await client.delete(
+                f"https://app.daytona.io/api/sandbox/{sandbox['id']}",
+                params={"force": "true"},
+                headers=headers,
+                timeout=30,
+            )
+            response.raise_for_status()
+
 
 class OWUIClient:
-    """Headless Open WebUI client that drives conversations with tool execution.
-
-    Connects via Socket.IO to get a session_id, then POSTs to
-    /api/chat/completions with the session_id to trigger the server-side
-    tool execution loop.  Collects results via Socket.IO events.
-
-    OWUI wraps all events in a top-level "events" socket.io event with
-    structure: {chat_id, message_id, data: {type, data: {...}}}.  The
-    tool execution pipeline emits:
-      - chat:active (active=true)    — generation started
-      - chat:completion (streaming)  — tool calls building, results, text
-      - status                       — tool status ("Running command...", etc.)
-      - chat:completion (done=true)  — final output with complete output array
-      - chat:active (active=false)   — generation finished
-    """
-
-    def __init__(self, base_url: str, token: str):
-        self.base_url = base_url.rstrip("/")
-        self.token = token
+    def __init__(self):
         self.sio = socketio.AsyncClient()
-        self.session_id: str | None = None
-        self._events: list[dict] = []
-        self._done = asyncio.Event()
+        self.session_id = None
+        self.events = []
+        self.done = asyncio.Event()
 
         @self.sio.event
         async def connect():
@@ -100,322 +220,189 @@ class OWUIClient:
         @self.sio.on("*")
         async def catch_all(event, *args):
             data = args[0] if args else None
-            self._events.append({"event": event, "data": data})
+            self.events.append({"event": event, "data": data})
             if VERBOSE:
-                preview = json.dumps(data, default=str)[:200] if data else "(none)"
-                print(f"    [ws] {event}: {preview}")
-            # Detect end of generation: events → data.type=="chat:completion" → data.data.done==True
-            if event == "events" and isinstance(data, dict):
-                inner = data.get("data", {})
-                if isinstance(inner, dict) and inner.get("type") == "chat:completion":
-                    inner_data = inner.get("data", {})
-                    if isinstance(inner_data, dict) and inner_data.get("done"):
-                        self._done.set()
+                print(f"  socket {event}: {json.dumps(data, default=str)[:300]}")
+            if event != "events" or not isinstance(data, dict):
+                return
+            inner = data.get("data", {})
+            if inner.get("type") == "chat:completion" and inner.get("data", {}).get("done"):
+                self.done.set()
 
     async def connect(self):
-        """Connect to OWUI Socket.IO and authenticate."""
-        # OWUI mounts socket.io at /ws/socket.io, not the default /socket.io/
         await self.sio.connect(
-            self.base_url,
+            OWUI_BASE,
             socketio_path="/ws/socket.io",
             transports=["websocket"],
-            auth={"token": self.token},
+            auth={"token": OWUI_TOKEN},
             wait_timeout=15,
         )
-        # Register in the OWUI session pool (mirrors frontend behavior)
-        await self.sio.emit("user-join", {"auth": {"token": self.token}})
-        await asyncio.sleep(0.5)  # let registration propagate
+        await self.sio.emit("user-join", {"auth": {"token": OWUI_TOKEN}})
+        await asyncio.sleep(0.5)
 
-    async def disconnect(self):
+    async def close(self):
         if self.sio.connected:
-            try:
-                await asyncio.wait_for(self.sio.disconnect(), timeout=5.0)
-            except (asyncio.TimeoutError, Exception):
-                pass
+            await self.sio.disconnect()
 
-    async def send_message(
-        self,
-        messages: list[dict],
-        tool_ids: list[str] | None = None,
-        model: str = MODEL,
-        timeout_seconds: int = 90,
-    ) -> dict:
-        """Send a chat completion request and wait for the full response.
-
-        Returns a dict with:
-          content  — the assistant's final HTML content string
-          output   — the structured output array (function_call, function_call_output, message)
-          events   — all raw Socket.IO events received during this turn
-        """
-        if not self.session_id:
-            raise RuntimeError("Not connected — call connect() first")
-
-        chat_id = f"local:{uuid.uuid4()}"
-        message_id = str(uuid.uuid4())
-
-        self._events.clear()
-        self._done.clear()
-
+    async def send(self, prompt, *, timeout=180):
+        self.events.clear()
+        self.done.clear()
         payload = {
-            "model": model,
-            "messages": messages,
+            "model": MODEL,
+            "messages": [{"role": "user", "content": prompt}],
             "stream": True,
-            "chat_id": chat_id,
-            "id": message_id,
+            "chat_id": f"local:{uuid.uuid4()}",
+            "id": str(uuid.uuid4()),
             "session_id": self.session_id,
+            "tool_ids": [TOOL_ID],
         }
-        if tool_ids:
-            payload["tool_ids"] = tool_ids
-
-        # POST triggers async processing; server returns {status, task_id}
-        # immediately, then streams results over Socket.IO
         async with httpx.AsyncClient() as client:
-            resp = await client.post(
-                f"{self.base_url}/api/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {self.token}",
-                    "Content-Type": "application/json",
-                },
+            response = await client.post(
+                f"{OWUI_BASE}/api/chat/completions",
+                headers=auth_headers(),
                 json=payload,
-                timeout=30.0,
+                timeout=30,
             )
-            resp.raise_for_status()
-            if VERBOSE:
-                print(f"    [http] {resp.status_code}: {resp.text[:200]}")
+            response.raise_for_status()
+        await asyncio.wait_for(self.done.wait(), timeout=timeout)
 
-        # Wait for the done event
-        try:
-            await asyncio.wait_for(self._done.wait(), timeout=timeout_seconds)
-        except asyncio.TimeoutError:
-            if VERBOSE:
-                print(f"    [timeout] {len(self._events)} events received before timeout")
-
-        # Extract final results from the done event
-        content = ""
         output = []
-        for ev in self._events:
-            if ev["event"] != "events":
+        for event in self.events:
+            if event["event"] != "events":
                 continue
-            inner = (ev.get("data") or {}).get("data", {})
-            if not isinstance(inner, dict) or inner.get("type") != "chat:completion":
+            inner = (event.get("data") or {}).get("data", {})
+            if inner.get("type") != "chat:completion":
                 continue
-            inner_data = inner.get("data", {})
-            if not isinstance(inner_data, dict):
-                continue
-            if "content" in inner_data:
-                content = inner_data["content"]
-            if "output" in inner_data:
-                output = inner_data["output"]
-
-        return {
-            "content": content,
-            "output": output,
-            "events": list(self._events),
-        }
+            data = inner.get("data", {})
+            if "output" in data:
+                output = data["output"]
+        return output
 
 
-# ── Helpers for inspecting output arrays ─────────────────────────────
-
-def get_tool_calls(output: list[dict]) -> list[dict]:
-    """Extract function_call items from an output array."""
-    return [o for o in output if o.get("type") == "function_call"]
+def tool_calls(output):
+    return [item for item in output if item.get("type") == "function_call"]
 
 
-def get_tool_results(output: list[dict]) -> list[dict]:
-    """Extract function_call_output items from an output array."""
-    return [o for o in output if o.get("type") == "function_call_output"]
-
-
-def get_tool_result_text(result: dict) -> str:
-    """Extract the text content from a function_call_output item.
-
-    OWUI stores tool output as either a plain string or an array of
-    {type: "input_text", text: "..."} objects.
-    """
-    out = result.get("output", "")
-    if isinstance(out, str):
-        return out
-    if isinstance(out, list):
-        return "".join(
-            item.get("text", "") for item in out
-            if isinstance(item, dict) and item.get("type") == "input_text"
-        )
-    return str(out)
-
-
-def get_messages(output: list[dict]) -> list[dict]:
-    """Extract message items from an output array."""
-    return [o for o in output if o.get("type") == "message"]
-
-
-# ── Tests ────────────────────────────────────────────────────────────
-
-async def test_tool_schema(R: Results):
-    """Verify Lathe is installed and has expected tools in its schema."""
-    print("\n── deployment: tool installation ──")
-    async with httpx.AsyncClient() as client:
-        resp = await client.get(
-            f"{OWUI_BASE}/api/v1/tools/",
-            headers={"Authorization": f"Bearer {OWUI_TOKEN}"},
-        )
-        resp.raise_for_status()
-        tools = resp.json()
-        lathe_tools = [t for t in tools if t["id"] == "lathe"]
-        R.check("Lathe is installed", len(lathe_tools) == 1, f"found {len(lathe_tools)}")
-
-        if lathe_tools:
-            lathe = lathe_tools[0]
-            specs = lathe.get("specs", [])
-            spec_names = {s.get("name") for s in specs}
-            for expected in ("bash", "read", "write", "edit", "expose", "destroy", "onboard", "lathe"):
-                R.check(f"spec includes {expected}", expected in spec_names, str(spec_names))
-
-
-async def test_bash_execution(R: Results, owui: OWUIClient):
-    """Full tool execution: model calls bash, OWUI executes it, canary appears in output."""
-    print("\n── deployment: bash tool execution ──")
-    before = R.failed
-
-    canary = f"CANARY_{uuid.uuid4().hex[:8]}"
-    result = await owui.send_message(
-        messages=[{"role": "user", "content": f"Use the bash tool to run exactly this command: echo {canary}"}],
-        tool_ids=["lathe"],
-    )
-    R.dump_on_failure("bash_execution", result["events"])
-
-    output = result["output"]
-    R.check("got output items", len(output) > 0, f"output has {len(output)} items")
-
-    calls = get_tool_calls(output)
-    R.check("model made a tool call", len(calls) > 0, f"got {len(calls)}")
-    if calls:
-        R.check("tool call is bash", calls[0].get("name") == "bash", calls[0].get("name"))
-
-    results = get_tool_results(output)
-    R.check("got tool result", len(results) > 0, f"got {len(results)}")
-    if results:
-        text = get_tool_result_text(results[0])
-        R.check("canary in tool output", canary in text, text[:200])
-
-    msgs = get_messages(output)
-    R.check("assistant responded after tool call", len(msgs) > 0, f"got {len(msgs)} messages")
-
-    R.flush_diagnostics(before)
-
-
-async def test_write_read_roundtrip(R: Results, owui: OWUIClient):
-    """Write a file via the write tool, then read it back via bash."""
-    print("\n── deployment: write + read roundtrip ──")
-    before = R.failed
-
-    marker = f"MARKER_{uuid.uuid4().hex[:8]}"
-    file_path = f"/tmp/deployment_test_{uuid.uuid4().hex[:8]}.txt"
-
-    # Turn 1: write the file
-    result1 = await owui.send_message(
-        messages=[{"role": "user", "content": f"Use the write tool to write exactly this text to {file_path}: {marker}"}],
-        tool_ids=["lathe"],
-    )
-    R.dump_on_failure("write_read_roundtrip (write)", result1["events"])
-
-    write_results = get_tool_results(result1["output"])
-    R.check("write produced output", len(write_results) > 0, f"got {len(write_results)}")
-    if write_results:
-        text = get_tool_result_text(write_results[0])
-        R.check("write succeeded", "Wrote" in text, text[:200])
-
-    # Turn 2: read it back via bash (avoids multi-turn message threading
-    # complexity — just a fresh single-turn with an explicit path)
-    result2 = await owui.send_message(
-        messages=[{"role": "user", "content": f"Use the bash tool to run: cat {file_path}"}],
-        tool_ids=["lathe"],
-    )
-    R.dump_on_failure("write_read_roundtrip (read)", result2["events"])
-
-    read_results = get_tool_results(result2["output"])
-    R.check("read produced output", len(read_results) > 0, f"got {len(read_results)}")
-    if read_results:
-        text = get_tool_result_text(read_results[0])
-        R.check("marker in read output", marker in text, text[:200])
-
-    R.flush_diagnostics(before)
-
-
-# ── Test registry and runner ─────────────────────────────────────────
-
-API_TESTS = {
-    "tool_schema": test_tool_schema,
-}
-
-LIVE_TESTS = {
-    "bash_execution": test_bash_execution,
-    "write_read": test_write_read_roundtrip,
-}
-
-ALL_TESTS = {**API_TESTS, **LIVE_TESTS}
+def tool_outputs(output):
+    results = []
+    for item in output:
+        if item.get("type") != "function_call_output":
+            continue
+        value = item.get("output", "")
+        if isinstance(value, list):
+            value = "".join(part.get("text", "") for part in value if isinstance(part, dict))
+        results.append(str(value))
+    return results
 
 
 async def main():
     global VERBOSE
-    args = [a for a in sys.argv[1:] if a != "--verbose"]
-    VERBOSE = "--verbose" in sys.argv[1:]
-
-    if "--list" in args:
-        print("API tests (httpx only):")
-        for name in API_TESTS:
-            print(f"  {name}")
-        print("\nLive tests (Socket.IO, full tool execution):")
-        for name in LIVE_TESTS:
-            print(f"  {name}")
-        return
-
-    selected = [a for a in args if a != "--list"] or list(ALL_TESTS.keys())
-    for name in selected:
-        if name not in ALL_TESTS:
-            print(f"Unknown test: {name}. Use --list to see available tests.")
-            sys.exit(1)
-
-    missing = [name for name, val in [("OWUI_URL", OWUI_BASE), ("OWUI_TOKEN", OWUI_TOKEN), ("OWUI_MODEL", MODEL)] if not val]
+    VERBOSE = "--verbose" in sys.argv
+    deploy = "--no-deploy" not in sys.argv
+    missing = [
+        name
+        for name, value in (
+            ("OWUI_URL", OWUI_BASE),
+            ("OWUI_TOKEN", OWUI_TOKEN),
+            ("OWUI_MODEL", MODEL),
+            ("DAYTONA_API_KEY", DAYTONA_API_KEY),
+        )
+        if not value
+    ]
     if missing:
-        print(f"Error: {', '.join(missing)} not set. Add to .env or export. See .env.example.")
-        sys.exit(1)
+        print(f"Error: missing {', '.join(missing)}")
+        return 2
 
-    R = Results()
-    t0 = time.time()
+    started = time.monotonic()
+    results = Results()
+    client = OWUIClient()
+    canary = f"OWUI_{uuid.uuid4().hex}"
+    path = f"/home/daytona/workspace/{canary}.txt"
 
-    print(f"{'='*60}")
-    print(f"DEPLOYMENT TESTS against {OWUI_BASE}")
-    if VERBOSE:
-        print("(verbose mode — all socket.io events will be printed)")
-    print(f"{'='*60}")
+    if deploy:
+        print(f"Deploying local lathe.py to isolated toolkit {TOOL_ID!r}...")
+        await deploy_staging_tool()
+    await cleanup_test_sandboxes()
 
-    api_selected = [g for g in selected if g in API_TESTS]
-    live_selected = [g for g in selected if g in LIVE_TESTS]
+    async def exact_source_and_schema():
+        remote = await fetch_staging_tool()
+        local_source = SOURCE_PATH.read_text()
+        remote_source = remote.get("content", "")
+        require(
+            remote_source == local_source,
+            "staging source differs: local "
+            f"{hashlib.sha256(local_source.encode()).hexdigest()[:12]}, remote "
+            f"{hashlib.sha256(remote_source.encode()).hexdigest()[:12]}",
+        )
 
-    for name in api_selected:
-        await API_TESTS[name](R)
+        specs = {spec["name"]: spec for spec in remote.get("specs", [])}
+        require(set(specs) == set(EXPECTED_SCHEMA), f"tool names: {sorted(specs)}")
+        for name, expected_params in EXPECTED_SCHEMA.items():
+            schema = specs[name]["parameters"]
+            properties = schema.get("properties", {})
+            required = set(schema.get("required", []))
+            require(set(properties) == set(expected_params), f"{name} params: {properties}")
+            for param, (expected_type, is_required, default) in expected_params.items():
+                actual = properties[param]
+                require(actual.get("type") == expected_type, f"{name}.{param}: {actual}")
+                require((param in required) == is_required, f"{name}.{param} required={required}")
+                if not is_required:
+                    require(actual.get("default") == default, f"{name}.{param}: {actual}")
 
-    if live_selected:
-        print("\nConnecting to OWUI via Socket.IO...")
-        owui = OWUIClient(OWUI_BASE, OWUI_TOKEN)
+    async def bash_dispatch():
+        output = await client.send(
+            f"Call bash exactly once with command printf {canary}. Do not use another tool."
+        )
+        calls = tool_calls(output)
+        require(calls and calls[0].get("name") == "bash", calls)
+        require(any(canary in value for value in tool_outputs(output)), output)
+
+    async def write_and_read_dispatch():
+        output = await client.send(
+            f"Call write exactly once to write the exact text {canary} to {path}."
+        )
+        require(any(call.get("name") == "write" for call in tool_calls(output)), output)
+        require(any("Wrote" in value for value in tool_outputs(output)), output)
+
+        output = await client.send(f"Call read exactly once for {path}.")
+        require(any(call.get("name") == "read" for call in tool_calls(output)), output)
+        require(any(canary in value for value in tool_outputs(output)), output)
+
+    async def interpreter_dispatch():
+        output = await client.send(
+            f"Call interpret exactly once with Python code print('{canary}')."
+        )
+        require(any(call.get("name") == "interpret" for call in tool_calls(output)), output)
+        require(any(canary in value for value in tool_outputs(output)), output)
+
+    async def delegate_dispatch():
+        output = await client.send(
+            "Call delegate exactly once with max_steps=3 and foreground_seconds=120. "
+            f"The delegated task is: use bash to run printf {canary}, then report the output.",
+            timeout=240,
+        )
+        require(any(call.get("name") == "delegate" for call in tool_calls(output)), output)
+        values = tool_outputs(output)
+        require(any(canary in value for value in values), values)
+
+    try:
+        await results.run("exact staged source and complete OWUI schema", exact_source_and_schema)
+        await client.connect()
+        await results.run("model to OWUI to bash dispatch", bash_dispatch)
+        await results.run("write and read dispatch", write_and_read_dispatch)
+        await results.run("interpreter dispatch", interpreter_dispatch)
+        await results.run("delegate dispatch", delegate_dispatch)
+    finally:
+        await client.close()
         try:
-            await owui.connect()
-            print(f"Connected (session_id: {owui.session_id})")
-            for name in live_selected:
-                await LIVE_TESTS[name](R, owui)
-        finally:
-            await owui.disconnect()
+            await cleanup_test_sandboxes()
+        except Exception as exc:
+            print(f"Cleanup warning: {exc}")
 
-    elapsed = time.time() - t0
-    total = R.passed + R.failed
-    print(f"\n{'='*60}")
-    print(f"Results: {R.passed} passed, {R.failed} failed out of {total}  ({elapsed:.1f}s)")
-    if R.failed:
-        print("SOME TESTS FAILED")
-        sys.exit(1)
-    else:
-        print("ALL TESTS PASSED")
+    elapsed = time.monotonic() - started
+    print(f"\n{results.scenarios - results.failed}/{results.scenarios} scenarios passed in {elapsed:.1f}s")
+    return 1 if results.failed else 0
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    sys.exit(asyncio.run(main()))
