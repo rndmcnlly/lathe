@@ -15,7 +15,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: explainer-video-${{ github.event.workflow_run.head_sha || github.sha }}
+  group: explainer-video-${{ github.event.workflow_run.head_sha || github.sha }}-${{ github.event_name }}
   cancel-in-progress: true
 
 jobs:
@@ -94,6 +94,7 @@ jobs:
       - name: Publish latest release assets
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
           if ! gh release view explainer-video-latest >/dev/null 2>&1; then
             gh release create explainer-video-latest --title "Explainer Video (latest)" --notes "Auto-rendered from explainer-video source." --latest=false

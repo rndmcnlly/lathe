@@ -72,6 +72,7 @@ jobs:
       - name: Publish latest release asset
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
           if ! gh release view demo-video-latest >/dev/null 2>&1; then
             gh release create demo-video-latest --title "Demo Video (latest)" --notes "Auto-captured Playwright demo session." --latest=false
