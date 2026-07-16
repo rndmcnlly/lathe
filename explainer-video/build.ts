@@ -12,13 +12,13 @@
  *   npx tsx build.ts --tts-only   # just render TTS, skip video
  */
 
-import { readFileSync, writeFileSync, mkdirSync, existsSync } from "fs";
+import { readFileSync, writeFileSync, mkdirSync, existsSync, renameSync, unlinkSync } from "fs";
 import { createHash } from "crypto";
 import { join, dirname } from "path";
 import { execSync } from "child_process";
 import { parseBuffer } from "music-metadata";
 import { script, extractNarrations, extractTimeline } from "./src/data/script";
-import { CANVAS, TIMING } from "./src/design";
+import { CANVAS } from "./src/design";
 
 // ── Config ────────────────────────────────────────────────────────
 
@@ -57,8 +57,16 @@ function loadCache(): CacheHashes {
 }
 
 function getToken(): string {
+  if (process.env.DEEPINFRA_TOKEN) return process.env.DEEPINFRA_TOKEN;
   const p = join(process.env.HOME || "~", ".tokens", "deepinfra");
   return readFileSync(p, "utf-8").trim();
+}
+
+async function audioDurationMs(buf: Buffer): Promise<number> {
+  const meta = await parseBuffer(buf, { mimeType: "audio/mpeg" });
+  const durationMs = Math.round((meta.format.duration ?? 0) * 1000);
+  if (durationMs <= 0) throw new Error("TTS response is not valid, non-empty MP3 audio");
+  return durationMs;
 }
 
 // ── TTS normalization ─────────────────────────────────────────────
@@ -81,7 +89,6 @@ function normalizeForTTS(text: string): string {
 // ── TTS rendering (sequential — simpler, cache makes it fast) ────
 
 async function renderTTS(force: boolean): Promise<Record<string, ManifestEntry>> {
-  const token = getToken();
   const cache = loadCache();
   const narrations = extractNarrations(script);
   const manifest: Record<string, ManifestEntry> = {};
@@ -93,17 +100,20 @@ async function renderTTS(force: boolean): Promise<Record<string, ManifestEntry>>
   for (const { id, narration } of narrations) {
     const filename = `${id}.mp3`;
     const filepath = join(AUDIO_DIR, filename);
-    const h = hash(`${MODEL}:${normalizeForTTS(narration)}`);
+    const h = hash(`${API_URL}:${MODEL}:${VOICE_ID}:${normalizeForTTS(narration)}`);
     newCache[id] = h;
 
     // Cache hit
     if (!force && existsSync(filepath) && cache[id] === h) {
       const buf = readFileSync(filepath);
-      const meta = await parseBuffer(buf, { mimeType: "audio/mpeg" });
-      const durationMs = Math.round((meta.format.duration ?? 0) * 1000);
-      manifest[id] = { file: filename, durationMs };
-      console.log(`  [cached] ${id} (${durationMs}ms)`);
-      continue;
+      try {
+        const durationMs = await audioDurationMs(buf);
+        manifest[id] = { file: filename, durationMs };
+        console.log(`  [cached] ${id} (${durationMs}ms)`);
+        continue;
+      } catch {
+        console.log(`  [invalid cache] ${id} — regenerating`);
+      }
     }
 
     if (!force && existsSync(filepath)) {
@@ -112,6 +122,7 @@ async function renderTTS(force: boolean): Promise<Record<string, ManifestEntry>>
 
     // Render
     const normalized = normalizeForTTS(narration);
+    const token = getToken();
     let success = false;
 
     for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
@@ -159,10 +170,14 @@ async function renderTTS(force: boolean): Promise<Record<string, ManifestEntry>>
         }
 
         const buf = Buffer.from(await resp.arrayBuffer());
-        writeFileSync(filepath, buf);
-
-        const meta = await parseBuffer(buf, { mimeType: "audio/mpeg" });
-        const durationMs = Math.round((meta.format.duration ?? 0) * 1000);
+        const durationMs = await audioDurationMs(buf);
+        const tempPath = `${filepath}.${process.pid}.tmp`;
+        try {
+          writeFileSync(tempPath, buf);
+          renameSync(tempPath, filepath);
+        } finally {
+          if (existsSync(tempPath)) unlinkSync(tempPath);
+        }
         manifest[id] = { file: filename, durationMs };
         console.log(`  [rendered] ${id} (${durationMs}ms)`);
         rendered++;
@@ -227,11 +242,7 @@ function generateVTT(manifest: Record<string, ManifestEntry>): void {
       const entry = manifest[slide.id];
       if (!entry) continue;
 
-      const leadIn = slide.section && slide.slideIndex > 0
-        ? TIMING.SECTION_LEAD_IN
-        : TIMING.SLIDE_LEAD_IN;
-
-      const startMs = ((slide.globalStart + leadIn) / fps) * 1000;
+      const startMs = ((slide.globalStart + slide.leadIn) / fps) * 1000;
       const endMs = startMs + entry.durationMs;
 
       lines.push(slide.id);
