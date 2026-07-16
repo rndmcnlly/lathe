@@ -5,7 +5,7 @@ author_url: https://adamsmith.as
 description: Coding agent tools (lathe, bash, read, write, edit, glob, grep, interpret, delegate, onboard, expose, destroy) backed by per-user sandbox VMs with transparent lifecycle management.
 required_open_webui_version: 0.4.0
 requirements: httpx, httpx-ws, pydantic-ai-slim[openai]~=1.60, cachetools
-version: 0.24.1
+version: 0.24.2
 licence: MIT
 """
 
@@ -94,6 +94,38 @@ def _extract_sandbox_list(payload) -> list:
     if isinstance(payload, dict):
         return payload.get("items") or []
     return []
+
+
+def _multiple_sandboxes_error(label_key: str, email: str, sandboxes: list[dict]) -> str:
+    """Explain why an ambiguous per-user sandbox association is refused."""
+    ids = ", ".join(str(s.get("id", "unknown"))[:12] for s in sandboxes)
+    return (
+        "Multiple sandboxes appear to be associated with your account. Lathe will not "
+        "choose, start, or destroy any of them because doing so could affect the wrong "
+        "environment. Please contact your system administrator and include this message. "
+        f"They should inspect the Daytona deployment label {label_key}={email} and "
+        f"reconcile these sandbox IDs: {ids}."
+    )
+
+
+async def _get_live_sandbox(valves, sandbox_id: str, client: httpx.AsyncClient) -> dict | None:
+    """Return authoritative sandbox data, or None for a deleted/deleting ghost.
+
+    GET /sandbox?labels=... is an eventually consistent discovery index. Once its
+    cardinality gate admits one candidate, this per-ID endpoint is authoritative.
+    """
+    resp = await client.get(
+        _api(valves, f"/sandbox/{sandbox_id}"),
+        headers=_headers(valves),
+        timeout=30.0,
+    )
+    if resp.status_code == 404:
+        return None
+    resp.raise_for_status()
+    sandbox = resp.json()
+    if sandbox.get("state") in ("destroying", "destroyed"):
+        return None
+    return sandbox
 
 
 async def _emit(emitter, description: str, done: bool = False):
@@ -2680,14 +2712,15 @@ async def _ensure_sandbox(valves, email: str, client: httpx.AsyncClient, emitter
     matches = [s for s in sandboxes if s.get("labels", {}).get(label_key) == email]
 
     if len(matches) > 1:
-        ids = ", ".join(s["id"] for s in matches)
-        raise RuntimeError(
-            f"Found {len(matches)} sandboxes labelled {label_key}={email} ({ids}). "
-            f"Expected at most 1. Please delete the extras in the Daytona dashboard "
-            f"and try again."
-        )
+        raise RuntimeError(_multiple_sandboxes_error(label_key, email, matches))
 
-    sandbox = matches[0] if matches else None
+    # The label list is an eventually consistent discovery index. Its only
+    # permitted live cardinality is zero or one, so this adds at most one
+    # authoritative per-ID request per tool call.
+    sandbox = (
+        await _get_live_sandbox(valves, matches[0]["id"], client)
+        if matches else None
+    )
     warning: str | None = None
 
     if sandbox is None:
@@ -3645,50 +3678,56 @@ class Tools:
                     if s.get("labels", {}).get(label_key) == email
                 ]
 
-                if not matches:
+                if len(matches) > 1:
+                    return f"Error: {_multiple_sandboxes_error(label_key, email, matches)}"
+
+                sandbox = (
+                    await _get_live_sandbox(valves, matches[0]["id"], client)
+                    if matches else None
+                )
+
+                if sandbox is None:
                     await _emit(__event_emitter__, "No sandbox found", done=True)
                     return "No sandbox found. One will be created on your next tool call."
 
-                deleted = []
-                for s in matches:
-                    sid = s["id"]
-                    await _emit(__event_emitter__, f"Destroying sandbox {sid[:12]}...")
-                    resp = await client.delete(
-                        _api(valves, f"/sandbox/{sid}"),
-                        headers=_headers(valves),
-                        params={"force": "true"},
-                        timeout=30.0,
-                    )
-                    resp.raise_for_status()
-                    deleted.append(sid)
+                sid = sandbox["id"]
+                await _emit(__event_emitter__, f"Destroying sandbox {sid[:12]}...")
+                resp = await client.delete(
+                    _api(valves, f"/sandbox/{sid}"),
+                    headers=_headers(valves),
+                    params={"force": "true"},
+                    timeout=30.0,
+                )
+                resp.raise_for_status()
 
-                # Poll until deletion propagates
+                # The label list may transiently disappear then reappear with a
+                # stale pre-delete state. Only the per-ID 404 is completion.
                 for _ in range(30):
                     await asyncio.sleep(1)
                     resp = await client.get(
-                        _api(valves, "/sandbox"),
-                        params={"labels": labels_filter},
+                        _api(valves, f"/sandbox/{sid}"),
                         headers=_headers(valves),
                         timeout=30.0,
                     )
-                    remaining = [
-                        s for s in _extract_sandbox_list(resp.json())
-                        if s.get("labels", {}).get(label_key) == email
-                    ]
-                    if not remaining:
+                    if resp.status_code == 404:
                         break
+                    resp.raise_for_status()
+                else:
+                    raise RuntimeError(
+                        f"Sandbox {sid[:12]} did not finish deletion within 30 seconds."
+                    )
 
                 await _emit(__event_emitter__, "Sandbox destroyed", done=True)
-                ids = ", ".join(d[:12] for d in deleted)
+                ids = sid[:12]
                 if has_volume:
                     return (
-                        f"Destroyed {len(deleted)} sandbox(es) ({ids})."
+                        f"Destroyed 1 sandbox(es) ({ids})."
                         f" Your persistent files in {VOLUME_MOUNT_PATH} are intact"
                         f" and will reappear in your next sandbox."
                         f" A fresh sandbox will be created on the next tool call."
                     )
                 return (
-                    f"Destroyed {len(deleted)} sandbox(es) ({ids})."
+                    f"Destroyed 1 sandbox(es) ({ids})."
                     f" A fresh sandbox will be created on the next tool call."
                 )
 

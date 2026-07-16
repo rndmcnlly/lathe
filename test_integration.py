@@ -436,7 +436,7 @@ async def test_int_ensure_sandbox(R: Results, tools: Tools, user: dict):
             await asyncio.sleep(1)
         R.check(
             "duplicate raises RuntimeError",
-            raised_msg is not None and "Found 2 sandboxes" in raised_msg,
+            raised_msg is not None and "Multiple sandboxes" in raised_msg,
             (raised_msg or "no exception raised")[:200],
         )
         R.check(

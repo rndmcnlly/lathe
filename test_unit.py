@@ -2647,6 +2647,155 @@ async def test_tools_schema_parity(R: Results):
                         f"expected {expected_cls}, got {hint}")
 
 
+async def test_sandbox_lifecycle_lookup(R: Results):
+    """Regression coverage for Daytona's stale label-list behavior (#62)."""
+    import lathe
+    from lathe import Tools, _ensure_sandbox, _get_live_sandbox
+
+    class FakeValves:
+        daytona_api_key = "fake"
+        daytona_api_url = "https://fake.api"
+        daytona_proxy_url = "https://fake.proxy"
+        deployment_label = "deploy"
+        auto_create_sandbox = False
+        sandbox_missing_message = "Ask an administrator to provision your sandbox."
+
+    class FakeResponse:
+        def __init__(self, status_code=200, json_data=None):
+            self.status_code = status_code
+            self._json = json_data if json_data is not None else {}
+
+        def json(self):
+            return self._json
+
+        def raise_for_status(self):
+            if self.status_code >= 400:
+                raise RuntimeError(f"HTTP {self.status_code}")
+
+    class LookupClient:
+        def __init__(self, list_response, detail_responses=()):
+            self.list_response = list_response
+            self.detail_responses = list(detail_responses)
+            self.get_calls = []
+
+        async def get(self, url, **kwargs):
+            self.get_calls.append(url)
+            if url.endswith("/sandbox"):
+                return self.list_response
+            return self.detail_responses.pop(0)
+
+    candidate = {
+        "id": "sandbox-1234567890",
+        "labels": {"deploy": "user@example.edu"},
+        "state": "started",  # Deliberately stale label-list state.
+    }
+
+    print("\n── sandbox lifecycle: authoritative per-ID filtering ──")
+    client = LookupClient(FakeResponse(200, {}), [FakeResponse(404)])
+    sandbox = await _get_live_sandbox(FakeValves(), candidate["id"], client)
+    R.check("404 per-ID is absent", sandbox is None, repr(sandbox))
+
+    client = LookupClient(FakeResponse(200, {}), [FakeResponse(200, {**candidate, "state": "destroying"})])
+    sandbox = await _get_live_sandbox(FakeValves(), candidate["id"], client)
+    R.check("destroying per-ID is absent", sandbox is None, repr(sandbox))
+
+    authoritative = {**candidate, "state": "stopped"}
+    client = LookupClient(FakeResponse(200, {}), [FakeResponse(200, authoritative)])
+    sandbox = await _get_live_sandbox(FakeValves(), candidate["id"], client)
+    R.check("uses authoritative per-ID object", sandbox == authoritative, repr(sandbox))
+
+    client = LookupClient(FakeResponse(200, {}), [FakeResponse(500)])
+    try:
+        await _get_live_sandbox(FakeValves(), candidate["id"], client)
+        R.check("non-404 per-ID error propagates", False, "no exception")
+    except RuntimeError as exc:
+        R.check("non-404 per-ID error propagates", "500" in str(exc), str(exc))
+
+    print("\n── sandbox lifecycle: label cardinality gate ──")
+    duplicate = {**candidate, "id": "sandbox-duplicate"}
+    client = LookupClient(FakeResponse(200, [candidate, duplicate]))
+    try:
+        await _ensure_sandbox(FakeValves(), "user@example.edu", client)
+        R.check("duplicate association is refused", False, "no exception")
+    except RuntimeError as exc:
+        message = str(exc)
+        R.check("duplicate association is refused", "Multiple sandboxes" in message, message)
+        R.check("duplicate directs to administrator", "system administrator" in message, message)
+    R.check("duplicates do not trigger per-ID fan-out",
+            all(url.endswith("/sandbox") for url in client.get_calls), str(client.get_calls))
+
+    client = LookupClient(FakeResponse(200, [candidate]), [FakeResponse(404)])
+    try:
+        await _ensure_sandbox(FakeValves(), "user@example.edu", client)
+        R.check("ghost reaches normal missing-sandbox path", False, "no exception")
+    except RuntimeError as exc:
+        R.check("ghost is not treated as duplicate or live",
+                str(exc) == FakeValves.sandbox_missing_message, str(exc))
+    R.check("single candidate makes one per-ID validation request",
+            len(client.get_calls) == 2, str(client.get_calls))
+
+    print("\n── destroy: cardinality and per-ID completion ──")
+    class DestroyClient:
+        def __init__(self, responses):
+            self.responses = list(responses)
+            self.get_calls = []
+            self.delete_calls = []
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def get(self, url, **kwargs):
+            self.get_calls.append(url)
+            return self.responses.pop(0)
+
+        async def delete(self, url, **kwargs):
+            self.delete_calls.append(url)
+            return self.responses.pop(0)
+
+    async def confirmed(_data):
+        return True
+
+    tools = Tools()
+    tools.valves.daytona_api_key = "fake"
+    tools.valves.daytona_api_url = "https://fake.api"
+    tools.valves.deployment_label = "deploy"
+    tools.valves.persistent_volume = False
+    original_client = lathe.httpx.AsyncClient
+    try:
+        duplicate_client = DestroyClient([FakeResponse(200, [candidate, duplicate])])
+        lathe.httpx.AsyncClient = lambda: duplicate_client
+        result = await tools.destroy(
+            __user__={"email": "user@example.edu"}, __event_call__=confirmed,
+        )
+        R.check("destroy refuses duplicate association", "Multiple sandboxes" in result, result)
+        R.check("destroy duplicates issue no per-ID requests", len(duplicate_client.get_calls) == 1,
+                str(duplicate_client.get_calls))
+        R.check("destroy duplicates issue no DELETE", not duplicate_client.delete_calls,
+                str(duplicate_client.delete_calls))
+
+        destroy_client = DestroyClient([
+            FakeResponse(200, [candidate]),
+            FakeResponse(200, candidate),
+            FakeResponse(204),
+            FakeResponse(404),
+        ])
+        lathe.httpx.AsyncClient = lambda: destroy_client
+        result = await tools.destroy(
+            __user__={"email": "user@example.edu"}, __event_call__=confirmed,
+        )
+        R.check("destroy succeeds after per-ID 404", result.startswith("Destroyed 1 sandbox"), result)
+        R.check("destroy issues exactly one DELETE", len(destroy_client.delete_calls) == 1,
+                str(destroy_client.delete_calls))
+        R.check("destroy polls only the sandbox ID after DELETE",
+                all(not url.endswith("/sandbox") for url in destroy_client.get_calls[1:]),
+                str(destroy_client.get_calls))
+    finally:
+        lathe.httpx.AsyncClient = original_client
+
+
 TESTS = {
     "parse_env_vars": test_parse_env_vars,
     "parse_create_overrides": test_parse_create_overrides,
@@ -2691,6 +2840,7 @@ TESTS = {
     "interpret_constant": test_interpret_constant,
     "interpret_manpage": test_interpret_manpage,
     "tools_schema_parity": test_tools_schema_parity,
+    "sandbox_lifecycle_lookup": test_sandbox_lifecycle_lookup,
 }
 
 
