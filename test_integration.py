@@ -278,15 +278,27 @@ async def test_int_truncation(R: Results, tools: Tools, user: dict):
     ctx = dict(__user__=user, __event_emitter__=mock_emitter)
     import re
 
-    print("\n── bash: output truncation ──")
+    print("\n── bash: output truncation with log file ──")
     result = await tools.bash(
         "for i in $(seq 1 3000); do echo \"output line $i\"; done",
         **ctx,
     )
     R.check("truncated output has notice", "[Showing lines" in result, result[-200:])
+    R.check("notice mentions log file", "/dev/shm/lathe/cmd/" in result, result[-200:])
     R.check("last line present in output", "output line 3000" in result, result[-200:])
     R.check("first line NOT in truncated output", "output line 1\n" not in result, "line 1 should be truncated away")
-    R.check("foreground sidecar is not retained", "/dev/shm/lathe/cmd/" not in result, result[-200:])
+
+    spill_match = re.search(r"/dev/shm/lathe/cmd/[0-9a-f-]+/log", result)
+    if spill_match:
+        spill_path = spill_match.group(0)
+        verify, head_result = await asyncio.gather(
+            tools.bash(f"wc -l < {spill_path}", **ctx),
+            tools.bash(f"head -n 3 {spill_path}", **ctx),
+        )
+        R.check("log file has all 3000 lines", "3000" in verify, verify.strip())
+        R.check("can retrieve early lines from log file", "output line 1" in head_result, head_result[:100])
+    else:
+        R.check("log file path found in notice", False, "no path match found")
 
     print("\n── bash: small output NOT truncated ──")
     result = await tools.bash("echo hello", **ctx)

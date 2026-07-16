@@ -260,7 +260,6 @@ def _shell_quote(s: str) -> str:
 
 _EPHEMERAL_ROOT = "/dev/shm/lathe"
 _DURABLE_ROOT = "/tmp/lathe"
-_BASH_LOG_MAX_BYTES = 1024 * 1024
 
 
 def _bash_sidecar_dir(cmd_id: str) -> str:
@@ -435,6 +434,16 @@ def _truncate_tail(text: str) -> tuple[str, bool, dict]:
         "truncated_by": truncated_by,
     }
     return output, True, meta
+
+
+def _human_size(n: int) -> str:
+    """Format byte count as human-readable string."""
+    b = float(n)
+    for unit in ("B", "KB", "MB", "GB"):
+        if b < 1024:
+            return f"{b:,.0f} {unit}" if unit == "B" else f"{b:,.1f} {unit}"
+        b /= 1024
+    return f"{b:,.1f} TB"
 
 
 # ── shared glob infrastructure (runs on sandbox) ────────────────────
@@ -1121,21 +1130,6 @@ async def _download_file(valves, sandbox_id: str, client: httpx.AsyncClient,
     return resp.text
 
 
-async def _remove_sandbox_path(valves, sandbox_id: str, client: httpx.AsyncClient,
-                               path: str) -> None:
-    """Best-effort removal of an ephemeral sandbox path after consumption."""
-    try:
-        resp = await client.post(
-            _toolbox(valves, sandbox_id, "/process/execute"),
-            headers=_headers(valves),
-            json={"command": f"rm -rf -- {_shell_quote(path)}", "timeout": 5000},
-            timeout=15.0,
-        )
-        resp.raise_for_status()
-    except Exception as exc:
-        logger.debug("sidecar cleanup failed for %s: %s", path, exc)
-
-
 async def _run_sandbox_script(valves, sandbox_id: str, client: httpx.AsyncClient,
                               script: str, *, error_prefix: str,
                               timeout_ms: int = 30000,
@@ -1483,46 +1477,9 @@ async def _core_grep(valves, sandbox_id: str, client: httpx.AsyncClient, *,
 # ── bash core (session + sidecar protocol) ──────────────────────────
 
 
-_BASH_LOG_RELAY = r'''import sys
-
-path, limit = sys.argv[1], int(sys.argv[2])
-marker = b"\n[Lathe: log capture truncated; full output remains in the command session.]\n"
-remaining = limit - len(marker)
-truncated = False
-
-try:
-    log = open(path, "wb")
-except OSError as exc:
-    log = None
-    sys.stderr.write(f"[Lathe: log capture unavailable: {exc}]\n")
-
-with log or open("/dev/null", "wb") as destination:
-    while chunk := sys.stdin.buffer.read(65536):
-        try:
-            sys.stdout.buffer.write(chunk)
-            sys.stdout.buffer.flush()
-        except BrokenPipeError:
-            pass
-        if log is None or truncated:
-            continue
-        try:
-            if len(chunk) <= remaining:
-                destination.write(chunk)
-                remaining -= len(chunk)
-            else:
-                destination.write(chunk[:remaining])
-                destination.write(marker)
-                destination.flush()
-                truncated = True
-                sys.stderr.write(marker.decode())
-        except OSError as exc:
-            truncated = True
-            sys.stderr.write(f"[Lathe: log capture stopped: {exc}]\n")
-'''
-
 def _build_bash_script(command: str, user_pairs: list[tuple[str, str]],
                        pid_path: str, log_path: str) -> str:
-    """Build a wrapper with bounded, failure-tolerant sidecar logging."""
+    """Build the bash wrapper script with sidecar file setup."""
     user_env_lines = "".join(
         f"export {k}={_shell_quote(v)}\n" for k, v in user_pairs
     )
@@ -1536,16 +1493,15 @@ def _build_bash_script(command: str, user_pairs: list[tuple[str, str]],
         "CI=true\n"
         + user_env_lines
         + f"echo $BASHPID > {_shell_quote(pid_path)}\n"
-        + (
-            f"exec > >(python3 -c {_shell_quote(_BASH_LOG_RELAY)} "
-            f"{_shell_quote(log_path)} {_BASH_LOG_MAX_BYTES}) 2>&1\n"
-        )
+        + f"exec > >(tee {_shell_quote(log_path)}) 2>&1\n"
         + command
         + "\n"
     )
 
 
 def _format_bash_result(output: str, exit_code: int | None,
+                        was_truncated: bool, meta: dict,
+                        spill_path: str | None = None,
                         background_info: dict | None = None) -> str:
     """Format bash output for return to the caller."""
     if background_info is not None:
@@ -1570,6 +1526,24 @@ def _format_bash_result(output: str, exit_code: int | None,
 
     if not output.strip():
         output = "(no output)"
+
+    if was_truncated and spill_path:
+        start = meta["shown_start_line"]
+        end = meta["shown_end_line"]
+        total = meta["total_lines"]
+        total_size = _human_size(meta["total_bytes"])
+        if meta["truncated_by"] == "lines":
+            notice = (
+                f"\n\n[Showing lines {start}-{end} of {total}. "
+                f"Full output ({total_size}): {spill_path}]"
+            )
+        else:
+            notice = (
+                f"\n\n[Showing lines {start}-{end} of {total} "
+                f"({_human_size(_MAX_BYTES)} limit, full output is {total_size}). "
+                f"Full output: {spill_path}]"
+            )
+        output += notice
 
     return output
 
@@ -1710,7 +1684,7 @@ async def _core_bash(valves, sandbox_id: str, client: httpx.AsyncClient, *,
     )
     result = logs_resp.text if logs_resp.status_code == 200 else ""
 
-    output, _, _ = _truncate_tail(result)
+    output, was_truncated, meta = _truncate_tail(result)
 
     if not finished:
         elapsed = int(time.time() - (deadline - fg_timeout))
@@ -1719,14 +1693,16 @@ async def _core_bash(valves, sandbox_id: str, client: httpx.AsyncClient, *,
                           session_cmd_id=session_cmd_id, cmd_id=cmd_id,
                           start_time=deadline - fg_timeout)
         return _format_bash_result(
-            output, exit_code,
+            output, exit_code, was_truncated, meta,
             background_info={"elapsed": elapsed, "cmd_id": cmd_id},
         )
 
     # Command finished within foreground window
-    result = _format_bash_result(output, exit_code)
-    await _remove_sandbox_path(valves, sandbox_id, client, cmd_dir)
-    return result
+    spill_path = log_path if was_truncated else None
+    return _format_bash_result(
+        output, exit_code, was_truncated, meta,
+        spill_path=spill_path,
+    )
 
 
 # ── Background bash completion polling ───────────────────────────────
@@ -1795,9 +1771,6 @@ async def _poll_bg_bash(valves, sandbox_id: str, session_id: str,
 
             notice = _format_bg_bash_notice(cmd_id, exit_code, elapsed, tail)
             _push_bg_notice(chat_state, chat_id, notice)
-            await _remove_sandbox_path(
-                valves, sandbox_id, poll_client, _bash_sidecar_dir(cmd_id),
-            )
 
         except Exception as e:
             logger.debug("bg-poll: poller failed: %s", e)
@@ -3094,8 +3067,7 @@ class Tools:
             Absence of CMD/exit means the process is still running *or* the
             sandbox was restarted (in which case the PID is stale). To
             distinguish the two, check whether the PID is still alive.
-            Sidecars are removed after Lathe has collected a completed job's
-            result; inspect them while the job is running.
+            Sidecars remain available until the sandbox stops or restarts.
 
             ## Recipes
 
@@ -3279,8 +3251,7 @@ class Tools:
 
             DELEGATE/result or DELEGATE/error appears when the sub-agent
             finishes. Absence of both means it's still running.
-            Sidecars are removed after Lathe has collected completion, so
-            inspect them while the delegation is running.
+            Sidecars remain available until the sandbox stops or restarts.
 
             ### Monitoring recipes
 
@@ -3564,9 +3535,9 @@ class Tools:
               benefit and risks tripping the foreground timeout on the wait builtin,
               producing an alarming background descriptor even when the real work
               is already done.
-            - bash() output is truncated to the last 2000 lines / 50 KB.
-              While a backgrounded command runs, its bounded live log is at
-              /dev/shm/lathe/cmd/<id>/log.
+            - bash() output is truncated to the last 2000 lines / 50 KB. If
+              truncated, the full output is available in the log file at
+              /dev/shm/lathe/cmd/<id>/log — use read() to inspect specific sections.
             - edit() requires an exact string match (including whitespace). If
               the match is ambiguous, provide more surrounding context or use
               replace_all=true.
@@ -3818,38 +3789,34 @@ class Tools:
             p = p.rstrip("/")
             script = _build_onboard_script(p)
 
-            # The generated script is needed only for this invocation.
             script_path = _onboard_script_path(str(uuid.uuid4()))
-            try:
-                await _upload_file(
-                    self.valves, sandbox_id, client,
-                    script_path, script.encode("utf-8"),
-                )
+            await _upload_file(
+                self.valves, sandbox_id, client,
+                script_path, script.encode("utf-8"),
+            )
 
-                resp = await client.post(
-                    _toolbox(self.valves, sandbox_id, "/process/execute"),
-                    headers=_headers(self.valves),
-                    json={
-                        "command": f"python3 {script_path}",
-                        "timeout": 30000,
-                    },
-                    timeout=60.0,
-                )
-                resp.raise_for_status()
-                data = resp.json()
+            resp = await client.post(
+                _toolbox(self.valves, sandbox_id, "/process/execute"),
+                headers=_headers(self.valves),
+                json={
+                    "command": f"python3 {script_path}",
+                    "timeout": 30000,
+                },
+                timeout=60.0,
+            )
+            resp.raise_for_status()
+            data = resp.json()
 
-                result = data.get("result", "")
-                exit_code = data.get("exitCode", -1)
+            result = data.get("result", "")
+            exit_code = data.get("exitCode", -1)
 
-                if exit_code != 0:
-                    await _emit(__event_emitter__, "Error loading context", done=True)
-                    return f"Error: onboard script failed (exit {exit_code}): {result[:500]}"
+            if exit_code != 0:
+                await _emit(__event_emitter__, "Error loading context", done=True)
+                return f"Error: onboard script failed (exit {exit_code}): {result[:500]}"
 
-                await _emit(__event_emitter__, "Project context loaded", done=True)
-                messages = _drain_harness_messages(self._chat_state, __chat_id__, _sb_warning)
-                return _prepend_harness_messages(result if result else "(empty project context)", messages)
-            finally:
-                await _remove_sandbox_path(self.valves, sandbox_id, client, script_path)
+            await _emit(__event_emitter__, "Project context loaded", done=True)
+            messages = _drain_harness_messages(self._chat_state, __chat_id__, _sb_warning)
+            return _prepend_harness_messages(result if result else "(empty project context)", messages)
 
         return await _tool_context(__event_emitter__, _run)
 
@@ -4330,9 +4297,6 @@ class Tools:
                             error=agent_result.get("error"),
                         )
                         _push_bg_notice(self._chat_state, __chat_id__, notice)
-                    await _remove_sandbox_path(
-                        self.valves, sandbox_id, bg_client, delegate_dir,
-                    )
                     await inner_client.aclose()
                     await bg_client.aclose()
 
