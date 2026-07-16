@@ -17,15 +17,23 @@ Credentials in `.env` (gitignored); see `.env.example`. Dependencies via `uv run
 ```
 uv run python test_unit.py                      # no sandbox needed
 uv run python test_integration.py               # needs DAYTONA_API_KEY
-uv run python test_deployment.py [--verbose]     # needs OWUI_URL, OWUI_TOKEN, OWUI_MODEL
+uv run python test_deployment.py [--verbose]     # also needs OWUI_URL, OWUI_TOKEN, OWUI_MODEL
 ```
 
+`test_deployment.py` owns the separate OWUI toolkit ID `lathe_test` and never
+updates or invokes production `lathe`. It also uses a separate Daytona label
+with persistent volumes disabled. Override the staging ID with
+`LATHE_TEST_TOOL_ID`; use `--no-deploy` only when intentionally testing the
+already-staged source.
+
 Run `uv run python test_unit.py` before committing any change to `lathe.py`. Keep tests in sync: rename/remove/add tests when you rename/remove/add code they cover.
+Use `test_unit.py --extended` for targeted diagnostics that intentionally sit outside the required fast gate.
 
 ## Closing issues
 
 1. Unit tests pass.
-2. Deploy to the OWUI instance (`OWUI_URL` / `OWUI_TOKEN` in `.env`) and verify end-to-end — unless the change has no runtime impact.
+2. Run `test_integration.py` for Daytona-facing changes.
+3. Run `test_deployment.py` for loader, schema, wrapper, interpreter, or delegate changes. It deploys and verifies the isolated `lathe_test` copy end-to-end.
 
 Unit tests can't catch broken HTTP paths or OWUI integration bugs. Real deployment is the final gate.
 

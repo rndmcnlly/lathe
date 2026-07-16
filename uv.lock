@@ -594,7 +594,7 @@ wheels = [
 
 [[package]]
 name = "lathe"
-version = "0.24.2"
+version = "0.24.3"
 source = { virtual = "." }
 dependencies = [
     { name = "aiohttp" },

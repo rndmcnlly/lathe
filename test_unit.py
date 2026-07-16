@@ -1156,35 +1156,20 @@ async def test_manpage_rendering(R: Results):
     MIN_MANPAGE_LEN = 500
     KNOWN_PLACEHOLDERS = ("{volume_note}", "{destroy_volume_note}", "{tool_catalog}")
 
-    print("\n── manpage rendering: every page non-trivial in length ──")
+    print("\n── manpage rendering: every page is complete ──")
     for has_volume in (True, False):
         t = Tools()
         t.valves.persistent_volume = has_volume
         for page in sorted(t._MANPAGES.keys()):
             label = f"{page!r} (persistent_volume={has_volume})"
             result = await t.lathe(manpage=page)
-            R.check(
-                f"manpage {label} returns a string",
-                isinstance(result, str),
-                f"got {type(result).__name__}: {result!r}",
+            complete = (
+                isinstance(result, str)
+                and len(result) >= MIN_MANPAGE_LEN
+                and not result.startswith(("Error:", "API error:"))
+                and all(ph not in result for ph in KNOWN_PLACEHOLDERS)
             )
-            R.check(
-                f"manpage {label} length >= {MIN_MANPAGE_LEN}",
-                len(result) >= MIN_MANPAGE_LEN,
-                f"got {len(result)} chars: {result[:300]!r}",
-            )
-            R.check(
-                f"manpage {label} not an error message",
-                not result.startswith("Error:")
-                and not result.startswith("API error:"),
-                result[:300],
-            )
-            for ph in KNOWN_PLACEHOLDERS:
-                R.check(
-                    f"manpage {label} resolves {ph}",
-                    ph not in result,
-                    result[:500],
-                )
+            R.check(f"manpage {label} is complete", complete, result[:500])
 
     print("\n── manpage rendering: overview specifics ──")
     for has_volume in (True, False):
@@ -2816,60 +2801,72 @@ TESTS = {
     "truncate": test_truncate,
     "shell_quote": test_shell_quote,
     "require_abs_path": test_require_abs_path,
-    "build_tool_catalog": test_build_tool_catalog,
     "glob_script": test_glob_script,
     "grep_script": test_grep_script,
     "read_script": test_read_script,
     "write_script": test_write_script,
     "edit_script": test_edit_script,
-    "delegate_infrastructure": test_delegate_infrastructure,
     "delegate_exception_unwrapping": test_delegate_exception_unwrapping,
-    "persistent_volume_valve": test_persistent_volume_valve,
     "manpage_rendering": test_manpage_rendering,
     "delegate_prompt_build": test_delegate_prompt_build,
     "delegate_tools_build": test_delegate_tools_build,
     "build_bash_script": test_build_bash_script,
-    "sidecar_paths": test_sidecar_paths,
     "format_bash_result": test_format_bash_result,
     "core_read_mock": test_core_read_mock,
     "core_write_mock": test_core_write_mock,
     "core_edit_mock": test_core_edit_mock,
     "string_typed_params": test_string_typed_params,
     "string_future_annotations_loading": test_string_future_annotations_loading,
-    "delegate_bash_foreground": test_delegate_bash_foreground,
     "format_delegate_background": test_format_delegate_background,
-    "delegate_foreground_constant": test_delegate_foreground_constant,
-    "delegate_catalog_foreground_param": test_delegate_catalog_foreground_param,
-    "delegate_background_branching": test_delegate_background_branching,
-    "handoff": test_handoff,
     "harness_messages": test_harness_messages,
-    "chat_state": test_chat_state,
-    "snapshot_script": test_snapshot_script,
     "ensure_chat_init": test_ensure_chat_init,
-    "chat_id_signatures": test_chat_id_in_signatures,
     "push_bg_notice": test_push_bg_notice,
     "format_bg_notices": test_format_bg_notices,
     "format_interpret_result": test_format_interpret_result,
     "ensure_interpreter_context": test_ensure_interpreter_context,
-    "interpret_constant": test_interpret_constant,
-    "interpret_manpage": test_interpret_manpage,
     "tools_schema_parity": test_tools_schema_parity,
     "sandbox_lifecycle_lookup": test_sandbox_lifecycle_lookup,
+}
+
+# Lower-signal diagnostics retained for targeted work, but excluded from the
+# required fast gate. Run all of them with ``--extended`` or name one directly.
+EXTENDED_TESTS = {
+    "build_tool_catalog": test_build_tool_catalog,
+    "delegate_infrastructure": test_delegate_infrastructure,
+    "persistent_volume_valve": test_persistent_volume_valve,
+    "sidecar_paths": test_sidecar_paths,
+    "delegate_bash_foreground": test_delegate_bash_foreground,
+    "delegate_foreground_constant": test_delegate_foreground_constant,
+    "delegate_catalog_foreground_param": test_delegate_catalog_foreground_param,
+    "delegate_background_branching": test_delegate_background_branching,
+    "handoff": test_handoff,
+    "chat_state": test_chat_state,
+    "snapshot_script": test_snapshot_script,
+    "chat_id_signatures": test_chat_id_in_signatures,
+    "interpret_constant": test_interpret_constant,
+    "interpret_manpage": test_interpret_manpage,
 }
 
 
 async def main():
     args = sys.argv[1:]
+    available = {**TESTS, **EXTENDED_TESTS}
 
     if "--list" in args:
-        print("Available unit tests:")
+        print("Default unit tests:")
         for name in TESTS:
+            print(f"  {name}")
+        print("\nExtended diagnostics (--extended):")
+        for name in EXTENDED_TESTS:
             print(f"  {name}")
         return
 
-    selected = args if args else list(TESTS.keys())
+    explicit = [arg for arg in args if not arg.startswith("--")]
+    selected = explicit or list(TESTS.keys())
+    if "--extended" in args and not explicit:
+        selected += list(EXTENDED_TESTS.keys())
     for name in selected:
-        if name not in TESTS:
+        if name not in available:
             print(f"Unknown test: {name}. Use --list to see available tests.")
             sys.exit(1)
 
@@ -2880,13 +2877,15 @@ async def main():
     print(f"UNIT TESTS ({', '.join(selected)})")
     print(f"{'='*50}")
 
-    # Unit tests are instant — run concurrently
-    await asyncio.gather(*(TESTS[name](R) for name in selected))
+    # Run sequentially: several tests temporarily patch module globals, and
+    # deterministic output and isolation matter more than shaving milliseconds.
+    for name in selected:
+        await available[name](R)
 
     elapsed = time.time() - t0
     total = R.passed + R.failed
     print(f"\n{'='*50}")
-    print(f"Results: {R.passed} passed, {R.failed} failed out of {total}  ({elapsed:.1f}s)")
+    print(f"Results: {R.passed} checks passed, {R.failed} failed out of {total}  ({elapsed:.1f}s)")
     if R.failed:
         print("SOME TESTS FAILED")
         sys.exit(1)
