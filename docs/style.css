@@ -46,21 +46,6 @@ body {
     overflow: hidden;
 }
 
-#canvas-container::before {
-    content: "";
-    position: absolute;
-    z-index: 0;
-    width: min(74vw, 900px);
-    height: min(20vw, 240px);
-    min-height: 100px;
-    top: 50%;
-    left: 50%;
-    transform: translate(-50%, -50%) rotate(-8deg);
-    border-radius: 50%;
-    background: linear-gradient(180deg, #756f66, #29251f 48%, #0e0c0a 90%);
-    box-shadow: 0 30px 90px #000, inset 0 10px 24px rgb(255 221 175 / 18%);
-}
-
 #canvas-container canvas {
     display: block;
     width: 100%;
