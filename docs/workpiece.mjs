@@ -53,11 +53,9 @@ export function initWorkpiece(containerId) {
 
     var renderer = new THREE.WebGLRenderer({ antialias: true });
     renderer.setSize(container.clientWidth, container.clientHeight);
-    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.5));
     renderer.toneMapping = THREE.ACESFilmicToneMapping;
     renderer.toneMappingExposure = 1.3;
-    renderer.shadowMap.enabled = true;
-    renderer.shadowMap.type = THREE.PCFSoftShadowMap;
     container.insertBefore(renderer.domElement, container.firstChild);
 
     // ── Procedural textures ───────────────────────────────
@@ -257,7 +255,7 @@ export function initWorkpiece(containerId) {
 
     var cylinderGeo = new THREE.CylinderGeometry(1.3, 1.3, 12, 64, 1, false);
 
-    var TEX = 2048;
+    var TEX = 1024;
     var cylinderMat = new THREE.MeshStandardMaterial({
         map: generateDiffuse(TEX, TEX),
         bumpMap: generateBump(TEX, TEX),
@@ -270,7 +268,6 @@ export function initWorkpiece(containerId) {
 
     var cylinder = new THREE.Mesh(cylinderGeo, cylinderMat);
     cylinder.rotation.z = Math.PI / 2;
-    cylinder.castShadow = true;
     scene.add(cylinder);
 
     // ── Lighting ──────────────────────────────────────────
@@ -280,7 +277,6 @@ export function initWorkpiece(containerId) {
     var SUN_REST = 3.5, SUN_ACTIVE = 4.2;
     var sun = new THREE.DirectionalLight(0xffd8a8, SUN_REST);
     sun.position.set(3, 5, 3);
-    sun.castShadow = true;
     scene.add(sun);
 
     var FILL_REST = 0.1, FILL_ACTIVE = 0.2;
@@ -346,9 +342,10 @@ export function initWorkpiece(containerId) {
 
     var mouseX = 0, mouseY = 0;
 
-    document.addEventListener('mousemove', function(e) {
-        mouseX = (e.clientX / window.innerWidth - 0.5) * 2;
-        mouseY = (e.clientY / window.innerHeight - 0.5) * 2;
+    container.addEventListener('mousemove', function(e) {
+        var rect = container.getBoundingClientRect();
+        mouseX = ((e.clientX - rect.left) / rect.width - 0.5) * 2;
+        mouseY = ((e.clientY - rect.top) / rect.height - 0.5) * 2;
         lastMouseMove = performance.now() / 1000;
 
         if (state === STATE.IDLE) {
