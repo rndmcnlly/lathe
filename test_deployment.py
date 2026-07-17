@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """Open WebUI loader and dispatch tests using an isolated toolkit ID.
 
-By default this suite deploys the exact local ``lathe.py`` as ``lathe_test``.
-It never updates or invokes the production ``lathe`` toolkit. The staging
-toolkit uses a distinct Daytona deployment label and persistent volumes are
-disabled, so its sandboxes are also isolated and disposable.
+By default this suite temporarily deploys the exact local ``lathe.py`` as
+``lathe_test``. It never updates or invokes the production ``lathe`` toolkit.
+The staging toolkit uses a distinct Daytona deployment label and persistent
+volumes are disabled, so its sandboxes are also isolated and disposable. The
+staging toolkit and sandboxes are deleted when the suite exits, including after
+failures and ``--no-deploy`` runs.
 
 Usage:
     uv run python test_deployment.py
@@ -179,6 +181,26 @@ async def fetch_staging_tool():
         return response.json()
 
 
+async def delete_staging_tool():
+    """Delete the suite-owned OWUI toolkit if it exists."""
+    async with httpx.AsyncClient() as client:
+        response = await client.get(
+            f"{OWUI_BASE}/api/v1/tools/id/{TOOL_ID}",
+            headers=auth_headers(),
+            timeout=30,
+        )
+        if response.status_code == 404:
+            return
+        response.raise_for_status()
+        response = await client.delete(
+            f"{OWUI_BASE}/api/v1/tools/id/{TOOL_ID}/delete",
+            headers=auth_headers(),
+            timeout=30,
+        )
+        response.raise_for_status()
+        require(response.json() is True, f"toolkit deletion returned {response.text}")
+
+
 async def cleanup_test_sandboxes():
     """Delete only sandboxes carrying the staging deployment-label key."""
     headers = {
@@ -316,13 +338,9 @@ async def main():
     started = time.monotonic()
     results = Results()
     client = OWUIClient()
+    cleanup_failed = False
     canary = f"OWUI_{uuid.uuid4().hex}"
     path = f"/home/daytona/workspace/{canary}.txt"
-
-    if deploy:
-        print(f"Deploying local lathe.py to isolated toolkit {TOOL_ID!r}...")
-        await deploy_staging_tool()
-    await cleanup_test_sandboxes()
 
     async def exact_source_and_schema():
         remote = await fetch_staging_tool()
@@ -386,6 +404,11 @@ async def main():
         require(any(canary in value for value in values), values)
 
     try:
+        if deploy:
+            print(f"Deploying local lathe.py to isolated toolkit {TOOL_ID!r}...")
+            await deploy_staging_tool()
+        await cleanup_test_sandboxes()
+
         await results.run("exact staged source and complete OWUI schema", exact_source_and_schema)
         await client.connect()
         await results.run("model to OWUI to bash dispatch", bash_dispatch)
@@ -397,11 +420,17 @@ async def main():
         try:
             await cleanup_test_sandboxes()
         except Exception as exc:
-            print(f"Cleanup warning: {exc}")
+            cleanup_failed = True
+            print(f"Sandbox cleanup warning: {exc}")
+        try:
+            await delete_staging_tool()
+        except Exception as exc:
+            cleanup_failed = True
+            print(f"Toolkit cleanup warning: {exc}")
 
     elapsed = time.monotonic() - started
     print(f"\n{results.scenarios - results.failed}/{results.scenarios} scenarios passed in {elapsed:.1f}s")
-    return 1 if results.failed else 0
+    return 1 if results.failed or cleanup_failed else 0
 
 
 if __name__ == "__main__":

@@ -4,8 +4,8 @@ author: Adam Smith
 author_url: https://adamsmith.as
 description: Coding agent tools (lathe, bash, read, write, edit, glob, grep, interpret, delegate, onboard, expose, destroy) backed by per-user sandbox VMs with transparent lifecycle management.
 required_open_webui_version: 0.4.0
-requirements: httpx, httpx-ws, pydantic-ai-slim[openai]~=1.60, cachetools
-version: 0.24.3
+requirements: httpx, httpx-ws, pydantic-ai-slim[openai]~=2.5, cachetools
+version: 0.25.0
 licence: MIT
 """
 
@@ -239,19 +239,6 @@ def _format_bg_delegate_notice(delegate_id: str, elapsed: int,
         else:
             lines.append("(no result text)")
     return "\n".join(lines)
-
-
-def _unwrap_delegate_exception(exc: Exception) -> Exception:
-    """Recover an exception masked by pydantic-ai's old async cleanup bug."""
-    cleanup_exc = exc.__context__
-    if (
-        isinstance(exc, RuntimeError)
-        and str(exc) == "async generator raised StopAsyncIteration"
-        and isinstance(cleanup_exc, StopAsyncIteration)
-        and isinstance(cleanup_exc.__context__, Exception)
-    ):
-        return cleanup_exc.__context__
-    return exc
 
 
 def _shell_quote(s: str) -> str:
@@ -4176,20 +4163,16 @@ class Tools:
                                     and remaining > 0
                                     and not nudge_injected
                                 ):
-                                    from pydantic_ai.messages import ModelRequest, UserPromptPart
-                                    nudge_msg = ModelRequest(parts=[UserPromptPart(
-                                        content=(
-                                            f"[SYSTEM: You have {remaining} step(s) remaining out of "
-                                            f"{clamped_steps}. Do not make any more tool calls. Use "
-                                            f"your final step to hand off your work. Write:\n"
-                                            f"1. What you accomplished.\n"
-                                            f"2. What remains unresolved — specific next steps.\n"
-                                            f"3. Absolute paths to critical sandbox files the calling "
-                                            f"agent or a follow-up sub-agent needs to continue "
-                                            f"(modified sources, failing tests, relevant logs).]"
-                                        ),
-                                    )])
-                                    agent_run._graph_run.state.message_history.append(nudge_msg)
+                                    agent_run.enqueue(
+                                        f"[SYSTEM: You have {remaining} step(s) remaining out of "
+                                        f"{clamped_steps}. Do not make any more tool calls. Use "
+                                        f"your final step to hand off your work. Write:\n"
+                                        f"1. What you accomplished.\n"
+                                        f"2. What remains unresolved — specific next steps.\n"
+                                        f"3. Absolute paths to critical sandbox files the calling "
+                                        f"agent or a follow-up sub-agent needs to continue "
+                                        f"(modified sources, failing tests, relevant logs).]"
+                                    )
                                     nudge_injected = True
 
                             elif Agent.is_call_tools_node(node):
@@ -4221,7 +4204,7 @@ class Tools:
                                     if emit_to_owui:
                                         await _emit(__event_emitter__, tool_status)
 
-                        usage = agent_run.usage()
+                        usage = agent_run.usage
                         result_output = agent_run.result.output if agent_run.result else "(no output)"
 
                     # ── Write sidecar result files ────────────────────
@@ -4251,9 +4234,8 @@ class Tools:
                     })
 
                 except Exception as e:
-                    root_error = _unwrap_delegate_exception(e)
-                    error_type = type(root_error).__name__
-                    error_detail = str(root_error)
+                    error_type = type(e).__name__
+                    error_detail = str(e)
                     # Detect provider-level failures (malformed upstream responses)
                     # and surface a concise, actionable message instead of raw
                     # pydantic validation noise.

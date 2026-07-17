@@ -1067,42 +1067,50 @@ async def test_delegate_infrastructure(R: Results):
                     f"params: {param_names}")
 
 
-async def test_delegate_exception_unwrapping(R: Results):
-    """Recover only the known pydantic-ai cleanup masking chain."""
-    from lathe import _unwrap_delegate_exception
-
-    print("\n── delegate exception: known cleanup chain ──")
-    original = ConnectionError("model request timed out")
-    cleanup = StopAsyncIteration()
-    cleanup.__context__ = original
-    masked = RuntimeError("async generator raised StopAsyncIteration")
-    masked.__context__ = cleanup
-    R.check("known chain returns original",
-            _unwrap_delegate_exception(masked) is original)
-
-    print("\n── delegate exception: unrelated chains ──")
-    unrelated = RuntimeError("different runtime failure")
-    unrelated.__context__ = cleanup
-    R.check("different RuntimeError remains intact",
-            _unwrap_delegate_exception(unrelated) is unrelated)
-
-    matching_message_only = RuntimeError("async generator raised StopAsyncIteration")
-    matching_message_only.__context__ = ValueError("not a cleanup artifact")
-    R.check("wrong context type remains intact",
-            _unwrap_delegate_exception(matching_message_only) is matching_message_only)
-
-    print("\n── delegate exception: dependency floor ──")
+async def test_pydantic_ai_v2_migration(R: Results):
+    """Lock in the supported V2 range and use of public AgentRun APIs."""
+    print("\n── pydantic-ai V2: dependency range ──")
     from pathlib import Path
+    import re
     import tomllib
 
     root = Path(__file__).parent
     module_source = (root / "lathe.py").read_text()
     project = tomllib.loads((root / "pyproject.toml").read_text())
-    requirement = "pydantic-ai-slim[openai]~=1.60"
-    R.check("tool metadata has fixed-version floor",
-            f"requirements: httpx, httpx-ws, {requirement}, cachetools" in module_source)
-    R.check("project metadata has fixed-version floor",
-            requirement in project["project"]["dependencies"])
+    requirement_text = next(
+        dep for dep in project["project"]["dependencies"]
+        if dep.startswith("pydantic-ai-slim")
+    )
+    requirement = re.fullmatch(
+        r"pydantic-ai-slim\[([^]]+)]~=(\d+)\.(\d+)",
+        requirement_text,
+    )
+    metadata_line = next(
+        line for line in module_source.splitlines()
+        if line.startswith("requirements:")
+    )
+    R.check("OWUI and project requirements match",
+            requirement_text in metadata_line, metadata_line)
+    R.check("OpenAI provider extra is explicit",
+            requirement is not None and requirement.group(1) == "openai",
+            requirement_text)
+    floor = (
+        (int(requirement.group(2)), int(requirement.group(3)))
+        if requirement else None
+    )
+    R.check("supported range starts at secure V2 floor",
+            floor == (2, 5), requirement_text)
+    R.check("compatible release excludes V1 and V3",
+            requirement_text.startswith("pydantic-ai-slim")
+            and floor is not None and floor[0] == 2,
+            requirement_text)
+
+    print("\n── pydantic-ai V2: public AgentRun APIs ──")
+    R.check("nudge uses AgentRun.enqueue", "agent_run.enqueue(" in module_source)
+    R.check("no private graph state access", "agent_run._graph_run" not in module_source)
+    R.check("usage is accessed as a property", "usage = agent_run.usage\n" in module_source)
+    R.check("obsolete cleanup workaround removed",
+            "_unwrap_delegate_exception" not in module_source)
 
 
 async def test_persistent_volume_valve(R: Results):
@@ -2806,7 +2814,7 @@ TESTS = {
     "read_script": test_read_script,
     "write_script": test_write_script,
     "edit_script": test_edit_script,
-    "delegate_exception_unwrapping": test_delegate_exception_unwrapping,
+    "pydantic_ai_v2_migration": test_pydantic_ai_v2_migration,
     "manpage_rendering": test_manpage_rendering,
     "delegate_prompt_build": test_delegate_prompt_build,
     "delegate_tools_build": test_delegate_tools_build,

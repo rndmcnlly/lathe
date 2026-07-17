@@ -121,7 +121,7 @@ The tiers cover different boundaries:
 
 - `test_unit.py` checks deterministic helpers, generated sandbox scripts, wrapper schemas, and mocked state machines. `--extended` adds lower-signal prose, constant, and scheduling diagnostics for targeted investigations.
 - `test_integration.py` calls `Tools` directly against an isolated Daytona identity. It verifies core tool roundtrips, background notices, lifecycle policy, and persistent-volume survival. Cleanup runs even after scenario failures.
-- `test_deployment.py` deploys local `lathe.py` to the isolated OWUI toolkit ID `lathe_test`, never `lathe`. It configures a separate Daytona label with persistent volumes disabled, checks exact source and complete loaded schema parity, then exercises model-mediated `bash`, `write`, `read`, `interpret`, and `delegate` dispatch. Use `--no-deploy` to test an already staged copy, or `LATHE_TEST_TOOL_ID` to choose another staging ID.
+- `test_deployment.py` temporarily deploys local `lathe.py` to the isolated OWUI toolkit ID `lathe_test`, never `lathe`. It configures a separate Daytona label with persistent volumes disabled, checks exact source and complete loaded schema parity, then exercises model-mediated `bash`, `write`, `read`, `interpret`, and `delegate` dispatch. It deletes the staging toolkit and sandboxes on exit, including after failures and `--no-deploy` runs. Use `--no-deploy` to test an already staged copy that may be deleted afterward, or `LATHE_TEST_TOOL_ID` to choose another staging ID.
 
 ## Files
 

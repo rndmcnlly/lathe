@@ -22,9 +22,10 @@ uv run python test_deployment.py [--verbose]     # also needs OWUI_URL, OWUI_TOK
 
 `test_deployment.py` owns the separate OWUI toolkit ID `lathe_test` and never
 updates or invokes production `lathe`. It also uses a separate Daytona label
-with persistent volumes disabled. Override the staging ID with
-`LATHE_TEST_TOOL_ID`; use `--no-deploy` only when intentionally testing the
-already-staged source.
+with persistent volumes disabled. The suite deletes its staging toolkit and
+sandboxes on exit, including after failures and `--no-deploy` runs. Override
+the staging ID with `LATHE_TEST_TOOL_ID`; use `--no-deploy` only when
+intentionally testing already-staged source that may be deleted afterward.
 
 Run `uv run python test_unit.py` before committing any change to `lathe.py`. Keep tests in sync: rename/remove/add tests when you rename/remove/add code they cover.
 Use `test_unit.py --extended` for targeted diagnostics that intentionally sit outside the required fast gate.
