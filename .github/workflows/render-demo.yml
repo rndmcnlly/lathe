@@ -61,6 +61,7 @@ jobs:
       group: demo-video-publication
       cancel-in-progress: false
     permissions:
+      actions: write
       contents: write
     steps:
       - name: Download rendered artifact
@@ -78,3 +79,9 @@ jobs:
             gh release create demo-video-latest --title "Demo Video (latest)" --notes "Auto-captured Playwright demo session." --latest=false
           fi
           gh release upload demo-video-latest release/demo.webm --clobber
+
+      - name: Render explainer with the published demo
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: gh workflow run render-explainer.yml --ref "$GITHUB_REF_NAME"
