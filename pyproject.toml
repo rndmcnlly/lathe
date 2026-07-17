@@ -8,7 +8,7 @@ dependencies = [
     "pydantic",
     "pydantic-ai-slim[openai]~=1.60",
     "python-dotenv",
-    "python-socketio[asyncio_client]",
-    "aiohttp>=3.14.0",
+    "python-socketio[asyncio_client]>=5.16.2",
+    "aiohttp>=3.14.1",
     "cachetools>=7.0.5",
 ]
