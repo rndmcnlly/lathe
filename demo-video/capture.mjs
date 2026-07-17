@@ -541,7 +541,7 @@ try {
   // ── Beat 5: Second prompt — VS Code ─────────────────────────────
   log("beat5", "Typing second prompt...");
   await cursorClick(page, "#chat-input");
-  await typeMessage(page, `Give me a VS Code editor for this repo. When you share the link, use a markdown link with a friendly label instead of showing the raw URL.`);
+  await typeMessage(page, `Give me a VS Code editor for this repo. Share it as a markdown link with a friendly label so the raw URL is not visible. Briefly say that the link is private, expires in about an hour, and should not be shared because anyone with it can access the workspace.`);
 
   // ── Beat 6: Send and wait for code-server install + expose ─────
   log("beat6", "Sending second prompt...");

@@ -1,220 +1,60 @@
-// Animated lifecycle diagram: Spin Up → Work → Spin Down → (repeat)
-// Circular flow showing the three phases with looping arrow
-
 import React from "react";
-import {
-  useCurrentFrame,
-  useVideoConfig,
-  spring,
-  interpolate,
-} from "remotion";
+import { interpolate, spring, useCurrentFrame, useVideoConfig } from "remotion";
 import { COLORS, FONTS, PART_THEMES } from "../design";
 
-const CX = 660;
-const CY = 360;
-const RADIUS = 220;
-
-// Three phases arranged in a triangle/circle
-const PHASES = [
-  {
-    label: "Spin Up",
-    sublabel: "VM created on first tool call",
-    angle: -90, // top
-    color: PART_THEMES["spin-up"].accent,
-  },
-  {
-    label: "Get to Work",
-    sublabel: "bash, files, expose, onboard",
-    angle: 30, // bottom-right
-    color: PART_THEMES["work"].accent,
-  },
-  {
-    label: "Spin Down",
-    sublabel: "Auto-sleep, persist, wake later",
-    angle: 150, // bottom-left
-    color: PART_THEMES["spin-down"].accent,
-  },
+const rows = [
+  { label: "Filesystem", detail: "files, packages, Git history", stop: "remains", color: COLORS.green },
+  { label: "Processes", detail: "servers, jobs, interpreter state", stop: "ends", color: PART_THEMES["spin-down"].accent },
 ];
-
-function polarToXY(angleDeg: number, r: number): [number, number] {
-  const rad = (angleDeg * Math.PI) / 180;
-  return [CX + r * Math.cos(rad), CY + r * Math.sin(rad)];
-}
-
-const BOX_W = 260;
-const BOX_H = 100;
 
 export const LifecycleDiagram: React.FC = () => {
   const frame = useCurrentFrame();
   const { fps, durationInFrames } = useVideoConfig();
   const isStill = durationInFrames === 1;
-
-  // Staggered entrance for each phase
-  const phaseProgress = PHASES.map((_, i) =>
-    isStill
-      ? 1
-      : spring({ frame: frame - i * 12, fps, config: { damping: 200 } })
-  );
-
-  // Connecting arcs appear after all boxes
-  const arcProgress = isStill
-    ? 1
-    : interpolate(frame, [40, 65], [0, 1], {
-        extrapolateLeft: "clamp",
-        extrapolateRight: "clamp",
-      });
-
-  // Rotating highlight pulse (loops every 90 frames = 3s)
-  const pulsePhase = isStill ? -1 : (frame % 90) / 90;
-  const activeIndex = isStill ? -1 : Math.floor(pulsePhase * 3);
-
-  // Tagline fade
-  const taglineProgress = isStill
-    ? 1
-    : spring({ frame: frame - 50, fps, config: { damping: 200 } });
+  const p = (delay: number) => isStill ? 1 : spring({ frame: frame - delay, fps, config: { damping: 200 } });
+  const arrow = isStill ? 1 : interpolate(frame, [18, 40], [0, 1], { extrapolateLeft: "clamp", extrapolateRight: "clamp" });
 
   return (
-    <div
-      style={{
-        width: "100%",
-        maxWidth: 1400,
-        display: "flex",
-        flexDirection: "column",
-        alignItems: "center",
-        gap: 40,
-      }}
-    >
-      <svg viewBox="0 0 1320 720" style={{ width: "100%", height: "auto" }}>
-        <defs>
-          <filter id="lcGlow" x="-20%" y="-20%" width="140%" height="140%">
-            <feGaussianBlur stdDeviation="6" result="blur" />
-            <feComposite in="SourceGraphic" in2="blur" operator="over" />
-          </filter>
-          <marker
-            id="lcArrow"
-            markerWidth="10"
-            markerHeight="7"
-            refX="9"
-            refY="3.5"
-            orient="auto"
-          >
-            <polygon points="0 0, 10 3.5, 0 7" fill={COLORS.textMuted} />
-          </marker>
-        </defs>
+    <svg viewBox="0 0 1320 720" style={{ width: "100%", maxWidth: 1500 }}>
+      <defs>
+        <marker id="life-arrow" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
+          <polygon points="0 0, 10 4, 0 8" fill={COLORS.textMuted} />
+        </marker>
+      </defs>
 
-        {/* Curved arrows between phases */}
-        {PHASES.map((_, i) => {
-          const nextI = (i + 1) % PHASES.length;
-          const startAngle = PHASES[i].angle;
-          const endAngle = PHASES[nextI].angle;
+      <text x="660" y="72" textAnchor="middle" fill={COLORS.text} fontFamily={FONTS.body} fontSize="40" fontWeight="700">What sleep preserves</text>
 
-          // Arc midpoint control — push outward slightly
-          const midAngle = (startAngle + endAngle) / 2;
-          // Handle wrap-around for the last → first arc
-          const effectiveMid =
-            i === 2 ? startAngle + (360 + endAngle - startAngle) / 2 : midAngle;
+      {[
+        { x: 90, title: "RUNNING", detail: "tools and services active", color: PART_THEMES.work.accent },
+        { x: 505, title: "STOPPED / ARCHIVED", detail: "compute is off", color: PART_THEMES["spin-down"].accent },
+        { x: 920, title: "LATER TOOL CALL", detail: "sandbox restarts", color: COLORS.green },
+      ].map((state, i) => (
+        <g key={state.title} opacity={Math.max(0, p(i * 8))}>
+          <rect x={state.x} y="120" width="310" height="105" rx="18" fill={COLORS.bgCard} stroke={`${state.color}99`} strokeWidth="2" />
+          <text x={state.x + 155} y="163" textAnchor="middle" fill={state.color} fontFamily={FONTS.body} fontSize="21" fontWeight="700">{state.title}</text>
+          <text x={state.x + 155} y="194" textAnchor="middle" fill={COLORS.textMuted} fontFamily={FONTS.body} fontSize="17">{state.detail}</text>
+        </g>
+      ))}
 
-          const [sx, sy] = polarToXY(startAngle, RADIUS - 60);
-          const [ex, ey] = polarToXY(endAngle, RADIUS - 60);
-          const [cx2, cy2] = polarToXY(effectiveMid, RADIUS + 40);
+      <line x1="400" y1="172" x2="505" y2="172" stroke={COLORS.textMuted} strokeWidth="3" markerEnd="url(#life-arrow)" opacity={arrow} />
+      <line x1="815" y1="172" x2="920" y2="172" stroke={COLORS.textMuted} strokeWidth="3" markerEnd="url(#life-arrow)" opacity={arrow} />
 
-          return (
-            <path
-              key={`arc-${i}`}
-              d={`M ${sx} ${sy} Q ${cx2} ${cy2} ${ex} ${ey}`}
-              fill="none"
-              stroke={`${COLORS.textMuted}88`}
-              strokeWidth={2}
-              strokeDasharray={`${arcProgress * 300}`}
-              markerEnd="url(#lcArrow)"
-              opacity={arcProgress * 0.7}
-            />
-          );
-        })}
+      {rows.map((row, i) => (
+        <g key={row.label} opacity={Math.max(0, p(30 + i * 8))}>
+          <rect x="150" y={290 + i * 115} width="1020" height="88" rx="16" fill={`${COLORS.bgCard}dd`} stroke={COLORS.terminalBorder} />
+          <text x="190" y={326 + i * 115} fill={row.color} fontFamily={FONTS.body} fontSize="24" fontWeight="700">{row.label}</text>
+          <text x="190" y={354 + i * 115} fill={COLORS.textMuted} fontFamily={FONTS.body} fontSize="18">{row.detail}</text>
+          <text x="660" y={343 + i * 115} textAnchor="middle" fill={row.color} fontFamily={FONTS.body} fontSize="27" fontWeight="700">{row.stop}</text>
+          <text x="1110" y={343 + i * 115} textAnchor="end" fill={i === 0 ? COLORS.green : COLORS.highlight} fontFamily={FONTS.body} fontSize="20">{i === 0 ? "available after restart" : "must be restarted"}</text>
+        </g>
+      ))}
 
-        {/* Phase nodes */}
-        {PHASES.map((phase, i) => {
-          const [px, py] = polarToXY(phase.angle, RADIUS);
-          const p = phaseProgress[i];
-          const scale = interpolate(p, [0, 1], [0.7, 1]);
-          const isActive = i === activeIndex;
-          const borderColor = isActive
-            ? phase.color
-            : `${phase.color}88`;
-          const glow = isActive
-            ? `0 0 20px ${phase.color}44`
-            : "none";
-
-          return (
-            <g
-              key={phase.label}
-              transform={`translate(${px}, ${py}) scale(${scale}) translate(${-px}, ${-py})`}
-              opacity={Math.max(0, p)}
-            >
-              {/* Box */}
-              <rect
-                x={px - BOX_W / 2}
-                y={py - BOX_H / 2}
-                width={BOX_W}
-                height={BOX_H}
-                rx={16}
-                fill={COLORS.bgCard}
-                stroke={borderColor}
-                strokeWidth={isActive ? 3 : 2}
-                filter={isActive ? "url(#lcGlow)" : undefined}
-              />
-              {/* Label */}
-              <text
-                x={px}
-                y={py - 8}
-                textAnchor="middle"
-                fill={phase.color}
-                fontSize={28}
-                fontWeight={700}
-                fontFamily={FONTS.body}
-              >
-                {phase.label}
-              </text>
-              {/* Sublabel */}
-              <text
-                x={px}
-                y={py + 22}
-                textAnchor="middle"
-                fill={COLORS.textMuted}
-                fontSize={16}
-                fontFamily={FONTS.body}
-              >
-                {phase.sublabel}
-              </text>
-            </g>
-          );
-        })}
-
-        {/* Center label */}
-        <text
-          x={CX}
-          y={CY - 10}
-          textAnchor="middle"
-          fill={COLORS.text}
-          fontSize={36}
-          fontWeight={700}
-          fontFamily={FONTS.body}
-          opacity={Math.max(0, taglineProgress)}
-        >
-          The Cycle
-        </text>
-        <text
-          x={CX}
-          y={CY + 24}
-          textAnchor="middle"
-          fill={COLORS.textMuted}
-          fontSize={20}
-          fontFamily={FONTS.body}
-          opacity={Math.max(0, taglineProgress)}
-        >
-          One toolkit. One API key.
-        </text>
-      </svg>
-    </div>
+      <g opacity={Math.max(0, p(48))}>
+        <line x1="245" y1="565" x2="1075" y2="565" stroke={`${COLORS.textMuted}66`} strokeWidth="2" strokeDasharray="8 7" />
+        <text x="245" y="604" fill={COLORS.text} fontFamily={FONTS.body} fontSize="21" fontWeight="700">DELETION / DESTROY</text>
+        <text x="490" y="604" fill={COLORS.textMuted} fontFamily={FONTS.body} fontSize="19">removes sandbox filesystem</text>
+        <text x="1075" y="604" textAnchor="end" fill={COLORS.highlight} fontFamily={FONTS.body} fontSize="19">optional volume: separate boundary</text>
+      </g>
+    </svg>
   );
 };
