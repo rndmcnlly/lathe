@@ -32,6 +32,12 @@ VOLUME_NAME = f"{DEPLOYMENT_LABEL}/{TEST_EMAIL}"
 WORKSPACE = "/home/daytona/workspace"
 VOLUME = "/home/daytona/volume"
 
+# 1x1 transparent PNG, used to exercise view().
+PNG_B64 = (
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk"
+    "+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
+)
+
 
 class Results:
     def __init__(self):
@@ -135,6 +141,54 @@ async def main():
         require(test_file in glob_output, glob_output)
         require(canary in grep_output and test_file in grep_output, grep_output)
 
+    async def view_tool_roundtrip():
+        import base64 as _b64
+
+        png_file = f"{WORKSPACE}/contract-{uuid.uuid4().hex}.png"
+        await tools.bash(f"printf '%s' '{PNG_B64}' | base64 -d > {png_file}", **ctx)
+
+        output = await tools.view(png_file, **ctx)
+        require(output.startswith("data:image/png;base64,"), output[:100])
+        payload = _b64.b64decode(output.removeprefix("data:image/png;base64,"))
+        require(payload.startswith(b"\x89PNG\r\n\x1a\n"), payload[:16])
+
+        # Non-image content is rejected by content sniffing, not extension
+        output = await tools.view(test_file, **ctx)
+        require(output.startswith("Error:") and "not a PNG" in output, output[:200])
+
+        # Missing file
+        output = await tools.view(f"{WORKSPACE}/no-such-image.png", **ctx)
+        require("not found" in output.lower(), output[:200])
+
+        # First call in a fresh chat queues the auto-init snapshot, but the
+        # image channel must stay byte-exact (defer_harness_messages).
+        fresh = {**ctx, "__chat_id__": f"integration-{uuid.uuid4()}"}
+        output = await tools.view(png_file, **fresh)
+        require(output.startswith("data:image/png;base64,"), output[:120])
+
+    async def view_capability_gate():
+        gate_png = f"{WORKSPACE}/contract-{uuid.uuid4().hex}.png"
+        await tools.bash(f"printf '%s' '{PNG_B64}' | base64 -d > {gate_png}", **ctx)
+
+        # Text-only model: refused with a reminder, no image delivered
+        text_model = {"id": "text-only.test",
+                      "architecture": {"modality": "text->text", "input_modalities": ["text"]}}
+        output = await tools.view(gate_png, __model__=text_model, **ctx)
+        require(output.startswith("Error:") and "image input" in output, output[:250])
+        require("vision-capable model" in output, output)
+        require("data:image" not in output, output[:250])
+
+        # Vision model: passes through to the image
+        vision_model = {"id": "vision.test",
+                        "architecture": {"input_modalities": ["text", "image"]}}
+        output = await tools.view(gate_png, __model__=vision_model, **ctx)
+        require(output.startswith("data:image/png;base64,"), output[:100])
+
+        # Admin-unchecked capability flag (no architecture): refused
+        flag_model = {"id": "flag.test", "info": {"meta": {"capabilities": {"vision": False}}}}
+        output = await tools.view(gate_png, __model__=flag_model, **ctx)
+        require(output.startswith("Error:"), output[:250])
+
     async def onboarding_and_interpreter():
         project = f"{WORKSPACE}/onboard-contract"
         await tools.write(
@@ -217,6 +271,8 @@ async def main():
 
     try:
         await results.run("core tool roundtrip", core_tool_roundtrip)
+        await results.run("view tool roundtrip", view_tool_roundtrip)
+        await results.run("view capability gate", view_capability_gate)
         await results.run("onboarding and persistent interpreter", onboarding_and_interpreter)
         await results.run("strict wrapper types", strict_wrapper_types)
         await results.run("background completion notice", background_completion_notice)

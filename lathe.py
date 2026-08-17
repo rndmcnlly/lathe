@@ -2,14 +2,15 @@
 title: Lathe
 author: Adam Smith
 author_url: https://adamsmith.as
-description: Coding agent tools (lathe, bash, read, write, edit, glob, grep, interpret, delegate, onboard, expose, destroy) backed by per-user sandbox VMs with transparent lifecycle management.
+description: Coding agent tools (lathe, bash, read, write, edit, glob, grep, view, interpret, delegate, onboard, expose, destroy) backed by per-user sandbox VMs with transparent lifecycle management.
 required_open_webui_version: 0.4.0
 requirements: httpx, httpx-ws, pydantic-ai-slim[openai]~=2.5, cachetools
-version: 0.25.0
+version: 0.26.0
 licence: MIT
 """
 
 import asyncio
+import base64
 import inspect
 import io
 import json
@@ -1461,6 +1462,123 @@ async def _core_grep(valves, sandbox_id: str, client: httpx.AsyncClient, *,
     )
 
 
+# ── view core (model-facing image perception) ───────────────────────
+#
+# Relies on OWUI's image-return convention (shipped in 0.11.0): a tool
+# result string starting with "data:image/<mime>;base64," is moved out of
+# the text channel and re-injected as an input_image part, so the model
+# sees the image on its next turn.  History replay flattens it back into
+# a user image message (convert_output_to_messages with
+# flatten_tool_images=True, the open-webui#27126-equivalent fix).
+#
+# Two hard requirements fall out of that convention:
+#   1. The result must START with the data URI.  Any prepended text (e.g.
+#      harness messages) breaks OWUI's startswith() detection, and the
+#      base64 lands in the model's text context instead.  The Tools
+#      wrapper uses defer_harness_messages=True for this reason.
+#   2. On OWUI < 0.11.0 the current turn works but replayed history is
+#      NOT flattened — strict providers reject the conversation on later
+#      turns.  Only deploy with view() on OWUI >= 0.11.0.
+#   3. Injection is NOT capability-gated upstream: a non-vision model
+#      receives an image part it cannot consume, and strict providers may
+#      then reject every later turn.  The Tools wrapper refuses view() up
+#      front for such models (_model_supports_vision), before any sandbox
+#      work happens.
+#
+# view() is deliberately withheld from the delegate sub-agent: pydantic-ai
+# returns tool results to the sub-model as plain text, so the data URI
+# convention never fires and the base64 would flood the sub-agent context.
+
+_VIEW_MAX_BYTES = 4 * 1024 * 1024  # 4 MiB, under Anthropic's 5 MB/image limit
+
+
+def _model_supports_vision(model: dict) -> bool:
+    """Best-effort vision-capability inference from an OWUI model dict.
+
+    Provider-declared architecture metadata (present on connection models)
+    is authoritative.  Otherwise fall back to the admin-declared
+    info.meta.capabilities.vision flag.  When neither says otherwise,
+    allow: a false refusal would silently disable view() for capable
+    models, which is worse than the residual risk of an unmarked
+    non-vision model.
+    """
+    if not isinstance(model, dict):
+        return True
+    arch = model.get("architecture") or {}
+    input_mods = arch.get("input_modalities")
+    if isinstance(input_mods, list) and input_mods:
+        return "image" in input_mods
+    modality = arch.get("modality")
+    if isinstance(modality, str) and "->" in modality:
+        return "image" in modality.split("->", 1)[0]
+    caps = ((model.get("info") or {}).get("meta") or {}).get("capabilities") or {}
+    if caps.get("vision") is False:
+        return False
+    return True
+
+
+def _sniff_image_mime(header: bytes) -> str | None:
+    """Return the MIME type for recognized raster image magic bytes, else None.
+
+    Checks content, not extension: the model can't be trusted to name files
+    accurately, and providers reject mislabeled image payloads.  SVG and
+    other text formats return None (they are not viewable raster images).
+    """
+    if header.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if header.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if header[:6] in (b"GIF87a", b"GIF89a"):
+        return "image/gif"
+    if header[:4] == b"RIFF" and header[8:12] == b"WEBP":
+        return "image/webp"
+    return None
+
+
+async def _core_view(valves, sandbox_id: str, client: httpx.AsyncClient, *,
+                     path: str) -> str:
+    """View an image file from the sandbox, loading it into your visual context.
+    Use for screenshots, charts, rendered pages, or generated images.
+    Requires a vision-capable model; if the current model cannot accept image
+    input, the call is refused with a reminder instead of the image.
+    Supported formats: PNG, JPEG, GIF, WebP (detected from file contents, not
+    extension). Max 4 MB; downscale larger images first via bash (e.g. with
+    ImageMagick or Pillow).
+
+    :param path: Absolute path to the image file.
+    """
+    err = _require_abs_path(path)
+    if err:
+        return err
+    resp = await client.get(
+        _toolbox(valves, sandbox_id, "/files/download"),
+        params={"path": path},
+        headers=_headers(valves),
+        timeout=60.0,
+    )
+    if resp.status_code == 404:
+        return f"Error: File not found: {path}"
+    resp.raise_for_status()
+    data = resp.content
+
+    mime = _sniff_image_mime(data[:16])
+    if mime is None:
+        return (
+            f"Error: {path} is not a PNG, JPEG, GIF, or WebP image "
+            f"(checked file contents, not extension). Convert it to PNG "
+            f"first via bash (e.g. with ImageMagick or Pillow). SVG and "
+            f"other text/vector formats cannot be viewed directly."
+        )
+    if len(data) > _VIEW_MAX_BYTES:
+        return (
+            f"Error: {path} is {_human_size(len(data))}, over the "
+            f"{_human_size(_VIEW_MAX_BYTES)} limit for view(). Downscale or "
+            f"recompress it via bash (e.g. ImageMagick or Pillow) and view "
+            f"the smaller result."
+        )
+    return f"data:{mime};base64,{base64.b64encode(data).decode('ascii')}"
+
+
 # ── bash core (session + sidecar protocol) ──────────────────────────
 
 
@@ -2348,7 +2466,10 @@ def _build_delegate_system_prompt(max_steps: int, *, has_volume: bool = True) ->
 #   expose()   — user-facing; sub-agent has no user to give a URL to
 #   destroy()  — irreversible lifecycle operation
 #   delegate() — no recursion
-_DELEGATE_WITHHELD = {"lathe", "onboard", "expose", "destroy", "delegate", "handoff"}
+#   view()     — data-URI image returns only fire through OWUI's tool
+#                middleware; the sub-agent's pydantic-ai result channel is
+#                plain text, so the base64 would flood its context
+_DELEGATE_WITHHELD = {"lathe", "onboard", "expose", "destroy", "delegate", "handoff", "view"}
 
 
 # ── handoff() instructions ──────────────────────────────────────────
@@ -3916,6 +4037,59 @@ class Tools:
             "chat_id": chat_id,
         },
     )
+
+    async def view(
+        self,
+        path: str,
+        __user__: dict = {},
+        __chat_id__: str = "",
+        __model__: dict = {},
+        __metadata__: dict = {},
+        __event_emitter__=None,
+    ) -> str:
+        # Capability gate: refuse cleanly when the current model cannot
+        # accept image input.  Checked BEFORE _ensure_sandbox so a refusal
+        # never spins up a VM.  __metadata__["model"] reflects the user's
+        # actual selection more reliably than __model__ (same dispatch
+        # quirk noted in delegate()).
+        model = __metadata__.get("model") if isinstance(__metadata__, dict) else None
+        if not isinstance(model, dict) or not model:
+            model = __model__ if isinstance(__model__, dict) else {}
+        if not _model_supports_vision(model):
+            modality = (model.get("architecture") or {}).get("modality", "unknown")
+            return (
+                f"Error: the current model ({model.get('id', 'unknown')}) does not "
+                f"accept image input (modality: {modality}), so view() would deliver "
+                f"an image you cannot perceive, and some providers then reject every "
+                f"later turn of the conversation. Ask the user to switch to a "
+                f"vision-capable model, or extract the information without vision "
+                f"(e.g. OCR or metadata inspection via bash)."
+            )
+
+        async def _run(client):
+            email = _get_email(__user__)
+            sandbox_id, _sb_warning = await _ensure_sandbox(self.valves, email, client, __event_emitter__)
+            await _ensure_chat_init(
+                self.valves, sandbox_id, client,
+                self._chat_state, __chat_id__, __user__, __event_emitter__,
+            )
+
+            await _emit(__event_emitter__, f"Loading image {path}...")
+            result = await _core_view(self.valves, sandbox_id, client, path=path)
+
+            await _emit(__event_emitter__, "Image loaded", done=True)
+            # The result must stay byte-identical to the core output: OWUI
+            # detects image tool results with startswith("data:image/"), and
+            # prepended harness text would silently break that detection and
+            # flood the model's text context with base64.  Defer (don't drop)
+            # the sandbox warning; leave pending messages queued for the
+            # next non-deferring tool call.
+            if _sb_warning:
+                _push_bg_notice(self._chat_state, __chat_id__, _sb_warning)
+            return result
+
+        return await _tool_context(__event_emitter__, _run)
+    view.__doc__ = inspect.getdoc(_core_view)
 
     async def delegate(
         self,

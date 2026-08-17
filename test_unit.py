@@ -2198,7 +2198,7 @@ async def test_chat_id_in_signatures(R: Results):
     tools = Tools()
     # Tools that use _ensure_sandbox should have __chat_id__
     sandbox_tools = ["bash", "read", "write", "edit", "glob", "grep",
-                     "interpret", "onboard", "delegate", "expose"]
+                     "interpret", "onboard", "delegate", "expose", "view"]
     for name in sandbox_tools:
         method = getattr(tools, name, None)
         if method is None:
@@ -2449,6 +2449,54 @@ async def test_interpret_manpage(R: Results):
             "should compare with bash")
 
 
+async def test_sniff_image_mime(R: Results):
+    from lathe import _sniff_image_mime
+
+    print("\n── _sniff_image_mime: recognized raster formats ──")
+    R.check("png", _sniff_image_mime(b"\x89PNG\r\n\x1a\n" + b"\x00" * 8) == "image/png")
+    R.check("jpeg", _sniff_image_mime(b"\xff\xd8\xff\xe0" + b"\x00" * 12) == "image/jpeg")
+    R.check("gif87a", _sniff_image_mime(b"GIF87a" + b"\x00" * 10) == "image/gif")
+    R.check("gif89a", _sniff_image_mime(b"GIF89a" + b"\x00" * 10) == "image/gif")
+    R.check("webp", _sniff_image_mime(b"RIFF\x24\x00\x00\x00WEBPVP8 ") == "image/webp")
+
+    print("\n── _sniff_image_mime: rejected content ──")
+    R.check("svg text", _sniff_image_mime(b'<svg xmlns="http://www.w3.org/2000/svg">') is None)
+    R.check("plain text", _sniff_image_mime(b"hello world, this is text") is None)
+    R.check("empty", _sniff_image_mime(b"") is None)
+    R.check("riff but not webp", _sniff_image_mime(b"RIFF\x24\x00\x00\x00AVI ") is None)
+    R.check("truncated png", _sniff_image_mime(b"\x89PNG") is None)
+
+
+async def test_model_supports_vision(R: Results):
+    from lathe import _model_supports_vision
+
+    print("\n── _model_supports_vision: architecture is authoritative ──")
+    R.check("text-only modality refused",
+            _model_supports_vision({"architecture": {"modality": "text->text",
+                                                     "input_modalities": ["text"]}}) is False)
+    R.check("image input allowed",
+            _model_supports_vision({"architecture": {"modality": "text+image->text",
+                                                     "input_modalities": ["text", "image"]}}) is True)
+    R.check("input_modalities without modality string",
+            _model_supports_vision({"architecture": {"input_modalities": ["text", "video", "image"]}}) is True)
+    R.check("modality string without input_modalities",
+            _model_supports_vision({"architecture": {"modality": "text+image+file->text"}}) is True)
+    R.check("architecture beats capabilities flag",
+            _model_supports_vision({"architecture": {"input_modalities": ["text"]},
+                                    "info": {"meta": {"capabilities": {"vision": True}}}}) is False)
+
+    print("\n── _model_supports_vision: capabilities fallback ──")
+    R.check("admin-unchecked vision refused",
+            _model_supports_vision({"info": {"meta": {"capabilities": {"vision": False}}}}) is False)
+    R.check("admin-declared vision allowed",
+            _model_supports_vision({"info": {"meta": {"capabilities": {"vision": True}}}}) is True)
+
+    print("\n── _model_supports_vision: unknown allows ──")
+    R.check("empty dict allowed", _model_supports_vision({}) is True)
+    R.check("non-dict allowed", _model_supports_vision(None) is True)
+    R.check("no architecture allowed", _model_supports_vision({"id": "x"}) is True)
+
+
 async def test_tools_schema_parity(R: Results):
     """Verify OWUI-visible parameter schemas for all Tools methods.
 
@@ -2508,6 +2556,9 @@ async def test_tools_schema_parity(R: Results):
         "interpret": [
             ("code", "str", False, None),
             ("timeout", "int", True, 120),
+        ],
+        "view": [
+            ("path", "str", False, None),
         ],
         "delegate": [
             ("task", "str", False, None),
@@ -2610,6 +2661,7 @@ async def test_tools_schema_parity(R: Results):
         "write": {"__user__", "__chat_id__", "__event_emitter__"},
         "edit": {"__user__", "__chat_id__", "__event_emitter__"},
         "interpret": {"__user__", "__chat_id__", "__event_emitter__"},
+        "view": {"__user__", "__chat_id__", "__model__", "__metadata__", "__event_emitter__"},
         "delegate": {"__user__", "__chat_id__", "__event_emitter__", "__metadata__", "__model__", "__request__"},
         "expose": {"__user__", "__chat_id__", "__event_emitter__"},
     }
@@ -2832,6 +2884,8 @@ TESTS = {
     "format_bg_notices": test_format_bg_notices,
     "format_interpret_result": test_format_interpret_result,
     "ensure_interpreter_context": test_ensure_interpreter_context,
+    "sniff_image_mime": test_sniff_image_mime,
+    "model_supports_vision": test_model_supports_vision,
     "tools_schema_parity": test_tools_schema_parity,
     "sandbox_lifecycle_lookup": test_sandbox_lifecycle_lookup,
 }

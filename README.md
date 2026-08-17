@@ -1,12 +1,12 @@
 # Lathe
 
-A single-file Open WebUI toolkit that gives any model a coding agent's tool surface — `bash`, `read`, `write`, `edit`, `glob`, `grep`, `delegate`, `onboard`, `expose`, `destroy` — executing against per-user cloud sandboxes via [Daytona](https://www.daytona.io/).
+A single-file Open WebUI toolkit that gives any model a coding agent's tool surface — `bash`, `read`, `write`, `edit`, `glob`, `grep`, `view`, `delegate`, `onboard`, `expose`, `destroy` — executing against per-user cloud sandboxes via [Daytona](https://www.daytona.io/).
 
 **For users**: See [lathe.tools](https://lathe.tools) for what Lathe can do, how to use it, and example workflows.
 
 ## What it does to your instance
 
-Lathe registers thirteen tools that models can call in [Native function calling mode](https://docs.openwebui.com/features/extensibility/plugin/tools/). When a user's model calls a tool, Lathe creates, starts, or resumes a cloud sandbox VM via the Daytona control plane and toolbox APIs. All sandbox operations go outbound from your OWUI server.
+Lathe registers fourteen tools that models can call in [Native function calling mode](https://docs.openwebui.com/features/extensibility/plugin/tools/). When a user's model calls a tool, Lathe creates, starts, or resumes a cloud sandbox VM via the Daytona control plane and toolbox APIs. All sandbox operations go outbound from your OWUI server.
 
 No OWUI internals are touched. The toolkit does not import `open_webui.*`, does not use OWUI file storage, and does not modify models, prompts, users, or other configuration. Its runtime dependencies are `httpx` and `pydantic-ai-slim[openai]`.
 
@@ -21,8 +21,8 @@ No OWUI internals are touched. The toolkit does not import `open_webui.*`, does 
 ## Requirements
 
 1. **Daytona account** with an API key ([daytona.io](https://www.daytona.io/))
-2. **Open WebUI** with Native function calling mode enabled
-3. Models that support tool/function calling
+2. **Open WebUI** with Native function calling mode enabled (≥ 0.11.0 for `view()`; image returns to the model rely on the history-replay fix shipped in that release)
+3. Models that support tool/function calling (`view()` additionally needs a vision-capable model)
 
 ## Installation
 
@@ -103,6 +103,7 @@ flow, e.g. *"Visit https://example.com/setup to create your sandbox first."*
 | `edit(path, old_string, new_string, replace_all)` | Exact string replacement |
 | `glob(pattern, max_lines)` | Search for files by glob pattern (hierarchical output, collapsed directories) |
 | `grep(pattern, files, max_lines)` | Search file contents by regex (grouped by file with line numbers) |
+| `view(path)` | Load an image into the model's visual context (PNG/JPEG/GIF/WebP, ≤ 4 MB, content-sniffed) |
 | `interpret(code, timeout)` | Run Python in a conversation-scoped persistent interpreter |
 | `delegate(task, context_files, max_steps, foreground_seconds)` | Dispatch a sub-agent to perform a multi-step task autonomously |
 | `expose(target)` | Expose a sandbox service — `"http:5000"` for a public HTTPS URL, `"ssh"` for a time-limited SSH command |
@@ -121,7 +122,7 @@ The tiers cover different boundaries:
 
 - `test_unit.py` checks deterministic helpers, generated sandbox scripts, wrapper schemas, and mocked state machines. `--extended` adds lower-signal prose, constant, and scheduling diagnostics for targeted investigations.
 - `test_integration.py` calls `Tools` directly against an isolated Daytona identity. It verifies core tool roundtrips, background notices, lifecycle policy, and persistent-volume survival. Cleanup runs even after scenario failures.
-- `test_deployment.py` temporarily deploys local `lathe.py` to the isolated OWUI toolkit ID `lathe_test`, never `lathe`. It configures a separate Daytona label with persistent volumes disabled, checks exact source and complete loaded schema parity, then exercises model-mediated `bash`, `write`, `read`, `interpret`, and `delegate` dispatch. It deletes the staging toolkit and sandboxes on exit, including after failures and `--no-deploy` runs. Use `--no-deploy` to test an already staged copy that may be deleted afterward, or `LATHE_TEST_TOOL_ID` to choose another staging ID.
+- `test_deployment.py` temporarily deploys local `lathe.py` to the isolated OWUI toolkit ID `lathe_test`, never `lathe`. It configures a separate Daytona label with persistent volumes disabled, checks exact source and complete loaded schema parity, then exercises model-mediated `bash`, `write`, `read`, `interpret`, `view`, and `delegate` dispatch. It deletes the staging toolkit and sandboxes on exit, including after failures and `--no-deploy` runs. Use `--no-deploy` to test an already staged copy that may be deleted afterward, or `LATHE_TEST_TOOL_ID` to choose another staging ID.
 
 ## Files
 

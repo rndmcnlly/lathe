@@ -42,6 +42,12 @@ DEPLOYMENT_LABEL = "lathe-owui-deployment-test"
 SOURCE_PATH = Path(__file__).with_name("lathe.py")
 VERBOSE = False
 
+# 1x1 transparent PNG, used to exercise view() end-to-end.
+PNG_B64 = (
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk"
+    "+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
+)
+
 
 EXPECTED_SCHEMA = {
     "lathe": {"manpage": ("string", False, "overview")},
@@ -81,6 +87,7 @@ EXPECTED_SCHEMA = {
         "code": ("string", True, None),
         "timeout": ("integer", False, 120),
     },
+    "view": {"path": ("string", True, None)},
     "delegate": {
         "task": ("string", True, None),
         "context_files": ("array", False, []),
@@ -393,6 +400,24 @@ async def main():
         require(any(call.get("name") == "interpret" for call in tool_calls(output)), output)
         require(any(canary in value for value in tool_outputs(output)), output)
 
+    async def view_dispatch():
+        png_path = f"/home/daytona/workspace/{canary}.png"
+        output = await client.send(
+            "Call bash exactly once with command: "
+            f"printf '%s' '{PNG_B64}' | base64 -d > {png_path}"
+        )
+        require(any(call.get("name") == "bash" for call in tool_calls(output)), output)
+
+        output = await client.send(f"Call view exactly once for {png_path}.")
+        require(any(call.get("name") == "view" for call in tool_calls(output)), output)
+        values = tool_outputs(output)
+        # OWUI's image-return convention (0.11.0+): the data URI is lifted
+        # out of the text channel, leaving this summary in its place.
+        # Raw base64 in the text channel means the convention did not fire.
+        require(any("Image file read successfully" in v for v in values), values)
+        require(not any(PNG_B64[:40] in v for v in values),
+                f"raw base64 leaked into text channel: {values[0][:120]}")
+
     async def delegate_dispatch():
         output = await client.send(
             "Call delegate exactly once with max_steps=3 and foreground_seconds=120. "
@@ -414,6 +439,7 @@ async def main():
         await results.run("model to OWUI to bash dispatch", bash_dispatch)
         await results.run("write and read dispatch", write_and_read_dispatch)
         await results.run("interpreter dispatch", interpreter_dispatch)
+        await results.run("view dispatch", view_dispatch)
         await results.run("delegate dispatch", delegate_dispatch)
     finally:
         await client.close()
