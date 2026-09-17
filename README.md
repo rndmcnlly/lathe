@@ -51,6 +51,9 @@ To update an existing installation, use the `/api/v1/tools/id/lathe/update` endp
 | `daytona_api_key` | *(empty, password field)* | Daytona API key |
 | `daytona_api_url` | `https://app.daytona.io/api` | Control plane URL |
 | `daytona_proxy_url` | `https://proxy.app.daytona.io/toolbox` | Toolbox proxy URL |
+| `preview_wrapper_url` | *(empty)* | HTTPS registration endpoint for an owner-authenticated preview wrapper |
+| `preview_wrapper_key` | *(empty, password field)* | Installation bearer credential for that wrapper |
+| `preview_expiry_seconds` | `86400` | Upstream HTTP signed-URL lifetime (60–86400 seconds); independent of wrapper registration expiry |
 | `deployment_label` | *(empty, must configure)* | Label key for sandbox tagging (e.g. `chat.example.com`) |
 | `auto_stop_minutes` | `15` | Idle timeout before sandbox stops |
 | `auto_archive_minutes` | `60` | Minutes after stop before sandbox archives |
@@ -76,6 +79,31 @@ the Daytona [`POST /sandbox`](https://www.daytona.io/docs/en/tools/api/) body
 accepts works here. The keys `name`, `labels`, and `volumes` are managed by
 lathe (per-user lookup invariant and the `persistent_volume` valve) and are
 rejected with a clear error if you try to set them.
+
+### Owner-authenticated HTTP previews
+
+Configure `preview_wrapper_url` and `preview_wrapper_key` to wrap all HTTP
+exposure, including dufs and code-server, before a URL reaches the model or user.
+The wrapper receives the upstream URL and ownership from OWUI's injected user
+context. It is trusted infrastructure: its operator must explicitly authorize
+this installation and decide which identities and destinations it may register.
+
+Wrapping fails closed on missing configuration, rejected ownership, malformed
+responses, redirects, and network errors. Lathe returns neither an upstream
+bearer URL nor a raw wrapping error. With both valves empty, direct signed-URL
+behavior remains available; anyone who copies those direct URLs can use them.
+SSH remains a separate credential-bearing exposure path.
+
+The wrapper registration endpoint accepts an authenticated JSON POST:
+
+```json
+{"owner":{"subject":"injected-owui-user-id","email":"owner@example.edu"},"slot":"5000","upstream_url":"https://temporary-upstream.example/"}
+```
+
+It responds with `url` (HTTPS), `access_mode: "owner-authenticated"`, and
+`expires_at` (timezone-qualified ISO timestamp). These describe the protected
+registration, not a guarantee that the underlying sandbox stays available.
+See [the wrapping contract](docs/preview-wrapping.md) for implementation details.
 
 ### Externally provisioned sandboxes (`auto_create_sandbox`)
 
@@ -106,7 +134,7 @@ flow, e.g. *"Visit https://example.com/setup to create your sandbox first."*
 | `view(path)` | Load an image into the model's visual context (PNG/JPEG/GIF/WebP, ≤ 4 MB, content-sniffed) |
 | `interpret(code, timeout)` | Run Python in a conversation-scoped persistent interpreter |
 | `delegate(task, context_files, max_steps, foreground_seconds)` | Dispatch a sub-agent to perform a multi-step task autonomously |
-| `expose(target)` | Expose a sandbox service — `"http:5000"` for a public HTTPS URL, `"ssh"` for a time-limited SSH command |
+| `expose(target)` | Expose a sandbox service: `"http:5000"` for an HTTPS preview, `"ssh"` for a time-limited SSH command |
 | `handoff()` | Prepare instructions for continuing work in a fresh conversation |
 | `destroy()` | Permanently delete the sandbox after interactive confirmation |
 
@@ -123,6 +151,18 @@ The tiers cover different boundaries:
 - `test_unit.py` checks deterministic helpers, generated sandbox scripts, wrapper schemas, and mocked state machines. `--extended` adds lower-signal prose, constant, and scheduling diagnostics for targeted investigations.
 - `test_integration.py` calls `Tools` directly against an isolated Daytona identity. It verifies core tool roundtrips, background notices, lifecycle policy, and persistent-volume survival. Cleanup runs even after scenario failures.
 - `test_deployment.py` temporarily deploys local `lathe.py` to the isolated OWUI toolkit ID `lathe_test`, never `lathe`. It configures a separate Daytona label with persistent volumes disabled, checks exact source and complete loaded schema parity, then exercises model-mediated `bash`, `write`, `read`, `interpret`, `view`, and `delegate` dispatch. It deletes the staging toolkit and sandboxes on exit, including after failures and `--no-deploy` runs. Use `--no-deploy` to test an already staged copy that may be deleted afterward, or `LATHE_TEST_TOOL_ID` to choose another staging ID.
+
+For a focused protected-preview test, use `test_deployment.py --preview-only`
+with `LATHE_PREVIEW_WRAPPER_URL`, `LATHE_PREVIEW_WRAPPER_KEY`,
+`LATHE_PREVIEW_EXPECTED_URL`, and `LATHE_PREVIEW_REVOKE_URL` in the environment.
+For transient hostnames, use `LATHE_PREVIEW_EXPECTED_PATTERN` instead of the
+exact URL and `{label}` in the revoke URL; cleanup uses the validated returned
+hostname. The disposable suite refuses the production toolkit ID `lathe`.
+This checks staged source/schema and model-mediated exposure, then revokes the
+test registration. It removes only the dependency-install frontmatter from the
+staging copy, so testing `expose` beside an older toolkit does not upgrade that
+instance's shared Pydantic AI dependency. It does not qualify the other tools or
+a full dependency migration.
 
 ## Files
 

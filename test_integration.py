@@ -232,12 +232,21 @@ async def main():
         require("background-finished" in output, output)
 
     async def expose_contract():
+        import re
         await tools.bash(
             "nohup python3 -m http.server 8765 >/tmp/lathe-http.log 2>&1 &",
             **ctx,
         )
         output = await tools.expose("http:8765", **ctx)
-        require("Public URL" in output and "https://" in output, output)
+        require("Service URL" in output and "bearer credential" in output, "Direct preview result missing expected access description")
+        match = re.search(r'https://\S+', output)
+        require(match is not None, "Direct preview URL missing")
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.get(match.group(), headers={"X-Daytona-Skip-Preview-Warning":"true"}, timeout=20)
+                require(response.status_code == 200, "Signed preview did not reach the test service")
+        except Exception:
+            raise AssertionError("Direct signed-preview reachability failed") from None
 
     async def volume_survives_recreation():
         await tools.write(volume_file, canary + "\n", **ctx)

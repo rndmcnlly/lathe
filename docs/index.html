@@ -206,7 +206,7 @@
     <ul class="limit-list trust-list">
         <li><strong>Sandbox data lives in Daytona.</strong> Lathe labels each sandbox with the Open WebUI user's email. When persistent volumes are enabled, <code>/home/daytona/volume</code> is backed by Daytona's S3/FUSE storage.</li>
         <li><strong>User environment variables are credentials entrusted to the agent.</strong> Lathe injects them into model-directed shell commands. The model can print them, inspect process environments, or read generated command wrappers. Use scoped, revocable credentials.</li>
-        <li><strong>Exposed URLs are bearer credentials.</strong> Anyone with a current dufs or code-server URL can access the service, including files or a terminal. URLs expire after about one hour; do not publish or log them.</li>
+        <li><strong>Check the preview's access mode.</strong> With an administrator-configured wrapper, HTTP previews require owner login. Otherwise the direct signed URL is a bearer credential: anyone who copies it can access the service. Upstream access defaults to 24 hours; the tool reports the wrapper's registration expiry separately. SSH commands remain credential-bearing.</li>
         <li><strong>Auto-delete and volume retention are separate.</strong> By default, neither the sandbox nor its persistent volume is automatically deleted. An admin can set sandbox deletion intervals, but a separately managed persistent volume survives sandbox destruction.</li>
         <li><strong>Updates are manual.</strong> Open WebUI stores the uploaded copy of <code>lathe.py</code>. An installed deployment does not receive fixes merely because the GitHub repository changed.</li>
     </ul>

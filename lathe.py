@@ -5,7 +5,7 @@ author_url: https://adamsmith.as
 description: Coding agent tools (lathe, bash, read, write, edit, glob, grep, view, interpret, delegate, onboard, expose, destroy) backed by per-user sandbox VMs with transparent lifecycle management.
 required_open_webui_version: 0.4.0
 requirements: httpx, httpx-ws, pydantic-ai-slim[openai]~=2.5, cachetools
-version: 0.26.0
+version: 0.27.0
 licence: MIT
 """
 
@@ -21,6 +21,7 @@ import time
 import typing
 import urllib.parse
 import uuid
+from datetime import datetime, timezone
 
 import httpx
 from cachetools import LRUCache
@@ -360,6 +361,77 @@ def _extract_pid(output: str) -> str:
     """Extract PID=<number> from ensure-script output. Returns the number or '?'."""
     m = re.search(r"PID=(\d+)", output)
     return m.group(1) if m else "?"
+
+
+async def _http_preview(valves, sandbox_id: str, port: int, user: dict,
+                        client: httpx.AsyncClient) -> tuple[str, str]:
+    """Obtain a signed URL privately, then optionally wrap it before disclosure.
+
+    The wrapper is an administrator-trusted service, not a model-selected URL.
+    Catch failures inside this credential boundary: _tool_context otherwise
+    includes raw response bodies and exception text in model-visible output.
+    """
+    endpoint = valves.preview_wrapper_url.strip()
+    credential = valves.preview_wrapper_key
+    wrapped = bool(endpoint or credential)
+    error = "HTTP preview unavailable. "
+    if wrapped:
+        error += "Protected preview registration failed; no direct URL was returned. Ask the administrator to check the wrapping service."
+    else:
+        error += "Could not obtain a signed preview URL. Try expose again."
+    try:
+        if wrapped:
+            parsed = urllib.parse.urlsplit(endpoint)
+            if (not endpoint or not credential or parsed.scheme != "https" or not parsed.hostname
+                    or parsed.username or parsed.password or parsed.fragment
+                    or any(c.isspace() for c in endpoint)
+                    or not isinstance(user.get("id"), str) or not user["id"]
+                    or not isinstance(user.get("email"), str) or not user["email"]):
+                raise ValueError()
+        response = await client.get(
+            _api(valves, f"/sandbox/{sandbox_id}/ports/{port}/signed-preview-url"),
+            params={"expiresInSeconds": valves.preview_expiry_seconds},
+            headers=_headers(valves), timeout=30.0, follow_redirects=False,
+        )
+        response.raise_for_status()
+        upstream = response.json()["url"]
+        upstream_parts = urllib.parse.urlsplit(upstream)
+        if (upstream_parts.scheme != "https" or not upstream_parts.hostname
+                or upstream_parts.username or upstream_parts.password
+                or any(c.isspace() for c in upstream)):
+            raise ValueError()
+        lifetime = f"{valves.preview_expiry_seconds / 3600:g} hour(s)"
+        if not wrapped:
+            return upstream, (
+                f"Direct signed preview: this URL is a bearer credential, valid for up to {lifetime}. "
+                "Anyone who copies it can access the service. You may see a Daytona warning on first visit. "
+                "Sandbox sleep or service failure can end access sooner; call expose again to renew."
+            )
+        response = await client.post(endpoint, headers={"Authorization": f"Bearer {credential}"},
+            json={"owner": {"subject": user["id"], "email": user["email"]},
+                  "slot": str(port), "upstream_url": upstream},
+            timeout=30.0, follow_redirects=False)
+        response.raise_for_status()
+        result = response.json()
+        url = result["url"]
+        parsed = urllib.parse.urlsplit(url)
+        expiry = datetime.fromisoformat(result["expires_at"].replace("Z", "+00:00"))
+        if (result.get("access_mode") != "owner-authenticated"
+                or parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password
+                or parsed.fragment or parsed.hostname == upstream_parts.hostname
+                or upstream_parts.hostname in urllib.parse.unquote(url)
+                or credential in url or any(c.isspace() for c in url)
+                or expiry.tzinfo is None or expiry <= datetime.now(timezone.utc)):
+            raise ValueError()
+        return url, (
+            f"Owner-authenticated preview: sign in as the owning user. Copying the URL does not grant access. "
+            f"Registration expires {expiry.astimezone(timezone.utc).isoformat()}; "
+            f"upstream access lasts up to {lifetime}. "
+            "Sandbox sleep or service failure can end availability sooner. "
+            "Call expose again to replace/renew the registration; the wrapper may invalidate previous browser sessions."
+        )
+    except Exception:
+        raise RuntimeError(error) from None
 
 
 def _require_abs_path(path: str, param_name: str = "path") -> str | None:
@@ -2991,6 +3063,17 @@ class Tools:
             "https://proxy.app.daytona.io/toolbox",
             description="Daytona toolbox proxy URL",
         )
+        preview_wrapper_url: str = Field(
+            "", description="Optional HTTPS registration endpoint for owner-authenticated HTTP previews. Configured wrapping fails closed.",
+        )
+        preview_wrapper_key: str = Field(
+            "", description="Installation bearer credential for the preview wrapper (admin only).",
+            json_schema_extra={"input": {"type": "password"}},
+        )
+        preview_expiry_seconds: int = Field(
+            86400, ge=60, le=86400,
+            description="Lifetime of upstream HTTP signed previews, in seconds (default/max: 24 hours). Independent of wrapper registration expiry. Does not affect SSH.",
+        )
         deployment_label: str = Field(
             "",
             description="Label key used to tag sandboxes for this OWUI deployment (e.g. 'chat.example.com')",
@@ -3127,7 +3210,7 @@ class Tools:
             Ask the user to download the file on their own machine, then
             upload it to the sandbox through the dufs file browser. Call
             expose(target="dufs") to get the URL. This handles any file
-            type and any host with no size constraints.
+            type and any host, subject to the deployment's upload limits.
 
             **Rare — custom browser-side fetch service:**
             For repeated fetch needs (e.g. crawling an API the sandbox
@@ -3292,7 +3375,7 @@ class Tools:
             ```
             This installs dufs if missing, starts it on port 5000 serving
             /home/daytona/workspace with full upload/download, and returns a
-            signed URL. Idempotent — safe to call again after sandbox restart.
+            preview URL. Safe to call again after sandbox restart.
 
             **Custom directory or read-only access:**
             For non-default configurations, install and start dufs manually:
@@ -3311,8 +3394,10 @@ class Tools:
             expose(target="code-server")
             ```
             This installs code-server if missing, starts it on port 8080
-            serving /home/daytona/workspace with no auth, and returns a signed
-            URL. Idempotent — safe to call again after sandbox restart.
+            serving /home/daytona/workspace with no application-level auth, and
+            returns a preview URL. Safe to call again after sandbox restart.
+
+            {preview_access_note}
 
             **Custom configuration:**
             For non-default settings, install and start code-server manually:
@@ -3559,7 +3644,7 @@ class Tools:
 
             **Running services and exposing them:**
             The sandbox is a server. Background a web server with nohup, then
-            call expose(target="http:N") to get a public HTTPS URL the user can open.
+            call expose(target="http:N") to get an HTTPS preview URL the user can open.
             The sandbox auto-stops on idle, which kills background processes —
             restart the server and call expose() again if needed.
 
@@ -3653,8 +3738,11 @@ class Tools:
               foreground_seconds). Backgrounded delegates write to
               /dev/shm/lathe/delegate/<id>/{log,result,error,usage}. Use foreground_seconds=0
               to fire-and-forget for parallel agent teams.
-            - expose() URLs expire after ~1 hour (call expose again for a fresh URL). The sandbox itself stops on
-              idle (~15 min default), killing servers.
+            - {preview_access_note}
+            - The sandbox stops on idle (~15 min default), killing servers.
+              A preview registration does not keep it awake or restart a service.
+            - HTTP preview wrapping does not protect SSH commands: they contain
+              access credentials and should not be exposed in screen recordings.
             - destroy() prompts for user confirmation via a dialog before proceeding. Irreversible.{destroy_volume_note}
             - **Network egress may be restricted.** Depending on the admin's
               Daytona tier, the sandbox may only reach a curated allowlist of
@@ -3714,6 +3802,15 @@ class Tools:
             content = content.replace("{tool_catalog}", tool_catalog)
             content = content.replace("{volume_note}", volume_note)
             content = content.replace("{destroy_volume_note}", destroy_volume_note)
+            preview_note = (
+                "HTTP expose uses an owner-authenticated wrapper. Return only its URL; "
+                "never work around a wrapping failure by obtaining or sharing a direct signed URL. "
+                "The tool result states registration expiry; copying the URL does not grant access."
+                if self.valves.preview_wrapper_url or self.valves.preview_wrapper_key else
+                "HTTP expose returns a direct signed bearer URL: anyone who copies it can access the service."
+            )
+            preview_note += f" Upstream HTTP access lasts up to {self.valves.preview_expiry_seconds / 3600:g} hour(s); call expose again to renew."
+            content = content.replace("{preview_access_note}", preview_note)
             await _emit(__event_emitter__, f"Manual page: {manpage}", done=True)
             return content
 
@@ -4579,20 +4676,11 @@ class Tools:
                     await _emit(__event_emitter__, f"Generating URL for port {svc_port}...")
 
                 await _emit(__event_emitter__, "Generating URL...")
-                resp = await client.get(
-                    _api(self.valves, f"/sandbox/{sandbox_id}/ports/{svc_port}/signed-preview-url"),
-                    params={"expiresInSeconds": 3600},
-                    headers=_headers(self.valves),
-                    timeout=30.0,
-                )
-                resp.raise_for_status()
-                url = resp.json().get("url", "")
-                if not url:
-                    return "Error: Daytona returned an empty URL."
+                url, access_note = await _http_preview(self.valves, sandbox_id, svc_port, __user__, client)
 
                 await _emit(__event_emitter__, ready_status, done=True)
                 messages = _drain_harness_messages(self._chat_state, __chat_id__, _sb_warning)
-                return _prepend_harness_messages(result_msg(url, pid), messages)
+                return _prepend_harness_messages(result_msg(url, pid) + "\n\n" + access_note, messages)
 
             if target_stripped == "ssh":
                 await _emit(__event_emitter__, "Creating SSH access token...")
@@ -4620,7 +4708,8 @@ class Tools:
                     f"The user can paste this into their terminal, VS Code Remote SSH, "
                     f"or JetBrains Gateway.\n\n"
                     f"Note: the sandbox auto-stops after ~{self.valves.auto_stop_minutes} min of inactivity. "
-                    f"Active SSH sessions keep the sandbox alive.",
+                    f"Active SSH sessions keep the sandbox alive. "
+                    f"This command contains an access credential; HTTP preview wrapping does not protect it.",
                     messages,
                 )
 
@@ -4632,7 +4721,7 @@ class Tools:
                     ready_status="File browser ready",
                     fail_status="dufs setup failed",
                     result_msg=lambda url, pid: (
-                        f"File browser URL (valid ~1 hour): {url}\n\n"
+                        f"File browser URL: {url}\n\n"
                         f"Give this URL to the user. In their browser they can:\n"
                         f"- **Upload**: drag and drop files onto the page\n"
                         f"- **Download**: click any file\n"
@@ -4649,7 +4738,7 @@ class Tools:
                     ready_status="IDE ready",
                     fail_status="code-server setup failed",
                     result_msg=lambda url, pid: (
-                        f"IDE URL (valid ~1 hour): {url}\n\n"
+                        f"IDE URL: {url}\n\n"
                         f"Give this URL to the user. They get VS Code in the browser with:\n"
                         f"- Full terminal access\n"
                         f"- File editing and navigation\n"
@@ -4683,9 +4772,9 @@ class Tools:
                 ready_status=f"URL ready (port {port})",
                 fail_status="",
                 result_msg=lambda url, pid: (
-                    f"Public URL (valid ~1 hour): {url}\n\n"
+                    f"Service URL: {url}\n\n"
                     f"The user can open this in a new browser tab. "
-                    f"They may see a Daytona security warning on first visit — they can click through it.\n\n"
+                    f"\n\n"
                     f"Note: the sandbox auto-stops after ~{self.valves.auto_stop_minutes} min of inactivity regardless of "
                     f"running background processes, killing the server. If the user reports "
                     f"the URL stopped working, restart the server and call expose() again."

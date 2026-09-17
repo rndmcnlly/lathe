@@ -2854,7 +2854,83 @@ async def test_sandbox_lifecycle_lookup(R: Results):
         lathe.httpx.AsyncClient = original_client
 
 
+async def test_preview_wrapping(R: Results):
+    import json
+    import httpx
+    from unittest.mock import AsyncMock, patch
+    from lathe import Tools
+
+    upstream = 'https://synthetic-secret.preview.test/'
+    protected = 'https://owner-5000.previews.test/'
+    secret = 'synthetic-installation-secret'
+    user = {'id': 'injected-user-id', 'email': 'owner@example.edu'}
+    successful = {'url': protected, 'access_mode': 'owner-authenticated', 'expires_at': '2099-01-01T00:00:00Z'}
+
+    async def invoke(target='http:5000', payload=None, status=200, direct=False, missing_id=False, partial=False):
+        tools = Tools()
+        tools.valves.daytona_api_key = 'synthetic-daytona-key'
+        if not direct:
+            tools.valves.preview_wrapper_url = 'https://wrapper.test/register'
+            tools.valves.preview_wrapper_key = '' if partial else secret
+        calls, events = [], []
+        async def emit(event): events.append(event)
+        def handler(request):
+            calls.append(request)
+            if request.url.host == 'wrapper.test':
+                if payload == 'timeout':
+                    raise httpx.ReadTimeout(upstream + secret)
+                if payload == 'malformed':
+                    return httpx.Response(status, text=upstream + secret)
+                return httpx.Response(status, json=successful if payload is None else payload)
+            if request.url.path.endswith('/signed-preview-url'):
+                assert request.url.params['expiresInSeconds'] == '86400'
+                return httpx.Response(200, json={'url': upstream})
+            return httpx.Response(200, json={'exitCode': 0, 'result': 'READY PID=123'})
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        injected = {'email': user['email']} if missing_id else user
+        with patch('lathe.httpx.AsyncClient', return_value=client), \
+             patch('lathe._ensure_sandbox', AsyncMock(return_value=('sandbox-id', None))), \
+             patch('lathe._ensure_chat_init', AsyncMock()):
+            result = await tools.expose(target, __user__=injected, __event_emitter__=emit)
+        return result, calls, json.dumps(events)
+
+    for target, slot in [('http:5000','5000'), ('dufs','5000'), ('code-server','8080')]:
+        result, calls, events = await invoke(target)
+        R.check(f'{target} returns protected URL', protected in result and 'Owner-authenticated' in result, result)
+        R.check(f'{target} withholds upstream and key', all(s not in result + events for s in [upstream, secret]))
+        registrations = [r for r in calls if r.url.host == 'wrapper.test']
+        R.check(f'{target} wraps in common path', len(registrations) == 1)
+        payload = json.loads(registrations[0].content)
+        R.check(f'{target} identity is injected, slot is resolved', payload == {
+            'owner': {'subject': user['id'], 'email': user['email']}, 'slot': slot, 'upstream_url': upstream,
+        })
+        R.check(f'{target} authenticates installation', registrations[0].headers['Authorization'] == 'Bearer ' + secret)
+
+    invalid = [
+        ({'url': upstream, 'access_mode':'owner-authenticated', 'expires_at':successful['expires_at']}, 200),
+        ({**successful, 'access_mode':'public'}, 200),
+        ({**successful, 'url':'http://insecure.test/'}, 200),
+        ({**successful, 'url':protected + '?leak=' + upstream}, 200),
+        ({**successful, 'expires_at':'2000-01-01T00:00:00Z'}, 200),
+        ({**successful, 'expires_at':'2099-01-01T00:00:00'}, 200),
+        ({'error': upstream + secret}, 500), ('malformed', 200), ('timeout', 200),
+        (successful, 302),
+    ]
+    for i, (payload, status) in enumerate(invalid):
+        result, calls, events = await invoke(payload=payload, status=status)
+        R.check(f'wrapper failure {i} is closed', result.startswith('Error:') and protected not in result, result)
+        R.check(f'wrapper failure {i} is redacted', upstream not in result + events and secret not in result + events)
+        R.check(f'wrapper failure {i} never follows redirects', len([r for r in calls if r.url.host == 'wrapper.test']) == 1)
+    for kwargs in [{'missing_id':True}, {'partial':True}]:
+        result, calls, events = await invoke(**kwargs)
+        R.check('missing trusted identity/configuration fails before signing', result.startswith('Error:') and not calls, result)
+    result, calls, events = await invoke(direct=True)
+    R.check('unconfigured mode retains direct exposure', upstream in result and 'bearer credential' in result)
+    R.check('direct mode never calls a wrapper', not any(r.url.host == 'wrapper.test' for r in calls))
+
+
 TESTS = {
+    "preview_wrapping": test_preview_wrapping,
     "parse_env_vars": test_parse_env_vars,
     "parse_create_overrides": test_parse_create_overrides,
     "onboard_script": test_onboard_script,

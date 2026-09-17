@@ -21,6 +21,7 @@ import asyncio
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 import sys
 import time
@@ -41,6 +42,21 @@ TOOL_ID = os.environ.get("LATHE_TEST_TOOL_ID", "lathe_test")
 DEPLOYMENT_LABEL = "lathe-owui-deployment-test"
 SOURCE_PATH = Path(__file__).with_name("lathe.py")
 VERBOSE = False
+PREVIEW_WRAPPER_URL = os.environ.get("LATHE_PREVIEW_WRAPPER_URL", "")
+PREVIEW_WRAPPER_KEY = os.environ.get("LATHE_PREVIEW_WRAPPER_KEY", "")
+PREVIEW_EXPECTED_URL = os.environ.get("LATHE_PREVIEW_EXPECTED_URL", "")
+PREVIEW_EXPECTED_PATTERN = os.environ.get("LATHE_PREVIEW_EXPECTED_PATTERN", "")
+PREVIEW_REVOKE_URL = os.environ.get("LATHE_PREVIEW_REVOKE_URL", "")
+
+
+def staged_source():
+    source = SOURCE_PATH.read_text()
+    if "--preview-only" in sys.argv:
+        # expose has no pydantic-ai dependency. Avoid changing the shared OWUI
+        # environment while qualifying only this path beside an older toolkit.
+        # All executable source remains identical; only install metadata differs.
+        source = re.sub(r'^requirements:.*\n', '', source, count=1, flags=re.MULTILINE)
+    return source
 
 # 1x1 transparent PNG, used to exercise view() end-to-end.
 PNG_B64 = (
@@ -124,7 +140,7 @@ class Results:
 
 
 async def deploy_staging_tool():
-    source = SOURCE_PATH.read_text()
+    source = staged_source()
     payload = {
         "id": TOOL_ID,
         "name": "Lathe Test",
@@ -167,6 +183,9 @@ async def deploy_staging_tool():
             "sandbox_missing_message": "",
             "sandbox_create_overrides": "{}",
             "foreground_timeout_seconds": 30,
+            "preview_wrapper_url": PREVIEW_WRAPPER_URL,
+            "preview_wrapper_key": PREVIEW_WRAPPER_KEY,
+            "preview_expiry_seconds": 86400,
         }
         response = await client.post(
             f"{OWUI_BASE}/api/v1/tools/id/{TOOL_ID}/valves/update",
@@ -236,7 +255,8 @@ async def cleanup_test_sandboxes():
 
 
 class OWUIClient:
-    def __init__(self):
+    def __init__(self, tool_id=TOOL_ID):
+        self.tool_id = tool_id
         self.sio = socketio.AsyncClient()
         self.session_id = None
         self.events = []
@@ -283,7 +303,7 @@ class OWUIClient:
             "chat_id": f"local:{uuid.uuid4()}",
             "id": str(uuid.uuid4()),
             "session_id": self.session_id,
-            "tool_ids": [TOOL_ID],
+            "tool_ids": [self.tool_id],
         }
         async with httpx.AsyncClient() as client:
             response = await client.post(
@@ -328,6 +348,14 @@ async def main():
     global VERBOSE
     VERBOSE = "--verbose" in sys.argv
     deploy = "--no-deploy" not in sys.argv
+    if TOOL_ID == 'lathe':
+        print('Refusing to use the production toolkit ID for the disposable deployment suite.')
+        return 2
+    preview_only = "--preview-only" in sys.argv
+    preview_enabled = all([PREVIEW_WRAPPER_URL, PREVIEW_WRAPPER_KEY, PREVIEW_EXPECTED_URL or PREVIEW_EXPECTED_PATTERN, PREVIEW_REVOKE_URL])
+    if preview_only and not preview_enabled:
+        print("Preview-only tests require wrapper URL/key, expected URL, and revoke URL in LATHE_PREVIEW_* variables.")
+        return 2
     missing = [
         name
         for name, value in (
@@ -348,10 +376,11 @@ async def main():
     cleanup_failed = False
     canary = f"OWUI_{uuid.uuid4().hex}"
     path = f"/home/daytona/workspace/{canary}.txt"
+    preview_url = None
 
     async def exact_source_and_schema():
         remote = await fetch_staging_tool()
-        local_source = SOURCE_PATH.read_text()
+        local_source = staged_source()
         remote_source = remote.get("content", "")
         require(
             remote_source == local_source,
@@ -428,6 +457,23 @@ async def main():
         values = tool_outputs(output)
         require(any(canary in value for value in values), values)
 
+    async def protected_preview_dispatch():
+        nonlocal preview_url
+        output = await client.send(
+            "Call bash to run this exact command: "
+            "nohup python3 -m http.server 8765 >/tmp/lathe-preview-test.log 2>&1 &\n"
+            "Then call expose with target http:8765. Return the resulting protected URL."
+        )
+        require(any(call.get('name') == 'expose' for call in tool_calls(output)), 'Model did not call expose')
+        values = '\n'.join(tool_outputs(output))
+        urls = re.findall(r'https://[^\s]+', values)
+        preview_url = next((u for u in urls if (re.fullmatch(PREVIEW_EXPECTED_PATTERN, u) if PREVIEW_EXPECTED_PATTERN else u == PREVIEW_EXPECTED_URL)), None)
+        require(preview_url and 'Owner-authenticated preview' in values,
+                'Protected preview result missing expected URL/access mode')
+        require(PREVIEW_WRAPPER_KEY not in values, 'Installation credential leaked')
+        require('daytonaproxy' not in values and '.proxy.daytona.work' not in values,
+                'Upstream hostname leaked')
+
     try:
         if deploy:
             print(f"Deploying local lathe.py to isolated toolkit {TOOL_ID!r}...")
@@ -436,13 +482,30 @@ async def main():
 
         await results.run("exact staged source and complete OWUI schema", exact_source_and_schema)
         await client.connect()
-        await results.run("model to OWUI to bash dispatch", bash_dispatch)
-        await results.run("write and read dispatch", write_and_read_dispatch)
-        await results.run("interpreter dispatch", interpreter_dispatch)
-        await results.run("view dispatch", view_dispatch)
-        await results.run("delegate dispatch", delegate_dispatch)
+        if not preview_only:
+            await results.run("model to OWUI to bash dispatch", bash_dispatch)
+            await results.run("write and read dispatch", write_and_read_dispatch)
+            await results.run("interpreter dispatch", interpreter_dispatch)
+            await results.run("view dispatch", view_dispatch)
+            await results.run("delegate dispatch", delegate_dispatch)
+        if preview_enabled:
+            await results.run("model to OWUI to owner-authenticated expose", protected_preview_dispatch)
     finally:
         await client.close()
+        if preview_enabled:
+            try:
+                async with httpx.AsyncClient() as http:
+                    revoke_url = PREVIEW_REVOKE_URL
+                    if '{label}' in revoke_url:
+                        from urllib.parse import urlsplit
+                        require(preview_url, 'Cannot identify the preview registration for cleanup')
+                        revoke_url = revoke_url.replace('{label}', urlsplit(preview_url).hostname.split('.')[0])
+                    response = await http.delete(revoke_url,
+                        headers={"Authorization": f"Bearer {PREVIEW_WRAPPER_KEY}"}, timeout=30)
+                    response.raise_for_status()
+            except Exception:
+                cleanup_failed = True
+                print("Preview registration cleanup failed")
         try:
             await cleanup_test_sandboxes()
         except Exception as exc:
