@@ -44,8 +44,13 @@ implementation into a test and test the copy.
   delegate schemas; HTTP boundary failures; lifecycle and message delivery;
   preview credential handling; byte-exact image returns. Delegate tests run the
   actual Pydantic AI loop against a scripted in-process ASGI model responder.
-  Real HTTP is blocked. Use pytest fixtures and parametrization, not custom
-  runners or handwritten HTTP response classes.
+  Tool cores execute their shipped scripts against temporary files; completion
+  is observed through subsequent tool calls, not private task names. Real HTTP
+  is blocked. Unexpected requests and responder assertions are recorded and
+  fail fixture teardown even when production catches the exception. Polling
+  tests use a Lathe-scoped clock that advances and yields, not global no-op
+  sleeps. Use pytest fixtures and parametrization, not custom runners or
+  handwritten HTTP response classes.
 - **Daytona (`test_integration.py`)**: real remote execution, interpreter state,
   background notices, previews, and persistent-volume recreation. Type checking
   and capability-policy matrices belong offline. Phases share a sandbox and

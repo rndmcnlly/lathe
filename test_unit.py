@@ -31,9 +31,34 @@ PNG = b"\x89PNG\r\n\x1a\n" + b"\0" * 8
 
 @pytest.fixture(autouse=True)
 def no_network(monkeypatch):
-    async def refuse(*args, **kwargs):
+    attempts = []
+    async def refuse(self, request):
+        attempts.append(f"{request.method} {request.url}")
         raise AssertionError("offline suite attempted real HTTP")
     monkeypatch.setattr(httpx.AsyncHTTPTransport, "handle_async_request", refuse)
+    yield
+    assert not attempts, attempts
+
+
+@pytest.fixture
+def transport():
+    """Keep evidence of broken test boundaries even if production catches it."""
+    violations = []
+
+    def create(handler):
+        async def guarded(request):
+            try:
+                response = handler(request)
+                return await response if inspect.isawaitable(response) else response
+            except httpx.HTTPError:
+                raise  # Deliberately injected transport failures are valid stimuli.
+            except Exception as exc:
+                violations.append(f"{request.method} {request.url}: {type(exc).__name__}: {exc}")
+                raise
+        return httpx.MockTransport(guarded)
+
+    yield create
+    assert not violations, "Unexpected I/O or broken test responder:\n" + "\n".join(violations)
 
 
 @pytest.fixture
@@ -47,7 +72,7 @@ def tools():
 
 
 @pytest.fixture
-def http(monkeypatch):
+def http(monkeypatch, transport):
     """Install a strict HTTP boundary, retaining real httpx response semantics."""
     constructor = httpx.AsyncClient
     clients = []
@@ -55,7 +80,7 @@ def http(monkeypatch):
     def install(handler):
         def create(*args, **kwargs):
             # Delegate's in-process model transport must remain real.
-            kwargs.setdefault("transport", httpx.MockTransport(handler))
+            kwargs.setdefault("transport", transport(handler))
             client = constructor(*args, **kwargs)
             clients.append(client)
             return client
@@ -63,6 +88,22 @@ def http(monkeypatch):
         return clients
 
     return install
+
+
+@pytest.fixture
+def clock(monkeypatch):
+    """Advance Lathe's polling clock without modifying asyncio for other code."""
+    real_sleep = asyncio.sleep
+    now = [0.0]
+
+    async def sleep(seconds):
+        now[0] += seconds
+        await real_sleep(0)
+
+    monkeypatch.setattr(lathe, "time", SimpleNamespace(**{
+        **vars(lathe.time), "time": lambda: now[0], "monotonic": lambda: now[0]}))
+    monkeypatch.setattr(lathe, "asyncio", SimpleNamespace(**{**vars(asyncio), "sleep": sleep}))
+    return lambda: now[0]
 
 
 @pytest.fixture
@@ -280,7 +321,7 @@ async def test_relative_file_path_never_reaches_http(tools, name, kwargs):
     assert "absolute path" in result
 
 
-async def test_file_core_http_roundtrip(tools, tmp_path):
+async def test_file_core_http_roundtrip(tools, tmp_path, transport):
     # Execute the actual HTTP command locally: covers quoting and argument
     # assembly as well as real disk effects, rather than echoing canned text.
     def handler(request):
@@ -291,7 +332,7 @@ async def test_file_core_http_roundtrip(tools, tmp_path):
         result = run_script(command[2])
         return httpx.Response(200, json={"exitCode": 0, "result": result})
     path = str(tmp_path / "it's a file.txt")
-    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+    async with httpx.AsyncClient(transport=transport(handler)) as client:
         await lathe._core_write(tools.valves, "sb", client, path=path, content="alpha\ncafé\n")
         await lathe._core_edit(tools.valves, "sb", client, path=path, old_string="café", new_string="世界")
         result = await lathe._core_read(tools.valves, "sb", client, path=path, start=2, stop=3)
@@ -374,15 +415,16 @@ async def test_rendered_manual(tools, volume, wrapped):
     assert "overview" in await tools.lathe("nonexistent")
 
 
-async def test_chat_init_and_notice_delivery(tools):
+async def test_chat_init_and_notice_delivery(tools, transport):
     calls = []
     def handler(request):
         calls.append(request)
-        if request.method == "POST":
+        if (request.method, request.url.path) == ("POST", "/sb/process/execute"):
             return httpx.Response(200, json={"exitCode": 0, "result": "workspace snapshot"})
+        assert (request.method, request.url.path) == ("GET", "/sandbox/sb")
         return httpx.Response(200, json={"cpu": 2})
     user = {**USER, "valves": tools.UserValves(env_vars='{"TOKEN":"hidden-value"}')}
-    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+    async with httpx.AsyncClient(transport=transport(handler)) as client:
         for _ in range(2):
             await lathe._ensure_chat_init(tools.valves, "sb", client, tools._chat_state, "a", user)
     assert len(calls) == 2
@@ -399,7 +441,7 @@ async def test_chat_init_and_notice_delivery(tools):
     (None, [], "new", False), ("old", [{"id": "old"}], "old", False),
     ("old", [], "new", True),
 ])
-async def test_interpreter_context_recovery(tools, prior, live, expected, lost):
+async def test_interpreter_context_recovery(tools, transport, prior, live, expected, lost):
     tools._chat_state["a"] = {"init": True, "pending": []}
     if prior:
         tools._chat_state["a"]["interpreter_context_id"] = prior
@@ -407,37 +449,57 @@ async def test_interpreter_context_recovery(tools, prior, live, expected, lost):
     def handler(request):
         calls.append(request.method)
         assert request.url.path == "/sb/process/interpreter/context"
+        assert request.method in {"GET", "POST"}
         return httpx.Response(200, json={"contexts": live} if request.method == "GET" else {"id": "new"})
-    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+    async with httpx.AsyncClient(transport=transport(handler)) as client:
         assert await lathe._ensure_interpreter_context(tools.valves, "sb", client, tools._chat_state, "a") == (expected, lost)
     assert tools._chat_state["a"]["interpreter_context_id"] == expected
     assert calls.count("POST") == (expected == "new")
 
 
-async def test_background_bash_poll_delivers_once(tools, http, monkeypatch):
+async def test_background_bash_poll_delivers_once(tools, sandbox, http, clock):
     tools._chat_state["chat"] = {"init": True, "pending": []}
     statuses = iter([httpx.Response(503), httpx.Response(200, json={"commands": [{"id": "cmd"}]}),
                      httpx.Response(200, json={"commands": [{"id": "cmd", "exitCode": 7}]})])
     requests = []
     def handler(request):
         requests.append(request.url.path)
+        if (request.method, request.url.path) == ("POST", "/sb/process/execute"):
+            return httpx.Response(200, json={"exitCode": 0, "result": "caller output"})
         assert request.method == "GET"
         if request.url.path == "/sb/process/session/session":
             return next(statuses)
         assert request.url.path == "/sb/process/session/session/command/cmd/logs"
         return httpx.Response(200, text="final output")
     http(handler)
-    monkeypatch.setattr(lathe.asyncio, "sleep", AsyncMock())
     await lathe._poll_bg_bash(tools.valves, "sb", "session", "cmd", "job", 0, tools._chat_state, "chat")
-    notices = lathe._drain_harness_messages(tools._chat_state, "chat", None)
     assert len(requests) == 4
-    assert len(notices) == 1
-    assert all(s in notices[0] for s in ["job", "Exit code: 7", "final output"])
-    assert lathe._drain_harness_messages(tools._chat_state, "chat", None) == []
+    # Observe delivery through an ordinary wrapper, not by draining its queue.
+    assert await tools.read("/file", __user__=USER, __chat_id__="other") == "caller output"
+    result = await tools.read("/file", __user__=USER, __chat_id__="chat")
+    assert result.count("Background job completed") == 1
+    assert all(s in result for s in ["job", "Exit code: 7", "final output", "caller output"])
+    assert await tools.read("/file", __user__=USER, __chat_id__="chat") == "caller output"
+
+
+async def test_background_bash_poll_deadline(tools, http, clock, monkeypatch):
+    tools._chat_state["chat"] = {"init": True, "pending": []}
+    requests = []
+    def handler(request):
+        requests.append(request)
+        assert (request.method, request.url.path) == ("GET", "/sb/process/session/session")
+        return httpx.Response(200, json={"commands": [{"id": "cmd"}]})
+    http(handler)
+    monkeypatch.setattr(lathe, "_BG_BASH_POLL_MAX_SECONDS", 5)
+    await asyncio.wait_for(lathe._poll_bg_bash(
+        tools.valves, "sb", "session", "cmd", "job", 0, tools._chat_state, "chat"), 1)
+    assert clock() >= 5
+    assert requests and len(requests) < 10
+    assert tools._chat_state["chat"]["pending"] == []
 
 
 @pytest.mark.parametrize("state,status", [("destroying", 200), ("destroyed", 200), ("started", 404)])
-async def test_stale_discovery_never_resurrects_sandbox(tools, state, status):
+async def test_stale_discovery_never_resurrects_sandbox(tools, transport, state, status):
     tools.valves.auto_create_sandbox = False
     tools.valves.sandbox_missing_message = "provision externally"
     candidate = {"id": "sb", "labels": {"test": USER["email"]}, "state": "started"}
@@ -449,7 +511,7 @@ async def test_stale_discovery_never_resurrects_sandbox(tools, state, status):
             return httpx.Response(200, json={"items": [candidate]})
         assert request.url.path == "/sandbox/sb"
         return httpx.Response(status, json={**candidate, "state": state})
-    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+    async with httpx.AsyncClient(transport=transport(handler)) as client:
         with pytest.raises(RuntimeError, match="provision externally"):
             await lathe._ensure_sandbox(tools.valves, USER["email"], client)
     assert calls == ["/sandbox", "/sandbox/sb"]
@@ -469,7 +531,7 @@ async def test_duplicate_sandbox_association_refuses_use_and_destroy(tools, http
     assert calls == [("GET", "/sandbox")] * 2
 
 
-async def test_destroy_requires_consent_and_authoritative_completion(tools, http, monkeypatch):
+async def test_destroy_requires_consent_and_authoritative_completion(tools, http, clock):
     calls = []
     responses = iter([
         httpx.Response(200, json=[{"id": "sb", "labels": {"test": USER["email"]}}]),
@@ -480,7 +542,6 @@ async def test_destroy_requires_consent_and_authoritative_completion(tools, http
         calls.append((request.method, request.url.path))
         return next(responses)
     http(handler)
-    monkeypatch.setattr(lathe.asyncio, "sleep", AsyncMock())
     assert "cannot confirm" in await tools.destroy(__user__=USER)
     assert "cancelled" in await tools.destroy(__user__=USER, __event_call__=AsyncMock(return_value=False))
     assert calls == []
@@ -494,17 +555,25 @@ async def test_destroy_requires_consent_and_authoritative_completion(tools, http
     (PNG, "png"), (b"\xff\xd8\xff\xe0", "jpeg"), (b"GIF89a", "gif"),
     (b"RIFF0000WEBP", "webp"), (b"<svg/>", None), (b"\x89PNG", None),
 ])
-async def test_view_content_detection(tools, payload, mime):
-    async with httpx.AsyncClient(transport=httpx.MockTransport(lambda r: httpx.Response(200, content=payload))) as client:
+async def test_view_content_detection(tools, transport, payload, mime):
+    def handler(request):
+        assert (request.method, request.url.path) == ("GET", "/sb/files/download")
+        assert request.url.params["path"] == "/misleading.txt"
+        return httpx.Response(200, content=payload)
+    async with httpx.AsyncClient(transport=transport(handler)) as client:
         result = await lathe._core_view(tools.valves, "sb", client, path="/misleading.txt")
-    assert result == f"data:image/{mime};base64,{base64.b64encode(payload).decode()}" if mime else result.startswith("Error:")
+    if mime:
+        assert result == f"data:image/{mime};base64,{base64.b64encode(payload).decode()}"
+    else:
+        assert result.startswith("Error:")
 
 
 async def test_image_return_defers_notices_until_text_call(tools, sandbox, http):
     def handler(request):
         if request.url.path == "/sb/files/download":
+            assert request.method == "GET" and request.url.params["path"] == "/image"
             return httpx.Response(200, content=PNG)
-        assert request.url.path == "/sb/process/execute"
+        assert (request.method, request.url.path) == ("POST", "/sb/process/execute")
         return httpx.Response(200, json={"exitCode": 0, "result": "text result"})
     http(handler)
     tools._chat_state["a"] = {"init": True, "pending": ["pending notice"]}
@@ -540,15 +609,19 @@ def preview(tools, sandbox, http):
         def handler(request):
             calls.append(request)
             if request.url.host == "wrapper.test":
+                assert (request.method, request.url.path) == ("POST", "/register")
                 if payload == "timeout":
                     raise httpx.ReadTimeout(upstream + secret)
                 if payload == "malformed":
                     return httpx.Response(200, text=upstream + secret)
                 return httpx.Response(status, json=good if payload is None else payload)
             if request.url.path.endswith("/signed-preview-url"):
+                assert request.method == "GET" and request.url.host == "api.test"
+                assert re.fullmatch(r"/sandbox/sb/ports/(5000|8080)/signed-preview-url", request.url.path)
                 assert request.url.params["expiresInSeconds"] == "86400"
                 return httpx.Response(200, json={"url": upstream})
-            assert request.url.path == "/sb/process/execute"
+            assert request.url.host == "proxy.test"
+            assert (request.method, request.url.path) == ("POST", "/sb/process/execute")
             return httpx.Response(200, json={"exitCode": 0, "result": "READY PID=123"})
         http(handler)
         result = await tools.expose(target, __user__=user, __event_emitter__=emit)
@@ -600,57 +673,35 @@ async def test_preview_configuration_and_direct_mode(preview, tools):
 
 
 @pytest.mark.parametrize("background,fail", [(False, False), (True, False), (True, True)])
-async def test_real_delegate_execution_and_completion(tools, sandbox, http, monkeypatch, background, fail):
-    """Real Agent, OpenAI adapter, ASGI transport, tool dispatch and task lifetime.
-
-    Only the model's responses and sandbox I/O are controlled. The event holds
-    inference until after the outer tool returns, without timing a fake agent.
-    """
+async def test_real_delegate_execution_and_completion(tools, sandbox, http, monkeypatch, tmp_path, background, fail):
+    """Real Agent, tool cores and files; observe completion as the caller does."""
     release = asyncio.Event()
     if not background:
         release.set()
-    requests, sidecars, tasks = [], {}, []
-    tools._chat_state["chat"] = {"init": True, "pending": []}
-    tools._chat_state["other"] = {"init": True, "pending": []}
-    read = AsyncMock(return_value="secret discovered by tool")
-    # AsyncMock lacks the core signature/docstring needed by the tool factory.
-    async def read_core(valves, sandbox_id, client, *, path: str, start: int = 1, stop: int = 0) -> str:
-        """Read a file.
+    requests, emissions = [], []
+    source = tmp_path / "input.txt"
+    source.write_text("secret discovered by tool\n")
+    root = tmp_path / "sidecars"
+    monkeypatch.setattr(lathe, "_EPHEMERAL_ROOT", str(root))
+    for chat in ("chat", "other"):
+        tools._chat_state[chat] = {"init": True, "pending": []}
 
-        :param path: Absolute path.
-        :param start: Start line.
-        :param stop: Stop line.
-        """
-        assert not client.is_closed
-        return await read(path=path, start=start, stop=stop)
-    read_core.__name__ = "_core_read"
-    monkeypatch.setattr(lathe, "_core_read", read_core)
-
-    async def write_core(valves, sandbox_id, client, *, path: str, content: str) -> str:
-        """Write a file.
-
-        :param path: Absolute path.
-        :param content: Contents.
-        """
-        assert not client.is_closed
-        sidecars[path.rsplit("/", 1)[-1]] = content
-        return "Wrote"
-    write_core.__name__ = "_core_write"
-    monkeypatch.setattr(lathe, "_core_write", write_core)
+    def execute(request):
+        assert (request.method, request.url.path) == ("POST", "/sb/process/execute")
+        assert request.headers["authorization"] == "Bearer test-key"
+        command = shlex.split(json.loads(request.content)["command"])
+        assert command[:2] == ["python3", "-c"]
+        return httpx.Response(200, json={"exitCode": 0, "result": run_script(command[2])})
+    clients = http(execute)
 
     async def app(scope, receive, send):
-        assert scope["path"] == "/api/chat/completions"
-        assert dict(scope["headers"])[b"authorization"] == b"Bearer user-token"
         body = b""
         while True:
             message = await receive()
             body += message.get("body", b"")
             if not message.get("more_body"):
                 break
-        request = json.loads(body)
-        requests.append(request)
-        assert request["model"] == "selected-model"
-        assert request["chat_id"] == "chat"
+        requests.append((scope, json.loads(body)))
         await release.wait()
         if fail:
             response = {"error": {"message": "synthetic model failure", "type": "invalid_request_error"}}
@@ -659,11 +710,9 @@ async def test_real_delegate_execution_and_completion(tools, sandbox, http, monk
             if len(requests) == 1:
                 message = {"role": "assistant", "content": None, "tool_calls": [{
                     "id": "read-1", "type": "function", "function": {
-                        "name": "read", "arguments": '{"path":"/input"}'}}]}
+                        "name": "read", "arguments": json.dumps({"path": str(source)})}}]}
                 finish = "tool_calls"
             else:
-                assert any(m.get("role") == "tool" and "secret discovered by tool" in m["content"]
-                           for m in request["messages"])
                 message = {"role": "assistant", "content": "verified result"}
                 finish = "stop"
             response = {"id": "completion", "object": "chat.completion", "created": 0,
@@ -673,49 +722,70 @@ async def test_real_delegate_execution_and_completion(tools, sandbox, http, monk
         await send({"type": "http.response.start", "status": status, "headers": [(b"content-type", b"application/json")]})
         await send({"type": "http.response.body", "body": json.dumps(response).encode()})
 
-    def unexpected(request):
-        raise AssertionError(f"unexpected sandbox HTTP: {request.url}")
-    clients = http(unexpected)
-    original = asyncio.ensure_future
-    def track(coro, **kwargs):
-        task = original(coro, **kwargs)
-        if getattr(coro, "__name__", "") == "_run_agent":
-            tasks.append(task)
-        return task
-    monkeypatch.setattr(asyncio, "ensure_future", track)
+    async def emit(event):
+        emissions.append(event)
+
+    async def read_in(chat):
+        return await tools.read(str(source), __user__=USER, __chat_id__=chat)
+
     request = SimpleNamespace(app=app, state=SimpleNamespace(token=SimpleNamespace(credentials="user-token")))
+    task_description = f"Read {source} and report"
+    # Capture newly spawned tasks only for failure cleanup, never as an oracle.
+    existing_tasks = asyncio.all_tasks()
     try:
-        result = await tools.delegate("Read /input and report", max_steps=3,
+        result = await tools.delegate(task_description, max_steps=3,
             foreground_seconds=0 if background else 5, __user__=USER, __chat_id__="chat",
-            __model__={"id": "wrong-model"}, __metadata__={"model": {"id": "selected-model"}}, __request__=request)
-        assert len(tasks) == 1, result
+            __model__={"id": "wrong-model"}, __metadata__={"model": {"id": "selected-model"}},
+            __request__=request, __event_emitter__=emit)
+        directories = list((root / "delegate").iterdir())
+        assert len(directories) == 1, result
+        sidecars = directories[0]
+        assert (sidecars / "task").read_text() == task_description
+        emission_count = len(emissions)
+        notice = "Background delegation failed" if fail else "Background delegation completed"
         if background:
-            assert "Backgrounded" in result
-            assert not tasks[0].done()
+            descriptor = re.search(r"^DELEGATE=(.+)$", result, re.MULTILINE)
+            assert descriptor and sidecars.name == descriptor[1], result
+            assert not (sidecars / "result").exists() and not (sidecars / "error").exists()
+            assert any(client.is_closed for client in clients)
+            assert notice not in await read_in("chat")
         else:
             assert "verified result" in result and "1 tool call(s)" in result
         release.set()
-        await asyncio.wait_for(tasks[0], 5)
-        assert all(client.is_closed for client in clients)
-        if fail:
-            assert "synthetic model failure" in sidecars["error"]
-            assert "result" not in sidecars
-        else:
-            read.assert_awaited_once_with(path="/input", start=1, stop=0)
-            assert sidecars["result"] == "verified result"
-            assert json.loads(sidecars["usage"])["tool_calls"] == 1
-        notices = lathe._drain_harness_messages(tools._chat_state, "chat", None)
-        assert len(notices) == int(background)
+        async with asyncio.timeout(5):
+            if background:
+                while notice not in (delivered := await read_in("chat")):
+                    await asyncio.sleep(0)
+                assert delivered.count(notice) == 1
+            while not all(client.is_closed for client in clients):
+                await asyncio.sleep(0)
         if background:
-            assert ("failed" if fail else "completed") in notices[0]
-        assert lathe._drain_harness_messages(tools._chat_state, "chat", None) == []
-        assert tools._chat_state["other"]["pending"] == []
+            assert len(emissions) == emission_count, "delegate emitted to a closed foreground stream"
+        assert notice not in await read_in("chat")
+        assert notice not in await read_in("other")
+        if fail:
+            assert "synthetic model failure" in (sidecars / "error").read_text()
+            assert not (sidecars / "result").exists()
+        else:
+            assert (sidecars / "result").read_text() == "verified result"
+            assert json.loads((sidecars / "usage").read_text())["tool_calls"] == 1
+            assert len(requests) == 2
+            assert any(m.get("role") == "tool" and "1: secret discovered by tool" in m["content"]
+                       for m in requests[1][1]["messages"])
+        # Check the recorded model protocol outside production's exception handlers.
+        assert requests
+        for scope, body in requests:
+            assert scope["path"] == "/api/chat/completions"
+            assert dict(scope["headers"])[b"authorization"] == b"Bearer user-token"
+            assert body["model"] == "selected-model" and body["chat_id"] == "chat"
     finally:
         release.set()
+        tasks = asyncio.all_tasks() - existing_tasks
         for task in tasks:
-            if not task.done():
-                task.cancel()
+            task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
+        for client in clients:
+            await client.aclose()
 
 
 if __name__ == "__main__":
