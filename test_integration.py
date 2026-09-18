@@ -15,6 +15,7 @@ import json
 import os
 import sys
 import time
+import traceback
 import uuid
 
 import httpx
@@ -50,9 +51,12 @@ class Results:
         try:
             await fn()
             print(f"  PASS: {name}")
+            return True
         except Exception as exc:
             self.failed += 1
             print(f"  FAIL: {name}: {type(exc).__name__}: {exc}")
+            traceback.print_exc()
+            return False
 
 
 def require(condition, detail):
@@ -87,12 +91,14 @@ async def _delete_test_sandboxes(tools: Tools):
             if sandbox.get("labels", {}).get(DEPLOYMENT_LABEL) == TEST_EMAIL
         ]
         for sandbox in matches:
-            await client.delete(
+            response = await client.delete(
                 f"{tools.valves.daytona_api_url}/sandbox/{sandbox['id']}",
                 params={"force": "true"},
                 headers=_headers(tools.valves),
                 timeout=30,
             )
+            if response.status_code != 404:
+                response.raise_for_status()
 
 
 async def main():
@@ -120,6 +126,7 @@ async def main():
     volume_file = f"{VOLUME}/contract-volume-canary.txt"
     results = Results()
     started = time.monotonic()
+    cleanup_failed = False
 
     await _delete_test_sandboxes(tools)
 
@@ -166,29 +173,6 @@ async def main():
         output = await tools.view(png_file, **fresh)
         require(output.startswith("data:image/png;base64,"), output[:120])
 
-    async def view_capability_gate():
-        gate_png = f"{WORKSPACE}/contract-{uuid.uuid4().hex}.png"
-        await tools.bash(f"printf '%s' '{PNG_B64}' | base64 -d > {gate_png}", **ctx)
-
-        # Text-only model: refused with a reminder, no image delivered
-        text_model = {"id": "text-only.test",
-                      "architecture": {"modality": "text->text", "input_modalities": ["text"]}}
-        output = await tools.view(gate_png, __model__=text_model, **ctx)
-        require(output.startswith("Error:") and "image input" in output, output[:250])
-        require("vision-capable model" in output, output)
-        require("data:image" not in output, output[:250])
-
-        # Vision model: passes through to the image
-        vision_model = {"id": "vision.test",
-                        "architecture": {"input_modalities": ["text", "image"]}}
-        output = await tools.view(gate_png, __model__=vision_model, **ctx)
-        require(output.startswith("data:image/png;base64,"), output[:100])
-
-        # Admin-unchecked capability flag (no architecture): refused
-        flag_model = {"id": "flag.test", "info": {"meta": {"capabilities": {"vision": False}}}}
-        output = await tools.view(gate_png, __model__=flag_model, **ctx)
-        require(output.startswith("Error:"), output[:250])
-
     async def onboarding_and_interpreter():
         project = f"{WORKSPACE}/onboard-contract"
         await tools.write(
@@ -203,12 +187,6 @@ async def main():
         require("40" in output, output)
         output = await tools.interpret("print(contract_value + 2)", **ctx)
         require("42" in output, output)
-
-    async def strict_wrapper_types():
-        output = await tools.read(test_file, start="2", **ctx)
-        require("expected type int" in output, output)
-        output = await tools.edit(test_file, "alpha", "ALPHA", replace_all="false", **ctx)
-        require("expected type bool" in output, output)
 
     async def background_completion_notice():
         output = await tools.bash(
@@ -279,15 +257,19 @@ async def main():
             tools.valves.sandbox_missing_message = ""
 
     try:
-        await results.run("core tool roundtrip", core_tool_roundtrip)
-        await results.run("view tool roundtrip", view_tool_roundtrip)
-        await results.run("view capability gate", view_capability_gate)
-        await results.run("onboarding and persistent interpreter", onboarding_and_interpreter)
-        await results.run("strict wrapper types", strict_wrapper_types)
-        await results.run("background completion notice", background_completion_notice)
-        await results.run("signed preview URL", expose_contract)
-        await results.run("persistent volume survives VM recreation", volume_survives_recreation)
-        await results.run("disabled auto-create policy", disabled_auto_create_is_respected)
+        # These phases share one VM. Stop after a failed prerequisite rather
+        # than reporting a cascade of failures against a broken fixture.
+        for name, scenario in [
+            ("core tool roundtrip", core_tool_roundtrip),
+            ("view tool roundtrip", view_tool_roundtrip),
+            ("onboarding and persistent interpreter", onboarding_and_interpreter),
+            ("background completion notice", background_completion_notice),
+            ("signed preview URL", expose_contract),
+            ("persistent volume survives VM recreation", volume_survives_recreation),
+            ("disabled auto-create policy", disabled_auto_create_is_respected),
+        ]:
+            if not await results.run(name, scenario):
+                break
     finally:
         # Cleanup runs even when an HTTP exception aborts a scenario. The named
         # volume is intentionally retained and reused, so runs do not leak one
@@ -295,11 +277,12 @@ async def main():
         try:
             await _delete_test_sandboxes(tools)
         except Exception as exc:
-            print(f"Cleanup warning: {exc}")
+            cleanup_failed = True
+            print(f"Cleanup failed: {exc}")
 
     elapsed = time.monotonic() - started
     print(f"\n{results.scenarios - results.failed}/{results.scenarios} scenarios passed in {elapsed:.1f}s")
-    return 1 if results.failed else 0
+    return 1 if results.failed or cleanup_failed else 0
 
 
 if __name__ == "__main__":

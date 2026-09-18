@@ -15,7 +15,7 @@ Every line of code in this repo was written by an AI coding agent, directed by a
 ## Before you open a PR
 
 1. **Read `AGENTS.md`** — it has architecture notes, test procedures, and contribution rules that apply to both humans and agents working on the repo.
-2. **Run the unit tests**: `uv run --script test_harness.py unit`
+2. **Run the offline tests**: `uv run pytest`. See `AGENTS.md` for live checks appropriate to your change.
 3. **Don't break the single-file constraint** — `lathe.py` is one file, deliberately. Resist the urge to split it.
 4. **Route documentation to the right home** — user-facing docs go in `docs/`, admin docs in `README.md`, agent/contributor docs in `AGENTS.md`. See the "Three audiences, three homes" section in `AGENTS.md`.
 

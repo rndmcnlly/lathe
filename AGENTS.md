@@ -15,7 +15,8 @@ Implementation internals belong in `docs/` or code comments, not the README.
 Credentials in `.env` (gitignored); see `.env.example`. Dependencies via `uv run`.
 
 ```
-uv run python test_unit.py                      # no sandbox needed
+uv run pytest                                  # offline, no credentials
+uv run pytest -k delegate                       # focused selection
 uv run python test_integration.py               # needs DAYTONA_API_KEY
 uv run python test_deployment.py [--verbose]     # also needs OWUI_URL, OWUI_TOKEN, OWUI_MODEL
 ```
@@ -27,8 +28,44 @@ sandboxes on exit, including after failures and `--no-deploy` runs. Override
 the staging ID with `LATHE_TEST_TOOL_ID`; use `--no-deploy` only when
 intentionally testing already-staged source that may be deleted afterward.
 
-Run `uv run python test_unit.py` before committing any change to `lathe.py`. Keep tests in sync: rename/remove/add tests when you rename/remove/add code they cover.
-Use `test_unit.py --extended` for targeted diagnostics that intentionally sit outside the required fast gate.
+Run `uv run pytest` before committing any change to `lathe.py`.
+`uv run python test_unit.py` remains an equivalent entry point; it accepts pytest
+options. The old named-test registry and `--extended` diagnostics are gone.
+
+### Testing policy
+
+Protect observable contracts and known failure modes, rather than inventorying
+functions, constants, prompt wording, or implementation choices. A regression
+test must execute the production path it claims to protect. Do not copy the
+implementation into a test and test the copy.
+
+- **Offline (`test_unit.py`)**: real temporary files and shipped scripts;
+  real module loading with and without future annotations; public wrapper and
+  delegate schemas; HTTP boundary failures; lifecycle and message delivery;
+  preview credential handling; byte-exact image returns. Delegate tests run the
+  actual Pydantic AI loop against a scripted in-process ASGI model responder.
+  Real HTTP is blocked. Use pytest fixtures and parametrization, not custom
+  runners or handwritten HTTP response classes.
+- **Daytona (`test_integration.py`)**: real remote execution, interpreter state,
+  background notices, previews, and persistent-volume recreation. Type checking
+  and capability-policy matrices belong offline. Phases share a sandbox and
+  stop after the first failure; cleanup failure makes the run fail.
+- **OWUI (`test_deployment.py`)**: actual loader/schema/middleware and real-model
+  dispatch. The delegate must produce a file verified by a separate read; an
+  echoed canary in its answer is insufficient. This remains a nondeterministic
+  smoke test, not an offline model simulation.
+
+`testing_support.py` holds one independently specified public schema contract
+shared by local and deployed checks. Do not derive expected values from Lathe
+itself. Delegate-specific differences are explicit in the local test.
+
+Run each live suite only once at a time: its fixed staging identity is shared
+across invocations. Integration retains one named test volume for reuse;
+deployment disables volumes. Neither belongs in default pytest collection.
+
+When replacing coverage, verify a few plausible injected faults are detected.
+Use in-memory module copies or disposable workspaces, never mutate a deployed
+toolkit to evaluate tests. Assertion counts and line coverage are not goals.
 
 ## Closing issues
 
@@ -54,13 +91,14 @@ Rather than coercing bad types leniently (which silently masks upstream bugs), l
 - **Hand-written methods** (`bash`, `delegate`): call `_check_tool_params()` explicitly before entering `_run()`.
 - **`_core_*` functions**: trust their type signatures. No coercion code.
 
-The `string_typed_params` unit test verifies that `_check_tool_params` rejects wrong types (string for int, string for bool, etc.) and accepts correct types.
+`test_bad_types_rejected_before_io` invokes the actual wrappers with wrong types
+(string for int, string for bool, etc.) in both loading modes.
 
 ### Annotations arrive stringized (PEP 563)
 
 OWUI's tool loader (`open_webui/utils/plugin.py`) has `from __future__ import annotations` and execs tool source with a bare `exec()`, which **inherits the caller's `__future__` flags**. So lathe's module compiles under PEP 563: `inspect.signature(core_fn).parameters[...].annotation` returns the **string** `'int'`, not the class `int`. Feeding that to `isinstance()` raises `isinstance() arg 2 must be a type, a tuple of types, or a union` (the prod bug fixed in 0.23.2: every typed-param tool crashed; `bash` survived only because it passes a literal `int`).
 
-Rule: **never trust raw signature annotations at runtime.** Resolve via `typing.get_type_hints(fn)` (which resolves the strings back to real classes against module globals), as `_standard_tool` now does for both `tool_annotations` and `__annotations__`. `_check_tool_params` also guards: a non-`type` `base_type` is skipped, never passed to `isinstance()`. This only reproduces under OWUI's loader, not a normal file import or top-level `exec` — verify fixes inside the OWUI process (or simulate with `from __future__ import annotations` + `exec`), not just offline. The `string_future_annotations_loading` unit test locks this in.
+Rule: **never trust raw signature annotations at runtime.** Resolve via `typing.get_type_hints(fn)` (which resolves the strings back to real classes against module globals), as `_standard_tool` now does for both `tool_annotations` and `__annotations__`. `_check_tool_params` also guards: a non-`type` `base_type` is skipped, never passed to `isinstance()`. This only reproduces under OWUI's loader, not a normal file import or top-level `exec`: verify fixes inside the OWUI process or load the real source with future annotations enabled. The `module` fixture does the latter for interface and wrapper-dispatch tests.
 
 
 ## Cold-start bootstrap
@@ -116,8 +154,9 @@ To change tool behavior, edit the `_core_*` function. Both surfaces pick it up.
 
 **Both are critical.** OWUI's `convert_function_to_pydantic_model` uses `inspect.signature()` for parameter names and defaults, but `get_type_hints()` (which reads `__annotations__`) for **types**. Without `__annotations__`, all params silently fall back to `Any`, which Pydantic renders as `"type": "string"` in the JSON schema after OWUI's `clean_properties` fallback. `functools.wraps` copies `__annotations__` but does NOT copy `__signature__`, so both must be set manually on dynamically generated methods.
 
-The `tools_schema_parity` unit test locks in the known-good parameter names, types, defaults, dunder params, and `get_type_hints()` results for every Tools method, catching silent schema breakage.
+`test_tools_interface` checks known-good parameter names, types, defaults,
+injected context parameters, and `get_type_hints()` results in both loading modes.
 
 ### Docstring single source of truth
 
-`_core_*` docstrings (`:param:` format) are the single source of truth for tool descriptions and parameter docs. `_standard_tool` and `@_doc_from_core(_core_fn)` copy the docstring onto Tools methods and delegate closures respectively. Both OWUI and pydantic-ai parse `:param:` natively; extra `:param:` lines for infrastructure params are silently ignored. The `delegate_tools_build` test verifies delegate schema parity; `tools_schema_parity` verifies the Tools class surface.
+`_core_*` docstrings (`:param:` format) are the single source of truth for tool descriptions and parameter docs. `_standard_tool` and `_build_delegate_tool` copy the docstring onto Tools methods and delegate closures respectively. Both OWUI and pydantic-ai parse `:param:` natively; extra `:param:` lines for infrastructure params are silently ignored. `test_delegate_interface` verifies delegate schema parity; `test_tools_interface` verifies the Tools class surface.

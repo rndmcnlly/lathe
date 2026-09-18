@@ -1,3039 +1,722 @@
-#!/usr/bin/env python3
-"""
-Unit tests for lathe.py — pure Python, no network, no sandbox.
+"""Offline behavioral contracts. Run with `uv run pytest` (no credentials).
 
-Usage:
-    uv run python test_unit.py
+Exercise shipped code; replace only network/model boundaries. Each test owns
+its files and state. Live Daytona and OWUI checks remain explicit scripts.
 """
 
+import __future__
 import asyncio
+import base64
+import inspect
+import json
+import os
+from pathlib import Path
+import re
+import shlex
 import subprocess
 import sys
-import os
-import tempfile
-import time
+from types import ModuleType, SimpleNamespace
 import typing
-
-sys.path.insert(0, os.path.dirname(__file__))
-
-
-# ── Test result tracking ─────────────────────────────────────────────
-
-class Results:
-    def __init__(self):
-        self.passed = 0
-        self.failed = 0
-
-    def check(self, name, condition, detail=""):
-        if condition:
-            print(f"  PASS: {name}")
-            self.passed += 1
-        else:
-            print(f"  FAIL: {name} — {detail}")
-            self.failed += 1
-
-
-# ── Tests ────────────────────────────────────────────────────────────
-
-async def test_parse_env_vars(R: Results):
-    from lathe import _parse_env_vars
-
-    print("\n── _parse_env_vars: valid JSON object ──")
-    pairs = _parse_env_vars('{"FOO":"bar","BAZ":"qux"}')
-    R.check("parses two pairs", len(pairs) == 2, f"got {len(pairs)}")
-    R.check("first key is FOO", pairs[0] == ("FOO", "bar"), str(pairs[0]))
-    R.check("second key is BAZ", pairs[1] == ("BAZ", "qux"), str(pairs[1]))
-
-    print("\n── _parse_env_vars: empty / default ──")
-    R.check("empty string returns []", _parse_env_vars("") == [], str(_parse_env_vars("")))
-    R.check("bare {} returns []", _parse_env_vars("{}") == [], str(_parse_env_vars("{}")))
-    R.check("whitespace only returns []", _parse_env_vars("   ") == [], str(_parse_env_vars("   ")))
-
-    print("\n── _parse_env_vars: values with special chars ──")
-    pairs = _parse_env_vars('{"KEY":"val=ue","OTHER":"has spaces","QUOTE":"it\'s"}')
-    R.check("value with = preserved", ("KEY", "val=ue") in pairs, str(pairs))
-    R.check("value with spaces preserved", ("OTHER", "has spaces") in pairs, str(pairs))
-    R.check("value with quote preserved", ("QUOTE", "it's") in pairs, str(pairs))
-
-    print("\n── _parse_env_vars: invalid keys raise ──")
-    try:
-        _parse_env_vars('{"GOOD":"yes","123bad":"no","also-bad":"no","_ok":"yes"}')
-        R.check("invalid keys raise ValueError", False, "no exception raised")
-    except ValueError as e:
-        R.check("invalid keys raise ValueError", True)
-        R.check("error mentions bad key", "123bad" in str(e) or "also-bad" in str(e), str(e))
-
-    print("\n── _parse_env_vars: non-string values raise ──")
-    try:
-        _parse_env_vars('{"A":"ok","B":123,"C":true}')
-        R.check("non-string values raise ValueError", False, "no exception raised")
-    except ValueError as e:
-        R.check("non-string values raise ValueError", True)
-        R.check("error mentions bad key", "'B'" in str(e) or "'C'" in str(e), str(e))
-
-    print("\n── _parse_env_vars: invalid JSON raises ──")
-    try:
-        _parse_env_vars("not json")
-        R.check("garbage raises ValueError", False, "no exception raised")
-    except ValueError as e:
-        R.check("garbage raises ValueError", True)
-        R.check("garbage error mentions JSON", "JSON" in str(e), str(e))
-
-    try:
-        _parse_env_vars('["a","b"]')
-        R.check("array raises ValueError", False, "no exception raised")
-    except ValueError as e:
-        R.check("array raises ValueError", True)
-        R.check("array error mentions object", "object" in str(e), str(e))
-
-
-async def test_parse_create_overrides(R: Results):
-    from lathe import _parse_create_overrides, _PROTECTED_CREATE_KEYS, Tools
-
-    print("\n── _parse_create_overrides: empty / default ──")
-    R.check("empty string returns {}", _parse_create_overrides("") == {}, str(_parse_create_overrides("")))
-    R.check("bare {} returns {}", _parse_create_overrides("{}") == {}, str(_parse_create_overrides("{}")))
-    R.check("whitespace only returns {}", _parse_create_overrides("   ") == {})
-
-    print("\n── _parse_create_overrides: valid shape args ──")
-    out = _parse_create_overrides('{"cpu":2,"memory":4,"disk":20,"snapshot":"my-snap","target":"us"}')
-    R.check("cpu parsed as int", out.get("cpu") == 2, str(out))
-    R.check("memory parsed", out.get("memory") == 4, str(out))
-    R.check("snapshot parsed", out.get("snapshot") == "my-snap", str(out))
-    R.check("target parsed", out.get("target") == "us", str(out))
-
-    print("\n── _parse_create_overrides: protected keys rejected ──")
-    for key in ("name", "labels", "volumes"):
-        try:
-            _parse_create_overrides('{"%s":"x"}' % key)
-            R.check(f"{key} rejected", False, "no exception raised")
-        except ValueError as e:
-            R.check(f"{key} rejected", True)
-            R.check(f"error names {key}", key in str(e), str(e))
-
-    print("\n── _parse_create_overrides: invalid input raises ──")
-    try:
-        _parse_create_overrides("not json")
-        R.check("garbage raises", False, "no exception")
-    except ValueError as e:
-        R.check("garbage raises", True)
-        R.check("garbage mentions JSON", "JSON" in str(e), str(e))
-    try:
-        _parse_create_overrides('["a","b"]')
-        R.check("array raises", False, "no exception")
-    except ValueError as e:
-        R.check("array raises", True)
-        R.check("array mentions object", "object" in str(e), str(e))
-
-    print("\n── _PROTECTED_CREATE_KEYS contents ──")
-    R.check("protects name/labels/volumes",
-            _PROTECTED_CREATE_KEYS == frozenset({"name", "labels", "volumes"}),
-            str(_PROTECTED_CREATE_KEYS))
-
-    print("\n── new valves exist with safe defaults ──")
-    v = Tools().valves
-    R.check("auto_create_sandbox defaults True", v.auto_create_sandbox is True)
-    R.check("sandbox_missing_message defaults empty", v.sandbox_missing_message == "")
-    R.check("sandbox_create_overrides defaults {}", v.sandbox_create_overrides == "{}")
-
-
-async def test_onboard_script(R: Results):
-    from lathe import _build_onboard_script
-
-    print("\n── _build_onboard_script: generates valid Python ──")
-    script = _build_onboard_script("/home/daytona/workspace/myproject")
-    try:
-        compile(script, "<onboard>", "exec")
-        R.check("script compiles", True)
-    except SyntaxError as e:
-        R.check("script compiles", False, str(e))
-
-    R.check("script has PROJECT assignment", "PROJECT = '/home/daytona/workspace/myproject'" in script, script[:200])
-    R.check("script references ~/.agents", "~/.agents" in script, "missing global path")
-    R.check("script uses os.listdir", "os.listdir" in script, "missing directory listing call")
-
-    print("\n── _build_onboard_script: handles tricky paths ──")
-    script = _build_onboard_script("/home/daytona/workspace/it's a \"test\"")
-    try:
-        compile(script, "<onboard>", "exec")
-        R.check("tricky path compiles", True)
-    except SyntaxError as e:
-        R.check("tricky path compiles", False, str(e))
-
-
-async def test_truncate(R: Results):
-    from lathe import _truncate_tail, _MAX_LINES, _MAX_BYTES
-
-    print("\n── _truncate_tail: no truncation needed ──")
-    short = "line 1\nline 2\nline 3"
-    out, trunc, meta = _truncate_tail(short)
-    R.check("short text not truncated", not trunc, f"truncated={trunc}")
-    R.check("short text unchanged", out == short, out[:80])
-
-    print("\n── _truncate_tail: line limit ──")
-    many_lines = "\n".join(f"line {i}" for i in range(5000))
-    out, trunc, meta = _truncate_tail(many_lines)
-    R.check("many lines truncated", trunc, f"truncated={trunc}")
-    R.check("truncated by lines", meta["truncated_by"] == "lines", meta.get("truncated_by"))
-    R.check("keeps last N lines", out.endswith("line 4999"), out[-30:])
-    R.check("total_lines correct", meta["total_lines"] == 5000, meta.get("total_lines"))
-    out_line_count = out.count("\n") + 1
-    R.check(f"output has <= {_MAX_LINES} lines", out_line_count <= _MAX_LINES, f"got {out_line_count}")
-
-    print("\n── _truncate_tail: byte limit ──")
-    fat_lines = "\n".join(f"{'x' * 99}" for _ in range(600))
-    out, trunc, meta = _truncate_tail(fat_lines)
-    R.check("fat lines truncated", trunc, f"truncated={trunc}")
-    R.check("truncated by bytes", meta["truncated_by"] == "bytes", meta.get("truncated_by"))
-    out_bytes = len(out.encode("utf-8"))
-    R.check(f"output <= {_MAX_BYTES} bytes", out_bytes <= _MAX_BYTES, f"got {out_bytes}")
-
-    print("\n── _truncate_tail: empty string ──")
-    out, trunc, meta = _truncate_tail("")
-    R.check("empty string not truncated", not trunc, f"truncated={trunc}")
-
-
-async def test_shell_quote(R: Results):
-    from lathe import _shell_quote
-
-    print("\n── _shell_quote: basic quoting ──")
-    R.check("simple string", _shell_quote("hello") == "'hello'", _shell_quote("hello"))
-    R.check("empty string", _shell_quote("") == "''", _shell_quote(""))
-    R.check("spaces preserved", _shell_quote("hello world") == "'hello world'", _shell_quote("hello world"))
-    R.check("single quote escaped", _shell_quote("it's") == "'it'\\''s'", _shell_quote("it's"))
-    R.check("dollar sign literal", _shell_quote("$HOME") == "'$HOME'", _shell_quote("$HOME"))
-    R.check("backticks literal", _shell_quote("`whoami`") == "'`whoami`'", _shell_quote("`whoami`"))
-
-
-async def test_require_abs_path(R: Results):
-    from lathe import _require_abs_path
-
-    print("\n── _require_abs_path: validation ──")
-    R.check("absolute path passes", _require_abs_path("/home/daytona/file.txt") is None, "should be None")
-    R.check("relative path fails", _require_abs_path("workspace/file.txt") is not None, "should be error")
-    R.check("error mentions absolute", "absolute" in (_require_abs_path("file.txt") or ""), _require_abs_path("file.txt"))
-    R.check("custom param name in error", "mypath" in (_require_abs_path("bad", "mypath") or ""), _require_abs_path("bad", "mypath"))
-
-
-async def test_build_tool_catalog(R: Results):
-    from lathe import _build_tool_catalog, Tools
-
-    print("\n── _build_tool_catalog: filtering ──")
-    tools = Tools()
-    catalog = _build_tool_catalog(tools)
-    R.check("catalog excludes lathe", "lathe(" not in catalog, "lathe should be excluded")
-    R.check("catalog excludes private", "_" not in catalog.split("(")[0] if "(" in catalog else True, "private methods should be excluded")
-    # Sanity: catalog is non-empty (at least one real tool listed)
-    R.check("catalog is non-empty", len(catalog) > 0, "catalog should list at least one tool")
-
-
-async def test_glob_script(R: Results):
-    from lathe import _GLOB_SCRIPT
-
-    def run_glob(base_dir, pattern, max_lines):
-        """Exec the glob script via subprocess, return stdout."""
-        script = (
-            _GLOB_SCRIPT
-            + f"\nprint(glob_hierarchy({base_dir!r}, {pattern!r}, {max_lines!r}))"
-        )
-        result = subprocess.run(
-            [sys.executable, "-c", script],
-            capture_output=True, text=True,
-        )
-        if result.returncode != 0:
-            return f"SCRIPT ERROR: {result.stderr}"
-        return result.stdout.rstrip("\n")
-
-    def parse_header(output):
-        """Extract match count from header line."""
-        first_line = output.split("\n")[0]
-        return int(first_line.split(" ")[0])
-
-    def body_lines(output):
-        """All lines after the header."""
-        return output.split("\n")[1:]
-
-    # ── Build a known directory tree ─────────────────────────────
-    #
-    #   tmp/
-    #     a.py
-    #     b.py
-    #     c.txt
-    #     sub/
-    #       d.py
-    #       e.py
-    #       deep/
-    #         f.py
-    #         g.py
-    #         h.py
-    #     other/
-    #       i.py
-    #     empty/
-    #     chain/
-    #       only/
-    #         child/
-    #           leaf.py
-
-    with tempfile.TemporaryDirectory() as tmp:
-        # Create files
-        for name in ["a.py", "b.py", "c.txt"]:
-            open(os.path.join(tmp, name), "w").close()
-
-        os.makedirs(os.path.join(tmp, "sub", "deep"))
-        for name in ["d.py", "e.py"]:
-            open(os.path.join(tmp, "sub", name), "w").close()
-        for name in ["f.py", "g.py", "h.py"]:
-            open(os.path.join(tmp, "sub", "deep", name), "w").close()
-
-        os.makedirs(os.path.join(tmp, "other"))
-        open(os.path.join(tmp, "other", "i.py"), "w").close()
-
-        os.makedirs(os.path.join(tmp, "empty"))
-
-        os.makedirs(os.path.join(tmp, "chain", "only", "child"))
-        open(os.path.join(tmp, "chain", "only", "child", "leaf.py"), "w").close()
-
-        # ── Full expansion with generous budget ──────────────────
-        print("\n── glob_script: full expansion ──")
-        out = run_glob(tmp, "**/*.py", 100)
-        R.check("no script error", not out.startswith("SCRIPT ERROR"), out[:200])
-        R.check("header shows 9 matches", parse_header(out) == 9, out.split("\n")[0])
-        lines = body_lines(out)
-        R.check("9 file lines", len(lines) == 9, f"got {len(lines)}")
-        R.check("all paths absolute", all(l.startswith("/") for l in lines), lines[:3])
-        R.check("no collapsed dirs", not any("matches)" in l for l in lines), str(lines))
-        R.check("no budget note in header", "budget" not in out.split("\n")[0], out.split("\n")[0])
-
-        # ── Tight budget forces collapsing ───────────────────────
-        print("\n── glob_script: tight budget ──")
-        out = run_glob(tmp, "**/*.py", 5)
-        R.check("header still shows 9", parse_header(out) == 9, out.split("\n")[0])
-        lines = body_lines(out)
-        R.check("body within budget", len(lines) <= 5, f"got {len(lines)} lines")
-        R.check("budget note in header", "budget" in out.split("\n")[0], out.split("\n")[0])
-        # sub/ has the most matches (5) so it should be collapsed
-        collapsed = [l for l in lines if "matches)" in l]
-        R.check("at least one collapsed dir", len(collapsed) >= 1, str(lines))
-
-        # ── Match counts are conserved ───────────────────────────
-        print("\n── glob_script: count conservation ──")
-        out = run_glob(tmp, "**/*.py", 5)
-        total = parse_header(out)
-        lines = body_lines(out)
-        # Count: each plain file = 1, each "(N matches)" = N, each "... and N more" = N
-        accounted = 0
-        for l in lines:
-            if "... and " in l and " more matches" in l:
-                accounted += int(l.split("... and ")[1].split(" more")[0])
-            elif "matches)" in l:
-                accounted += int(l.split("(")[1].split(" ")[0])
-            else:
-                accounted += 1
-        R.check("counts conserved", accounted == total,
-                f"accounted {accounted} vs header {total}")
-
-        # ── Single-child chains expand for free ──────────────────
-        print("\n── glob_script: single-child chain ──")
-        out = run_glob(tmp, "chain/**/*.py", 5)
-        R.check("header shows 1 match", parse_header(out) == 1, out.split("\n")[0])
-        lines = body_lines(out)
-        R.check("leaf.py fully expanded", len(lines) == 1, f"got {len(lines)}")
-        R.check("shows absolute path to leaf",
-                lines[0].endswith("chain/only/child/leaf.py"), lines[0])
-
-        # ── Pattern filters correctly ────────────────────────────
-        print("\n── glob_script: pattern filtering ──")
-        out = run_glob(tmp, "*.txt", 100)
-        R.check("txt header shows 1", parse_header(out) == 1, out.split("\n")[0])
-        R.check("only c.txt", body_lines(out)[0].endswith("c.txt"), body_lines(out))
-
-        # ── No matches ───────────────────────────────────────────
-        print("\n── glob_script: no matches ──")
-        out = run_glob(tmp, "**/*.rs", 100)
-        R.check("reports 0 matches", out.startswith("0 matches"), out[:50])
-
-        # ── Bad directory ────────────────────────────────────────
-        print("\n── glob_script: bad directory ──")
-        out = run_glob("/nonexistent/path", "**/*", 100)
-        R.check("reports error", out.startswith("Error:"), out[:50])
-
-        # ── Partial expansion ────────────────────────────────────
-        print("\n── glob_script: partial expansion ──")
-        # sub/ has 5 matches (2 files + deep/ with 3). Expanding sub/
-        # costs 2 net lines (3 children - 1). Budget=7 means:
-        #   root: 2 files + 3 collapsed dirs = 5 lines
-        #   expand sub/ (+2): 2 files + deep/(collapsed) = 7 lines
-        #   expand deep/ (+2 net) would be 9 — over budget.
-        # But deep/ has 3 children and expanding costs 2 net lines.
-        # At budget=8, deep/ expansion fits (7+2=9 > 8) — nope.
-        # At budget=9, deep fits. So budget=8 should leave deep/ collapsed.
-        #
-        # For actual partial expansion we need a dir with many children.
-        # Make a wide/ dir with 10 files:
-        os.makedirs(os.path.join(tmp, "wide"))
-        for j in range(10):
-            open(os.path.join(tmp, "wide", f"w{j}.py"), "w").close()
-
-        # Now root has 2 files + 4 dirs = 6 lines.
-        # wide/ has 10 children; full expansion costs 9 net lines.
-        # Budget=10: 6 + 9 = 15 > 10, so wide/ gets partial expansion.
-        # Budget_for_children = 10 - 6 = 4 items shown + overflow line.
-        out = run_glob(tmp, "**/*.py", 10)
-        lines = body_lines(out)
-        R.check("body within budget", len(lines) <= 10, f"got {len(lines)}")
-        overflow = [l for l in lines if "... and " in l and " more matches" in l]
-        R.check("has overflow line", len(overflow) >= 1, str(lines))
-        # Verify conservation still holds
-        total = parse_header(out)
-        accounted = 0
-        for l in lines:
-            if "... and " in l and " more matches" in l:
-                accounted += int(l.split("... and ")[1].split(" more")[0])
-            elif "matches)" in l:
-                accounted += int(l.split("(")[1].split(" ")[0])
-            else:
-                accounted += 1
-        R.check("partial expansion counts conserved", accounted == total,
-                f"accounted {accounted} vs header {total}")
-
-        # ── Multi-pattern union ──────────────────────────────────
-        print("\n── glob_script: multi-pattern union ──")
-        out = run_glob(tmp, "**/*.py,**/*.txt", 100)
-        total = parse_header(out)
-        # 19 .py files (original 9 + 10 in wide/) + 1 .txt = 20
-        R.check("union includes both extensions", total == 20,
-                f"expected 20, got {total}")
-        lines = body_lines(out)
-        has_py = any(l.endswith(".py") for l in lines)
-        has_txt = any(l.endswith(".txt") for l in lines)
-        R.check("has .py files", has_py, str(lines[:3]))
-        R.check("has .txt files", has_txt, str(lines[:3]))
-
-        # ── Negation excludes matches ────────────────────────────
-        print("\n── glob_script: negation ──")
-        out = run_glob(tmp, "**/*.py,!**/deep/**", 100)
-        total = parse_header(out)
-        # 19 .py total minus 3 in deep/ = 16
-        R.check("negation removes deep/", total == 16,
-                f"expected 16, got {total}")
-        lines = body_lines(out)
-        has_deep = any("deep" in l for l in lines)
-        R.check("no deep/ files in output", not has_deep, str([l for l in lines if "deep" in l]))
-
-        # ── Negation is order-independent ────────────────────────
-        print("\n── glob_script: negation order-independent ──")
-        out_a = run_glob(tmp, "**/*.py,!**/wide/**", 100)
-        out_b = run_glob(tmp, "!**/wide/**,**/*.py", 100)
-        R.check("order does not matter",
-                parse_header(out_a) == parse_header(out_b),
-                f"{parse_header(out_a)} vs {parse_header(out_b)}")
-
-        # ── Braces not split ─────────────────────────────────────
-        print("\n── glob_script: braces preserved ──")
-        # {py,txt} brace expansion — if Python supports it, should
-        # match both; if not, 0 matches.  Either way, no crash.
-        out = run_glob(tmp, "*.{py,txt}", 100)
-        R.check("brace pattern no error",
-                not out.startswith("Error:") and not out.startswith("SCRIPT ERROR"),
-                out[:80])
-        # Verify braces + comma delimiter coexist:
-        # "*.{py,txt},!**/deep/**" should parse as two terms, not three.
-        out = run_glob(tmp, "**/*.{py,txt},!**/deep/**", 100)
-        total = parse_header(out)
-        lines = body_lines(out)
-        has_deep = any("deep" in l for l in lines)
-        R.check("brace+negation excludes deep/", not has_deep,
-                str([l for l in lines if "deep" in l]))
-
-        # ── No positive patterns is an error ─────────────────────
-        print("\n── glob_script: no positive patterns ──")
-        out = run_glob(tmp, "!**/*.py", 100)
-        R.check("rejects all-negative", out.startswith("Error:"), out[:80])
-
-        # ── Negation count conservation ──────────────────────────
-        print("\n── glob_script: negation count conservation ──")
-        out = run_glob(tmp, "**/*,!**/wide/**,!**/deep/**", 5)
-        total = parse_header(out)
-        lines = body_lines(out)
-        accounted = 0
-        for l in lines:
-            if "... and " in l and " more matches" in l:
-                accounted += int(l.split("... and ")[1].split(" more")[0])
-            elif "matches)" in l:
-                accounted += int(l.split("(")[1].split(" ")[0])
-            else:
-                accounted += 1
-        R.check("negation counts conserved", accounted == total,
-                f"accounted {accounted} vs header {total}")
-
-        # ── Absolute pattern under base is silently relativized ──
-        print("\n── glob_script: absolute pattern relativized ──")
-        # A model that knows the workspace root naturally uses absolute
-        # paths like /tmp/something/**/*.py.  The fix should strip the
-        # base prefix and produce the same result as the relative form.
-        # Use the resolved path because Path.resolve() normalises symlinks
-        # (e.g. /var -> /private/var on macOS), matching what the script
-        # itself does when it calls Path(base_dir).resolve().
-        import pathlib as _pathlib
-        abs_pattern = str(_pathlib.Path(tmp).resolve()) + "/**/*.py"
-        rel_pattern = "**/*.py"
-        out_abs = run_glob(tmp, abs_pattern, 100)
-        out_rel = run_glob(tmp, rel_pattern, 100)
-        R.check("abs pattern no script error",
-                not out_abs.startswith("SCRIPT ERROR") and not out_abs.startswith("Error:"),
-                out_abs[:200])
-        R.check("abs pattern matches same count as relative",
-                parse_header(out_abs) == parse_header(out_rel),
-                f"abs={parse_header(out_abs)}, rel={parse_header(out_rel)}")
-
-        # ── Absolute pattern outside base works ─────────────────
-        print("\n── glob_script: absolute pattern outside base ──")
-        # Create a sibling directory outside the "workspace" tmp dir
-        # and verify we can glob into it with an absolute pattern.
-        import pathlib as _pathlib2
-        sibling = tempfile.mkdtemp()
-        try:
-            open(os.path.join(sibling, "outside.py"), "w").close()
-            resolved_sibling = str(_pathlib2.Path(sibling).resolve())
-            out_outside = run_glob(tmp, resolved_sibling + "/**/*.py", 100)
-            R.check("outside-base pattern no error",
-                    not out_outside.startswith("SCRIPT ERROR") and not out_outside.startswith("Error:"),
-                    out_outside[:200])
-            R.check("outside-base finds file",
-                    parse_header(out_outside) == 1,
-                    out_outside.split("\n")[0])
-            R.check("outside-base shows absolute path",
-                    "outside.py" in out_outside,
-                    out_outside)
-        finally:
-            import shutil
-            shutil.rmtree(sibling)
-
-
-async def test_grep_script(R: Results):
-    from lathe import _GREP_SCRIPT
-
-    def run_grep(base_dir, regex, files_pattern, max_lines):
-        """Exec the grep script via subprocess, return stdout."""
-        script = (
-            _GREP_SCRIPT
-            + f"\nprint(grep_hierarchy({base_dir!r}, {regex!r}, {files_pattern!r}, {max_lines!r}))"
-        )
-        result = subprocess.run(
-            [sys.executable, "-c", script],
-            capture_output=True, text=True,
-        )
-        if result.returncode != 0:
-            return f"SCRIPT ERROR: {result.stderr}"
-        return result.stdout.rstrip("\n")
-
-    def parse_header_matches(output):
-        """Extract total match count from header."""
-        return int(output.split("\n")[0].split(" ")[0])
-
-    def parse_header_files(output):
-        """Extract file count from header."""
-        first = output.split("\n")[0]
-        # "N matches across M files for ..."
-        return int(first.split(" across ")[1].split(" ")[0])
-
-    def body_lines(output):
-        return output.split("\n")[1:]
-
-    # ── Build a known directory tree with known content ──────────
-    #
-    #   tmp/
-    #     a.py          contains: "def foo():", "def bar():"
-    #     b.py          contains: "def baz():"
-    #     c.txt         contains: "def txt_func():"
-    #     sub/
-    #       d.py        contains: "def sub_one():", "def sub_two():", "def sub_three():"
-    #       e.py        contains: "class Helper:"
-    #     other/
-    #       f.py        contains: "def other_func():"
-
-    with tempfile.TemporaryDirectory() as tmp:
-        def writef(relpath, content):
-            full = os.path.join(tmp, relpath)
-            os.makedirs(os.path.dirname(full), exist_ok=True)
-            with open(full, "w") as f:
-                f.write(content)
-
-        writef("a.py", "def foo():\n    pass\ndef bar():\n    pass\n")
-        writef("b.py", "def baz():\n    pass\n")
-        writef("c.txt", "def txt_func():\n    pass\n")
-        writef("sub/d.py", "def sub_one():\n    pass\ndef sub_two():\n    pass\ndef sub_three():\n    pass\n")
-        writef("sub/e.py", "class Helper:\n    pass\n")
-        writef("other/f.py", "def other_func():\n    pass\n")
-
-        # ── Full expansion with generous budget ──────────────────
-        print("\n── grep_script: full expansion ──")
-        out = run_grep(tmp, "def ", "**/*.py", 100)
-        R.check("no script error", not out.startswith("SCRIPT ERROR"), out[:200])
-        total = parse_header_matches(out)
-        R.check("header shows 7 matches", total == 7, out.split("\n")[0])
-        n_files = parse_header_files(out)
-        R.check("header shows 4 files", n_files == 4, out.split("\n")[0])
-        lines = body_lines(out)
-        # All 7 matches should be expanded as file:line: text
-        match_lines = [l for l in lines if ":" in l and "matches)" not in l]
-        R.check("7 match lines", len(match_lines) == 7, f"got {len(match_lines)}")
-        R.check("no budget note", "budget" not in out.split("\n")[0], out.split("\n")[0])
-
-        # ── File scope filtering ─────────────────────────────────
-        print("\n── grep_script: file scope ──")
-        out = run_grep(tmp, "def ", "**/*.txt", 100)
-        total = parse_header_matches(out)
-        R.check("txt scope finds 1", total == 1, out.split("\n")[0])
-
-        # ── Tight budget collapses files ─────────────────────────
-        print("\n── grep_script: tight budget ──")
-        # 4 files with matches; budget=5 means d.py (3 matches) can
-        # expand (+2 net) for 6 total, which won't fit. So all stay
-        # collapsed except single-match files (free to expand).
-        out = run_grep(tmp, "def ", "**/*.py", 5)
-        lines = body_lines(out)
-        R.check("body within budget", len(lines) <= 5, f"got {len(lines)}")
-        R.check("budget note in header", "budget" in out.split("\n")[0], out.split("\n")[0])
-        collapsed = [l for l in lines if "matches)" in l and "... and" not in l]
-        R.check("at least one collapsed file", len(collapsed) >= 1, str(lines))
-
-        # ── Match count conservation ─────────────────────────────
-        print("\n── grep_script: count conservation ──")
-        out = run_grep(tmp, "def ", "**/*.py", 5)
-        total = parse_header_matches(out)
-        lines = body_lines(out)
-        accounted = 0
-        for l in lines:
-            if "... and " in l and " more match" in l:
-                accounted += int(l.split("... and ")[1].split(" more")[0])
-            elif "matches)" in l and "files)" not in l:
-                # "file (N matches)" — extract N
-                accounted += int(l.split("(")[1].split(" ")[0])
-            elif "matches in " in l:
-                # "dir/ (N matches in M files)" — extract N
-                accounted += int(l.split("(")[1].split(" ")[0])
-            else:
-                accounted += 1
-        R.check("counts conserved", accounted == total,
-                f"accounted {accounted} vs header {total}")
-
-        # ── Negation in file scope ───────────────────────────────
-        print("\n── grep_script: file negation ──")
-        out = run_grep(tmp, "def ", "**/*.py,!**/sub/**", 100)
-        total = parse_header_matches(out)
-        # a.py(2) + b.py(1) + other/f.py(1) = 4
-        R.check("negation removes sub/", total == 4,
-                f"expected 4, got {total}")
-        lines = body_lines(out)
-        has_sub = any("sub" in l for l in lines)
-        R.check("no sub/ in output", not has_sub, str([l for l in lines if "sub" in l]))
-
-        # ── No matches ───────────────────────────────────────────
-        print("\n── grep_script: no matches ──")
-        out = run_grep(tmp, "ZZZNOMATCH", "**/*.py", 100)
-        R.check("reports 0 matches", "0 matches" in out, out[:50])
-
-        # ── Bad regex ────────────────────────────────────────────
-        print("\n── grep_script: bad regex ──")
-        out = run_grep(tmp, "[invalid", "**/*.py", 100)
-        R.check("reports regex error", out.startswith("Error:"), out[:80])
-
-        # ── Bad directory ────────────────────────────────────────
-        print("\n── grep_script: bad directory ──")
-        out = run_grep("/nonexistent/path", "foo", "**/*", 100)
-        R.check("reports dir error", out.startswith("Error:"), out[:50])
-
-        # ── Single-match file expands for free ───────────────────
-        print("\n── grep_script: single match file ──")
-        out = run_grep(tmp, "class ", "**/*.py", 100)
-        total = parse_header_matches(out)
-        R.check("finds 1 class match", total == 1, out.split("\n")[0])
-        lines = body_lines(out)
-        R.check("match line has line number",
-                any(":1: class Helper:" in l for l in lines), str(lines))
-
-        # ── Partial file expansion ───────────────────────────────
-        print("\n── grep_script: partial file expansion ──")
-        # d.py has 3 matches. With budget=2 and 4 files:
-        # all collapsed = 4 lines > budget 2.
-        # Actually we need a scenario where files fit but match lines don't.
-        # Make a file with many matches:
-        writef("many.py", "\n".join(f"def func_{i}():" for i in range(20)))
-        out = run_grep(tmp, "def ", "many.py", 10)
-        total = parse_header_matches(out)
-        R.check("many.py has 20 matches", total == 20, out.split("\n")[0])
-        lines = body_lines(out)
-        R.check("body within budget", len(lines) <= 10, f"got {len(lines)}")
-        overflow = [l for l in lines if "... and " in l and " more match" in l]
-        R.check("has overflow line", len(overflow) == 1, str(lines))
-
-        # ── Line truncation ──────────────────────────────────────
-        print("\n── grep_script: line truncation ──")
-        writef("long.py", "def " + "x" * 300 + "():\n    pass\n")
-        out = run_grep(tmp, "def ", "long.py", 100)
-        lines = body_lines(out)
-        R.check("long line truncated", lines[0].endswith("..."), lines[0][-20:])
-        # 200 char max + file:line: prefix + "..."
-        content_part = lines[0].split(": ", 1)[1] if ": " in lines[0] else lines[0]
-        R.check("truncated within limit", len(content_part) <= 210,
-                f"got {len(content_part)}")
-
-        # ── Absolute files pattern under base is relativized ─────
-        print("\n── grep_script: absolute files pattern relativized ──")
-        # Use the resolved path (see glob test comment above).
-        import pathlib as _pathlib
-        abs_files = str(_pathlib.Path(tmp).resolve()) + "/**/*.py"
-        rel_files = "**/*.py"
-        out_abs = run_grep(tmp, "def ", abs_files, 100)
-        out_rel = run_grep(tmp, "def ", rel_files, 100)
-        R.check("abs files pattern no script error",
-                not out_abs.startswith("SCRIPT ERROR") and not out_abs.startswith("Error:"),
-                out_abs[:200])
-        R.check("abs files pattern matches same count as relative",
-                parse_header_matches(out_abs) == parse_header_matches(out_rel),
-                f"abs={parse_header_matches(out_abs)}, rel={parse_header_matches(out_rel)}")
-
-        # ── Absolute files pattern outside base works ────────────
-        print("\n── grep_script: absolute files pattern outside base ──")
-        # Create a sibling directory outside the "workspace" tmp dir
-        # and verify we can grep into it with an absolute files pattern.
-        import pathlib as _pathlib2
-        sibling = tempfile.mkdtemp()
-        try:
-            with open(os.path.join(sibling, "outside.py"), "w") as f:
-                f.write("def outside_func():\n    pass\n")
-            resolved_sibling = str(_pathlib2.Path(sibling).resolve())
-            out_outside = run_grep(tmp, "def ", resolved_sibling + "/**/*.py", 100)
-            R.check("outside-base files pattern no error",
-                    not out_outside.startswith("SCRIPT ERROR") and not out_outside.startswith("Error:"),
-                    out_outside[:200])
-            R.check("outside-base grep finds match",
-                    parse_header_matches(out_outside) == 1,
-                    out_outside.split("\n")[0])
-            R.check("outside-base grep shows file",
-                    "outside.py" in out_outside,
-                    out_outside)
-        finally:
-            import shutil
-            shutil.rmtree(sibling)
-
-
-async def test_read_script(R: Results):
-    from lathe import _READ_SCRIPT
-
-    def run_read(path, start, stop):
-        """Exec the read script via subprocess, return stdout."""
-        script = (
-            _READ_SCRIPT
-            + f"\nprint(read_file({path!r}, {start!r}, {stop!r}))"
-        )
-        result = subprocess.run(
-            [sys.executable, "-c", script],
-            capture_output=True, text=True,
-        )
-        if result.returncode != 0:
-            return f"SCRIPT ERROR: {result.stderr}"
-        return result.stdout.rstrip("\n")
-
-    with tempfile.TemporaryDirectory() as tmp:
-        def writef(name, content):
-            p = os.path.join(tmp, name)
-            with open(p, "w") as f:
-                f.write(content)
-            return p
-
-        # ── Basic read (all lines) ───────────────────────────────
-        print("\n── read_script: basic read ──")
-        p = writef("basic.txt", "line1\nline2\nline3\n")
-        out = run_read(p, 1, 0)
-        R.check("no script error", not out.startswith("SCRIPT ERROR"), out[:100])
-        R.check("has file header", "File:" in out and "3 lines total" in out, out[:80])
-        R.check("has line 1", "1: line1" in out, out)
-        R.check("has line 2", "2: line2" in out, out)
-        R.check("has line 3", "3: line3" in out, out)
-        R.check("no range annotation", "showing lines" not in out, out[:80])
-
-        # ── Positive start/stop ──────────────────────────────────
-        print("\n── read_script: positive start/stop ──")
-        p = writef("ten.txt", "\n".join(f"line{i}" for i in range(1, 11)) + "\n")
-        out = run_read(p, 3, 5)
-        R.check("range annotation present", "showing lines 3-4" in out, out[:100])
-        R.check("has line 3", "3: line3" in out, out)
-        R.check("has line 4", "4: line4" in out, out)
-        R.check("no line 5", "5: line5" not in out, out)
-
-        # ── Negative start (last N lines) ────────────────────────
-        print("\n── read_script: negative start ──")
-        out = run_read(p, -3, 0)
-        R.check("has line 8", "8: line8" in out, out)
-        R.check("has line 9", "9: line9" in out, out)
-        R.check("has line 10", "10: line10" in out, out)
-        R.check("no line 7", "7: line7" not in out, out)
-
-        # ── Negative start and stop ──────────────────────────────
-        print("\n── read_script: negative start and stop ──")
-        out = run_read(p, -5, -3)
-        R.check("has line 6", "6: line6" in out, out)
-        R.check("has line 7", "7: line7" in out, out)
-        R.check("no line 8", "8: line8" not in out, out)
-        R.check("no line 5", "5: line5" not in out, out)
-
-        # ── start=0 treated as 1 ─────────────────────────────────
-        print("\n── read_script: start=0 clamps to 1 ──")
-        out = run_read(p, 0, 3)
-        R.check("starts at line 1", "1: line1" in out, out)
-        R.check("no line 3", "3: line3" not in out, out)
-
-        # ── Empty range ───────────────────────────────────────────
-        print("\n── read_script: empty range ──")
-        out = run_read(p, 5, 3)
-        R.check("header shows total", "10 lines total" in out, out[:100])
-        R.check("no numbered lines", "1: line" not in out, out)
-
-        # ── File not found ────────────────────────────────────────
-        print("\n── read_script: file not found ──")
-        out = run_read("/nonexistent/path/file.txt", 1, 0)
-        R.check("reports not found", out.startswith("Error:") and "not found" in out.lower(), out[:80])
-
-        # ── File with special chars in path ───────────────────────
-        print("\n── read_script: special chars in path ──")
-        tricky = writef("it's a 'test'.txt", "hello\nworld\n")
-        out = run_read(tricky, 1, 0)
-        R.check("reads file with special path", "1: hello" in out, out)
-
-        # ── 2000-line cap ─────────────────────────────────────────
-        print("\n── read_script: 2000-line cap ──")
-        big = writef("big.txt", "\n".join(f"x{i}" for i in range(3000)) + "\n")
-        out = run_read(big, 1, 0)
-        line_count = out.count("\n")
-        R.check("capped at 2000 lines", line_count <= 2001, f"got {line_count} lines")
-
-
-async def test_write_script(R: Results):
-    from lathe import _WRITE_SCRIPT
-
-    def run_write(path, content):
-        """Exec the write script via subprocess, return stdout."""
-        script = (
-            _WRITE_SCRIPT
-            + f"\nprint(write_file({path!r}, {content!r}))"
-        )
-        result = subprocess.run(
-            [sys.executable, "-c", script],
-            capture_output=True, text=True,
-        )
-        if result.returncode != 0:
-            return f"SCRIPT ERROR: {result.stderr}"
-        return result.stdout.rstrip("\n")
-
-    with tempfile.TemporaryDirectory() as tmp:
-        def readf(path):
-            with open(path) as f:
-                return f.read()
-
-        # ── Basic write ──────────────────────────────────────────
-        print("\n── write_script: basic write ──")
-        p = os.path.join(tmp, "basic.txt")
-        out = run_write(p, "hello\nworld\n")
-        R.check("no script error", not out.startswith("SCRIPT ERROR"), out[:100])
-        R.check("reports bytes", "12 bytes" in out, out)
-        R.check("reports lines", "2 lines" in out, out)
-        R.check("reports path", p in out, out)
-        R.check("file written", readf(p) == "hello\nworld\n", readf(p))
-
-        # ── Creates parent directories ────────────────────────────
-        print("\n── write_script: creates parents ──")
-        p = os.path.join(tmp, "a", "b", "c", "nested.py")
-        out = run_write(p, "x = 1\n")
-        R.check("nested write succeeds", "Wrote" in out, out)
-        R.check("nested file written", readf(p) == "x = 1\n", readf(p))
-
-        # ── Overwrites existing file ──────────────────────────────
-        print("\n── write_script: overwrites existing ──")
-        p = os.path.join(tmp, "over.txt")
-        run_write(p, "original\n")
-        out = run_write(p, "replaced\n")
-        R.check("overwrite succeeds", "Wrote" in out, out)
-        R.check("content replaced", readf(p) == "replaced\n", readf(p))
-
-        # ── Byte count is UTF-8 ───────────────────────────────────
-        print("\n── write_script: UTF-8 byte count ──")
-        p = os.path.join(tmp, "utf8.txt")
-        content = "café\n"  # 'é' is 2 bytes in UTF-8
-        out = run_write(p, content)
-        expected_bytes = len(content.encode("utf-8"))
-        R.check("byte count is UTF-8", str(expected_bytes) + " bytes" in out, out)
-
-        # ── Empty file ────────────────────────────────────────────
-        print("\n── write_script: empty file ──")
-        p = os.path.join(tmp, "empty.txt")
-        out = run_write(p, "")
-        R.check("empty write succeeds", "Wrote" in out, out)
-        R.check("empty file exists", os.path.exists(p), p)
-
-        # ── Content with special chars ────────────────────────────
-        print("\n── write_script: special chars in content ──")
-        p = os.path.join(tmp, "special.py")
-        content = "x = \"it's a \\\"test\\\"\"\n"
-        out = run_write(p, content)
-        R.check("special chars no script error",
-                not out.startswith("SCRIPT ERROR"), out[:100])
-        R.check("file content correct", readf(p) == content, readf(p))
-
-        # ── No trailing newline line count ────────────────────────
-        print("\n── write_script: no trailing newline ──")
-        p = os.path.join(tmp, "nonl.txt")
-        out = run_write(p, "a\nb\nc")
-        R.check("3 lines reported", "3 lines" in out, out)
-
-
-async def test_edit_script(R: Results):
-    from lathe import _EDIT_SCRIPT
-
-    def run_edit(path, old_string, new_string, replace_all):
-        """Exec the edit script via subprocess, return stdout."""
-        script = (
-            _EDIT_SCRIPT
-            + f"\nprint(edit_file({path!r}, {old_string!r}, {new_string!r}, {replace_all!r}))"
-        )
-        result = subprocess.run(
-            [sys.executable, "-c", script],
-            capture_output=True, text=True,
-        )
-        if result.returncode != 0:
-            return f"SCRIPT ERROR: {result.stderr}"
-        return result.stdout.rstrip("\n")
-
-    with tempfile.TemporaryDirectory() as tmp:
-        def writef(name, content):
-            p = os.path.join(tmp, name)
-            with open(p, "w") as f:
-                f.write(content)
-            return p
-
-        def readf(path):
-            with open(path) as f:
-                return f.read()
-
-        # ── Single match succeeds ────────────────────────────────
-        print("\n── edit_script: single match ──")
-        p = writef("single.txt", "hello world\n")
-        out = run_edit(p, "hello", "goodbye", False)
-        R.check("reports 1 replacement", "Replaced 1 occurrence" in out, out)
-        R.check("file updated", readf(p) == "goodbye world\n", readf(p))
-
-        # ── No match returns error ───────────────────────────────
-        print("\n── edit_script: no match ──")
-        p = writef("nomatch.txt", "hello world\n")
-        out = run_edit(p, "ZZZNOMATCH", "x", False)
-        R.check("reports not found", out.startswith("Error:") and "not found" in out, out)
-        R.check("file unchanged", readf(p) == "hello world\n", readf(p))
-
-        # ── Ambiguous match without replace_all ─────────────────
-        print("\n── edit_script: ambiguous match ──")
-        p = writef("ambig.txt", "foo bar foo\n")
-        out = run_edit(p, "foo", "baz", False)
-        R.check("reports 2 matches", "2 matches" in out or "Found 2" in out, out)
-        R.check("suggests replace_all", "replace_all" in out, out)
-        R.check("file unchanged", readf(p) == "foo bar foo\n", readf(p))
-
-        # ── replace_all replaces all occurrences ─────────────────
-        print("\n── edit_script: replace_all ──")
-        p = writef("all.txt", "foo bar foo\n")
-        out = run_edit(p, "foo", "baz", True)
-        R.check("reports 2 replacements", "2 occurrence" in out, out)
-        R.check("both replaced", readf(p) == "baz bar baz\n", readf(p))
-
-        # ── File not found ────────────────────────────────────────
-        print("\n── edit_script: file not found ──")
-        out = run_edit("/nonexistent/path/x.txt", "a", "b", False)
-        R.check("reports not found", out.startswith("Error:") and "not found" in out.lower(), out)
-
-        # ── Multiline old/new strings ─────────────────────────────
-        print("\n── edit_script: multiline strings ──")
-        p = writef("multi.txt", "def foo():\n    pass\n\ndef bar():\n    pass\n")
-        out = run_edit(p, "def foo():\n    pass", "def foo():\n    return 42", False)
-        R.check("multiline replacement succeeds", "Replaced 1" in out, out)
-        R.check("new content present", "return 42" in readf(p), readf(p))
-
-        # ── Strings with special chars (quotes, backslashes) ─────
-        print("\n── edit_script: strings with special chars ──")
-        p = writef("special.txt", "it's a \"test\"\n")
-        out = run_edit(p, "it's a \"test\"", "it works", False)
-        R.check("special chars no script error",
-                not out.startswith("SCRIPT ERROR"), out[:100])
-        R.check("special chars replaced", "Replaced 1" in out, out)
-        R.check("file updated", readf(p) == "it works\n", readf(p))
-
-        # ── replace_all=False with multiple → error, file untouched ──
-        print("\n── edit_script: multiple + replace_all=False ──")
-        p = writef("multi2.txt", "x x x\n")
-        out = run_edit(p, "x", "y", False)
-        R.check("reports 3 matches", "3" in out and "match" in out, out)
-        R.check("file untouched", readf(p) == "x x x\n", readf(p))
-
-
-async def test_delegate_infrastructure(R: Results):
-    from lathe import (
-        _build_delegate_system_prompt, _DELEGATE_WITHHELD,
-        _DELEGATE_NUDGE_REMAINING,
-        _build_tool_catalog, Tools,
-    )
-
-    print("\n── delegate: system prompt (static content) ──")
-    # Test with a representative budget
-    prompt_10 = _build_delegate_system_prompt(10)
-    R.check("system prompt non-empty", len(prompt_10) > 100,
-            f"length={len(prompt_10)}")
-    R.check("system prompt mentions absolute paths",
-            "absolute" in prompt_10.lower(),
-            "should mention absolute path requirement")
-    R.check("system prompt mentions /home/daytona/workspace",
-            "/home/daytona/workspace" in prompt_10,
-            "should mention default working directory")
-
-    print("\n── delegate: system prompt (step budget) ──")
-    R.check("prompt includes step count",
-            "10 steps" in prompt_10,
-            "should state the budget")
-    R.check("prompt mentions planning",
-            "plan" in prompt_10.lower(),
-            "should tell sub-agent to plan")
-    R.check("prompt mentions summary",
-            "summary" in prompt_10.lower(),
-            "should mention reserving steps for summary")
-    R.check("prompt mentions handoff value",
-            "handoff" in prompt_10.lower() or "hand off" in prompt_10.lower(),
-            "should emphasize handing off work over rushing to finish")
-
-    # Verify budget is parameterized, not hardcoded
-    prompt_5 = _build_delegate_system_prompt(5)
-    R.check("budget is parameterized (5 vs 10)",
-            "5 steps" in prompt_5 and "10 steps" not in prompt_5,
-            f"5-step prompt should say '5 steps'")
-    prompt_1 = _build_delegate_system_prompt(1)
-    R.check("budget works for edge case (1 step)",
-            "1 steps" in prompt_1,
-            "1-step prompt should state the budget")
-
-    print("\n── delegate: nudge threshold ──")
-    R.check("nudge threshold is positive int",
-            isinstance(_DELEGATE_NUDGE_REMAINING, int) and _DELEGATE_NUDGE_REMAINING > 0,
-            f"got {_DELEGATE_NUDGE_REMAINING}")
-    R.check("nudge threshold is reasonable (<=5)",
-            _DELEGATE_NUDGE_REMAINING <= 5,
-            f"got {_DELEGATE_NUDGE_REMAINING}, should not be too aggressive")
-
-    print("\n── delegate: withheld tools ──")
-    R.check("withheld is a set", isinstance(_DELEGATE_WITHHELD, set),
-            type(_DELEGATE_WITHHELD).__name__)
-    R.check("lathe withheld", "lathe" in _DELEGATE_WITHHELD, str(_DELEGATE_WITHHELD))
-    R.check("onboard withheld", "onboard" in _DELEGATE_WITHHELD, str(_DELEGATE_WITHHELD))
-    R.check("expose withheld", "expose" in _DELEGATE_WITHHELD, str(_DELEGATE_WITHHELD))
-    R.check("destroy withheld", "destroy" in _DELEGATE_WITHHELD, str(_DELEGATE_WITHHELD))
-    R.check("delegate withheld (no recursion)", "delegate" in _DELEGATE_WITHHELD, str(_DELEGATE_WITHHELD))
-    R.check("bash NOT withheld", "bash" not in _DELEGATE_WITHHELD, str(_DELEGATE_WITHHELD))
-    R.check("read NOT withheld", "read" not in _DELEGATE_WITHHELD, str(_DELEGATE_WITHHELD))
-
-    print("\n── delegate: tool catalog includes delegate ──")
-    tools = Tools()
-    catalog = _build_tool_catalog(tools)
-    R.check("catalog includes delegate", "delegate(" in catalog,
-            "delegate should appear in tool catalog")
-    R.check("catalog includes bash", "bash(" in catalog,
-            "bash should appear in tool catalog")
-    # Verify delegate params are shown (task, context_files, max_steps — no standalone context)
-    delegate_line = [l for l in catalog.split("\n") if "delegate(" in l]
-    R.check("delegate line exists", len(delegate_line) == 1,
-            f"got {len(delegate_line)} lines")
-    if delegate_line:
-        R.check("delegate shows task param", "task" in delegate_line[0],
-                delegate_line[0])
-        R.check("delegate shows context_files param", "context_files" in delegate_line[0],
-                delegate_line[0])
-        R.check("delegate shows max_steps param", "max_steps" in delegate_line[0],
-                delegate_line[0])
-        R.check("delegate shows foreground_seconds param", "foreground_seconds" in delegate_line[0],
-                delegate_line[0])
-        # Ensure the old standalone "context" param is gone (context_files contains
-        # "context" as a substring, so check the actual param list in parens)
-        import re as _re
-        paren_match = _re.search(r"delegate\(([^)]*)\)", delegate_line[0])
-        if paren_match:
-            params_str = paren_match.group(1)
-            param_names = [p.strip() for p in params_str.split(",")]
-            R.check("no standalone context param", "context" not in param_names,
-                    f"params: {param_names}")
-
-
-async def test_pydantic_ai_v2_migration(R: Results):
-    """Lock in the supported V2 range and use of public AgentRun APIs."""
-    print("\n── pydantic-ai V2: dependency range ──")
-    from pathlib import Path
-    import re
-    import tomllib
-
-    root = Path(__file__).parent
-    module_source = (root / "lathe.py").read_text()
-    project = tomllib.loads((root / "pyproject.toml").read_text())
-    requirement_text = next(
-        dep for dep in project["project"]["dependencies"]
-        if dep.startswith("pydantic-ai-slim")
-    )
-    requirement = re.fullmatch(
-        r"pydantic-ai-slim\[([^]]+)]~=(\d+)\.(\d+)",
-        requirement_text,
-    )
-    metadata_line = next(
-        line for line in module_source.splitlines()
-        if line.startswith("requirements:")
-    )
-    R.check("OWUI and project requirements match",
-            requirement_text in metadata_line, metadata_line)
-    R.check("OpenAI provider extra is explicit",
-            requirement is not None and requirement.group(1) == "openai",
-            requirement_text)
-    floor = (
-        (int(requirement.group(2)), int(requirement.group(3)))
-        if requirement else None
-    )
-    R.check("supported range starts at secure V2 floor",
-            floor == (2, 5), requirement_text)
-    R.check("compatible release excludes V1 and V3",
-            requirement_text.startswith("pydantic-ai-slim")
-            and floor is not None and floor[0] == 2,
-            requirement_text)
-
-    print("\n── pydantic-ai V2: public AgentRun APIs ──")
-    R.check("nudge uses AgentRun.enqueue", "agent_run.enqueue(" in module_source)
-    R.check("no private graph state access", "agent_run._graph_run" not in module_source)
-    R.check("usage is accessed as a property", "usage = agent_run.usage\n" in module_source)
-    R.check("obsolete cleanup workaround removed",
-            "_unwrap_delegate_exception" not in module_source)
-
-
-async def test_persistent_volume_valve(R: Results):
-    """Test persistent_volume valve controls volume-related messaging."""
-    from lathe import Tools, _build_delegate_system_prompt
-
-    print("\n── persistent_volume valve: default ──")
-    tools = Tools()
-    R.check("valve exists", hasattr(tools.valves, "persistent_volume"))
-    R.check("valve defaults to True", tools.valves.persistent_volume is True)
-
-    print("\n── persistent_volume valve: delegate system prompt ──")
-    prompt_with = _build_delegate_system_prompt(10, has_volume=True)
-    prompt_without = _build_delegate_system_prompt(10, has_volume=False)
-    R.check("volume line present when has_volume=True",
-            "/home/daytona/volume" in prompt_with)
-    R.check("volume line absent when has_volume=False",
-            "/home/daytona/volume" not in prompt_without)
-    # Both should still mention the workspace
-    R.check("workspace present regardless (True)",
-            "/home/daytona/workspace" in prompt_with)
-    R.check("workspace present regardless (False)",
-            "/home/daytona/workspace" in prompt_without)
-
-    print("\n── persistent_volume valve: manpage substitution ──")
-    # Simulate what lathe() does with the overview manpage
-    overview = tools._MANPAGES["overview"]
-    R.check("overview has volume_note placeholder",
-            "{volume_note}" in overview)
-    R.check("overview has destroy_volume_note placeholder",
-            "{destroy_volume_note}" in overview)
-
-
-async def test_manpage_rendering(R: Results):
-    """Regression: every rendered manpage must be substantial and have all
-    placeholders resolved.
-
-    This class of bug recurs.  We've shipped at least once where
-    lathe(manpage="overview") returned the 14-character KeyError repr
-    "'volume_note'" because str.format() couldn't find a placeholder.
-    The test below would have caught that immediately: any non-trivial
-    length floor (say, 500 chars) would have failed for the broken
-    output, and the placeholder check would have failed independently.
-    """
-    from lathe import Tools
-
-    # Floor chosen to be (a) far above any plausible error message
-    # (KeyError reprs, "Error: ..." strings) and (b) far below the
-    # smallest legitimate manpage so we don't have to revisit it on
-    # every edit.
-    MIN_MANPAGE_LEN = 500
-    KNOWN_PLACEHOLDERS = ("{volume_note}", "{destroy_volume_note}", "{tool_catalog}")
-
-    print("\n── manpage rendering: every page is complete ──")
-    for has_volume in (True, False):
-        t = Tools()
-        t.valves.persistent_volume = has_volume
-        for page in sorted(t._MANPAGES.keys()):
-            label = f"{page!r} (persistent_volume={has_volume})"
-            result = await t.lathe(manpage=page)
-            complete = (
-                isinstance(result, str)
-                and len(result) >= MIN_MANPAGE_LEN
-                and not result.startswith(("Error:", "API error:"))
-                and all(ph not in result for ph in KNOWN_PLACEHOLDERS)
-            )
-            R.check(f"manpage {label} is complete", complete, result[:500])
-
-    print("\n── manpage rendering: overview specifics ──")
-    for has_volume in (True, False):
-        t = Tools()
-        t.valves.persistent_volume = has_volume
-        result = await t.lathe(manpage="overview")
-        label = f"persistent_volume={has_volume}"
-        R.check(
-            f"overview includes tool catalog entries ({label})",
-            "bash(" in result and "delegate(" in result,
-            result[:500],
-        )
-        if has_volume:
-            R.check(
-                "volume note appears when persistent_volume=True",
-                "/home/daytona/volume" in result,
-                result[:1000],
-            )
-        else:
-            R.check(
-                "volume note absent when persistent_volume=False",
-                "/home/daytona/volume" not in result,
-                result[:1000],
-            )
-
-    print("\n── manpage rendering: version page ──")
-    t = Tools()
-    ver = await t.lathe(manpage="version")
-    R.check(
-        "version page mentions Lathe",
-        "Lathe" in ver,
-        ver,
-    )
-
-    print("\n── manpage rendering: unknown manpage returns index ──")
-    t = Tools()
-    unknown = await t.lathe(manpage="not-a-real-page-xyz")
-    R.check(
-        "unknown manpage names the missing page",
-        "not-a-real-page-xyz" in unknown,
-        unknown[:300],
-    )
-    R.check(
-        "unknown manpage suggests overview",
-        "overview" in unknown,
-        unknown[:300],
-    )
-
-
-async def test_delegate_prompt_build(R: Results):
-    """Test _build_delegate_prompt assembles the sub-agent prompt correctly."""
-    from lathe import _build_delegate_prompt
-
-    print("\n── delegate prompt: task only ──")
-    msg = _build_delegate_prompt("Do the thing", [])
-    R.check("task-only starts with ## Task", msg.startswith("## Task"), msg[:30])
-    R.check("task-only contains task text", "Do the thing" in msg, msg)
-    R.check("task-only no Context section", "## Context" not in msg, msg)
-    R.check("task-only no Reference Files section", "## Reference Files" not in msg, msg)
-
-    print("\n── delegate prompt: task with inline context ──")
-    msg = _build_delegate_prompt("Do the thing. Error: something broke", [])
-    R.check("has Task section", "## Task" in msg, msg)
-    R.check("no Context section", "## Context" not in msg, msg)
-    R.check("inline context present in task", "Error: something broke" in msg, msg)
-    R.check("no Reference Files section", "## Reference Files" not in msg, msg)
-
-    print("\n── delegate prompt: task + context_files ──")
-    files = ["### /home/daytona/workspace/AGENTS.md\n\nBe careful."]
-    msg = _build_delegate_prompt("Do the thing", files)
-    R.check("has Task section", "## Task" in msg, msg)
-    R.check("no Context section", "## Context" not in msg, msg)
-    R.check("has Reference Files section", "## Reference Files" in msg, msg)
-    R.check("file path in output", "/home/daytona/workspace/AGENTS.md" in msg, msg)
-    R.check("file content in output", "Be careful." in msg, msg)
-
-    print("\n── delegate prompt: task + context_files (multiple) ──")
-    files = [
-        "### /home/daytona/workspace/AGENTS.md\n\nBe careful.",
-        "### /home/daytona/workspace/.agents/skills/deploy/SKILL.md\n\nDeploy instructions.",
-    ]
-    msg = _build_delegate_prompt("Fix the deploy. Build failed with exit 1", files)
-    R.check("has Task and Reference Files sections",
-            "## Task" in msg and "## Reference Files" in msg,
-            msg[:200])
-    R.check("no Context section", "## Context" not in msg, msg)
-    R.check("task text", "Fix the deploy" in msg, msg)
-    R.check("inline context in task", "Build failed with exit 1" in msg, msg)
-    R.check("first file present", "AGENTS.md" in msg, msg)
-    R.check("second file present", "SKILL.md" in msg, msg)
-    R.check("second file content", "Deploy instructions." in msg, msg)
-
-    print("\n── delegate prompt: section ordering ──")
-    # Task must come before Reference Files
-    task_pos = msg.index("## Task")
-    ref_pos = msg.index("## Reference Files")
-    R.check("Task before Reference Files", task_pos < ref_pos, f"{task_pos} vs {ref_pos}")
-
-
-async def test_delegate_tools_build(R: Results):
-    """Test that _build_delegate_tools produces the expected set of tools."""
-    from lathe import _build_delegate_tools
-
-    print("\n── delegate tools: structure ──")
-
-    # We can't call the tools (they need a real sandbox), but we can
-    # verify the factory produces the right number and names.
-    # Use a mock valves/sandbox_id/client — the factory only captures
-    # them in closures, doesn't call anything during construction.
-    class FakeValves:
-        daytona_api_key = "fake"
-        daytona_api_url = "https://fake.api"
-        daytona_proxy_url = "https://fake.proxy"
-
-    from cachetools import LRUCache
-    chat_state = LRUCache(maxsize=10)
-    chat_state["test-chat"] = {"init": True, "pending": []}
-
-    tools = _build_delegate_tools(FakeValves(), "fake-sandbox-id", None, [],
-                                  chat_state=chat_state, chat_id="test-chat")
-    tool_names = {t.name for t in tools}
-
-    R.check("produces 7 tools", len(tools) == 7, f"got {len(tools)}")
-    R.check("has bash", "bash" in tool_names, str(tool_names))
-    R.check("has read", "read" in tool_names, str(tool_names))
-    R.check("has write", "write" in tool_names, str(tool_names))
-    R.check("has edit", "edit" in tool_names, str(tool_names))
-    R.check("has glob", "glob" in tool_names, str(tool_names))
-    R.check("has grep", "grep" in tool_names, str(tool_names))
-    R.check("has interpret", "interpret" in tool_names, str(tool_names))
-
-    print("\n── delegate tools: without chat context ──")
-    tools_no_chat = _build_delegate_tools(FakeValves(), "fake-sandbox-id", None, [])
-    R.check("produces 6 tools without chat", len(tools_no_chat) == 6,
-            f"got {len(tools_no_chat)}")
-    R.check("no interpret without chat",
-            "interpret" not in {t.name for t in tools_no_chat})
-
-    # Verify withheld tools are NOT present
-    from lathe import _DELEGATE_WITHHELD
-    for withheld in _DELEGATE_WITHHELD:
-        R.check(f"does not have {withheld}", withheld not in tool_names,
-                str(tool_names))
-
-    # Verify _doc_from_core decorator populates docstrings from _core_*
-    print("\n── delegate tools: docstrings from _core_* ──")
-    from lathe import _core_read, _core_write, _core_edit, _core_bash, _core_glob, _core_grep, _core_interpret
-    import inspect
-    cores = {
-        "bash": _core_bash, "read": _core_read, "write": _core_write,
-        "edit": _core_edit, "glob": _core_glob, "grep": _core_grep,
-        "interpret": _core_interpret,
-    }
-    for t in tools:
-        core_fn = cores[t.name]
-        core_doc = inspect.getdoc(core_fn) or ""
-        # The tool's description should be the summary from the core docstring
-        # (everything before the first :param line)
-        summary = core_doc.split(":param")[0].strip()
-        R.check(f"{t.name} description from core",
-                t.description == summary,
-                f"got {t.description!r}, expected {summary!r}")
-        # Verify param descriptions made it into the schema
-        td = t.tool_def
-        schema_props = td.parameters_json_schema.get("properties", {})
-        for line in core_doc.split("\n"):
-            line = line.strip()
-            if line.startswith(":param "):
-                # Parse ":param name: description"
-                rest = line[len(":param "):]
-                pname, pdesc = rest.split(":", 1)
-                pname = pname.strip()
-                pdesc = pdesc.strip()
-                if pname in ("valves", "sandbox_id", "client", "emit", "user_pairs",
-                            "chat_state", "chat_id"):
-                    continue  # infrastructure params not in closure signature
-                if pname in schema_props:
-                    got_desc = schema_props[pname].get("description", "")
-                    R.check(f"{t.name}.{pname} has description",
-                            got_desc == pdesc,
-                            f"got {got_desc!r}, expected {pdesc!r}")
-
-    # Verify parameter schemas match known-good values.
-    # Format: {tool_name: {param_name: (json_type, has_default, default)}}
-    from lathe import _GLOB_MAX_LINES, _GREP_MAX_LINES, _INTERPRET_DEFAULT_TIMEOUT, _DELEGATE_BASH_FOREGROUND_SECONDS
-    EXPECTED_PARAMS = {
-        "bash": {
-            "command": ("string", False, None),
-            "workdir": ("string", True, "/home/daytona/workspace"),
-            "foreground_seconds": ("integer", True, _DELEGATE_BASH_FOREGROUND_SECONDS),
-        },
-        "read": {
-            "path": ("string", False, None),
-            "start": ("integer", True, 1),
-            "stop": ("integer", True, 0),
-        },
-        "write": {
-            "path": ("string", False, None),
-            "content": ("string", False, None),
-        },
-        "edit": {
-            "path": ("string", False, None),
-            "old_string": ("string", False, None),
-            "new_string": ("string", False, None),
-            "replace_all": ("boolean", True, False),
-        },
-        "glob": {
-            "pattern": ("string", False, None),
-            "max_lines": ("integer", True, _GLOB_MAX_LINES),
-        },
-        "grep": {
-            "pattern": ("string", False, None),
-            "files": ("string", True, "**/*"),
-            "max_lines": ("integer", True, _GREP_MAX_LINES),
-        },
-        "interpret": {
-            "code": ("string", False, None),
-            "timeout": ("integer", True, _INTERPRET_DEFAULT_TIMEOUT),
-        },
-    }
-
-    print("\n── delegate tools: parameter schema parity ──")
-    for t in tools:
-        if t.name not in EXPECTED_PARAMS:
-            continue
-        td = t.tool_def
-        schema = td.parameters_json_schema
-        props = schema.get("properties", {})
-        required = set(schema.get("required", []))
-        expected = EXPECTED_PARAMS[t.name]
-
-        actual_names = set(props.keys())
-        expected_names = set(expected.keys())
-        R.check(f"{t.name}: param names match",
-                actual_names == expected_names,
-                f"expected {sorted(expected_names)}, got {sorted(actual_names)}")
-
-        for pname, (exp_type, exp_has_default, exp_default) in expected.items():
-            if pname not in props:
-                continue
-            prop = props[pname]
-            got_type = prop.get("type", "")
-            R.check(f"{t.name}.{pname}: json type",
-                    got_type == exp_type,
-                    f"expected {exp_type!r}, got {got_type!r}")
-            is_required = pname in required
-            R.check(f"{t.name}.{pname}: required",
-                    is_required == (not exp_has_default),
-                    f"expected required={not exp_has_default}, got {is_required}")
-            if exp_has_default:
-                got_default = prop.get("default")
-                R.check(f"{t.name}.{pname}: default",
-                        got_default == exp_default,
-                        f"expected {exp_default!r}, got {got_default!r}")
-
-
-async def test_build_bash_script(R: Results):
-    from lathe import _build_bash_script
-
-    print("\n── _build_bash_script: basic structure ──")
-    script = _build_bash_script("echo hello", [], "/dev/shm/lathe/cmd/test/pid", "/dev/shm/lathe/cmd/test/log")
-    R.check("starts with shebang", script.startswith("#!/usr/bin/env bash\n"), script[:30])
-    R.check("has set -e", "set -e -o pipefail" in script, script[:100])
-    R.check("has DEBIAN_FRONTEND", "DEBIAN_FRONTEND=noninteractive" in script, "missing env")
-    R.check("writes PID", "/dev/shm/lathe/cmd/test/pid" in script, "missing PID path")
-    R.check("tees to log", "/dev/shm/lathe/cmd/test/log" in script, "missing log path")
-    R.check("has command", "echo hello" in script, "missing command")
-    R.check("ends with newline", script.endswith("\n"), "should end with newline")
-
-    print("\n── _build_bash_script: user env vars ──")
-    script = _build_bash_script("ls", [("FOO", "bar"), ("SECRET", "it's a \"test\"")],
-                                "/dev/shm/lathe/cmd/x/pid", "/dev/shm/lathe/cmd/x/log")
-    R.check("exports FOO", "export FOO='bar'" in script, script[:300])
-    R.check("exports SECRET with quoting", "export SECRET=" in script, script[:300])
-    # The value should be shell-quoted
-    R.check("SECRET value quoted", "'it'\\''s a \"test\"'" in script, script[:300])
-
-    print("\n── _build_bash_script: no env vars ──")
-    script = _build_bash_script("pwd", [], "/dev/shm/lathe/cmd/y/pid", "/dev/shm/lathe/cmd/y/log")
-    R.check("no export lines", "export FOO" not in script, "should have no user exports")
-    R.check("still has CI=true", "CI=true" in script, "missing CI env")
-
-async def test_sidecar_paths(R: Results):
-    from lathe import (
-        _DURABLE_ROOT, _EPHEMERAL_ROOT, _bash_sidecar_dir,
-        _delegate_sidecar_dir, _onboard_script_path,
-    )
-
-    print("\n── sidecar paths: storage intent is explicit ──")
-    R.check("ephemeral root is tmpfs", _EPHEMERAL_ROOT == "/dev/shm/lathe", _EPHEMERAL_ROOT)
-    R.check("durable root is namespaced tmp", _DURABLE_ROOT == "/tmp/lathe", _DURABLE_ROOT)
-    R.check("bash path uses ephemeral root", _bash_sidecar_dir("abc") == "/dev/shm/lathe/cmd/abc", _bash_sidecar_dir("abc"))
-    R.check("delegate path uses ephemeral root", _delegate_sidecar_dir("abc") == "/dev/shm/lathe/delegate/abc", _delegate_sidecar_dir("abc"))
-    R.check("onboard path uses ephemeral root", _onboard_script_path("abc") == "/dev/shm/lathe/onboard/abc.py", _onboard_script_path("abc"))
-
-
-async def test_format_bash_result(R: Results):
-    from lathe import _format_bash_result, _MAX_BYTES
-
-    print("\n── _format_bash_result: successful command ──")
-    result = _format_bash_result("hello world", 0, False, {})
-    R.check("returns output", result == "hello world", result)
-
-    print("\n── _format_bash_result: non-zero exit code ──")
-    result = _format_bash_result("some error", 1, False, {})
-    R.check("prepends exit code", result.startswith("Exit code: 1\n"), result[:30])
-    R.check("includes output", "some error" in result, result)
-
-    print("\n── _format_bash_result: empty output ──")
-    result = _format_bash_result("", 0, False, {})
-    R.check("empty becomes (no output)", result == "(no output)", result)
-
-    result = _format_bash_result("   \n  ", 0, False, {})
-    R.check("whitespace-only becomes (no output)", result == "(no output)", result)
-
-    print("\n── _format_bash_result: truncated with spill path ──")
-    meta = {
-        "total_lines": 5000,
-        "total_bytes": 200000,
-        "shown_start_line": 3001,
-        "shown_end_line": 5000,
-        "truncated_by": "lines",
-    }
-    result = _format_bash_result("tail content", 0, True, meta, spill_path="/dev/shm/lathe/cmd/abc/log")
-    R.check("has truncation notice", "[Showing lines" in result, result[-100:])
-    R.check("mentions spill path", "/dev/shm/lathe/cmd/abc/log" in result, result[-100:])
-
-    print("\n── _format_bash_result: truncated by bytes ──")
-    meta["truncated_by"] = "bytes"
-    result = _format_bash_result("tail content", 0, True, meta, spill_path="/dev/shm/lathe/cmd/abc/log")
-    R.check("mentions byte limit", "limit" in result, result[-150:])
-
-    print("\n── _format_bash_result: backgrounded command ──")
-    result = _format_bash_result("partial output", None, False, {},
-                                 background_info={"elapsed": 30, "cmd_id": "abc-123"})
-    R.check("has backgrounded notice", "Backgrounded after 30s" in result, result)
-    R.check("has CMD id", "CMD=abc-123" in result, result)
-    R.check("has sidecar refs", "/dev/shm/lathe/cmd/$CMD/" in result, result)
-    R.check("mentions manpage", "lathe(manpage=" in result, result)
-
-    print("\n── _format_bash_result: backgrounded with empty output ──")
-    result = _format_bash_result("", None, False, {},
-                                 background_info={"elapsed": 5, "cmd_id": "xyz"})
-    R.check("empty becomes (no output yet)", "(no output yet)" in result, result[:30])
-
-    print("\n── _format_bash_result: exit code 0 not shown ──")
-    result = _format_bash_result("ok", 0, False, {})
-    R.check("exit code 0 not prepended", not result.startswith("Exit code:"), result[:20])
-
-
-async def test_core_read_mock(R: Results):
-    """Test _core_read wrapper: path validation and correct sandbox dispatch.
-
-    Script correctness (line selection, header formatting, etc.) is covered
-    by test_read_script which execs _READ_SCRIPT directly via subprocess.
-    These mock tests verify the HTTP plumbing — that _core_read rejects
-    bad paths early and forwards the script result from /process/execute.
-    """
-    from lathe import _core_read
-
-    class FakeValves:
-        daytona_api_key = "fake"
-        daytona_api_url = "https://fake.api"
-        daytona_proxy_url = "https://fake.proxy"
-
-    class FakeResponse:
-        def __init__(self, status_code=200, json_data=None):
-            self.status_code = status_code
-            self._json = json_data or {}
-        def json(self):
-            return self._json
-        def raise_for_status(self):
-            if self.status_code >= 400:
-                raise Exception(f"HTTP {self.status_code}")
-
-    class FakeClient:
-        def __init__(self, post_response=None):
-            self._post_resp = post_response
-            self.post_calls = []
-        async def post(self, url, **kwargs):
-            self.post_calls.append({"url": url, "kwargs": kwargs})
-            return self._post_resp
-
-    print("\n── _core_read: relative path rejected before sandbox ──")
-    client = FakeClient()
-    result = await _core_read(FakeValves(), "sb-id", client,
-                              path="relative/path.py")
-    R.check("rejects relative path", "absolute path" in result, result[:80])
-    R.check("no HTTP calls made", len(client.post_calls) == 0,
-            f"expected 0, got {len(client.post_calls)}")
-
-    print("\n── _core_read: dispatches to /process/execute ──")
-    client = FakeClient(FakeResponse(200, {"exitCode": 0, "result": "File: /p (3 lines total)\n1: a"}))
-    result = await _core_read(FakeValves(), "sb-id", client,
-                              path="/home/daytona/workspace/test.py")
-    R.check("made one POST call", len(client.post_calls) == 1,
-            f"got {len(client.post_calls)}")
-    R.check("called /process/execute",
-            "/process/execute" in client.post_calls[0]["url"],
-            client.post_calls[0]["url"])
-    R.check("returns script result", "File: /p" in result, result[:80])
-
-    print("\n── _core_read: script error propagated ──")
-    client = FakeClient(FakeResponse(200, {"exitCode": 1, "result": "Error: File not found: /missing.py"}))
-    result = await _core_read(FakeValves(), "sb-id", client,
-                              path="/missing.py")
-    R.check("propagates error", "Error:" in result, result[:80])
-
-
-async def test_core_write_mock(R: Results):
-    """Test _core_write wrapper: path validation and correct sandbox dispatch.
-
-    Script correctness (makedirs, byte counts, overwrite, etc.) is covered
-    by test_write_script which execs _WRITE_SCRIPT directly via subprocess.
-    These mock tests verify the HTTP plumbing.
-    """
-    from lathe import _core_write
-
-    class FakeValves:
-        daytona_api_key = "fake"
-        daytona_api_url = "https://fake.api"
-        daytona_proxy_url = "https://fake.proxy"
-
-    class FakeResponse:
-        def __init__(self, status_code=200, json_data=None):
-            self.status_code = status_code
-            self._json = json_data or {}
-        def json(self):
-            return self._json
-        def raise_for_status(self):
-            if self.status_code >= 400:
-                raise Exception(f"HTTP {self.status_code}")
-
-    class FakeClient:
-        def __init__(self, post_response=None):
-            self._post_resp = post_response
-            self.post_calls = []
-        async def post(self, url, **kwargs):
-            self.post_calls.append({"url": url, "kwargs": kwargs})
-            return self._post_resp
-
-    print("\n── _core_write: relative path rejected before sandbox ──")
-    client = FakeClient()
-    result = await _core_write(FakeValves(), "sb-id", client,
-                               path="relative.py", content="hello")
-    R.check("rejects relative path", "absolute path" in result, result[:80])
-    R.check("no HTTP calls made", len(client.post_calls) == 0,
-            f"expected 0, got {len(client.post_calls)}")
-
-    print("\n── _core_write: dispatches to /process/execute ──")
-    client = FakeClient(FakeResponse(200, {"exitCode": 0, "result": "Wrote 12 bytes (2 lines) to /home/daytona/workspace/sub/file.py"}))
-    result = await _core_write(FakeValves(), "sb-id", client,
-                               path="/home/daytona/workspace/sub/file.py",
-                               content="hello\nworld\n")
-    R.check("made one POST call", len(client.post_calls) == 1,
-            f"got {len(client.post_calls)}")
-    R.check("called /process/execute",
-            "/process/execute" in client.post_calls[0]["url"],
-            client.post_calls[0]["url"])
-    R.check("returns script result", "Wrote 12 bytes" in result, result[:80])
-
-    print("\n── _core_write: script error propagated ──")
-    client = FakeClient(FakeResponse(200, {"exitCode": 1, "result": "Error: Cannot create parent directory /bad: Permission denied"}))
-    result = await _core_write(FakeValves(), "sb-id", client,
-                               path="/bad/path/file.py", content="x")
-    R.check("propagates error", "Error:" in result, result[:80])
-
-
-async def test_core_edit_mock(R: Results):
-    """Test _core_edit wrapper: path validation and correct sandbox dispatch.
-
-    Script correctness (match counting, file writes, replace_all, etc.) is
-    covered by test_edit_script which execs _EDIT_SCRIPT directly via
-    subprocess.  These mock tests verify the HTTP plumbing.
-    """
-    from lathe import _core_edit
-
-    class FakeValves:
-        daytona_api_key = "fake"
-        daytona_api_url = "https://fake.api"
-        daytona_proxy_url = "https://fake.proxy"
-
-    class FakeResponse:
-        def __init__(self, status_code=200, json_data=None):
-            self.status_code = status_code
-            self._json = json_data or {}
-        def json(self):
-            return self._json
-        def raise_for_status(self):
-            if self.status_code >= 400:
-                raise Exception(f"HTTP {self.status_code}")
-
-    class FakeClient:
-        def __init__(self, post_response=None):
-            self._post_resp = post_response
-            self.post_calls = []
-        async def post(self, url, **kwargs):
-            self.post_calls.append({"url": url, "kwargs": kwargs})
-            return self._post_resp
-
-    print("\n── _core_edit: relative path rejected before sandbox ──")
-    client = FakeClient()
-    result = await _core_edit(FakeValves(), "sb-id", client,
-                              path="rel.py", old_string="a", new_string="b")
-    R.check("rejects relative path", "absolute path" in result, result[:80])
-    R.check("no HTTP calls made", len(client.post_calls) == 0,
-            f"expected 0, got {len(client.post_calls)}")
-
-    print("\n── _core_edit: dispatches to /process/execute ──")
-    client = FakeClient(FakeResponse(200, {"exitCode": 0, "result": "Replaced 1 occurrence(s) in /home/daytona/workspace/x.py"}))
-    result = await _core_edit(FakeValves(), "sb-id", client,
-                              path="/home/daytona/workspace/x.py",
-                              old_string="hello", new_string="goodbye")
-    R.check("made one POST call", len(client.post_calls) == 1,
-            f"got {len(client.post_calls)}")
-    R.check("called /process/execute",
-            "/process/execute" in client.post_calls[0]["url"],
-            client.post_calls[0]["url"])
-    R.check("returns script result", "Replaced 1" in result, result[:80])
-
-    print("\n── _core_edit: script error propagated ──")
-    client = FakeClient(FakeResponse(200, {"exitCode": 1, "result": "Error: old_string not found in /x.py"}))
-    result = await _core_edit(FakeValves(), "sb-id", client,
-                              path="/x.py", old_string="NOMATCH", new_string="b")
-    R.check("propagates error", "Error:" in result, result[:80])
-
-
-async def test_string_typed_params(R: Results):
-    """Strict type enforcement: wrong-type params are rejected at the boundary.
-
-    After fixing __annotations__ so OWUI generates correct JSON schemas,
-    we enforce types strictly: if OWUI (or the model) sends a string where
-    an int or bool is expected, _check_tool_params rejects it rather than
-    silently coercing.
-    """
-    from lathe import _check_tool_params
-
-    print("\n── strict type check: int params ──")
-    # Correct type passes
-    err = _check_tool_params({"offset": 3, "limit": 2}, {"offset": int, "limit": int})
-    R.check("correct int: no error", err is None, repr(err))
-
-    # String where int expected: rejected
-    err = _check_tool_params({"offset": "3"}, {"offset": int})
-    R.check("string for int: rejected", err is not None, repr(err))
-    R.check("string for int: mentions param", "offset" in err, err)
-    R.check("string for int: mentions expected type", "int" in err, err)
-
-    print("\n── strict type check: bool params ──")
-    # Correct type passes
-    err = _check_tool_params({"replace_all": True}, {"replace_all": bool})
-    R.check("correct bool: no error", err is None, repr(err))
-    err = _check_tool_params({"replace_all": False}, {"replace_all": bool})
-    R.check("correct bool False: no error", err is None, repr(err))
-
-    # String where bool expected: rejected
-    err = _check_tool_params({"replace_all": "true"}, {"replace_all": bool})
-    R.check("string 'true' for bool: rejected", err is not None, repr(err))
-    err = _check_tool_params({"replace_all": "false"}, {"replace_all": bool})
-    R.check("string 'false' for bool: rejected", err is not None, repr(err))
-
-    # int where bool expected: rejected. Even though bool is a subclass
-    # of int, isinstance(1, bool) is False — 1 is not a bool.
-    err = _check_tool_params({"replace_all": 1}, {"replace_all": bool})
-    R.check("int for bool: rejected", err is not None, repr(err))
-
-    print("\n── strict type check: str params skipped ──")
-    # str params are always skipped (everything is at least a string)
-    err = _check_tool_params({"path": "/foo"}, {"path": str})
-    R.check("str param: no error", err is None, repr(err))
-
-    print("\n── strict type check: list params ──")
-    err = _check_tool_params({"files": ["a.py"]}, {"files": list})
-    R.check("correct list: no error", err is None, repr(err))
-    err = _check_tool_params({"files": "a.py"}, {"files": list})
-    R.check("string for list: rejected", err is not None, repr(err))
-
-    print("\n── strict type check: missing params ignored ──")
-    err = _check_tool_params({}, {"offset": int})
-    R.check("missing param: no error", err is None, repr(err))
-
-    print("\n── strict type check: garbage values ──")
-    err = _check_tool_params({"offset": "hello"}, {"offset": int})
-    R.check("garbage string for int: rejected", err is not None, repr(err))
-    err = _check_tool_params({"offset": [1, 2]}, {"offset": int})
-    R.check("list for int: rejected", err is not None, repr(err))
-
-    print("\n── defensive: stringized/unresolved annotations degrade to skip ──")
-    # Under OWUI's loader, exec() inherits plugin.py's `from __future__
-    # import annotations`, so a raw signature annotation can arrive as the
-    # STRING 'int' instead of the class int.  A naive isinstance(value,
-    # 'int') raises "arg 2 must be a type".  The guard must skip such
-    # unresolved annotations rather than crash. (_standard_tool resolves via
-    # get_type_hints, but the guard is the last line of defense.)
-    err = _check_tool_params({"start": 1}, {"start": "int"})
-    R.check("stringized 'int' annotation: no crash, skipped", err is None, repr(err))
-    err = _check_tool_params({"replace_all": True}, {"replace_all": "bool"})
-    R.check("stringized 'bool' annotation: no crash, skipped", err is None, repr(err))
-    err = _check_tool_params({"start": "not-an-int"}, {"start": "int"})
-    R.check("stringized annotation can't validate, but never crashes", err is None, repr(err))
-
-
-async def test_string_future_annotations_loading(R: Results):
-    """Reproduce OWUI's loader: exec under `from __future__ import
-    annotations` stringizes signature annotations.  _standard_tool must
-    still produce real-class tool_annotations (via get_type_hints), so the
-    type check at the boundary never hits the isinstance() crash.
-
-    This is the regression test for the prod bug where read/grep/glob/write
-    returned "isinstance() arg 2 must be a type, a tuple of types, or a
-    union": OWUI's plugin loader has `from __future__ import annotations`,
-    and exec() inherits the caller's __future__ flags, so the tool source
-    compiled with PEP 563 semantics.
-    """
-    import inspect
-    import typing
-
-    print("\n── OWUI future-annotations loading ──")
-
-    # Compile a module that mirrors lathe's _standard_tool construction,
-    # under future-annotations semantics (dont_inherit ensures the flag is
-    # on regardless of this test file's own __future__ state).
-    src = (
-        "from __future__ import annotations\n"
-        "import inspect, typing\n"
-        "def _core(valves, sandbox_id, client, *, path: str, start: int = 1) -> str:\n"
-        "    return ''\n"
-        "_CORE_INFRA = {'valves', 'sandbox_id', 'client'}\n"
-        "sig = inspect.signature(_core)\n"
-        "raw = {n: p.annotation for n, p in sig.parameters.items()\n"
-        "       if n not in _CORE_INFRA and p.annotation is not inspect.Parameter.empty}\n"
-        "hints = typing.get_type_hints(_core)\n"
-        "resolved = {n: hints.get(n, raw[n]) for n in raw}\n"
-    )
-    code = compile(src, "<owui_tool>", "exec", dont_inherit=True)
-    ns: dict = {}
-    exec(code, ns)
-
-    raw = ns["raw"]
-    resolved = ns["resolved"]
-
-    # Under future-annotations, the raw signature annotation is the STRING.
-    R.check(
-        "raw signature annotation is stringized",
-        raw["start"] == "int" and isinstance(raw["start"], str),
-        repr(raw),
-    )
-    # get_type_hints resolves it back to the real class.
-    R.check(
-        "get_type_hints resolves to real class",
-        resolved["start"] is int and resolved["path"] is str,
-        repr(resolved),
-    )
-
-    # The fix: _check_tool_params over the RESOLVED map works; over the RAW
-    # (stringized) map it must NOT crash (defensive guard).
-    from lathe import _check_tool_params
-
-    err = _check_tool_params({"start": 1}, resolved)
-    R.check("resolved map: valid int passes", err is None, repr(err))
-    err = _check_tool_params({"start": "3"}, resolved)
-    R.check("resolved map: string for int rejected", err is not None, repr(err))
-    err = _check_tool_params({"start": 1}, raw)
-    R.check("raw stringized map: no crash", err is None, repr(err))
-
-
-async def test_delegate_bash_foreground(R: Results):
-    """Test that delegate bash uses a shorter foreground timeout."""
-    from lathe import _DELEGATE_BASH_FOREGROUND_SECONDS
-
-    print("\n── delegate bash foreground default ──")
-    R.check("shorter than 30s", _DELEGATE_BASH_FOREGROUND_SECONDS < 30,
-            f"got {_DELEGATE_BASH_FOREGROUND_SECONDS}")
-    R.check("at least 5s", _DELEGATE_BASH_FOREGROUND_SECONDS >= 5,
-            f"got {_DELEGATE_BASH_FOREGROUND_SECONDS}")
-
-
-async def test_format_delegate_background(R: Results):
-    """Test the background delegate descriptor formatting."""
-    from lathe import _format_delegate_background
-
-    print("\n── _format_delegate_background: basic structure ──")
-    result = _format_delegate_background("abc-123", 30, "Sub-agent thinking... (1/10)")
-    R.check("has backgrounded notice", "Backgrounded after 30s" in result, result[:100])
-    R.check("has DELEGATE id", "DELEGATE=abc-123" in result, result)
-    R.check("has sidecar refs", "/dev/shm/lathe/delegate/$DELEGATE/" in result, result)
-    R.check("has log preview", "Sub-agent thinking" in result, result)
-    R.check("mentions manpage", "lathe(manpage=" in result, result)
-
-    print("\n── _format_delegate_background: empty preview ──")
-    result = _format_delegate_background("xyz-789", 5, "")
-    R.check("empty becomes no progress yet", "(no progress yet)" in result, result[:50])
-    R.check("still has DELEGATE", "DELEGATE=xyz-789" in result, result)
-
-    print("\n── _format_delegate_background: whitespace-only preview ──")
-    result = _format_delegate_background("qqq", 10, "   \n  ")
-    R.check("whitespace becomes no progress yet", "(no progress yet)" in result, result[:50])
-
-
-async def test_delegate_foreground_constant(R: Results):
-    """Test the delegate foreground timeout constant."""
-    from lathe import _DELEGATE_FOREGROUND_SECONDS
-
-    print("\n── delegate foreground constant ──")
-    R.check("is positive int",
-            isinstance(_DELEGATE_FOREGROUND_SECONDS, int) and _DELEGATE_FOREGROUND_SECONDS > 0,
-            f"got {_DELEGATE_FOREGROUND_SECONDS}")
-    R.check("reasonable default (15-60s)",
-            15 <= _DELEGATE_FOREGROUND_SECONDS <= 60,
-            f"got {_DELEGATE_FOREGROUND_SECONDS}")
-
-
-async def test_delegate_catalog_foreground_param(R: Results):
-    """Test that delegate's foreground_seconds param appears in the tool catalog."""
-    from lathe import _build_tool_catalog, Tools
-
-    print("\n── delegate catalog: foreground_seconds param ──")
-    tools = Tools()
-    catalog = _build_tool_catalog(tools)
-    delegate_line = [l for l in catalog.split("\n") if "delegate(" in l]
-    R.check("delegate line exists", len(delegate_line) == 1,
-            f"got {len(delegate_line)} lines")
-    if delegate_line:
-        R.check("delegate shows foreground_seconds param",
-                "foreground_seconds" in delegate_line[0],
-                delegate_line[0])
-
-
-async def test_delegate_background_branching(R: Results):
-    """Test the foreground/background asyncio branching pattern used by delegate().
-
-    This exercises the exact same pattern as delegate(): ensure_future +
-    wait_for(shield(event.wait())) + mutable emit flag.
-    """
-    from lathe import _DELEGATE_FOREGROUND_SECONDS
-
-    # ── Helper: simulates _run_agent with configurable delay ─────────
-    async def fake_agent(delay: float, done_event: asyncio.Event,
-                         result: dict, emit_flag: list):
-        """Mimics _run_agent: waits, writes result, sets event."""
-        try:
-            await asyncio.sleep(delay)
-            result.update({"ok": True, "output": "done", "step_count": 1})
-        except asyncio.CancelledError:
-            result.update({"ok": False, "error": "cancelled"})
-        finally:
-            done_event.set()
-
-    # ── Path 1: task finishes within foreground window ────────────────
-    print("\n── delegate branching: foreground completion ──")
-    done = asyncio.Event()
-    result: dict = {}
-    emit_flag = [True]
-
-    task = asyncio.ensure_future(fake_agent(0.01, done, result, emit_flag))
-    try:
-        await asyncio.wait_for(asyncio.shield(done.wait()), timeout=1.0)
-    except asyncio.TimeoutError:
-        pass
-
-    R.check("fg: event is set", done.is_set(), f"done={done.is_set()}")
-    R.check("fg: result is ok", result.get("ok") is True, str(result))
-    R.check("fg: emit still True", emit_flag[0] is True, str(emit_flag))
-    await task  # clean up
-
-    # ── Path 2: task exceeds foreground window → backgrounded ────────
-    print("\n── delegate branching: auto-background ──")
-    done = asyncio.Event()
-    result = {}
-    emit_flag = [True]
-
-    task = asyncio.ensure_future(fake_agent(5.0, done, result, emit_flag))
-    try:
-        await asyncio.wait_for(asyncio.shield(done.wait()), timeout=0.05)
-    except asyncio.TimeoutError:
-        pass
-
-    R.check("bg: event NOT set", not done.is_set(), f"done={done.is_set()}")
-    R.check("bg: result still empty", len(result) == 0, str(result))
-
-    # Simulate what delegate does: flip the emit flag
-    emit_flag[0] = False
-    R.check("bg: emit flag flipped", emit_flag[0] is False, str(emit_flag))
-
-    # The background task should still be running and eventually complete
-    await asyncio.wait_for(done.wait(), timeout=10.0)
-    R.check("bg: task eventually completes", done.is_set(), f"done={done.is_set()}")
-    R.check("bg: result populated", result.get("ok") is True, str(result))
-    await task  # clean up
-
-    # ── Path 3: immediate background (fg_seconds=0 → timeout=0.01) ───
-    print("\n── delegate branching: immediate background ──")
-    done = asyncio.Event()
-    result = {}
-    emit_flag = [True]
-
-    task = asyncio.ensure_future(fake_agent(0.5, done, result, emit_flag))
-    try:
-        await asyncio.wait_for(asyncio.shield(done.wait()), timeout=0.01)
-    except asyncio.TimeoutError:
-        pass
-
-    R.check("imm: event NOT set immediately", not done.is_set(),
-            f"done={done.is_set()}")
-    emit_flag[0] = False
-
-    await asyncio.wait_for(done.wait(), timeout=5.0)
-    R.check("imm: task completes after background", done.is_set(),
-            f"done={done.is_set()}")
-    R.check("imm: result ok", result.get("ok") is True, str(result))
-    await task  # clean up
-
-    # ── Verify shield prevents cancellation ──────────────────────────
-    print("\n── delegate branching: shield prevents cancel ──")
-    done = asyncio.Event()
-    result = {}
-
-    task = asyncio.ensure_future(fake_agent(0.5, done, result, [True]))
-    try:
-        await asyncio.wait_for(asyncio.shield(done.wait()), timeout=0.01)
-    except asyncio.TimeoutError:
-        pass
-
-    # The key invariant: the background task was NOT cancelled by wait_for
-    R.check("shield: task not cancelled", not task.cancelled(),
-            f"cancelled={task.cancelled()}")
-    await asyncio.wait_for(done.wait(), timeout=5.0)
-    R.check("shield: task completed ok", result.get("ok") is True, str(result))
-    await task
-
-
-# ── Test registry and runner ─────────────────────────────────────────
-
-async def test_handoff(R: Results):
-    from lathe import _HANDOFF_INSTRUCTIONS, _DELEGATE_WITHHELD, _build_tool_catalog, Tools
-
-    print("\n── handoff: instructions content ──")
-    R.check("instructions non-empty",
-            len(_HANDOFF_INSTRUCTIONS) > 200,
-            f"length={len(_HANDOFF_INSTRUCTIONS)}")
-    R.check("instructions mention no tool calls",
-            "do not make any tool calls" in _HANDOFF_INSTRUCTIONS.lower(),
-            "should enforce no-tools rule")
-    R.check("instructions mention horizontal rule",
-            "---" in _HANDOFF_INSTRUCTIONS,
-            "should tell agent to write a separator")
-    R.check("instructions mention user instruction above line",
-            "user instruction" in _HANDOFF_INSTRUCTIONS.lower(),
-            "should describe the user-facing instruction")
-    R.check("instructions mention user's chat style",
-            "evident" in _HANDOFF_INSTRUCTIONS.lower()
-            and "language" in _HANDOFF_INSTRUCTIONS.lower(),
-            "should instruct to match the user's evident chat style and language")
-    R.check("instructions mention Goal section",
-            "### Goal" in _HANDOFF_INSTRUCTIONS,
-            "should have Goal section template")
-    R.check("instructions mention Accomplished section",
-            "### Accomplished" in _HANDOFF_INSTRUCTIONS,
-            "should have Accomplished section template")
-    R.check("instructions mention Unresolved section",
-            "### Unresolved" in _HANDOFF_INSTRUCTIONS,
-            "should have Unresolved section template")
-    R.check("instructions mention Key files section",
-            "### Key files" in _HANDOFF_INSTRUCTIONS,
-            "should have Key files section template")
-    R.check("instructions mention What didn't work",
-            "### What didn" in _HANDOFF_INSTRUCTIONS,
-            "should have What didn't work section template")
-    R.check("instructions mention verbatim quotes",
-            "verbatim" in _HANDOFF_INSTRUCTIONS.lower(),
-            "should encourage verbatim quotes to prevent drift")
-    R.check("instructions mention sandbox persists",
-            "persist" in _HANDOFF_INSTRUCTIONS.lower(),
-            "should note that sandbox survives across conversations")
-    R.check("instructions mention no-continue rule",
-            "delete" in _HANDOFF_INSTRUCTIONS.lower()
-            and "handoff" in _HANDOFF_INSTRUCTIONS.lower(),
-            "should tell agent to resist continuing after handoff")
-
-    print("\n── handoff: withheld from delegate ──")
-    R.check("handoff withheld from delegate",
-            "handoff" in _DELEGATE_WITHHELD,
-            f"should be in withheld set: {_DELEGATE_WITHHELD}")
-
-    print("\n── handoff: tool catalog ──")
-    tools = Tools()
-    catalog = _build_tool_catalog(tools)
-    R.check("handoff in tool catalog",
-            "handoff(" in catalog,
-            "handoff should appear in tool catalog")
-
-    print("\n── handoff: manpage index ──")
-    R.check("handoff in manpage index",
-            "handoff" in tools._MANPAGE_INDEX,
-            "handoff should have a manpage index entry")
-    R.check("handoff manpage exists",
-            "handoff" in tools._MANPAGES,
-            "handoff should have a manpage")
-
-
-async def test_harness_messages(R: Results):
-    from lathe import _prepend_harness_messages, _drain_harness_messages
-    from cachetools import LRUCache
-
-    print("\n── _prepend_harness_messages: empty list ──")
-    R.check("no messages = passthrough",
-            _prepend_harness_messages("hello", []) == "hello")
-
-    print("\n── _prepend_harness_messages: single message ──")
-    result = _prepend_harness_messages("tool output", ["[warning]"])
-    R.check("warning prepended", result.startswith("[warning]"), result[:50])
-    R.check("tool output follows", "tool output" in result, result)
-
-    print("\n── _prepend_harness_messages: multiple messages ──")
-    result = _prepend_harness_messages("output", ["msg1", "msg2", "msg3"])
-    R.check("all messages present", "msg1" in result and "msg2" in result and "msg3" in result, result)
-    R.check("output at end", result.endswith("output"), result[-20:])
-    R.check("messages separated by blank lines", "\n\n" in result)
-
-    print("\n── _drain_harness_messages: no chat_id ──")
-    cache = LRUCache(maxsize=10)
-    messages = _drain_harness_messages(cache, None, None)
-    R.check("no chat_id = empty", messages == [], str(messages))
-
-    messages = _drain_harness_messages(cache, None, "[restarted]")
-    R.check("no chat_id + warning = just warning", messages == ["[restarted]"], str(messages))
-
-    print("\n── _drain_harness_messages: chat_id with pending ──")
-    cache["chat-1"] = {"init": True, "pending": ["snapshot data", "job done"]}
-    messages = _drain_harness_messages(cache, "chat-1", "[restarted]")
-    R.check("drains warning + pending",
-            messages == ["[restarted]", "snapshot data", "job done"], str(messages))
-    R.check("pending cleared after drain",
-            cache["chat-1"]["pending"] == [], str(cache["chat-1"]))
-
-    print("\n── _drain_harness_messages: second drain is empty ──")
-    messages = _drain_harness_messages(cache, "chat-1", None)
-    R.check("second drain empty", messages == [], str(messages))
-
-    print("\n── _drain_harness_messages: unknown chat_id ──")
-    messages = _drain_harness_messages(cache, "chat-unknown", None)
-    R.check("unknown chat = empty", messages == [], str(messages))
-
-
-async def test_chat_state(R: Results):
-    from lathe import Tools
-    from cachetools import LRUCache
-
-    print("\n── Tools._chat_state: exists on init ──")
-    tools = Tools()
-    R.check("_chat_state exists", hasattr(tools, "_chat_state"))
-    R.check("_chat_state is LRUCache", isinstance(tools._chat_state, LRUCache))
-    R.check("_chat_state maxsize is 1024", tools._chat_state.maxsize == 1024,
-            f"got {tools._chat_state.maxsize}")
-    R.check("_chat_state starts empty", len(tools._chat_state) == 0)
-
-
-async def test_snapshot_script(R: Results):
-    from lathe import _SNAPSHOT_SCRIPT
-
-    print("\n── _SNAPSHOT_SCRIPT: generates valid Python ──")
-    try:
-        compile(_SNAPSHOT_SCRIPT, "<snapshot>", "exec")
-        R.check("script compiles", True)
-    except SyntaxError as e:
-        R.check("script compiles", False, str(e))
-
-    R.check("script references workspace",
-            "/home/daytona/workspace" in _SNAPSHOT_SCRIPT)
-    R.check("script references volume",
-            "/home/daytona/volume" in _SNAPSHOT_SCRIPT)
-    R.check("script uses os.listdir",
-            "os.listdir" in _SNAPSHOT_SCRIPT)
-    R.check("script checks uname",
-            "uname" in _SNAPSHOT_SCRIPT)
-    R.check("script checks python3",
-            "python3" in _SNAPSHOT_SCRIPT)
-    R.check("script checks node",
-            "node" in _SNAPSHOT_SCRIPT)
-
-
-async def test_ensure_chat_init(R: Results):
-    from lathe import _ensure_chat_init
-    from cachetools import LRUCache
-
-    print("\n── _ensure_chat_init: no chat_id is no-op ──")
-    cache = LRUCache(maxsize=10)
-    # Should not raise, should not modify cache
-    await _ensure_chat_init(None, "sb-id", None, cache, None, {})
-    R.check("empty chat_id = no-op", len(cache) == 0)
-    await _ensure_chat_init(None, "sb-id", None, cache, "", {})
-    R.check("blank chat_id = no-op", len(cache) == 0)
-
-    print("\n── _ensure_chat_init: second call is no-op ──")
-    # Pre-populate as if already initialized
-    cache["chat-already"] = {"init": True, "pending": ["existing"]}
-    await _ensure_chat_init(None, "sb-id", None, cache, "chat-already", {})
-    R.check("existing pending preserved",
-            cache["chat-already"]["pending"] == ["existing"],
-            str(cache["chat-already"]))
-
-    print("\n── _ensure_chat_init: new chat creates state ──")
-    # For a truly new chat with no valves/client, auto-init will fail
-    # gracefully (best-effort) but should still create the state entry.
-    await _ensure_chat_init(None, "sb-id", None, cache, "chat-new", {})
-    R.check("new chat entry created", "chat-new" in cache)
-    R.check("new chat marked init", cache["chat-new"].get("init") is True)
-    R.check("new chat has pending list",
-            isinstance(cache["chat-new"].get("pending"), list))
-
-
-async def test_chat_id_in_signatures(R: Results):
-    """Verify all sandbox-using Tools methods accept __chat_id__."""
-    import inspect
-    from lathe import Tools
-
-    print("\n── __chat_id__ in tool signatures ──")
-    tools = Tools()
-    # Tools that use _ensure_sandbox should have __chat_id__
-    sandbox_tools = ["bash", "read", "write", "edit", "glob", "grep",
-                     "interpret", "onboard", "delegate", "expose", "view"]
-    for name in sandbox_tools:
-        method = getattr(tools, name, None)
-        if method is None:
-            R.check(f"{name} exists", False, "method not found")
-            continue
-        sig = inspect.signature(method)
-        R.check(f"{name} has __chat_id__",
-                "__chat_id__" in sig.parameters,
-                f"params: {list(sig.parameters.keys())}")
-
-    # Tools that don't use _ensure_sandbox should NOT have __chat_id__
-    # (or it's fine if they do, but let's check they still work)
-    non_sandbox = ["lathe", "handoff"]
-    for name in non_sandbox:
-        method = getattr(tools, name, None)
-        if method is None:
-            R.check(f"{name} exists", False, "method not found")
-
-
-async def test_push_bg_notice(R: Results):
-    from lathe import _push_bg_notice
-    from cachetools import LRUCache
-
-    print("\n── _push_bg_notice: pushes to existing chat ──")
-    cache = LRUCache(maxsize=10)
-    cache["chat-1"] = {"init": True, "pending": ["existing"]}
-    _push_bg_notice(cache, "chat-1", "job done")
-    R.check("notice appended", cache["chat-1"]["pending"] == ["existing", "job done"],
-            str(cache["chat-1"]["pending"]))
-
-    print("\n── _push_bg_notice: no chat_id is no-op ──")
-    _push_bg_notice(cache, None, "notice")
-    _push_bg_notice(cache, "", "notice")
-    R.check("None chat_id no-op", True)  # no crash = pass
-
-    print("\n── _push_bg_notice: evicted chat_id is no-op ──")
-    _push_bg_notice(cache, "chat-gone", "notice")
-    R.check("evicted chat_id no-op", "chat-gone" not in cache)
-
-    print("\n── _push_bg_notice: empty pending list ──")
-    cache["chat-2"] = {"init": True, "pending": []}
-    _push_bg_notice(cache, "chat-2", "first notice")
-    R.check("pushed to empty pending", cache["chat-2"]["pending"] == ["first notice"],
-            str(cache["chat-2"]["pending"]))
-
-    print("\n── _push_bg_notice: missing pending key ──")
-    cache["chat-3"] = {"init": True}
-    _push_bg_notice(cache, "chat-3", "notice")
-    R.check("created pending list", cache["chat-3"]["pending"] == ["notice"],
-            str(cache["chat-3"]))
-
-
-async def test_format_bg_notices(R: Results):
-    from lathe import _format_bg_bash_notice, _format_bg_delegate_notice
-
-    print("\n── _format_bg_bash_notice: success with output ──")
-    result = _format_bg_bash_notice("abc-123", 0, 47, "line1\nline2\nline3")
-    R.check("has CMD id", "CMD-abc-123" in result, result[:80])
-    R.check("has exit code", "Exit code: 0" in result, result)
-    R.check("has elapsed", "47s" in result, result)
-    R.check("has output lines", "line3" in result, result)
-
-    print("\n── _format_bg_bash_notice: failure ──")
-    result = _format_bg_bash_notice("xyz", 1, 10, "error: bad thing")
-    R.check("has exit code 1", "Exit code: 1" in result, result)
-    R.check("has error output", "bad thing" in result, result)
-
-    print("\n── _format_bg_bash_notice: empty output ──")
-    result = _format_bg_bash_notice("qqq", 0, 5, "")
-    R.check("has no output marker", "(no output)" in result, result)
-
-    print("\n── _format_bg_bash_notice: unknown exit code ──")
-    result = _format_bg_bash_notice("rrr", None, 3, "stuff")
-    R.check("has unknown exit code", "unknown" in result, result)
-
-    print("\n── _format_bg_bash_notice: long output truncated to 5 lines ──")
-    long_output = "\n".join(f"line {i}" for i in range(20))
-    result = _format_bg_bash_notice("sss", 0, 30, long_output)
-    R.check("has last line", "line 19" in result, result)
-    R.check("no early line", "line 10" not in result, result)
-
-    print("\n── _format_bg_delegate_notice: success ──")
-    result = _format_bg_delegate_notice("del-123", 95, 12, 34, "task completed", None)
-    R.check("has DELEGATE id", "DELEGATE-del-123" in result, result[:80])
-    R.check("has steps", "12 step(s)" in result, result)
-    R.check("has tool calls", "34 tool call(s)" in result, result)
-    R.check("has elapsed", "95s" in result, result)
-    R.check("has preview", "task completed" in result, result)
-    R.check("says completed", "completed" in result.lower(), result[:80])
-
-    print("\n── _format_bg_delegate_notice: failure ──")
-    result = _format_bg_delegate_notice("del-456", 30, 3, 5, "", "timeout error")
-    R.check("has DELEGATE id", "DELEGATE-del-456" in result, result[:80])
-    R.check("says failed", "failed" in result.lower(), result[:80])
-    R.check("has error", "timeout error" in result, result)
-
-    print("\n── _format_bg_delegate_notice: empty preview ──")
-    result = _format_bg_delegate_notice("del-789", 10, 1, 2, "", None)
-    R.check("has no result marker", "(no result text)" in result, result)
-
-
-async def test_format_interpret_result(R: Results):
-    from lathe import _format_interpret_result
-
-    print("\n── _format_interpret_result: stdout only ──")
-    result = _format_interpret_result("Hello world\n", "", [], False)
-    R.check("has stdout", "Hello world" in result, result)
-    R.check("no warning", "Warning" not in result, result)
-
-    print("\n── _format_interpret_result: stderr ──")
-    result = _format_interpret_result("", "some warning\n", [], False)
-    R.check("has stderr marker", "[stderr]" in result, result)
-    R.check("has warning text", "some warning" in result, result)
-
-    print("\n── _format_interpret_result: error with traceback ──")
-    result = _format_interpret_result("", "", [
-        {"name": "ValueError", "value": "bad", "traceback": "Traceback...\nValueError: bad"}
-    ], False)
-    R.check("has traceback", "Traceback" in result, result)
-
-    print("\n── _format_interpret_result: error without traceback ──")
-    result = _format_interpret_result("", "", [
-        {"name": "TypeError", "value": "oops", "traceback": ""}
-    ], False)
-    R.check("has error name", "TypeError" in result, result)
-    R.check("has error value", "oops" in result, result)
-
-    print("\n── _format_interpret_result: lost state warning ──")
-    result = _format_interpret_result("ok\n", "", [], True)
-    R.check("has lost state warning", "reset" in result.lower(), result[:120])
-    R.check("has stdout after warning", "ok" in result, result)
-
-    print("\n── _format_interpret_result: no output ──")
-    result = _format_interpret_result("", "", [], False)
-    R.check("has no output marker", "(no output)" in result, result)
-
-    print("\n── _format_interpret_result: stdout + stderr + error ──")
-    result = _format_interpret_result("line1\n", "warn\n", [
-        {"name": "E", "value": "x", "traceback": "tb"}
-    ], False)
-    R.check("has all three", "line1" in result and "warn" in result and "tb" in result, result)
-
-
-async def test_ensure_interpreter_context(R: Results):
-    from lathe import _ensure_interpreter_context
-    from cachetools import LRUCache
-
-    class FakeValves:
-        daytona_api_key = "fake"
-        daytona_api_url = "https://fake.api"
-        daytona_proxy_url = "https://fake.proxy"
-
-    class FakeResponse:
-        def __init__(self, status_code=200, json_data=None):
-            self.status_code = status_code
-            self._json = json_data or {}
-        def json(self):
-            return self._json
-        def raise_for_status(self):
-            if self.status_code >= 400:
-                raise Exception(f"HTTP {self.status_code}")
-
-    class FakeClient:
-        def __init__(self, get_response=None, post_response=None):
-            self._get_resp = get_response or FakeResponse(200, {"contexts": []})
-            self._post_resp = post_response or FakeResponse(200, {"id": "ctx-new"})
-            self.get_calls = []
-            self.post_calls = []
-        async def get(self, url, **kwargs):
-            self.get_calls.append(url)
-            return self._get_resp
-        async def post(self, url, **kwargs):
-            self.post_calls.append({"url": url, "kwargs": kwargs})
-            return self._post_resp
-
-    print("\n── _ensure_interpreter_context: new chat creates context ──")
-    cache = LRUCache(maxsize=10)
-    cache["chat-1"] = {"init": True, "pending": []}
-    client = FakeClient()
-    ctx_id, lost = await _ensure_interpreter_context(
-        FakeValves(), "sb-id", client, cache, "chat-1")
-    R.check("returns new context id", ctx_id == "ctx-new", f"got {ctx_id}")
-    R.check("not lost state", lost is False)
-    R.check("stored in cache", cache["chat-1"]["interpreter_context_id"] == "ctx-new")
-
-    print("\n── _ensure_interpreter_context: reuses existing context ──")
-    client2 = FakeClient(
-        get_response=FakeResponse(200, {"contexts": [{"id": "ctx-new"}]}))
-    ctx_id, lost = await _ensure_interpreter_context(
-        FakeValves(), "sb-id", client2, cache, "chat-1")
-    R.check("reuses existing", ctx_id == "ctx-new", f"got {ctx_id}")
-    R.check("no lost state", lost is False)
-    R.check("no POST call", len(client2.post_calls) == 0,
-            f"got {len(client2.post_calls)} calls")
-
-    print("\n── _ensure_interpreter_context: stale context replaced ──")
-    # Context exists in cache but not on server
-    cache["chat-2"] = {"init": True, "pending": [],
-                       "interpreter_context_id": "ctx-old"}
-    client3 = FakeClient(
-        get_response=FakeResponse(200, {"contexts": []}),  # ctx-old not listed
-        post_response=FakeResponse(200, {"id": "ctx-fresh"}))
-    ctx_id, lost = await _ensure_interpreter_context(
-        FakeValves(), "sb-id", client3, cache, "chat-2")
-    R.check("returns fresh id", ctx_id == "ctx-fresh", f"got {ctx_id}")
-    R.check("lost state = True", lost is True)
-    R.check("cache updated", cache["chat-2"]["interpreter_context_id"] == "ctx-fresh")
-
-    print("\n── _ensure_interpreter_context: no prior chat state ──")
-    cache2 = LRUCache(maxsize=10)
-    client4 = FakeClient(post_response=FakeResponse(200, {"id": "ctx-brand-new"}))
-    ctx_id, lost = await _ensure_interpreter_context(
-        FakeValves(), "sb-id", client4, cache2, "chat-brand-new")
-    R.check("creates new entry", "chat-brand-new" in cache2)
-    R.check("returns id", ctx_id == "ctx-brand-new", f"got {ctx_id}")
-    R.check("not lost", lost is False)
-
-
-async def test_interpret_constant(R: Results):
-    from lathe import _INTERPRET_DEFAULT_TIMEOUT
-
-    print("\n── interpret default timeout ──")
-    R.check("is positive int",
-            isinstance(_INTERPRET_DEFAULT_TIMEOUT, int) and _INTERPRET_DEFAULT_TIMEOUT > 0,
-            f"got {_INTERPRET_DEFAULT_TIMEOUT}")
-    R.check("reasonable default (30-300s)",
-            30 <= _INTERPRET_DEFAULT_TIMEOUT <= 300,
-            f"got {_INTERPRET_DEFAULT_TIMEOUT}")
-
-
-async def test_interpret_manpage(R: Results):
-    from lathe import Tools
-
-    print("\n── interpret manpage ──")
-    tools = Tools()
-    R.check("interpret in manpage index",
-            "interpret" in tools._MANPAGE_INDEX,
-            "should have index entry")
-    R.check("interpret manpage exists",
-            "interpret" in tools._MANPAGES,
-            "should have manpage content")
-    content = tools._MANPAGES.get("interpret", "")
-    R.check("manpage mentions state model",
-            "state" in content.lower() and "persist" in content.lower(),
-            "should describe state persistence")
-    R.check("manpage mentions bash comparison",
-            "bash" in content.lower(),
-            "should compare with bash")
-
-
-async def test_sniff_image_mime(R: Results):
-    from lathe import _sniff_image_mime
-
-    print("\n── _sniff_image_mime: recognized raster formats ──")
-    R.check("png", _sniff_image_mime(b"\x89PNG\r\n\x1a\n" + b"\x00" * 8) == "image/png")
-    R.check("jpeg", _sniff_image_mime(b"\xff\xd8\xff\xe0" + b"\x00" * 12) == "image/jpeg")
-    R.check("gif87a", _sniff_image_mime(b"GIF87a" + b"\x00" * 10) == "image/gif")
-    R.check("gif89a", _sniff_image_mime(b"GIF89a" + b"\x00" * 10) == "image/gif")
-    R.check("webp", _sniff_image_mime(b"RIFF\x24\x00\x00\x00WEBPVP8 ") == "image/webp")
-
-    print("\n── _sniff_image_mime: rejected content ──")
-    R.check("svg text", _sniff_image_mime(b'<svg xmlns="http://www.w3.org/2000/svg">') is None)
-    R.check("plain text", _sniff_image_mime(b"hello world, this is text") is None)
-    R.check("empty", _sniff_image_mime(b"") is None)
-    R.check("riff but not webp", _sniff_image_mime(b"RIFF\x24\x00\x00\x00AVI ") is None)
-    R.check("truncated png", _sniff_image_mime(b"\x89PNG") is None)
-
-
-async def test_model_supports_vision(R: Results):
-    from lathe import _model_supports_vision
-
-    print("\n── _model_supports_vision: architecture is authoritative ──")
-    R.check("text-only modality refused",
-            _model_supports_vision({"architecture": {"modality": "text->text",
-                                                     "input_modalities": ["text"]}}) is False)
-    R.check("image input allowed",
-            _model_supports_vision({"architecture": {"modality": "text+image->text",
-                                                     "input_modalities": ["text", "image"]}}) is True)
-    R.check("input_modalities without modality string",
-            _model_supports_vision({"architecture": {"input_modalities": ["text", "video", "image"]}}) is True)
-    R.check("modality string without input_modalities",
-            _model_supports_vision({"architecture": {"modality": "text+image+file->text"}}) is True)
-    R.check("architecture beats capabilities flag",
-            _model_supports_vision({"architecture": {"input_modalities": ["text"]},
-                                    "info": {"meta": {"capabilities": {"vision": True}}}}) is False)
-
-    print("\n── _model_supports_vision: capabilities fallback ──")
-    R.check("admin-unchecked vision refused",
-            _model_supports_vision({"info": {"meta": {"capabilities": {"vision": False}}}}) is False)
-    R.check("admin-declared vision allowed",
-            _model_supports_vision({"info": {"meta": {"capabilities": {"vision": True}}}}) is True)
-
-    print("\n── _model_supports_vision: unknown allows ──")
-    R.check("empty dict allowed", _model_supports_vision({}) is True)
-    R.check("non-dict allowed", _model_supports_vision(None) is True)
-    R.check("no architecture allowed", _model_supports_vision({"id": "x"}) is True)
-
-
-async def test_tools_schema_parity(R: Results):
-    """Verify OWUI-visible parameter schemas for all Tools methods.
-
-    OWUI introspects method signatures to build JSON schemas for the model.
-    This test locks in the known-good parameter names, types, defaults, and
-    docstrings so a decorator or factory refactor can't silently break them.
-    """
-    from lathe import Tools
-    import inspect
-
-    print("\n── Tools schema parity: parameter signatures ──")
-
-    tools = Tools()
-
-    # Expected OWUI-visible parameters per method (excluding __dunder__ params).
-    # Format: {method_name: [(param_name, annotation_name, has_default, default_value), ...]}
-    # annotation_name is the simple type name (str, int, bool, list) or "empty"
-    # if no annotation.
-    EXPECTED = {
-        "lathe": [
-            ("manpage", "str", True, "overview"),
-        ],
-        "handoff": [],
-        "destroy": [],
-        "onboard": [
-            ("path", "str", False, None),
-        ],
-        "bash": [
-            ("command", "str", False, None),
-            ("workdir", "str", True, "/home/daytona/workspace"),
-            ("foreground_seconds", "int", True, -1),
-        ],
-        "read": [
-            ("path", "str", False, None),
-            ("start", "int", True, 1),
-            ("stop", "int", True, 0),
-        ],
-        "glob": [
-            ("pattern", "str", False, None),
-            ("max_lines", "int", True, 100),
-        ],
-        "grep": [
-            ("pattern", "str", False, None),
-            ("files", "str", True, "**/*"),
-            ("max_lines", "int", True, 100),
-        ],
-        "write": [
-            ("path", "str", False, None),
-            ("content", "str", False, None),
-        ],
-        "edit": [
-            ("path", "str", False, None),
-            ("old_string", "str", False, None),
-            ("new_string", "str", False, None),
-            ("replace_all", "bool", True, False),
-        ],
-        "interpret": [
-            ("code", "str", False, None),
-            ("timeout", "int", True, 120),
-        ],
-        "view": [
-            ("path", "str", False, None),
-        ],
-        "delegate": [
-            ("task", "str", False, None),
-            ("context_files", "list", True, []),
-            ("max_steps", "int", True, 10),
-            ("foreground_seconds", "int", True, -1),
-        ],
-        "expose": [
-            ("target", "str", False, None),
-        ],
-    }
-
-    # Discover all public methods on the Tools instance
-    public_methods = {
-        name: method
-        for name, method in inspect.getmembers(tools, predicate=inspect.ismethod)
-        if not name.startswith("_")
-    }
-
-    R.check("all expected methods exist",
-            set(EXPECTED.keys()) == set(public_methods.keys()),
-            f"expected {sorted(EXPECTED.keys())}, got {sorted(public_methods.keys())}")
-
-    for method_name, expected_params in EXPECTED.items():
-        if method_name not in public_methods:
-            R.check(f"{method_name} exists", False, "method not found")
-            continue
-
-        method = public_methods[method_name]
-        sig = inspect.signature(method)
-
-        # Filter to OWUI-visible params (not __dunder__, not self)
-        visible_params = [
-            (name, param)
-            for name, param in sig.parameters.items()
-            if not name.startswith("__") and name != "self"
-        ]
-
-        R.check(f"{method_name}: param count",
-                len(visible_params) == len(expected_params),
-                f"expected {len(expected_params)}, got {len(visible_params)}: "
-                f"{[n for n, _ in visible_params]}")
-
-        for i, (pname, param) in enumerate(visible_params):
-            if i >= len(expected_params):
-                R.check(f"{method_name}.{pname}: unexpected param", False, "extra param")
-                continue
-            exp_name, exp_type, exp_has_default, exp_default = expected_params[i]
-
-            R.check(f"{method_name}: param[{i}] name",
-                    pname == exp_name,
-                    f"expected {exp_name!r}, got {pname!r}")
-
-            # Check annotation
-            ann = param.annotation
-            if ann is inspect.Parameter.empty:
-                ann_name = "empty"
-            elif hasattr(ann, "__name__"):
-                ann_name = ann.__name__
-            elif hasattr(ann, "_name"):  # typing generics
-                ann_name = ann._name
-            else:
-                ann_name = str(ann)
-            R.check(f"{method_name}.{pname}: type annotation",
-                    ann_name == exp_type,
-                    f"expected {exp_type!r}, got {ann_name!r}")
-
-            # Check default
-            has_default = param.default is not inspect.Parameter.empty
-            R.check(f"{method_name}.{pname}: has_default",
-                    has_default == exp_has_default,
-                    f"expected has_default={exp_has_default}, got {has_default}")
-            if has_default and exp_has_default:
-                R.check(f"{method_name}.{pname}: default value",
-                        param.default == exp_default,
-                        f"expected {exp_default!r}, got {param.default!r}")
-
-    # Verify docstrings are present on all public methods
-    print("\n── Tools schema parity: docstrings ──")
-    for method_name in EXPECTED:
-        if method_name not in public_methods:
-            continue
-        method = public_methods[method_name]
-        doc = inspect.getdoc(method) or ""
-        R.check(f"{method_name}: has docstring",
-                len(doc) > 10,
-                f"docstring too short: {doc!r}")
-
-    # Verify __dunder__ params are still present (OWUI needs them for injection)
-    print("\n── Tools schema parity: OWUI dunder params ──")
-    DUNDER_EXPECTATIONS = {
-        "lathe": {"__user__", "__event_emitter__"},
-        "handoff": {"__user__", "__event_emitter__"},
-        "destroy": {"__user__", "__event_emitter__", "__event_call__"},
-        "onboard": {"__user__", "__chat_id__", "__event_emitter__"},
-        "bash": {"__user__", "__chat_id__", "__event_emitter__"},
-        "read": {"__user__", "__chat_id__", "__event_emitter__"},
-        "glob": {"__user__", "__chat_id__", "__event_emitter__"},
-        "grep": {"__user__", "__chat_id__", "__event_emitter__"},
-        "write": {"__user__", "__chat_id__", "__event_emitter__"},
-        "edit": {"__user__", "__chat_id__", "__event_emitter__"},
-        "interpret": {"__user__", "__chat_id__", "__event_emitter__"},
-        "view": {"__user__", "__chat_id__", "__model__", "__metadata__", "__event_emitter__"},
-        "delegate": {"__user__", "__chat_id__", "__event_emitter__", "__metadata__", "__model__", "__request__"},
-        "expose": {"__user__", "__chat_id__", "__event_emitter__"},
-    }
-    for method_name, expected_dunders in DUNDER_EXPECTATIONS.items():
-        if method_name not in public_methods:
-            continue
-        method = public_methods[method_name]
-        sig = inspect.signature(method)
-        actual_dunders = {
-            name for name in sig.parameters
-            if name.startswith("__") and name.endswith("__")
-        }
-        R.check(f"{method_name}: dunder params",
-                actual_dunders == expected_dunders,
-                f"expected {sorted(expected_dunders)}, got {sorted(actual_dunders)}")
-
-    # Verify get_type_hints() returns correct types for all tool params.
-    # OWUI uses get_type_hints() (not inspect.signature().annotation) to
-    # build the JSON schema sent to models.  If __annotations__ is missing,
-    # all params silently fall back to "string" in the schema.
-    print("\n── Tools schema parity: get_type_hints() ──")
-    for method_name, expected_params in EXPECTED.items():
-        if method_name not in public_methods:
-            continue
-        method = public_methods[method_name]
+from unittest.mock import AsyncMock
+
+import httpx
+import pytest
+
+import lathe
+from testing_support import EXPECTED_SCHEMA, normalize_schema
+
+USER = {"email": "owner@example.test", "id": "trusted-user"}
+PNG = b"\x89PNG\r\n\x1a\n" + b"\0" * 8
+
+
+@pytest.fixture(autouse=True)
+def no_network(monkeypatch):
+    async def refuse(*args, **kwargs):
+        raise AssertionError("offline suite attempted real HTTP")
+    monkeypatch.setattr(httpx.AsyncHTTPTransport, "handle_async_request", refuse)
+
+
+@pytest.fixture
+def tools():
+    t = lathe.Tools()
+    t.valves.daytona_api_key = "test-key"
+    t.valves.deployment_label = "test"
+    t.valves.daytona_api_url = "https://api.test"
+    t.valves.daytona_proxy_url = "https://proxy.test"
+    return t
+
+
+@pytest.fixture
+def http(monkeypatch):
+    """Install a strict HTTP boundary, retaining real httpx response semantics."""
+    constructor = httpx.AsyncClient
+    clients = []
+
+    def install(handler):
+        def create(*args, **kwargs):
+            # Delegate's in-process model transport must remain real.
+            kwargs.setdefault("transport", httpx.MockTransport(handler))
+            client = constructor(*args, **kwargs)
+            clients.append(client)
+            return client
+        monkeypatch.setattr(lathe, "httpx", SimpleNamespace(**{**vars(httpx), "AsyncClient": create}))
+        return clients
+
+    return install
+
+
+@pytest.fixture
+def sandbox(monkeypatch):
+    """Bypass VM provisioning, retaining Tools dispatch and message delivery."""
+    monkeypatch.setattr(lathe, "_ensure_sandbox", AsyncMock(return_value=("sb", None)))
+    monkeypatch.setattr(lathe, "_ensure_chat_init", AsyncMock())
+
+
+@pytest.fixture(params=[False, True], ids=["import", "owui-future-exec"])
+def module(request, monkeypatch):
+    if not request.param:
+        return lathe
+    # Real source, real factory: copied demonstrations of get_type_hints do
+    # not protect against removing annotation resolution from production.
+    module = ModuleType("lathe_loader_test")
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    source = Path(lathe.__file__).read_text()
+    code = compile(source, lathe.__file__, "exec",
+                   flags=__future__.annotations.compiler_flag, dont_inherit=True)
+    exec(code, module.__dict__)
+    return module
+
+
+def test_tools_interface(module):
+    methods = dict(inspect.getmembers(module.Tools(), inspect.ismethod))
+    assert {n for n in methods if not n.startswith("_")} == set(EXPECTED_SCHEMA)
+    types = {str: "string", int: "integer", bool: "boolean", list: "array"}
+    for name, expected in EXPECTED_SCHEMA.items():
+        method = methods[name]
         hints = typing.get_type_hints(method)
-        for exp_name, exp_type, _has_default, _default in expected_params:
-            hint = hints.get(exp_name)
-            if exp_type == "empty":
-                R.check(f"{method_name}.{exp_name}: type hint absent",
-                        hint is None,
-                        f"expected no hint, got {hint}")
-            else:
-                expected_cls = {"str": str, "int": int, "bool": bool,
-                                "list": list, "dict": dict}.get(exp_type)
-                # For parameterized generics like list[str], compare
-                # the origin type (list) rather than the full generic.
-                actual = typing.get_origin(hint) or hint
-                R.check(f"{method_name}.{exp_name}: type hint",
-                        actual == expected_cls,
-                        f"expected {expected_cls}, got {hint}")
+        params = inspect.signature(method).parameters
+        actual = {}
+        for key, param in params.items():
+            if key.startswith("__"):
+                continue
+            hint = typing.get_origin(hints[key]) or hints[key]
+            required = param.default is inspect.Parameter.empty
+            actual[key] = (types[hint], required, None if required else param.default)
+        assert actual == expected, name
+        assert inspect.getdoc(method), name
+        assert "__user__" in params and "__event_emitter__" in params
+        if name not in {"lathe", "handoff", "destroy"}:
+            assert "__chat_id__" in params, name
+    assert "__event_call__" in inspect.signature(methods["destroy"]).parameters
+    assert {"__model__", "__metadata__", "__request__"} <= set(
+        inspect.signature(methods["delegate"]).parameters)
 
 
-async def test_sandbox_lifecycle_lookup(R: Results):
-    """Regression coverage for Daytona's stale label-list behavior (#62)."""
-    import lathe
-    from lathe import Tools, _ensure_sandbox, _get_live_sandbox
-
-    class FakeValves:
-        daytona_api_key = "fake"
-        daytona_api_url = "https://fake.api"
-        daytona_proxy_url = "https://fake.proxy"
-        deployment_label = "deploy"
-        auto_create_sandbox = False
-        sandbox_missing_message = "Ask an administrator to provision your sandbox."
-
-    class FakeResponse:
-        def __init__(self, status_code=200, json_data=None):
-            self.status_code = status_code
-            self._json = json_data if json_data is not None else {}
-
-        def json(self):
-            return self._json
-
-        def raise_for_status(self):
-            if self.status_code >= 400:
-                raise RuntimeError(f"HTTP {self.status_code}")
-
-    class LookupClient:
-        def __init__(self, list_response, detail_responses=()):
-            self.list_response = list_response
-            self.detail_responses = list(detail_responses)
-            self.get_calls = []
-
-        async def get(self, url, **kwargs):
-            self.get_calls.append(url)
-            if url.endswith("/sandbox"):
-                return self.list_response
-            return self.detail_responses.pop(0)
-
-    candidate = {
-        "id": "sandbox-1234567890",
-        "labels": {"deploy": "user@example.edu"},
-        "state": "started",  # Deliberately stale label-list state.
-    }
-
-    print("\n── sandbox lifecycle: authoritative per-ID filtering ──")
-    client = LookupClient(FakeResponse(200, {}), [FakeResponse(404)])
-    sandbox = await _get_live_sandbox(FakeValves(), candidate["id"], client)
-    R.check("404 per-ID is absent", sandbox is None, repr(sandbox))
-
-    client = LookupClient(FakeResponse(200, {}), [FakeResponse(200, {**candidate, "state": "destroying"})])
-    sandbox = await _get_live_sandbox(FakeValves(), candidate["id"], client)
-    R.check("destroying per-ID is absent", sandbox is None, repr(sandbox))
-
-    authoritative = {**candidate, "state": "stopped"}
-    client = LookupClient(FakeResponse(200, {}), [FakeResponse(200, authoritative)])
-    sandbox = await _get_live_sandbox(FakeValves(), candidate["id"], client)
-    R.check("uses authoritative per-ID object", sandbox == authoritative, repr(sandbox))
-
-    client = LookupClient(FakeResponse(200, {}), [FakeResponse(500)])
-    try:
-        await _get_live_sandbox(FakeValves(), candidate["id"], client)
-        R.check("non-404 per-ID error propagates", False, "no exception")
-    except RuntimeError as exc:
-        R.check("non-404 per-ID error propagates", "500" in str(exc), str(exc))
-
-    print("\n── sandbox lifecycle: label cardinality gate ──")
-    duplicate = {**candidate, "id": "sandbox-duplicate"}
-    client = LookupClient(FakeResponse(200, [candidate, duplicate]))
-    try:
-        await _ensure_sandbox(FakeValves(), "user@example.edu", client)
-        R.check("duplicate association is refused", False, "no exception")
-    except RuntimeError as exc:
-        message = str(exc)
-        R.check("duplicate association is refused", "Multiple sandboxes" in message, message)
-        R.check("duplicate directs to administrator", "system administrator" in message, message)
-    R.check("duplicates do not trigger per-ID fan-out",
-            all(url.endswith("/sandbox") for url in client.get_calls), str(client.get_calls))
-
-    client = LookupClient(FakeResponse(200, [candidate]), [FakeResponse(404)])
-    try:
-        await _ensure_sandbox(FakeValves(), "user@example.edu", client)
-        R.check("ghost reaches normal missing-sandbox path", False, "no exception")
-    except RuntimeError as exc:
-        R.check("ghost is not treated as duplicate or live",
-                str(exc) == FakeValves.sandbox_missing_message, str(exc))
-    R.check("single candidate makes one per-ID validation request",
-            len(client.get_calls) == 2, str(client.get_calls))
-
-    print("\n── destroy: cardinality and per-ID completion ──")
-    class DestroyClient:
-        def __init__(self, responses):
-            self.responses = list(responses)
-            self.get_calls = []
-            self.delete_calls = []
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, exc_type, exc, tb):
-            return False
-
-        async def get(self, url, **kwargs):
-            self.get_calls.append(url)
-            return self.responses.pop(0)
-
-        async def delete(self, url, **kwargs):
-            self.delete_calls.append(url)
-            return self.responses.pop(0)
-
-    async def confirmed(_data):
-        return True
-
-    tools = Tools()
-    tools.valves.daytona_api_key = "fake"
-    tools.valves.daytona_api_url = "https://fake.api"
-    tools.valves.deployment_label = "deploy"
-    tools.valves.persistent_volume = False
-    original_client = lathe.httpx.AsyncClient
-    try:
-        duplicate_client = DestroyClient([FakeResponse(200, [candidate, duplicate])])
-        lathe.httpx.AsyncClient = lambda: duplicate_client
-        result = await tools.destroy(
-            __user__={"email": "user@example.edu"}, __event_call__=confirmed,
-        )
-        R.check("destroy refuses duplicate association", "Multiple sandboxes" in result, result)
-        R.check("destroy duplicates issue no per-ID requests", len(duplicate_client.get_calls) == 1,
-                str(duplicate_client.get_calls))
-        R.check("destroy duplicates issue no DELETE", not duplicate_client.delete_calls,
-                str(duplicate_client.delete_calls))
-
-        destroy_client = DestroyClient([
-            FakeResponse(200, [candidate]),
-            FakeResponse(200, candidate),
-            FakeResponse(204),
-            FakeResponse(404),
-        ])
-        lathe.httpx.AsyncClient = lambda: destroy_client
-        result = await tools.destroy(
-            __user__={"email": "user@example.edu"}, __event_call__=confirmed,
-        )
-        R.check("destroy succeeds after per-ID 404", result.startswith("Destroyed 1 sandbox"), result)
-        R.check("destroy issues exactly one DELETE", len(destroy_client.delete_calls) == 1,
-                str(destroy_client.delete_calls))
-        R.check("destroy polls only the sandbox ID after DELETE",
-                all(not url.endswith("/sandbox") for url in destroy_client.get_calls[1:]),
-                str(destroy_client.get_calls))
-    finally:
-        lathe.httpx.AsyncClient = original_client
+def test_delegate_interface(module):
+    t = module.Tools()
+    t._chat_state["chat"] = {"init": True, "pending": []}
+    for with_chat in (False, True):
+        tools = module._build_delegate_tools(
+            t.valves, "sb", None, [],
+            chat_state=t._chat_state if with_chat else None, chat_id="chat")
+        expected_names = {"bash", "read", "write", "edit", "glob", "grep"}
+        if with_chat:
+            expected_names.add("interpret")
+        assert {tool.name for tool in tools} == expected_names
+        for tool in tools:
+            expected = dict(EXPECTED_SCHEMA[tool.name])
+            if tool.name == "bash":
+                expected["foreground_seconds"] = ("integer", False, 15)
+            assert normalize_schema(tool.tool_def.parameters_json_schema) == expected
+            assert tool.description
+            assert all(p.get("description") for p in
+                       tool.tool_def.parameters_json_schema["properties"].values())
 
 
-async def test_preview_wrapping(R: Results):
-    import json
-    import httpx
-    from unittest.mock import AsyncMock, patch
-    from lathe import Tools
+@pytest.mark.parametrize("name,kwargs", [
+    ("read", {"path": "/x", "start": "2"}),
+    ("edit", {"path": "/x", "old_string": "a", "new_string": "b", "replace_all": "false"}),
+    ("glob", {"pattern": "*", "max_lines": "4"}),
+    ("grep", {"pattern": "x", "max_lines": []}),
+    ("interpret", {"code": "1", "timeout": "2"}),
+    ("bash", {"command": "true", "foreground_seconds": "0"}),
+    ("delegate", {"task": "x", "context_files": "/x"}),
+    ("delegate", {"task": "x", "max_steps": "2"}),
+])
+async def test_bad_types_rejected_before_io(module, monkeypatch, name, kwargs):
+    context = AsyncMock(side_effect=AssertionError("invalid input reached I/O"))
+    monkeypatch.setattr(module, "_tool_context", context)
+    result = await getattr(module.Tools(), name)(**kwargs)
+    assert "expected type" in result
+    context.assert_not_called()
 
-    upstream = 'https://synthetic-secret.preview.test/'
-    protected = 'https://owner-5000.previews.test/'
-    secret = 'synthetic-installation-secret'
-    user = {'id': 'injected-user-id', 'email': 'owner@example.edu'}
-    successful = {'url': protected, 'access_mode': 'owner-authenticated', 'expires_at': '2099-01-01T00:00:00Z'}
 
-    async def invoke(target='http:5000', payload=None, status=200, direct=False, missing_id=False, partial=False):
-        tools = Tools()
-        tools.valves.daytona_api_key = 'synthetic-daytona-key'
-        if not direct:
-            tools.valves.preview_wrapper_url = 'https://wrapper.test/register'
-            tools.valves.preview_wrapper_key = '' if partial else secret
+async def test_loaded_wrapper_dispatches_typed_arguments(module, monkeypatch, tmp_path):
+    observed = []
+    monkeypatch.setattr(module, "_ensure_sandbox", AsyncMock(return_value=("sb", None)))
+    monkeypatch.setattr(module, "_ensure_chat_init", AsyncMock())
+
+    async def execute(valves, sid, client, script, **kwargs):
+        observed.append(script)
+        return run_script(script)
+
+    monkeypatch.setattr(module, "_run_sandbox_script", execute)
+    path = tmp_path / "input.txt"
+    path.write_text("first\nselected-line\nlast\n")
+    result = await module.Tools().read(str(path), start=2, stop=3, __user__=USER)
+    assert result.splitlines()[1:] == ["2: selected-line"]
+    assert len(observed) == 1
+
+
+def run_script(source, **kwargs):
+    return subprocess.run([sys.executable, "-c", source], capture_output=True,
+                          text=True, check=True, timeout=10, **kwargs).stdout.rstrip("\n")
+
+
+def script_call(kind, function, *args):
+    return run_script(getattr(lathe, f"_{kind}_SCRIPT") +
+                      f"\nprint({function}({', '.join(repr(a) for a in args)}))")
+
+
+@pytest.mark.parametrize("content", ["", "café\n世界\n", "it's a \\\"test\\\"\nlast"])
+def test_write_roundtrip(tmp_path, content):
+    path = tmp_path / "nested" / "it's a test.txt"
+    for value in ("old content", content):
+        result = script_call("WRITE", "write_file", str(path), value)
+        assert not result.startswith("Error:")
+        assert path.read_bytes() == value.encode()
+        assert f"{len(value.encode())} bytes" in result
+
+
+@pytest.mark.parametrize("start,stop,selected", [
+    (1, 0, list(range(1, 11))), (3, 5, [3, 4]), (-3, 0, [8, 9, 10]),
+    (-5, -3, [6, 7]), (0, 3, [1, 2]), (5, 3, []), (50, 0, []),
+])
+def test_read_ranges(tmp_path, start, stop, selected):
+    path = tmp_path / "lines.txt"
+    path.write_text("".join(f"line{i}\n" for i in range(1, 11)))
+    result = script_call("READ", "read_file", str(path), start, stop)
+    assert result.splitlines()[1:] == [f"{i}: line{i}" for i in selected]
+
+
+@pytest.mark.parametrize("old,new,all_,expected,error", [
+    ("foo", "baz", False, "foo bar foo\n", True),
+    ("absent", "baz", False, "foo bar foo\n", True),
+    ("foo", "baz", True, "baz bar baz\n", False),
+    ("bar", "it's\na test", False, "foo it's\na test foo\n", False),
+])
+def test_edit_is_unambiguous_or_non_destructive(tmp_path, old, new, all_, expected, error):
+    path = tmp_path / "edit.txt"
+    path.write_text("foo bar foo\n")
+    result = script_call("EDIT", "edit_file", str(path), old, new, all_)
+    assert result.startswith("Error:") == error
+    assert path.read_text() == expected
+
+
+def test_read_limit_and_missing_file(tmp_path):
+    path = tmp_path / "large.txt"
+    assert script_call("READ", "read_file", str(path), 1, 0).startswith("Error:")
+    assert script_call("EDIT", "edit_file", str(path), "x", "y", False).startswith("Error:")
+    path.write_text("x\n" * 3000)
+    assert len(script_call("READ", "read_file", str(path), 1, 0).splitlines()[1:]) == 2000
+
+
+@pytest.fixture
+def tree(tmp_path):
+    files = {"a.py": "needle\n", "b.txt": "needle\n", "sub/c.py": "no hit\n"}
+    files.update({f"sub/deep/{i}.py": "needle\nneedle\n" for i in range(10)})
+    for name, text in files.items():
+        path = tmp_path / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+    return tmp_path.resolve()
+
+
+@pytest.mark.parametrize("kind", ["GLOB", "GREP"])
+def test_search_scope_and_absolute_paths(tree, tmp_path_factory, kind):
+    def search(pattern):
+        args = (str(tree), pattern, 100) if kind == "GLOB" else (str(tree), "needle", pattern, 100)
+        return script_call(kind, kind.lower() + "_hierarchy", *args)
+    relative = search("**/*.py,!**/deep/**")
+    absolute = search(f"{tree}/**/*.py,!{tree}/**/deep/**")
+    assert relative.splitlines()[1:] == absolute.splitlines()[1:]
+    assert "deep/" not in "\n".join(relative.splitlines()[1:])
+    assert str(tree / "a.py") in relative
+    assert "b.txt" not in relative
+    assert search("!**/deep/**,**/*.py").splitlines()[1:] == relative.splitlines()[1:]
+    assert "b.txt" in search("**/*.py,**/*.txt")
+    assert search("!**/*.py").startswith("Error:")
+    outside = tmp_path_factory.mktemp("outside").resolve()
+    (outside / "other.py").write_text("needle\n")
+    assert str(outside / "other.py") in search(f"{outside}/*.py")
+
+
+@pytest.mark.parametrize("kind,total", [("GLOB", 13), ("GREP", 22)])
+@pytest.mark.parametrize("budget", [4, 8, 100])
+def test_search_budget_conserves_matches(tree, kind, total, budget):
+    args = (str(tree), "**/*", budget) if kind == "GLOB" else (str(tree), "needle", "**/*", budget)
+    result = script_call(kind, kind.lower() + "_hierarchy", *args)
+    header, *body = result.splitlines()
+    assert int(header.split()[0]) == total
+    assert len(body) <= budget
+    counts = [re.search(r"(?:\(|and )(\d+) (?:more )?matches", line) for line in body]
+    assert sum(int(m[1]) if m else 1 for m in counts) == total
+    if budget == 100:
+        assert all(line.startswith(str(tree)) for line in body)
+        assert len(body) == total
+
+
+def test_grep_invalid_regex_and_no_hits(tree):
+    assert script_call("GREP", "grep_hierarchy", str(tree), "[", "**/*", 10).startswith("Error:")
+    assert script_call("GREP", "grep_hierarchy", str(tree), "absent", "**/*", 10).startswith("0 matches")
+
+
+@pytest.mark.parametrize("name,kwargs", [
+    ("read", {}), ("write", {"content": "x"}),
+    ("edit", {"old_string": "x", "new_string": "y"}), ("view", {}),
+])
+async def test_relative_file_path_never_reaches_http(tools, name, kwargs):
+    result = await getattr(lathe, "_core_" + name)(tools.valves, "sb", None, path="relative", **kwargs)
+    assert "absolute path" in result
+
+
+async def test_file_core_http_roundtrip(tools, tmp_path):
+    # Execute the actual HTTP command locally: covers quoting and argument
+    # assembly as well as real disk effects, rather than echoing canned text.
+    def handler(request):
+        assert (request.method, request.url.path) == ("POST", "/sb/process/execute")
+        assert request.headers["authorization"] == "Bearer test-key"
+        command = shlex.split(json.loads(request.content)["command"])
+        assert command[:2] == ["python3", "-c"]
+        result = run_script(command[2])
+        return httpx.Response(200, json={"exitCode": 0, "result": result})
+    path = str(tmp_path / "it's a file.txt")
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        await lathe._core_write(tools.valves, "sb", client, path=path, content="alpha\ncafé\n")
+        await lathe._core_edit(tools.valves, "sb", client, path=path, old_string="café", new_string="世界")
+        result = await lathe._core_read(tools.valves, "sb", client, path=path, start=2, stop=3)
+    assert result.splitlines()[1:] == ["2: 世界"]
+    assert Path(path).read_text() == "alpha\n世界\n"
+
+
+@pytest.mark.parametrize("raw", ["invalid", "[]", '{"BAD-KEY":"x"}', '{"A":1}'])
+def test_invalid_environment_rejected(raw):
+    with pytest.raises(ValueError):
+        lathe._parse_env_vars(raw)
+
+
+@pytest.mark.parametrize("key", ["name", "labels", "volumes"])
+def test_create_overrides_cannot_replace_identity(key):
+    with pytest.raises(ValueError, match=key):
+        lathe._parse_create_overrides(json.dumps({key: "override"}))
+    assert lathe._parse_create_overrides('{"cpu":2}') == {"cpu": 2}
+
+
+def test_bash_script_preserves_environment_and_failure(tmp_path):
+    value = "it's $HOME `whoami`\n世界"
+    pairs = lathe._parse_env_vars(json.dumps({"SECRET": value}))
+    script = lathe._build_bash_script(
+        'printf "%s" "$SECRET"; false; printf should-not-run', pairs,
+        str(tmp_path / "pid"), str(tmp_path / "log"))
+    result = subprocess.run(["bash"], input=script, text=True, capture_output=True, timeout=10)
+    assert result.returncode != 0
+    assert result.stdout == value
+    assert (tmp_path / "log").read_text() == value
+    # macOS ships Bash 3 (no BASHPID); Linux sidecar PIDs are a live-suite concern.
+
+
+@pytest.mark.parametrize("text", ["", "short\ntext", "x\n" * 3000, ("é" * 100 + "\n") * 600])
+def test_output_tail_is_bounded_and_recoverable(text):
+    output, truncated, meta = lathe._truncate_tail(text)
+    assert len(output.encode()) <= 50 * 1024
+    assert len(output.splitlines()) <= 2000
+    assert text.endswith(output)
+    formatted = lathe._format_bash_result(output, 7, truncated, meta, spill_path="/logs/full")
+    assert "Exit code: 7" in formatted
+    if truncated:
+        assert "/logs/full" in formatted
+        assert meta["total_bytes"] == len(text.encode())
+    else:
+        assert output == text
+
+
+def test_onboard_merges_global_and_project_context(tmp_path):
+    home = tmp_path / "home"
+    project = tmp_path / "it's a project"
+    for base, instruction, description in [
+        (home / ".agents", "global instructions", "global skill"),
+        (project, "project instructions", "project skill"),
+    ]:
+        base.mkdir(parents=True)
+        (base / "AGENTS.md").write_text(instruction)
+        skill = (base if base == home / ".agents" else base / ".agents") / "skills" / "shared"
+        skill.mkdir(parents=True)
+        (skill / "SKILL.md").write_text(f"---\nname: shared\ndescription: {description}\n---\nPRIVATE BODY")
+    result = run_script(lathe._build_onboard_script(str(project)), env={**os.environ, "HOME": str(home)})
+    assert "global instructions" in result and "project instructions" in result
+    assert "project skill" in result and "global skill" not in result
+    assert "PRIVATE BODY" not in result
+    assert str(project / "AGENTS.md") in result
+
+
+@pytest.mark.parametrize("volume,wrapped", [(False, False), (True, False), (True, True)])
+async def test_rendered_manual(tools, volume, wrapped):
+    tools.valves.persistent_volume = volume
+    tools.valves.preview_wrapper_url = "https://wrapper.test" if wrapped else ""
+    for page in tools._MANPAGES:
+        result = await tools.lathe(page)
+        assert len(result) > 500 and not result.startswith("Error:")
+        assert not re.search(r"\{(?:tool_catalog|volume_note|destroy_volume_note|preview_access_note)\}", result)
+    overview = await tools.lathe()
+    assert ("/home/daytona/volume" in overview) == volume
+    assert "bash(" in overview and "delegate(" in overview
+    assert ("owner-authenticated wrapper" in overview) == wrapped
+    assert "overview" in await tools.lathe("nonexistent")
+
+
+async def test_chat_init_and_notice_delivery(tools):
+    calls = []
+    def handler(request):
+        calls.append(request)
+        if request.method == "POST":
+            return httpx.Response(200, json={"exitCode": 0, "result": "workspace snapshot"})
+        return httpx.Response(200, json={"cpu": 2})
+    user = {**USER, "valves": tools.UserValves(env_vars='{"TOKEN":"hidden-value"}')}
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        for _ in range(2):
+            await lathe._ensure_chat_init(tools.valves, "sb", client, tools._chat_state, "a", user)
+    assert len(calls) == 2
+    tools._chat_state["b"] = {"init": True, "pending": []}
+    lathe._push_bg_notice(tools._chat_state, "a", "job complete")
+    assert lathe._drain_harness_messages(tools._chat_state, "b", None) == []
+    delivered = "\n".join(lathe._drain_harness_messages(tools._chat_state, "a", "restarted"))
+    assert all(value in delivered for value in ["workspace snapshot", "TOKEN", "job complete", "restarted"])
+    assert "hidden-value" not in delivered
+    assert lathe._drain_harness_messages(tools._chat_state, "a", None) == []
+
+
+@pytest.mark.parametrize("prior,live,expected,lost", [
+    (None, [], "new", False), ("old", [{"id": "old"}], "old", False),
+    ("old", [], "new", True),
+])
+async def test_interpreter_context_recovery(tools, prior, live, expected, lost):
+    tools._chat_state["a"] = {"init": True, "pending": []}
+    if prior:
+        tools._chat_state["a"]["interpreter_context_id"] = prior
+    calls = []
+    def handler(request):
+        calls.append(request.method)
+        assert request.url.path == "/sb/process/interpreter/context"
+        return httpx.Response(200, json={"contexts": live} if request.method == "GET" else {"id": "new"})
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        assert await lathe._ensure_interpreter_context(tools.valves, "sb", client, tools._chat_state, "a") == (expected, lost)
+    assert tools._chat_state["a"]["interpreter_context_id"] == expected
+    assert calls.count("POST") == (expected == "new")
+
+
+async def test_background_bash_poll_delivers_once(tools, http, monkeypatch):
+    tools._chat_state["chat"] = {"init": True, "pending": []}
+    statuses = iter([httpx.Response(503), httpx.Response(200, json={"commands": [{"id": "cmd"}]}),
+                     httpx.Response(200, json={"commands": [{"id": "cmd", "exitCode": 7}]})])
+    requests = []
+    def handler(request):
+        requests.append(request.url.path)
+        assert request.method == "GET"
+        if request.url.path == "/sb/process/session/session":
+            return next(statuses)
+        assert request.url.path == "/sb/process/session/session/command/cmd/logs"
+        return httpx.Response(200, text="final output")
+    http(handler)
+    monkeypatch.setattr(lathe.asyncio, "sleep", AsyncMock())
+    await lathe._poll_bg_bash(tools.valves, "sb", "session", "cmd", "job", 0, tools._chat_state, "chat")
+    notices = lathe._drain_harness_messages(tools._chat_state, "chat", None)
+    assert len(requests) == 4
+    assert len(notices) == 1
+    assert all(s in notices[0] for s in ["job", "Exit code: 7", "final output"])
+    assert lathe._drain_harness_messages(tools._chat_state, "chat", None) == []
+
+
+@pytest.mark.parametrize("state,status", [("destroying", 200), ("destroyed", 200), ("started", 404)])
+async def test_stale_discovery_never_resurrects_sandbox(tools, state, status):
+    tools.valves.auto_create_sandbox = False
+    tools.valves.sandbox_missing_message = "provision externally"
+    candidate = {"id": "sb", "labels": {"test": USER["email"]}, "state": "started"}
+    calls = []
+    def handler(request):
+        calls.append(request.url.path)
+        assert request.method == "GET"
+        if request.url.path == "/sandbox":
+            return httpx.Response(200, json={"items": [candidate]})
+        assert request.url.path == "/sandbox/sb"
+        return httpx.Response(status, json={**candidate, "state": state})
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(RuntimeError, match="provision externally"):
+            await lathe._ensure_sandbox(tools.valves, USER["email"], client)
+    assert calls == ["/sandbox", "/sandbox/sb"]
+
+
+async def test_duplicate_sandbox_association_refuses_use_and_destroy(tools, http):
+    calls = []
+    def handler(request):
+        calls.append((request.method, request.url.path))
+        assert (request.method, request.url.path) == ("GET", "/sandbox")
+        return httpx.Response(200, json=[{"id": sid, "labels": {"test": USER["email"]}} for sid in ("a", "b")])
+    http(handler)
+    async with lathe.httpx.AsyncClient() as client:
+        with pytest.raises(RuntimeError, match="Multiple sandboxes"):
+            await lathe._ensure_sandbox(tools.valves, USER["email"], client)
+    assert "Multiple sandboxes" in await tools.destroy(__user__=USER, __event_call__=AsyncMock(return_value=True))
+    assert calls == [("GET", "/sandbox")] * 2
+
+
+async def test_destroy_requires_consent_and_authoritative_completion(tools, http, monkeypatch):
+    calls = []
+    responses = iter([
+        httpx.Response(200, json=[{"id": "sb", "labels": {"test": USER["email"]}}]),
+        httpx.Response(200, json={"id": "sb", "state": "started"}),
+        httpx.Response(204), httpx.Response(200, json={"state": "destroying"}), httpx.Response(404),
+    ])
+    def handler(request):
+        calls.append((request.method, request.url.path))
+        return next(responses)
+    http(handler)
+    monkeypatch.setattr(lathe.asyncio, "sleep", AsyncMock())
+    assert "cannot confirm" in await tools.destroy(__user__=USER)
+    assert "cancelled" in await tools.destroy(__user__=USER, __event_call__=AsyncMock(return_value=False))
+    assert calls == []
+    result = await tools.destroy(__user__=USER, __event_call__=AsyncMock(return_value=True))
+    assert result.startswith("Destroyed 1 sandbox")
+    assert calls == [("GET", "/sandbox"), ("GET", "/sandbox/sb"), ("DELETE", "/sandbox/sb"),
+                     ("GET", "/sandbox/sb"), ("GET", "/sandbox/sb")]
+
+
+@pytest.mark.parametrize("payload,mime", [
+    (PNG, "png"), (b"\xff\xd8\xff\xe0", "jpeg"), (b"GIF89a", "gif"),
+    (b"RIFF0000WEBP", "webp"), (b"<svg/>", None), (b"\x89PNG", None),
+])
+async def test_view_content_detection(tools, payload, mime):
+    async with httpx.AsyncClient(transport=httpx.MockTransport(lambda r: httpx.Response(200, content=payload))) as client:
+        result = await lathe._core_view(tools.valves, "sb", client, path="/misleading.txt")
+    assert result == f"data:image/{mime};base64,{base64.b64encode(payload).decode()}" if mime else result.startswith("Error:")
+
+
+async def test_image_return_defers_notices_until_text_call(tools, sandbox, http):
+    def handler(request):
+        if request.url.path == "/sb/files/download":
+            return httpx.Response(200, content=PNG)
+        assert request.url.path == "/sb/process/execute"
+        return httpx.Response(200, json={"exitCode": 0, "result": "text result"})
+    http(handler)
+    tools._chat_state["a"] = {"init": True, "pending": ["pending notice"]}
+    result = await tools.view("/image", __user__=USER, __chat_id__="a")
+    assert result == "data:image/png;base64," + base64.b64encode(PNG).decode()
+    assert await tools.read("/text", __user__=USER, __chat_id__="a") == "pending notice\n\ntext result"
+    assert await tools.read("/text", __user__=USER, __chat_id__="a") == "text result"
+
+
+@pytest.mark.parametrize("model", [
+    {"architecture": {"input_modalities": ["text"]}, "info": {"meta": {"capabilities": {"vision": True}}}},
+    {"info": {"meta": {"capabilities": {"vision": False}}}},
+])
+async def test_text_model_view_refused_before_io(tools, monkeypatch, model):
+    context = AsyncMock(side_effect=AssertionError("vision gate reached I/O"))
+    monkeypatch.setattr(lathe, "_tool_context", context)
+    result = await tools.view("/image", __metadata__={"model": model}, __model__={"architecture": {"input_modalities": ["image"]}})
+    assert "does not accept image input" in result
+    context.assert_not_called()
+
+
+@pytest.fixture
+def preview(tools, sandbox, http):
+    upstream, protected, secret = "https://secret.preview.test/", "https://owner.preview.test/", "installation-secret"
+    tools.valves.preview_wrapper_url = "https://wrapper.test/register"
+    tools.valves.preview_wrapper_key = secret
+    good = {"url": protected, "access_mode": "owner-authenticated", "expires_at": "2099-01-01T00:00:00Z"}
+
+    async def invoke(payload=None, status=200, target="http:5000", user=USER):
         calls, events = [], []
-        async def emit(event): events.append(event)
+        async def emit(event):
+            events.append(event)
         def handler(request):
             calls.append(request)
-            if request.url.host == 'wrapper.test':
-                if payload == 'timeout':
+            if request.url.host == "wrapper.test":
+                if payload == "timeout":
                     raise httpx.ReadTimeout(upstream + secret)
-                if payload == 'malformed':
-                    return httpx.Response(status, text=upstream + secret)
-                return httpx.Response(status, json=successful if payload is None else payload)
-            if request.url.path.endswith('/signed-preview-url'):
-                assert request.url.params['expiresInSeconds'] == '86400'
-                return httpx.Response(200, json={'url': upstream})
-            return httpx.Response(200, json={'exitCode': 0, 'result': 'READY PID=123'})
-        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-        injected = {'email': user['email']} if missing_id else user
-        with patch('lathe.httpx.AsyncClient', return_value=client), \
-             patch('lathe._ensure_sandbox', AsyncMock(return_value=('sandbox-id', None))), \
-             patch('lathe._ensure_chat_init', AsyncMock()):
-            result = await tools.expose(target, __user__=injected, __event_emitter__=emit)
+                if payload == "malformed":
+                    return httpx.Response(200, text=upstream + secret)
+                return httpx.Response(status, json=good if payload is None else payload)
+            if request.url.path.endswith("/signed-preview-url"):
+                assert request.url.params["expiresInSeconds"] == "86400"
+                return httpx.Response(200, json={"url": upstream})
+            assert request.url.path == "/sb/process/execute"
+            return httpx.Response(200, json={"exitCode": 0, "result": "READY PID=123"})
+        http(handler)
+        result = await tools.expose(target, __user__=user, __event_emitter__=emit)
         return result, calls, json.dumps(events)
-
-    for target, slot in [('http:5000','5000'), ('dufs','5000'), ('code-server','8080')]:
-        result, calls, events = await invoke(target)
-        R.check(f'{target} returns protected URL', protected in result and 'Owner-authenticated' in result, result)
-        R.check(f'{target} withholds upstream and key', all(s not in result + events for s in [upstream, secret]))
-        registrations = [r for r in calls if r.url.host == 'wrapper.test']
-        R.check(f'{target} wraps in common path', len(registrations) == 1)
-        payload = json.loads(registrations[0].content)
-        R.check(f'{target} identity is injected, slot is resolved', payload == {
-            'owner': {'subject': user['id'], 'email': user['email']}, 'slot': slot, 'upstream_url': upstream,
-        })
-        R.check(f'{target} authenticates installation', registrations[0].headers['Authorization'] == 'Bearer ' + secret)
-
-    invalid = [
-        ({'url': upstream, 'access_mode':'owner-authenticated', 'expires_at':successful['expires_at']}, 200),
-        ({**successful, 'access_mode':'public'}, 200),
-        ({**successful, 'url':'http://insecure.test/'}, 200),
-        ({**successful, 'url':protected + '?leak=' + upstream}, 200),
-        ({**successful, 'expires_at':'2000-01-01T00:00:00Z'}, 200),
-        ({**successful, 'expires_at':'2099-01-01T00:00:00'}, 200),
-        ({'error': upstream + secret}, 500), ('malformed', 200), ('timeout', 200),
-        (successful, 302),
-    ]
-    for i, (payload, status) in enumerate(invalid):
-        result, calls, events = await invoke(payload=payload, status=status)
-        R.check(f'wrapper failure {i} is closed', result.startswith('Error:') and protected not in result, result)
-        R.check(f'wrapper failure {i} is redacted', upstream not in result + events and secret not in result + events)
-        R.check(f'wrapper failure {i} never follows redirects', len([r for r in calls if r.url.host == 'wrapper.test']) == 1)
-    for kwargs in [{'missing_id':True}, {'partial':True}]:
-        result, calls, events = await invoke(**kwargs)
-        R.check('missing trusted identity/configuration fails before signing', result.startswith('Error:') and not calls, result)
-    result, calls, events = await invoke(direct=True)
-    R.check('unconfigured mode retains direct exposure', upstream in result and 'bearer credential' in result)
-    R.check('direct mode never calls a wrapper', not any(r.url.host == 'wrapper.test' for r in calls))
-
-    result, calls, events = await invoke(target='ssh')
-    R.check('ssh exposure is unsupported', result.startswith('Error: target must be'), result)
-    R.check('ssh rejection makes no Daytona requests', not calls, str(calls))
+    return SimpleNamespace(invoke=invoke, upstream=upstream, protected=protected, secret=secret, good=good)
 
 
-TESTS = {
-    "preview_wrapping": test_preview_wrapping,
-    "parse_env_vars": test_parse_env_vars,
-    "parse_create_overrides": test_parse_create_overrides,
-    "onboard_script": test_onboard_script,
-    "truncate": test_truncate,
-    "shell_quote": test_shell_quote,
-    "require_abs_path": test_require_abs_path,
-    "glob_script": test_glob_script,
-    "grep_script": test_grep_script,
-    "read_script": test_read_script,
-    "write_script": test_write_script,
-    "edit_script": test_edit_script,
-    "pydantic_ai_v2_migration": test_pydantic_ai_v2_migration,
-    "manpage_rendering": test_manpage_rendering,
-    "delegate_prompt_build": test_delegate_prompt_build,
-    "delegate_tools_build": test_delegate_tools_build,
-    "build_bash_script": test_build_bash_script,
-    "format_bash_result": test_format_bash_result,
-    "core_read_mock": test_core_read_mock,
-    "core_write_mock": test_core_write_mock,
-    "core_edit_mock": test_core_edit_mock,
-    "string_typed_params": test_string_typed_params,
-    "string_future_annotations_loading": test_string_future_annotations_loading,
-    "format_delegate_background": test_format_delegate_background,
-    "harness_messages": test_harness_messages,
-    "ensure_chat_init": test_ensure_chat_init,
-    "push_bg_notice": test_push_bg_notice,
-    "format_bg_notices": test_format_bg_notices,
-    "format_interpret_result": test_format_interpret_result,
-    "ensure_interpreter_context": test_ensure_interpreter_context,
-    "sniff_image_mime": test_sniff_image_mime,
-    "model_supports_vision": test_model_supports_vision,
-    "tools_schema_parity": test_tools_schema_parity,
-    "sandbox_lifecycle_lookup": test_sandbox_lifecycle_lookup,
-}
-
-# Lower-signal diagnostics retained for targeted work, but excluded from the
-# required fast gate. Run all of them with ``--extended`` or name one directly.
-EXTENDED_TESTS = {
-    "build_tool_catalog": test_build_tool_catalog,
-    "delegate_infrastructure": test_delegate_infrastructure,
-    "persistent_volume_valve": test_persistent_volume_valve,
-    "sidecar_paths": test_sidecar_paths,
-    "delegate_bash_foreground": test_delegate_bash_foreground,
-    "delegate_foreground_constant": test_delegate_foreground_constant,
-    "delegate_catalog_foreground_param": test_delegate_catalog_foreground_param,
-    "delegate_background_branching": test_delegate_background_branching,
-    "handoff": test_handoff,
-    "chat_state": test_chat_state,
-    "snapshot_script": test_snapshot_script,
-    "chat_id_signatures": test_chat_id_in_signatures,
-    "interpret_constant": test_interpret_constant,
-    "interpret_manpage": test_interpret_manpage,
-}
+@pytest.mark.parametrize("target,slot", [("http:5000", "5000"), ("dufs", "5000"), ("code-server", "8080")])
+async def test_preview_uses_trusted_identity_and_hides_credentials(preview, target, slot):
+    result, calls, events = await preview.invoke(target=target)
+    assert preview.protected in result and "Owner-authenticated" in result
+    assert all(s not in result + events for s in [preview.upstream, preview.secret])
+    registrations = [r for r in calls if r.url.host == "wrapper.test"]
+    assert len(registrations) == 1
+    assert json.loads(registrations[0].content) == {
+        "owner": {"subject": USER["id"], "email": USER["email"]}, "slot": slot, "upstream_url": preview.upstream}
+    assert registrations[0].headers["Authorization"] == "Bearer " + preview.secret
 
 
-async def main():
-    args = sys.argv[1:]
-    available = {**TESTS, **EXTENDED_TESTS}
+@pytest.mark.parametrize("failure", ["upstream", "public", "http", "leak", "expired", "naive", "500", "302", "malformed", "timeout"])
+async def test_preview_failures_are_closed_and_redacted(preview, failure):
+    changes = {
+        "upstream": {"url": preview.upstream}, "public": {"access_mode": "public"},
+        "http": {"url": "http://insecure.test/"}, "leak": {"url": preview.protected + "?leak=" + preview.upstream},
+        "expired": {"expires_at": "2000-01-01T00:00:00Z"}, "naive": {"expires_at": "2099-01-01T00:00:00"},
+    }
+    payload = {**preview.good, **changes[failure]} if failure in changes else failure
+    status = int(failure) if failure.isdigit() else 200
+    if status != 200:
+        payload = {"error": preview.upstream + preview.secret}
+    result, calls, events = await preview.invoke(payload, status)
+    assert result.startswith("Error:")
+    assert all(s not in result + events for s in [preview.protected, preview.upstream, preview.secret])
+    assert len([r for r in calls if r.url.host == "wrapper.test"]) == 1
 
-    if "--list" in args:
-        print("Default unit tests:")
-        for name in TESTS:
-            print(f"  {name}")
-        print("\nExtended diagnostics (--extended):")
-        for name in EXTENDED_TESTS:
-            print(f"  {name}")
-        return
 
-    explicit = [arg for arg in args if not arg.startswith("--")]
-    selected = explicit or list(TESTS.keys())
-    if "--extended" in args and not explicit:
-        selected += list(EXTENDED_TESTS.keys())
-    for name in selected:
-        if name not in available:
-            print(f"Unknown test: {name}. Use --list to see available tests.")
-            sys.exit(1)
+async def test_preview_configuration_and_direct_mode(preview, tools):
+    result, calls, _ = await preview.invoke(user={"email": USER["email"]})
+    assert result.startswith("Error:") and not calls
+    tools.valves.preview_wrapper_key = ""
+    result, calls, _ = await preview.invoke()
+    assert result.startswith("Error:") and not calls
+    tools.valves.preview_wrapper_url = ""
+    result, calls, _ = await preview.invoke()
+    assert preview.upstream in result and "bearer credential" in result
+    assert not any(r.url.host == "wrapper.test" for r in calls)
+    result, calls, _ = await preview.invoke(target="ssh")
+    assert result.startswith("Error:") and not calls
 
-    R = Results()
-    t0 = time.time()
 
-    print(f"{'='*50}")
-    print(f"UNIT TESTS ({', '.join(selected)})")
-    print(f"{'='*50}")
+@pytest.mark.parametrize("background,fail", [(False, False), (True, False), (True, True)])
+async def test_real_delegate_execution_and_completion(tools, sandbox, http, monkeypatch, background, fail):
+    """Real Agent, OpenAI adapter, ASGI transport, tool dispatch and task lifetime.
 
-    # Run sequentially: several tests temporarily patch module globals, and
-    # deterministic output and isolation matter more than shaving milliseconds.
-    for name in selected:
-        await available[name](R)
+    Only the model's responses and sandbox I/O are controlled. The event holds
+    inference until after the outer tool returns, without timing a fake agent.
+    """
+    release = asyncio.Event()
+    if not background:
+        release.set()
+    requests, sidecars, tasks = [], {}, []
+    tools._chat_state["chat"] = {"init": True, "pending": []}
+    tools._chat_state["other"] = {"init": True, "pending": []}
+    read = AsyncMock(return_value="secret discovered by tool")
+    # AsyncMock lacks the core signature/docstring needed by the tool factory.
+    async def read_core(valves, sandbox_id, client, *, path: str, start: int = 1, stop: int = 0) -> str:
+        """Read a file.
 
-    elapsed = time.time() - t0
-    total = R.passed + R.failed
-    print(f"\n{'='*50}")
-    print(f"Results: {R.passed} checks passed, {R.failed} failed out of {total}  ({elapsed:.1f}s)")
-    if R.failed:
-        print("SOME TESTS FAILED")
-        sys.exit(1)
-    else:
-        print("ALL TESTS PASSED")
+        :param path: Absolute path.
+        :param start: Start line.
+        :param stop: Stop line.
+        """
+        assert not client.is_closed
+        return await read(path=path, start=start, stop=stop)
+    read_core.__name__ = "_core_read"
+    monkeypatch.setattr(lathe, "_core_read", read_core)
+
+    async def write_core(valves, sandbox_id, client, *, path: str, content: str) -> str:
+        """Write a file.
+
+        :param path: Absolute path.
+        :param content: Contents.
+        """
+        assert not client.is_closed
+        sidecars[path.rsplit("/", 1)[-1]] = content
+        return "Wrote"
+    write_core.__name__ = "_core_write"
+    monkeypatch.setattr(lathe, "_core_write", write_core)
+
+    async def app(scope, receive, send):
+        assert scope["path"] == "/api/chat/completions"
+        assert dict(scope["headers"])[b"authorization"] == b"Bearer user-token"
+        body = b""
+        while True:
+            message = await receive()
+            body += message.get("body", b"")
+            if not message.get("more_body"):
+                break
+        request = json.loads(body)
+        requests.append(request)
+        assert request["model"] == "selected-model"
+        assert request["chat_id"] == "chat"
+        await release.wait()
+        if fail:
+            response = {"error": {"message": "synthetic model failure", "type": "invalid_request_error"}}
+            status = 400
+        else:
+            if len(requests) == 1:
+                message = {"role": "assistant", "content": None, "tool_calls": [{
+                    "id": "read-1", "type": "function", "function": {
+                        "name": "read", "arguments": '{"path":"/input"}'}}]}
+                finish = "tool_calls"
+            else:
+                assert any(m.get("role") == "tool" and "secret discovered by tool" in m["content"]
+                           for m in request["messages"])
+                message = {"role": "assistant", "content": "verified result"}
+                finish = "stop"
+            response = {"id": "completion", "object": "chat.completion", "created": 0,
+                        "model": "selected-model", "choices": [{"index": 0, "message": message, "finish_reason": finish}],
+                        "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}}
+            status = 200
+        await send({"type": "http.response.start", "status": status, "headers": [(b"content-type", b"application/json")]})
+        await send({"type": "http.response.body", "body": json.dumps(response).encode()})
+
+    def unexpected(request):
+        raise AssertionError(f"unexpected sandbox HTTP: {request.url}")
+    clients = http(unexpected)
+    original = asyncio.ensure_future
+    def track(coro, **kwargs):
+        task = original(coro, **kwargs)
+        if getattr(coro, "__name__", "") == "_run_agent":
+            tasks.append(task)
+        return task
+    monkeypatch.setattr(asyncio, "ensure_future", track)
+    request = SimpleNamespace(app=app, state=SimpleNamespace(token=SimpleNamespace(credentials="user-token")))
+    try:
+        result = await tools.delegate("Read /input and report", max_steps=3,
+            foreground_seconds=0 if background else 5, __user__=USER, __chat_id__="chat",
+            __model__={"id": "wrong-model"}, __metadata__={"model": {"id": "selected-model"}}, __request__=request)
+        assert len(tasks) == 1, result
+        if background:
+            assert "Backgrounded" in result
+            assert not tasks[0].done()
+        else:
+            assert "verified result" in result and "1 tool call(s)" in result
+        release.set()
+        await asyncio.wait_for(tasks[0], 5)
+        assert all(client.is_closed for client in clients)
+        if fail:
+            assert "synthetic model failure" in sidecars["error"]
+            assert "result" not in sidecars
+        else:
+            read.assert_awaited_once_with(path="/input", start=1, stop=0)
+            assert sidecars["result"] == "verified result"
+            assert json.loads(sidecars["usage"])["tool_calls"] == 1
+        notices = lathe._drain_harness_messages(tools._chat_state, "chat", None)
+        assert len(notices) == int(background)
+        if background:
+            assert ("failed" if fail else "completed") in notices[0]
+        assert lathe._drain_harness_messages(tools._chat_state, "chat", None) == []
+        assert tools._chat_state["other"]["pending"] == []
+    finally:
+        release.set()
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    raise SystemExit(pytest.main([__file__, *sys.argv[1:]]))

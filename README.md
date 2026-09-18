@@ -217,16 +217,19 @@ flow, e.g. *"Visit https://example.com/setup to create your sandbox first."*
 ## Testing
 
 ```bash
-uv run python test_unit.py                   # no sandbox needed (~2s)
+uv run pytest                               # offline, no credentials (~2s)
 uv run python test_integration.py            # needs DAYTONA_API_KEY in .env
 uv run python test_deployment.py [--verbose] # also needs OWUI_URL, OWUI_TOKEN, OWUI_MODEL
 ```
 
 The tiers cover different boundaries:
 
-- `test_unit.py` checks deterministic helpers, generated sandbox scripts, wrapper schemas, and mocked state machines. `--extended` adds lower-signal prose, constant, and scheduling diagnostics for targeted investigations.
-- `test_integration.py` calls `Tools` directly against an isolated Daytona identity. It verifies core tool roundtrips, background notices, lifecycle policy, and persistent-volume survival. Cleanup runs even after scenario failures.
+- The offline suite checks local behavior without provisioning resources. Use `uv run pytest -k delegate` for a focused selection; `uv run python test_unit.py` is also supported.
+- `test_integration.py` verifies the live Daytona API using an isolated test identity. It retains one named test volume for reuse and deletes test sandboxes on exit. Cleanup failure makes the run fail.
 - `test_deployment.py` temporarily deploys local `lathe.py` to the isolated OWUI toolkit ID `lathe_test`, never `lathe`. It configures a separate Daytona label with persistent volumes disabled, checks exact source and complete loaded schema parity, then exercises model-mediated `bash`, `write`, `read`, `interpret`, `view`, and `delegate` dispatch. It deletes the staging toolkit and sandboxes on exit, including after failures and `--no-deploy` runs. Use `--no-deploy` to test an already staged copy that may be deleted afterward, or `LATHE_TEST_TOOL_ID` to choose another staging ID.
+
+Run only one instance of each live suite at a time: staging identities are shared.
+See [AGENTS.md](AGENTS.md#testing-policy) for contributor testing policy.
 
 For a focused protected-preview test, use `test_deployment.py --preview-only`
 with `LATHE_PREVIEW_WRAPPER_URL`, `LATHE_PREVIEW_WRAPPER_KEY`,
@@ -245,7 +248,8 @@ a full dependency migration.
 | File | Purpose |
 |------|---------|
 | `lathe.py` | The OWUI toolkit (single file, deployed via OWUI admin API) |
-| `test_unit.py` | Unit tests (pure-Python helpers, no sandbox) |
+| `test_unit.py` | Offline behavioral contracts (pytest, no sandbox) |
+| `testing_support.py` | Shared public schema contract |
 | `test_integration.py` | Integration tests (live sandbox API) |
 | `test_deployment.py` | Deployment tests (live OWUI instance via Socket.IO) |
 | `AGENTS.md` | Agent/contributor working instructions |

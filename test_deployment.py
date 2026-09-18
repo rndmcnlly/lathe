@@ -30,6 +30,7 @@ import uuid
 import httpx
 import socketio
 from dotenv import load_dotenv
+from testing_support import EXPECTED_SCHEMA, normalize_schema
 
 
 load_dotenv()
@@ -65,55 +66,6 @@ PNG_B64 = (
 )
 
 
-EXPECTED_SCHEMA = {
-    "lathe": {"manpage": ("string", False, "overview")},
-    "handoff": {},
-    "destroy": {},
-    "onboard": {"path": ("string", True, None)},
-    "bash": {
-        "command": ("string", True, None),
-        "workdir": ("string", False, "/home/daytona/workspace"),
-        "foreground_seconds": ("integer", False, -1),
-    },
-    "read": {
-        "path": ("string", True, None),
-        "start": ("integer", False, 1),
-        "stop": ("integer", False, 0),
-    },
-    "write": {
-        "path": ("string", True, None),
-        "content": ("string", True, None),
-    },
-    "edit": {
-        "path": ("string", True, None),
-        "old_string": ("string", True, None),
-        "new_string": ("string", True, None),
-        "replace_all": ("boolean", False, False),
-    },
-    "glob": {
-        "pattern": ("string", True, None),
-        "max_lines": ("integer", False, 100),
-    },
-    "grep": {
-        "pattern": ("string", True, None),
-        "files": ("string", False, "**/*"),
-        "max_lines": ("integer", False, 100),
-    },
-    "interpret": {
-        "code": ("string", True, None),
-        "timeout": ("integer", False, 120),
-    },
-    "view": {"path": ("string", True, None)},
-    "delegate": {
-        "task": ("string", True, None),
-        "context_files": ("array", False, []),
-        "max_steps": ("integer", False, 10),
-        "foreground_seconds": ("integer", False, -1),
-    },
-    "expose": {"target": ("string", True, None)},
-}
-
-
 def auth_headers():
     return {"Authorization": f"Bearer {OWUI_TOKEN}", "Content-Type": "application/json"}
 
@@ -134,9 +86,11 @@ class Results:
         try:
             await fn()
             print(f"  PASS: {name}")
+            return True
         except Exception as exc:
             self.failed += 1
             print(f"  FAIL: {name}: {type(exc).__name__}: {exc}")
+            return False
 
 
 async def deploy_staging_tool():
@@ -312,6 +266,10 @@ class OWUIClient:
                 json=payload,
                 timeout=30,
             )
+            if response.is_error:
+                raise RuntimeError(
+                    f"OWUI completion HTTP {response.status_code}: {response.text[:1000]}"
+                )
             response.raise_for_status()
         await asyncio.wait_for(self.done.wait(), timeout=timeout)
 
@@ -375,7 +333,7 @@ async def main():
     client = OWUIClient()
     cleanup_failed = False
     canary = f"OWUI_{uuid.uuid4().hex}"
-    path = f"/home/daytona/workspace/{canary}.txt"
+    path = f"/home/daytona/workspace/contract-{uuid.uuid4().hex}.txt"
     preview_url = None
 
     async def exact_source_and_schema():
@@ -392,16 +350,8 @@ async def main():
         specs = {spec["name"]: spec for spec in remote.get("specs", [])}
         require(set(specs) == set(EXPECTED_SCHEMA), f"tool names: {sorted(specs)}")
         for name, expected_params in EXPECTED_SCHEMA.items():
-            schema = specs[name]["parameters"]
-            properties = schema.get("properties", {})
-            required = set(schema.get("required", []))
-            require(set(properties) == set(expected_params), f"{name} params: {properties}")
-            for param, (expected_type, is_required, default) in expected_params.items():
-                actual = properties[param]
-                require(actual.get("type") == expected_type, f"{name}.{param}: {actual}")
-                require((param in required) == is_required, f"{name}.{param} required={required}")
-                if not is_required:
-                    require(actual.get("default") == default, f"{name}.{param}: {actual}")
+            actual = normalize_schema(specs[name]["parameters"])
+            require(actual == expected_params, f"{name}: expected {expected_params}, got {actual}")
 
     async def bash_dispatch():
         output = await client.send(
@@ -448,14 +398,19 @@ async def main():
                 f"raw base64 leaked into text channel: {values[0][:120]}")
 
     async def delegate_dispatch():
+        # The value is in the sandbox, not in the delegate's task. Verify a
+        # disk effect separately so repeating the instructions cannot pass.
+        destination = path + ".copy"
         output = await client.send(
-            "Call delegate exactly once with max_steps=3 and foreground_seconds=120. "
-            f"The delegated task is: use bash to run printf {canary}, then report the output.",
+            "Call delegate exactly once with max_steps=5 and foreground_seconds=120. "
+            f"The delegated task is: read {path} and write an exact copy of its contents to {destination}. "
+            "Do not do the task yourself or call any other tool.",
             timeout=240,
         )
-        require(any(call.get("name") == "delegate" for call in tool_calls(output)), output)
-        values = tool_outputs(output)
-        require(any(canary in value for value in values), values)
+        require([call.get("name") for call in tool_calls(output)] == ["delegate"], output)
+        output = await client.send(f"Call read exactly once for {destination}.")
+        require([call.get("name") for call in tool_calls(output)] == ["read"], output)
+        require(any(canary in value for value in tool_outputs(output)), output)
 
     async def protected_preview_dispatch():
         nonlocal preview_url
@@ -480,18 +435,29 @@ async def main():
             await deploy_staging_tool()
         await cleanup_test_sandboxes()
 
-        await results.run("exact staged source and complete OWUI schema", exact_source_and_schema)
+        if not await results.run("exact staged source and complete OWUI schema", exact_source_and_schema):
+            return 1
         await client.connect()
+        scenarios = []
         if not preview_only:
-            await results.run("model to OWUI to bash dispatch", bash_dispatch)
-            await results.run("write and read dispatch", write_and_read_dispatch)
-            await results.run("interpreter dispatch", interpreter_dispatch)
-            await results.run("view dispatch", view_dispatch)
-            await results.run("delegate dispatch", delegate_dispatch)
+            scenarios.extend([
+                ("model to OWUI to bash dispatch", bash_dispatch),
+                ("write and read dispatch", write_and_read_dispatch),
+                ("interpreter dispatch", interpreter_dispatch),
+                ("view dispatch", view_dispatch),
+                ("delegate dispatch", delegate_dispatch),
+            ])
         if preview_enabled:
-            await results.run("model to OWUI to owner-authenticated expose", protected_preview_dispatch)
+            scenarios.append(("model to OWUI to owner-authenticated expose", protected_preview_dispatch))
+        for name, scenario in scenarios:
+            if not await results.run(name, scenario):
+                break
     finally:
-        await client.close()
+        try:
+            await client.close()
+        except Exception as exc:
+            cleanup_failed = True
+            print(f"Socket cleanup failed: {exc}")
         if preview_enabled:
             try:
                 async with httpx.AsyncClient() as http:

@@ -12,3 +12,11 @@ dependencies = [
     "aiohttp>=3.14.1",
     "cachetools>=7.0.5",
 ]
+
+[dependency-groups]
+dev = ["pytest>=8", "pytest-asyncio>=1"]
+
+[tool.pytest.ini_options]
+testpaths = ["test_unit.py"]
+asyncio_mode = "auto"
+addopts = "-q"
