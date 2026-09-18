@@ -2928,6 +2928,10 @@ async def test_preview_wrapping(R: Results):
     R.check('unconfigured mode retains direct exposure', upstream in result and 'bearer credential' in result)
     R.check('direct mode never calls a wrapper', not any(r.url.host == 'wrapper.test' for r in calls))
 
+    result, calls, events = await invoke(target='ssh')
+    R.check('ssh exposure is unsupported', result.startswith('Error: target must be'), result)
+    R.check('ssh rejection makes no Daytona requests', not calls, str(calls))
+
 
 TESTS = {
     "preview_wrapping": test_preview_wrapping,

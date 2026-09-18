@@ -82,28 +82,104 @@ rejected with a clear error if you try to set them.
 
 ### Owner-authenticated HTTP previews
 
-Configure `preview_wrapper_url` and `preview_wrapper_key` to wrap all HTTP
-exposure, including dufs and code-server, before a URL reaches the model or user.
-The wrapper receives the upstream URL and ownership from OWUI's injected user
-context. It is trusted infrastructure: its operator must explicitly authorize
-this installation and decide which identities and destinations it may register.
+> [!WARNING]
+> Without a preview wrapper, every HTTP URL returned by `expose()` is a bearer
+> credential: anyone who sees or copies it can access the service until it
+> expires or stops working. A raw URL exposed in chat, a screen share, or a
+> recording can disclose a terminal-capable code-server session or a writable
+> file browser. After several months of personal and institutional use, this has
+> been Lathe's most significant recurring security sharp edge.
 
-Wrapping fails closed on missing configuration, rejected ownership, malformed
-responses, redirects, and network errors. Lathe returns neither an upstream
-bearer URL nor a raw wrapping error. With both valves empty, direct signed-URL
-behavior remains available; anyone who copies those direct URLs can use them.
-SSH remains a separate credential-bearing exposure path.
+Direct signed URLs can still be appropriate for personal or otherwise
+low-risk deployments. For shared, institutional, demonstrated, or recorded
+deployments, configure `preview_wrapper_url` and `preview_wrapper_key` so every
+HTTP exposure requires browser authentication and authorization under the
+deployment's access policy. Wrapping applies to arbitrary HTTP services, dufs,
+and code-server before a URL reaches the model or user. Lathe does not provide
+SSH access.
 
-The wrapper registration endpoint accepts an authenticated JSON POST:
+#### What a wrapper does
+
+A wrapper is an authenticated reverse proxy deployed outside Lathe. It keeps the
+Daytona-provided bearer URL on the server side, gives the browser a different
+public URL, authenticates the browser user, and authorizes access according to
+the deployment's community policy. A personal deployment might admit only the
+owner; an institutional deployment might admit an appropriate class, lab, or
+campus community. Copying or recording the wrapped URL does not bypass that
+authentication policy.
+
+Run the wrapper on a domain distinct from Open WebUI. This provides cookie and
+origin isolation between OWUI and arbitrary user-controlled services running in
+the sandbox. Lathe does not include a wrapper service because the only HTTP
+surface it controls lives inside the OWUI process. Adding proxy routes there
+would require manipulating OWUI internals and, more importantly, could expose
+OWUI-origin cookies or other same-origin authority to sandbox applications whose
+content is controlled by users and models. An external origin makes that class
+of ambient-authority failure structurally unavailable.
+
+Without a wrapper, Daytona's opaque preview URL is effectively the access token.
+This capability-URL model is reasonable when the operator understands that
+constraint and will not share, stream, or record the screen while an exposed
+service or its URL is visible. It is a poor default when demonstrations,
+institutional support, or routine screen sharing are part of the workflow.
+
+The wrapper receives the upstream URL and ownership from OWUI's injected
+`__user__` context. The model can select an exposure target or port, but it
+cannot supply the owner identity or substitute an arbitrary upstream URL.
+The wrapper is trusted infrastructure: its operator must explicitly authorize
+the Lathe installation and define its identity namespace, destination policy,
+public naming, replacement behavior, revocation, retention, and browser-login
+policy.
+
+#### Registration contract
+
+Lathe sends an HTTPS POST to `preview_wrapper_url` with
+`Authorization: Bearer <preview_wrapper_key>` and JSON:
 
 ```json
 {"owner":{"subject":"injected-owui-user-id","email":"owner@example.edu"},"slot":"5000","upstream_url":"https://temporary-upstream.example/"}
 ```
 
-It responds with `url` (HTTPS), `access_mode: "owner-authenticated"`, and
-`expires_at` (timezone-qualified ISO timestamp). These describe the protected
-registration, not a guarantee that the underlying sandbox stays available.
-See [the wrapping contract](docs/preview-wrapping.md) for implementation details.
+`subject` and `email` come exclusively from trusted request context. `slot` is
+the resolved service port. Lathe sends no sandbox-management credential to the
+wrapper; the installation credential establishes only the registrar's
+authority.
+
+A successful response contains:
+
+```json
+{"url":"https://owner-5000.previews.example/","access_mode":"owner-authenticated","expires_at":"2026-09-18T19:00:00Z"}
+```
+
+Lathe verifies a distinct HTTPS destination, owner-authenticated access mode,
+and future timezone-qualified expiry. It rejects responses that reflect the
+upstream hostname or installation credential in the returned URL. It never
+follows registration redirects or exposes raw response/error text. Missing
+configuration or identity, registration failure, and malformed responses all
+fail closed. The wrapper remains trusted to implement its claims; valid JSON
+alone cannot prove that it enforces browser ownership.
+
+#### Lifetime and browser behavior
+
+`preview_expiry_seconds` controls the upstream signed URL (default and maximum:
+24 hours). The wrapper chooses its own registration lifetime; Lathe reports the
+two clocks separately. Sandbox sleep, service failure, or explicit shutdown can
+end availability sooner. Calling `expose()` again prepares the service and
+replaces or renews the registration. The wrapper may invalidate existing
+browser sessions and WebSocket connections when replacing it.
+
+A wrapper may assign a fresh browser origin on every registration. Do not
+promise bookmark stability: changing origins can intentionally isolate service
+workers and browser storage from previous exposures. Browser compatibility,
+including uploads, redirects, cookies, workers, WebSockets, and open-connection
+expiry, belongs to the wrapper. Lathe embeds no deployment domains,
+identity-provider protocol, or proprietary proxy protocol in this interface.
+
+An owner-authenticated URL appearing in a screen recording does not itself
+grant access to viewers. Wrapping does not hide application content already
+visible in the recording; collaborator access depends on the wrapper's policy,
+not possession of the URL. Opening a wrapped URL may require a separate login
+even when the owner is already signed into Open WebUI.
 
 ### Externally provisioned sandboxes (`auto_create_sandbox`)
 
@@ -134,7 +210,7 @@ flow, e.g. *"Visit https://example.com/setup to create your sandbox first."*
 | `view(path)` | Load an image into the model's visual context (PNG/JPEG/GIF/WebP, ≤ 4 MB, content-sniffed) |
 | `interpret(code, timeout)` | Run Python in a conversation-scoped persistent interpreter |
 | `delegate(task, context_files, max_steps, foreground_seconds)` | Dispatch a sub-agent to perform a multi-step task autonomously |
-| `expose(target)` | Expose a sandbox service: `"http:5000"` for an HTTPS preview, `"ssh"` for a time-limited SSH command |
+| `expose(target)` | Expose an HTTP service, file browser, or browser IDE through an HTTPS preview |
 | `handoff()` | Prepare instructions for continuing work in a fresh conversation |
 | `destroy()` | Permanently delete the sandbox after interactive confirmation |
 

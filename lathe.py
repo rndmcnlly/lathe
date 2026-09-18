@@ -5,7 +5,7 @@ author_url: https://adamsmith.as
 description: Coding agent tools (lathe, bash, read, write, edit, glob, grep, view, interpret, delegate, onboard, expose, destroy) backed by per-user sandbox VMs with transparent lifecycle management.
 required_open_webui_version: 0.4.0
 requirements: httpx, httpx-ws, pydantic-ai-slim[openai]~=2.5, cachetools
-version: 0.27.0
+version: 0.28.0
 licence: MIT
 """
 
@@ -3072,7 +3072,7 @@ class Tools:
         )
         preview_expiry_seconds: int = Field(
             86400, ge=60, le=86400,
-            description="Lifetime of upstream HTTP signed previews, in seconds (default/max: 24 hours). Independent of wrapper registration expiry. Does not affect SSH.",
+            description="Lifetime of upstream HTTP signed previews, in seconds (default/max: 24 hours). Independent of wrapper registration expiry.",
         )
         deployment_label: str = Field(
             "",
@@ -3660,11 +3660,6 @@ class Tools:
             VS Code in the browser with terminal, extensions, and file editing.
             See lathe(manpage="recipes") for custom configurations.
 
-            **Interactive shell:**
-            For interactive work, call expose(target="ssh") to give the user a
-            time-limited SSH command they can paste into their terminal, VS Code
-            Remote SSH, or JetBrains Gateway.
-
             **Project context:**
             Call onboard() at the start of a conversation to get a directory
             listing and load any AGENTS.md or skills. Works even without agent
@@ -3712,9 +3707,9 @@ class Tools:
 
             ## Gotchas
 
-            - Commands are non-interactive. No stdin prompts, no curses UIs. Use
-              -y or equivalent flags. For interactive work, give the user an
-              expose(target="ssh") token.
+            - Commands are non-interactive. No stdin prompts or curses UIs. Use
+              -y or equivalent flags. For an interactive terminal, expose
+              code-server and use its browser terminal.
             - bash() auto-backgrounds commands that exceed ~30 seconds. When this
               happens, it returns a background descriptor with CMD and PID paths.
               Use foreground_seconds= to extend the wait (e.g. foreground_seconds=120
@@ -3741,8 +3736,6 @@ class Tools:
             - {preview_access_note}
             - The sandbox stops on idle (~15 min default), killing servers.
               A preview registration does not keep it awake or restart a service.
-            - HTTP preview wrapping does not protect SSH commands: they contain
-              access credentials and should not be exposed in screen recordings.
             - destroy() prompts for user confirmation via a dialog before proceeding. Irreversible.{destroy_volume_note}
             - **Network egress may be restricted.** Depending on the admin's
               Daytona tier, the sandbox may only reach a curated allowlist of
@@ -4632,11 +4625,17 @@ class Tools:
         """
         Expose a sandbox service to the user. Pass "dufs" for a one-step file
         browser, "code-server" for a one-step IDE, "http:<port>" for a web
-        server you already started, or "ssh" for interactive shell access.
-        :param target: What to expose — "dufs" for file upload/download, "code-server" for a browser IDE, "ssh" for a shell, or "http:<port>" (e.g. "http:5000", port range 3000–9999) for an HTTP service you started manually.
+        server you already started.
+        :param target: What to expose — "dufs" for file upload/download, "code-server" for a browser IDE, or "http:<port>" (e.g. "http:5000", port range 3000–9999) for an HTTP service you started manually.
         """
         async def _run(client):
             target_stripped = target.strip().lower()
+
+            if target_stripped not in ("dufs", "code-server") and not target_stripped.startswith("http:"):
+                return (
+                    f"Error: target must be \"dufs\", \"code-server\", or \"http:<port>\" "
+                    f"(e.g. \"http:5000\"). Got: \"{target}\""
+                )
 
             email = _get_email(__user__)
             sandbox_id, _sb_warning = await _ensure_sandbox(self.valves, email, client, __event_emitter__)
@@ -4682,37 +4681,6 @@ class Tools:
                 messages = _drain_harness_messages(self._chat_state, __chat_id__, _sb_warning)
                 return _prepend_harness_messages(result_msg(url, pid) + "\n\n" + access_note, messages)
 
-            if target_stripped == "ssh":
-                await _emit(__event_emitter__, "Creating SSH access token...")
-                resp = await client.post(
-                    _api(self.valves, f"/sandbox/{sandbox_id}/ssh-access"),
-                    params={"expiresInMinutes": 60},
-                    headers=_headers(self.valves),
-                    timeout=30.0,
-                )
-                resp.raise_for_status()
-                data = resp.json()
-
-                ssh_command = data.get("sshCommand", "")
-                if not ssh_command:
-                    token = data.get("token", "")
-                    if not token:
-                        return "Error: Daytona returned neither sshCommand nor token."
-                    ssh_command = f"ssh {token}@ssh.app.daytona.io"
-
-                await _emit(__event_emitter__, "SSH access ready", done=True)
-                messages = _drain_harness_messages(self._chat_state, __chat_id__, _sb_warning)
-                return _prepend_harness_messages(
-                    f"SSH command (valid 60 min):\n\n"
-                    f"```\n{ssh_command}\n```\n\n"
-                    f"The user can paste this into their terminal, VS Code Remote SSH, "
-                    f"or JetBrains Gateway.\n\n"
-                    f"Note: the sandbox auto-stops after ~{self.valves.auto_stop_minutes} min of inactivity. "
-                    f"Active SSH sessions keep the sandbox alive. "
-                    f"This command contains an access credential; HTTP preview wrapping does not protect it.",
-                    messages,
-                )
-
             if target_stripped == "dufs":
                 return await _ensure_and_sign(
                     ensure_script=_DUFS_ENSURE_SCRIPT,
@@ -4747,11 +4715,6 @@ class Tools:
                     ),
                 )
 
-            if not target_stripped.startswith("http:"):
-                return (
-                    f"Error: target must be \"ssh\", \"dufs\", \"code-server\", or \"http:<port>\" "
-                    f"(e.g. \"http:5000\"). Got: \"{target}\""
-                )
             port_str = target_stripped.removeprefix("http:")
             try:
                 port = int(port_str)
