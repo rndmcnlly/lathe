@@ -2,14 +2,13 @@
 /**
  * Playwright video capture of a real Lathe session on an Open WebUI instance.
  *
- * Captures: login → pre-warm sandbox → enable Lathe → clone a repo →
- * ask for VS Code → model calls expose(target="code-server") → open
- * the live IDE URL → return to chat → ask model to stop the server →
- * delegate a gimmick task to a sub-agent.
+ * Captures: login → pre-warm sandbox → enable Lathe → clone and inspect
+ * a repo → edit a shared relay file in VS Code → read it back in chat →
+ * background a focused review while the main agent stops the IDE.
  *
  * Usage:  node capture.mjs
- * Env:    DEMO_OWUI_URL, DEMO_EMAIL, DEMO_PASS, DEMO_MODEL (loaded from .env if present)
- * Output: capture.webm
+ * Env:    DEMO_OWUI_URL, DEMO_EMAIL, DEMO_PASS, DEMO_MODEL or OWUI_MODEL
+ * Output: out/demo.webm
  */
 
 import { chromium } from "playwright";
@@ -33,13 +32,13 @@ try {
 const OWUI_URL = (process.env.DEMO_OWUI_URL || "").replace(/\/+$/, "");
 const EMAIL = process.env.DEMO_EMAIL;
 const PASS = process.env.DEMO_PASS;
-const MODEL = process.env.DEMO_MODEL;
+const MODEL = process.env.DEMO_MODEL || process.env.OWUI_MODEL;
 if (!OWUI_URL || !EMAIL || !PASS || !MODEL) {
   console.error("Set DEMO_OWUI_URL, DEMO_EMAIL, DEMO_PASS, and DEMO_MODEL");
   process.exit(1);
 }
 const CHAT_URL = `${OWUI_URL}/?model=${encodeURIComponent(MODEL)}`;
-const ALLOWED_PROXY_DOMAINS = (process.env.DEMO_PROXY_DOMAINS || "proxy.app.daytona.io,proxy.daytona.work")
+const ALLOWED_PROXY_DOMAINS = (process.env.DEMO_PROXY_DOMAINS || "daytonaproxy01.net,proxy.app.daytona.io,proxy.daytona.work")
   .split(",")
   .map((domain) => domain.trim().toLowerCase())
   .filter(Boolean);
@@ -63,8 +62,27 @@ async function suppressTooltips(page) {
     s.textContent = [
       `[data-tooltip]:before,[data-tooltip]:after,.tooltip,[role=tooltip]`,
       `{display:none!important;visibility:hidden!important}`,
+      `#model-selector-model-button`,
+      `{visibility:hidden!important}`,
     ].join("");
     document.head.appendChild(s);
+
+    // The empty-chat hero repeats the selected model at headline scale. Model
+    // identity is incidental to this demo, so remove that row rather than let
+    // a long deployment-specific name dominate the opening composition.
+    const modelInfo = document.querySelector('button[aria-label^="Get information on "]');
+    if (modelInfo?.parentElement?.parentElement) {
+      modelInfo.parentElement.parentElement.style.visibility = "hidden";
+    }
+    const modelName = modelInfo?.getAttribute("aria-label")
+      ?.match(/^Get information on (.+) in the UI$/)?.[1];
+    if (modelName) {
+      for (const el of document.querySelectorAll("*")) {
+        if (el.children.length === 0 && el.textContent.trim() === modelName) {
+          el.style.visibility = "hidden";
+        }
+      }
+    }
   });
 }
 
@@ -230,6 +248,43 @@ async function sendMessage(page) {
   await page.click("#send-message-button");
 }
 
+async function enableLathe(page, { animate = false } = {}) {
+  const intBtn = await page.evaluate(() => {
+    for (const sel of ["#integration-menu-button", "#tools-menu-button"])
+      if (document.querySelector(sel)) return sel;
+    return null;
+  });
+  if (!intBtn) throw new Error("Could not find integration menu button");
+
+  if (animate) await cursorClick(page, intBtn);
+  await page.click(intBtn);
+
+  const toolsRow = page.getByRole("button", { name: /^Tools \d+$/ }).last();
+  await toolsRow.waitFor({ state: "visible", timeout: 5000 });
+  if (animate) {
+    await toolsRow.evaluate((el) => el.setAttribute("data-capture-tools-row", "1"));
+    await cursorClick(page, "[data-capture-tools-row]");
+  }
+  await toolsRow.click();
+
+  const latheRow = page.getByRole("button", { name: /Lathe$/ }).last();
+  await latheRow.waitFor({ state: "visible", timeout: 5000 });
+  const latheToggle = latheRow.locator('button[role="switch"]');
+  await latheToggle.waitFor({ state: "visible", timeout: 5000 });
+  await latheToggle.evaluate((el) =>
+    el.setAttribute("data-capture-lathe-toggle", "1"),
+  );
+
+  if (animate) await cursorClick(page, "[data-capture-lathe-toggle]");
+  const enabled = await page.getAttribute(
+    "[data-capture-lathe-toggle]",
+    "aria-checked",
+  ) === "true";
+  if (!enabled) await latheRow.click();
+  await page.keyboard.press("Escape");
+  return intBtn;
+}
+
 /**
  * Wait for the model to finish responding.
  */
@@ -373,36 +428,15 @@ try {
       if (b.textContent.trim() === "Okay, Let's Go!") b.click();
   });
 
-  // Enable Lathe in this throwaway chat
-  const warmIntBtn = await loginPage.evaluate(() => {
-    for (const sel of ["#integration-menu-button", "#tools-menu-button"])
-      if (document.querySelector(sel)) return sel;
-    return null;
-  });
-  if (warmIntBtn) {
-    await loginPage.click(warmIntBtn);
-    await loginPage.waitForTimeout(300);
-    await loginPage.evaluate(() => {
-      for (const el of document.querySelectorAll("*"))
-        if (el.textContent.trim().startsWith("Tools ") && el.getBoundingClientRect().height > 20 && el.getBoundingClientRect().height < 60)
-          { el.click(); break; }
-    });
-    await loginPage.waitForTimeout(300);
-    await loginPage.evaluate(() => {
-      for (const b of document.querySelectorAll("button"))
-        if (b.textContent.trim().endsWith("Lathe") && b.getBoundingClientRect().y > 0)
-          { b.click(); break; }
-    });
-    await loginPage.waitForTimeout(300);
-    await loginPage.keyboard.press("Escape");
-  }
+  // Enable Lathe in this throwaway chat.
+  await enableLathe(loginPage);
 
   // Send a trivial message that triggers a tool call
   await loginPage.evaluate(() => {
     const input = document.getElementById("chat-input");
     if (!input) return;
     input.focus();
-    input.innerHTML = "<p>Run: echo warm</p>";
+    input.innerHTML = `<p>Run exactly: mkdir -p /home/daytona/workspace/.vscode &amp;&amp; printf '%s\\n' '{"chat.disableAIFeatures":true,"workbench.secondarySideBar.defaultVisibility":"hidden"}' &gt; /home/daytona/workspace/.vscode/settings.json &amp;&amp; rm -rf /home/daytona/workspace/lathe /home/daytona/workspace/DEMO_GIMMICK.md &amp;&amp; echo warm</p>`;
     input.dispatchEvent(new Event("input", { bubbles: true }));
   });
   await loginPage.waitForTimeout(200);
@@ -449,6 +483,9 @@ let chatUrl = null;
 try {
   await page.goto(CHAT_URL);
   await page.waitForLoadState("networkidle").catch(() => {});
+  // The ?model= launch route opens the model picker. Close it before the
+  // recorded interaction so provider internals do not dominate the frame.
+  await page.keyboard.press("Escape");
   await suppressTooltips(page);
   await injectCursor(page);
 
@@ -458,81 +495,23 @@ try {
 
   // ── Beat 2: Enable Lathe ───────────────────────────────────────
   log("beat2", "Enabling Lathe...");
-  // The integrations button ID varies across OWUI versions
-  const intBtn = await page.evaluate(() => {
-    const candidates = ["#integration-menu-button", "#tools-menu-button"];
-    for (const sel of candidates) {
-      if (document.querySelector(sel)) return sel;
-    }
-    // Fallback: find by aria-label or nearby text
-    for (const b of document.querySelectorAll("button")) {
-      const label = (b.getAttribute("aria-label") || "").toLowerCase();
-      if (label.includes("tool") || label.includes("integration")) return `#${b.id}`;
-    }
-    return null;
-  });
-  log("beat2", `Integration button: ${intBtn}`);
-  if (!intBtn) {
-    // Dump available button IDs for debugging
-    const ids = await page.evaluate(() =>
-      [...document.querySelectorAll("button[id]")].map(b => `${b.id}: ${b.textContent.trim().slice(0, 30)}`).join(", ")
-    );
-    log("beat2", `Available buttons: ${ids}`);
-    throw new Error("Could not find integration menu button");
-  }
-  await cursorClick(page, intBtn);
-  await page.click(intBtn);
-  await page.waitForTimeout(500);
-
-  // Click "Tools NN" row
-  await page.evaluate(() => {
-    for (const el of document.querySelectorAll("*")) {
-      if (el.textContent.trim().startsWith("Tools ")) {
-        const r = el.getBoundingClientRect();
-        if (r.width > 0 && r.height < 60 && r.height > 20 && r.y > 200) {
-          el.click(); return;
-        }
-      }
-    }
-  });
-  await page.waitForTimeout(500);
-
-  // Highlight the Lathe row, then toggle it on with animated cursor
-  await page.evaluate(() => {
-    for (const b of document.querySelectorAll("button")) {
-      if (b.textContent.trim().endsWith("Lathe") && b.getBoundingClientRect().y > 0) {
-        b.setAttribute("data-capture-lathe-row", "1");
-        break;
-      }
-    }
-  });
-  // The toggle is a button[role="switch"] inside the Lathe row.
-  // Clicking the row itself triggers the toggle logic in OWUI.
-  await cursorClick(page, "[data-capture-lathe-row]");
-  await page.click("[data-capture-lathe-row]");
-  const toggled = await page.evaluate(() => {
-    const row = document.querySelector("[data-capture-lathe-row]");
-    if (!row) return false;
-    const sw = row.querySelector('button[role="switch"]');
-    return sw ? sw.getAttribute("aria-checked") === "true" : false;
-  });
-  log("beat2", `Toggled: ${toggled}`);
+  const intBtn = await enableLathe(page, { animate: true });
+  log("beat2", `Enabled Lathe via ${intBtn}`);
   await page.waitForTimeout(800);
-  await page.keyboard.press("Escape");
   await cursorHide(page);
   await page.waitForTimeout(300);
 
   // ── Beat 3: First prompt — clone repo ──────────────────────────
   log("beat3", "Typing first prompt...");
   await cursorClick(page, "#chat-input");
-  await typeMessage(page, "Clone https://github.com/rndmcnlly/lathe and give me a friendly one-paragraph description of what it does.");
+  await typeMessage(page, "Clone https://github.com/rndmcnlly/lathe into /home/daytona/workspace/lathe-demo, replacing any previous checkout there. Create RELAY.md in that checkout with exactly two lines. Line 1: Lathe: What do you call a chat agent and an editor sharing one sandbox? Line 2: You: Then explain in three short bullets: what Lathe lets a model do, where the work runs, and what persists between conversations.");
 
   // ── Beat 4: Send and wait ──────────────────────────────────────
   log("beat4", "Sending first prompt...");
   await cursorClick(page, "#send-message-button");
   await sendMessage(page);
   await cursorHide(page);
-  await waitForResponse(page, { timeoutMs: 180000, stableMs: 5000 });
+  await waitForResponse(page, { timeoutMs: 180000, stableMs: 2000 });
 
   // Capture the chat URL so we can return to this conversation later
   chatUrl = page.url();
@@ -541,14 +520,14 @@ try {
   // ── Beat 5: Second prompt — VS Code ─────────────────────────────
   log("beat5", "Typing second prompt...");
   await cursorClick(page, "#chat-input");
-  await typeMessage(page, `Give me a VS Code editor for this repo. Share it as a markdown link with a friendly label so the raw URL is not visible. Briefly say that the link is private, expires in about an hour, and should not be shared because anyone with it can access the workspace.`);
+  await typeMessage(page, "Give me a browser-based VS Code editor for this repo. Share it as a markdown link with a short label instead of exposing the raw URL, then summarize the access and expiry information reported by the tool.");
 
   // ── Beat 6: Send and wait for code-server install + expose ─────
   log("beat6", "Sending second prompt...");
   await cursorClick(page, "#send-message-button");
   await sendMessage(page);
   await cursorHide(page);
-  await waitForResponse(page, { timeoutMs: 180000, stableMs: 5000 });
+  await waitForResponse(page, { timeoutMs: 180000, stableMs: 2000 });
 
   // ── Beat 7: Highlight and open the VS Code URL ─────────────────
   // The model was asked to use a markdown link, so the raw URL is only
@@ -574,7 +553,34 @@ try {
     await cursorClick(page, "[data-capture-expose-link]");
     await page.goto(exposeUrl);
     await page.waitForTimeout(6000);
-    log("beat7", "VS Code visible");
+    log("beat7", "VS Code visible; opening the agent-created proof file...");
+
+    // Open the file Lathe created in chat through VS Code's Explorer. Seeing
+    // the exact text demonstrates that both interfaces use the same filesystem.
+    const demoFolder = page.getByText("lathe-demo", { exact: true }).last();
+    await demoFolder.waitFor({ state: "visible", timeout: 10000 });
+    await demoFolder.evaluate((el) =>
+      el.setAttribute("data-capture-demo-folder", "1"),
+    );
+    await demoFolder.click();
+    await page.keyboard.press("ArrowRight");
+    const proofFile = page.getByText("RELAY.md", { exact: true }).last();
+    await proofFile.waitFor({ state: "visible", timeout: 5000 });
+    await proofFile.dblclick();
+    await page.locator(".view-line").filter({
+      hasText: "What do you call a chat agent and an editor sharing one sandbox?",
+    }).waitFor({ state: "visible", timeout: 5000 });
+    const answerLine = page.locator(".view-line").filter({ hasText: "You:" });
+    await answerLine.click();
+    await page.keyboard.press("Home");
+    await page.keyboard.press("Shift+End");
+    await page.keyboard.type("You: A shared state of mind.", { delay: 55 });
+    await page.keyboard.press("Control+S");
+    await page.locator(".view-line").filter({
+      hasText: "You: A shared state of mind.",
+    }).waitFor({ state: "visible", timeout: 5000 });
+    await page.click("[data-capture-demo-folder]");
+    await page.waitForTimeout(2500);
   } else {
     log("beat7", "No expose URL found — skipping VS Code navigation");
     await page.waitForTimeout(1000);
@@ -582,41 +588,71 @@ try {
 
   // ── Beat 8: Return to chat ──────────────────────────────────────
   log("beat8", "Returning to chat...");
-  await page.goto(chatUrl || `${OWUI_URL}/`);
+  await page.goBack({ waitUntil: "domcontentloaded" }).catch(() => {});
+  if (!page.url().startsWith(OWUI_URL)) {
+    await page.goto(chatUrl || `${OWUI_URL}/`);
+  }
   await page.waitForLoadState("networkidle").catch(() => {});
   await page.waitForTimeout(1000);
   await suppressTooltips(page);
   await injectCursor(page);
   await scrollToBottom(page);
+  await enableLathe(page);
+  log("beat8", "Lathe enabled after returning to chat");
 
-  // ── Beat 9: Ask model to stop the server ───────────────────────
-  log("beat9", "Typing stop-server prompt...");
+  // ── Beat 9: Complete the filesystem relay ──────────────────────
+  log("beat9", "Asking Lathe to read the VS Code edit...");
   await cursorClick(page, "#chat-input");
-  await typeMessage(page, "Thanks! Please stop the code-server now, I'm done with it.");
-
-  log("beat9", "Sending stop-server prompt...");
+  await typeMessage(page, "Read /home/daytona/workspace/lathe-demo/RELAY.md and quote exactly what I wrote after 'You:'. End with the exact sentence: Relay received.");
   await cursorClick(page, "#send-message-button");
   await sendMessage(page);
   await cursorHide(page);
-  await waitForResponse(page, { timeoutMs: 60000, stableMs: 5000 });
+  await waitForResponse(page, { timeoutMs: 60000, stableMs: 2000 });
+  await page.getByText("A shared state of mind.", { exact: false }).last().waitFor({
+    state: "visible",
+    timeout: 10000,
+  });
+  await page.getByText("Relay received.", { exact: false }).last().waitFor({
+    state: "visible",
+    timeout: 10000,
+  });
 
-  // ── Beat 10: Let the cleanup response sit visibly ──────────────
-  log("beat10", "Showing cleanup response...");
-  await scrollToBottom(page);
-
-  // ── Beat 11: Gimmick — delegate to a sub-agent ─────────────────
-  log("beat11", "Typing gimmick prompt...");
+  // ── Beat 10: Start a background architecture review ────────────
+  log("beat10", "Typing background delegation prompt...");
   await cursorClick(page, "#chat-input");
-  await typeMessage(page, "There's a file called DEMO_GIMMICK.md in the workspace. Don't read it yourself — delegate it to a sub-agent. Have the sub-agent read the file, do whatever it says, and explain what it did.");
+  await typeMessage(page, "Start a focused review of lines 1220-1420 in /home/daytona/workspace/lathe-demo/lathe.py using delegate with max_steps=5 and foreground_seconds=0. Ask the sub-agent for one strength and one tradeoff in the _standard_tool wrapper design, citing function names. Return control immediately and end your response with the exact sentence: Delegation started.");
 
-  log("beat11", "Sending gimmick prompt...");
+  log("beat10", "Starting background delegation...");
   await cursorClick(page, "#send-message-button");
   await sendMessage(page);
   await cursorHide(page);
-  await waitForResponse(page, { timeoutMs: 240000, stableMs: 5000 });
+  await waitForResponse(page, { timeoutMs: 60000, stableMs: 2000 });
+  await page.getByText("Delegation started.", { exact: false }).last().waitFor({
+    state: "visible",
+    timeout: 10000,
+  });
 
-  log("beat12", "Showing gimmick response...");
+  // ── Beat 11: Main agent remains useful while delegate runs ─────
+  log("beat11", "Giving main agent concurrent cleanup work...");
   await scrollToBottom(page);
+  await cursorClick(page, "#chat-input");
+  await typeMessage(page, "While the sub-agent works, use bash yourself, not delegate, to stop code-server and verify that port 8080 is no longer listening. Then check the background sub-agent's status once, without polling or waiting more than five seconds. When complete, summarize its strength and tradeoff in no more than four bullets. End with these exact sentences: Main agent responsive. Review complete.");
+  await cursorClick(page, "#send-message-button");
+  await sendMessage(page);
+  await cursorHide(page);
+  await waitForResponse(page, { timeoutMs: 60000, stableMs: 2000 });
+  await page.getByText("Main agent responsive.", { exact: false }).last().waitFor({
+    state: "visible",
+    timeout: 10000,
+  });
+  await page.getByText("Review complete.", { exact: false }).last().waitFor({
+    state: "visible",
+    timeout: 10000,
+  });
+
+  log("beat12", "Showing completed architecture review...");
+  await scrollToBottom(page);
+  await page.waitForTimeout(5000);
 
   log("done", "Capture complete");
   await page.waitForTimeout(1000);

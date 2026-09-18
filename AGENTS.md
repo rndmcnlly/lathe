@@ -67,9 +67,9 @@ Rule: **never trust raw signature annotations at runtime.** Resolve via `typing.
 
 The runtime agent must bootstrap from a blank Daytona sandbox. Recipes live in `lathe(manpage="recipes")`. Constraints: egress-allowlisted hosts only, no hardcoded version URLs (resolve via GitHub API), install to `/tmp`, x86_64 Linux (`*-musl` static builds preferred).
 
-## Video pipelines
+## Demo video
 
-Two CI-rendered videos in `explainer-video/` and `demo-video/`, uploaded to GitHub Releases, embedded on the docs site. The demo captures a live OWUI session (non-deterministic). Changes to user-visible behavior can break it, but it should not block merges.
+The Playwright capture in `demo-video/` is uploaded to GitHub Releases and embedded on the docs site. It captures a live OWUI session (non-deterministic). Changes to user-visible behavior can break it, but it should not block merges.
 
 ## Debugging OWUI integration
 

@@ -5,7 +5,7 @@ How this page should improve over time.
 ## Current state (v0 — starter)
 
 Static single-page site in `docs/` served via GitHub Pages. Catppuccin Mocha
-theme, no build step, no JS. Hotlinks the self-demo video from issue #11.
+theme, no build step, no JS. Hotlinks the live demo video from GitHub Releases.
 
 ## Near-term improvements
 
@@ -15,10 +15,6 @@ theme, no build step, no JS. Hotlinks the self-demo video from issue #11.
   Each tool card could show a brief inline clip or screenshot of it in action
   (e.g. a dufs file browser exposed via `expose`, SSH command output, a
   code-server IDE session).
-- **A proper hero demo.** The self-demo video is a stress-test artifact, not a
-  polished product demo. A screen recording of a real user session — clone a
-  repo, fix tests, expose the result — would be more compelling than the
-  Manim-style narrated slides.
 - **Recipes as expandable sections.** The current recipe list is flat text.
   Clicking a recipe could expand to show a transcript or annotated screenshot
   of the interaction.
@@ -64,7 +60,7 @@ theme, no build step, no JS. Hotlinks the self-demo video from issue #11.
   embeds) where visitors can try a Lathe-enabled model without creating an
   account. Major infrastructure lift, but the most compelling possible landing
   page.
-- **Video gallery.** As more self-demo videos are produced (issue #11 pattern),
+- **Video gallery.** As more demo videos are produced,
   curate them as a gallery of what agents have built inside Lathe.
 - **Community recipes.** User-submitted recipes with a lightweight contribution
   flow (PRs to a `recipes/` dir, rendered as subpages).
