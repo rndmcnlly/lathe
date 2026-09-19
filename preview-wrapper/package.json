@@ -1,0 +1,9 @@
+{
+  "name": "lathe-preview-wrapper",
+  "private": true,
+  "scripts": {
+    "check": "node --check src/index.js",
+    "deploy": "wrangler deploy",
+    "logs": "wrangler tail"
+  }
+}

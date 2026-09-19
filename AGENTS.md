@@ -124,6 +124,10 @@ Two techniques for bugs that only manifest at runtime:
 ## Architecture
 
 - **Single file** — everything in `lathe.py`. Resist splitting.
+- **Optional preview wrapper** — `preview-wrapper/` is separately deployed
+  Cloudflare Worker infrastructure, not imported by the OWUI toolkit. Keep the
+  toolkit single-file while maintaining the wrapper contract and deployment
+  guide beside it.
 - **`_tool_context(emitter, fn)`** — execution wrapper for all tools except `destroy`. Opens `httpx.AsyncClient`, calls `fn(client)`, catches exceptions.
 - **`_ensure_sandbox(valves, email, client, emitter)`** — called at top of every `_run`. Transparent create/start/recover/poll.
 - **`destroy`** — manages its own client; does not use `_ensure_sandbox`.

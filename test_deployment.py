@@ -48,6 +48,7 @@ PREVIEW_WRAPPER_KEY = os.environ.get("LATHE_PREVIEW_WRAPPER_KEY", "")
 PREVIEW_EXPECTED_URL = os.environ.get("LATHE_PREVIEW_EXPECTED_URL", "")
 PREVIEW_EXPECTED_PATTERN = os.environ.get("LATHE_PREVIEW_EXPECTED_PATTERN", "")
 PREVIEW_REVOKE_URL = os.environ.get("LATHE_PREVIEW_REVOKE_URL", "")
+PREVIEW_ACCESS = os.environ.get("LATHE_PREVIEW_ACCESS", "private")
 
 
 def staged_source():
@@ -417,13 +418,16 @@ async def main():
         output = await client.send(
             "Call bash to run this exact command: "
             "nohup python3 -m http.server 8765 >/tmp/lathe-preview-test.log 2>&1 &\n"
-            "Then call expose with target http:8765. Return the resulting protected URL."
+            f"Then call expose with target http:8765 and access {PREVIEW_ACCESS}. "
+            "Return the resulting URL."
         )
         require(any(call.get('name') == 'expose' for call in tool_calls(output)), 'Model did not call expose')
         values = '\n'.join(tool_outputs(output))
         urls = re.findall(r'https://[^\s]+', values)
         preview_url = next((u for u in urls if (re.fullmatch(PREVIEW_EXPECTED_PATTERN, u) if PREVIEW_EXPECTED_PATTERN else u == PREVIEW_EXPECTED_URL)), None)
-        require(preview_url and 'Owner-authenticated preview' in values,
+        expected_note = ('Owner-authenticated preview' if PREVIEW_ACCESS == 'private'
+                         else 'Public wrapped preview')
+        require(preview_url and expected_note in values,
                 'Protected preview result missing expected URL/access mode')
         require(PREVIEW_WRAPPER_KEY not in values, 'Installation credential leaked')
         require('daytonaproxy' not in values and '.proxy.daytona.work' not in values,
@@ -448,7 +452,7 @@ async def main():
                 ("delegate dispatch", delegate_dispatch),
             ])
         if preview_enabled:
-            scenarios.append(("model to OWUI to owner-authenticated expose", protected_preview_dispatch))
+            scenarios.append((f"model to OWUI to {PREVIEW_ACCESS} wrapped expose", protected_preview_dispatch))
         for name, scenario in scenarios:
             if not await results.run(name, scenario):
                 break

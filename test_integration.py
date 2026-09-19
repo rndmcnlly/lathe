@@ -215,7 +215,7 @@ async def main():
             "nohup python3 -m http.server 8765 >/tmp/lathe-http.log 2>&1 &",
             **ctx,
         )
-        output = await tools.expose("http:8765", **ctx)
+        output = await tools.expose("http:8765", "public", **ctx)
         require("Service URL" in output and "bearer credential" in output, "Direct preview result missing expected access description")
         match = re.search(r'https://\S+', output)
         require(match is not None, "Direct preview URL missing")

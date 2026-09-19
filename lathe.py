@@ -5,7 +5,7 @@ author_url: https://adamsmith.as
 description: Coding agent tools (lathe, bash, read, write, edit, glob, grep, view, interpret, delegate, onboard, expose, destroy) backed by per-user sandbox VMs with transparent lifecycle management.
 required_open_webui_version: 0.4.0
 requirements: httpx, httpx-ws, pydantic-ai-slim[openai]~=2.5, cachetools
-version: 0.28.0
+version: 0.29.0
 licence: MIT
 """
 
@@ -364,30 +364,36 @@ def _extract_pid(output: str) -> str:
 
 
 async def _http_preview(valves, sandbox_id: str, port: int, user: dict,
+                        requested_access: str,
                         client: httpx.AsyncClient) -> tuple[str, str]:
-    """Obtain a signed URL privately, then optionally wrap it before disclosure.
+    """Obtain a signed URL and negotiate the requested disclosure level.
 
-    The wrapper is an administrator-trusted service, not a model-selected URL.
-    Catch failures inside this credential boundary: _tool_context otherwise
-    includes raw response bodies and exception text in model-visible output.
+    Public requests fail open to the direct signed bearer URL when wrapping is
+    unavailable or refused. Private requests fail closed unless the trusted
+    wrapper returns a validated owner-authenticated URL. Wrapper failures stay
+    inside this credential boundary so raw response bodies never reach the model.
     """
     endpoint = valves.preview_wrapper_url.strip()
     credential = valves.preview_wrapper_key
-    wrapped = bool(endpoint or credential)
-    error = "HTTP preview unavailable. "
-    if wrapped:
-        error += "Protected preview registration failed; no direct URL was returned. Ask the administrator to check the wrapping service."
-    else:
-        error += "Could not obtain a signed preview URL. Try expose again."
+    wrapper_configured = bool(endpoint or credential)
+    lifetime = f"{valves.preview_expiry_seconds / 3600:g} hour(s)"
+
+    # Private requests should fail before minting an upstream bearer URL when
+    # the wrapper configuration or trusted caller identity is unusable.
+    if requested_access == "private":
+        endpoint_parts = urllib.parse.urlsplit(endpoint)
+        if (not endpoint or not credential or endpoint_parts.scheme != "https"
+                or not endpoint_parts.hostname or endpoint_parts.username
+                or endpoint_parts.password or endpoint_parts.fragment
+                or any(c.isspace() for c in endpoint)
+                or not isinstance(user.get("id"), str) or not user["id"]
+                or not isinstance(user.get("email"), str) or not user["email"]):
+            raise RuntimeError(
+                "Private HTTP preview unavailable. The wrapping service is not configured correctly; "
+                "no public URL was returned."
+            )
+
     try:
-        if wrapped:
-            parsed = urllib.parse.urlsplit(endpoint)
-            if (not endpoint or not credential or parsed.scheme != "https" or not parsed.hostname
-                    or parsed.username or parsed.password or parsed.fragment
-                    or any(c.isspace() for c in endpoint)
-                    or not isinstance(user.get("id"), str) or not user["id"]
-                    or not isinstance(user.get("email"), str) or not user["email"]):
-                raise ValueError()
         response = await client.get(
             _api(valves, f"/sandbox/{sandbox_id}/ports/{port}/signed-preview-url"),
             params={"expiresInSeconds": valves.preview_expiry_seconds},
@@ -400,38 +406,85 @@ async def _http_preview(valves, sandbox_id: str, port: int, user: dict,
                 or upstream_parts.username or upstream_parts.password
                 or any(c.isspace() for c in upstream)):
             raise ValueError()
-        lifetime = f"{valves.preview_expiry_seconds / 3600:g} hour(s)"
-        if not wrapped:
-            return upstream, (
-                f"Direct signed preview: this URL is a bearer credential, valid for up to {lifetime}. "
-                "Anyone who copies it can access the service. You may see a Daytona warning on first visit. "
-                "Sandbox sleep or service failure can end access sooner; call expose again to renew."
-            )
-        response = await client.post(endpoint, headers={"Authorization": f"Bearer {credential}"},
-            json={"owner": {"subject": user["id"], "email": user["email"]},
-                  "slot": str(port), "upstream_url": upstream},
-            timeout=30.0, follow_redirects=False)
+    except Exception:
+        raise RuntimeError(
+            "HTTP preview unavailable. Could not obtain a signed preview URL. Try expose again."
+        ) from None
+
+    def direct_public(reason: str) -> tuple[str, str]:
+        return upstream, (
+            f"Public direct preview ({reason}): this URL is a bearer credential, valid for up to {lifetime}. "
+            "Anyone who copies it can access the service. You may see a Daytona warning on first visit. "
+            "Sandbox sleep or service failure can end access sooner; call expose again to renew."
+        )
+
+    if not wrapper_configured:
+        if requested_access == "public":
+            return direct_public("no wrapping service is configured")
+        raise RuntimeError(
+            "Private HTTP preview unavailable. No wrapping service is configured; no public URL was returned."
+        )
+
+    try:
+        endpoint_parts = urllib.parse.urlsplit(endpoint)
+        if (not endpoint or not credential or endpoint_parts.scheme != "https"
+                or not endpoint_parts.hostname or endpoint_parts.username
+                or endpoint_parts.password or endpoint_parts.fragment
+                or any(c.isspace() for c in endpoint)
+                or not isinstance(user.get("id"), str) or not user["id"]
+                or not isinstance(user.get("email"), str) or not user["email"]):
+            raise ValueError()
+        response = await client.post(
+            endpoint,
+            headers={"Authorization": f"Bearer {credential}"},
+            json={
+                "owner": {"subject": user["id"], "email": user["email"]},
+                "slot": str(port),
+                "upstream_url": upstream,
+            },
+            timeout=30.0,
+            follow_redirects=False,
+        )
         response.raise_for_status()
         result = response.json()
         url = result["url"]
+        access_mode = result["access_mode"]
+        achieved_access = {
+            "public-wrapped": "public",
+            "owner-authenticated": "private",
+        }.get(access_mode)
         parsed = urllib.parse.urlsplit(url)
         expiry = datetime.fromisoformat(result["expires_at"].replace("Z", "+00:00"))
-        if (result.get("access_mode") != "owner-authenticated"
-                or parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password
-                or parsed.fragment or parsed.hostname == upstream_parts.hostname
+        if (achieved_access != requested_access
+                or parsed.scheme != "https" or not parsed.hostname
+                or parsed.username or parsed.password or parsed.fragment
+                or parsed.hostname == upstream_parts.hostname
                 or upstream_parts.hostname in urllib.parse.unquote(url)
                 or credential in url or any(c.isspace() for c in url)
                 or expiry.tzinfo is None or expiry <= datetime.now(timezone.utc)):
             raise ValueError()
-        return url, (
-            f"Owner-authenticated preview: sign in as the owning user. Copying the URL does not grant access. "
-            f"Registration expires {expiry.astimezone(timezone.utc).isoformat()}; "
-            f"upstream access lasts up to {lifetime}. "
-            "Sandbox sleep or service failure can end availability sooner. "
-            "Call expose again to replace/renew the registration; the wrapper may invalidate previous browser sessions."
-        )
     except Exception:
-        raise RuntimeError(error) from None
+        if requested_access == "public":
+            return direct_public("wrapping was unavailable or refused")
+        raise RuntimeError(
+            "Private HTTP preview unavailable. Protected preview registration failed; "
+            "no public URL was returned. Ask the administrator to check the wrapping service."
+        ) from None
+
+    if requested_access == "public":
+        access_note = (
+            "Public wrapped preview: anyone who has this URL can access the service."
+        )
+    else:
+        access_note = (
+            "Owner-authenticated private preview: sign in as the owning user. "
+            "Copying the URL does not grant access."
+        )
+    return url, (
+        f"{access_note} Registration expires {expiry.astimezone(timezone.utc).isoformat()}; "
+        f"upstream access lasts up to {lifetime}. "
+        "Sandbox sleep or service failure can end availability sooner; call expose again to renew."
+    )
 
 
 def _require_abs_path(path: str, param_name: str = "path") -> str | None:
@@ -3064,7 +3117,7 @@ class Tools:
             description="Daytona toolbox proxy URL",
         )
         preview_wrapper_url: str = Field(
-            "", description="Optional HTTPS registration endpoint for owner-authenticated HTTP previews. Configured wrapping fails closed.",
+            "", description="Optional HTTPS registration endpoint for public or owner-authenticated HTTP previews. Public requests fall back to the direct signed URL; private requests fail closed.",
         )
         preview_wrapper_key: str = Field(
             "", description="Installation bearer credential for the preview wrapper (admin only).",
@@ -3209,7 +3262,7 @@ class Tools:
             **Common — user downloads and uploads via dufs:**
             Ask the user to download the file on their own machine, then
             upload it to the sandbox through the dufs file browser. Call
-            expose(target="dufs") to get the URL. This handles any file
+            expose(target="dufs", access="public") to get the URL. This handles any file
             type and any host, subject to the deployment's upload limits.
 
             **Rare — custom browser-side fetch service:**
@@ -3365,13 +3418,13 @@ class Tools:
             ## File browser — dufs
 
             When the user asks to upload files, download files, browse files,
-            or transfer files, the answer is expose(target="dufs"). Do NOT
+            or transfer files, the answer is expose(target="dufs", access="public" or "private"). Do NOT
             attempt to relay file contents through the conversation — give the
             user a URL they can use directly in their browser.
 
             **One-step setup:**
             ```
-            expose(target="dufs")
+            expose(target="dufs", access="public")
             ```
             This installs dufs if missing, starts it on port 5000 serving
             /home/daytona/workspace with full upload/download, and returns a
@@ -3382,7 +3435,7 @@ class Tools:
             ```
             nohup /tmp/lathe/dufs /home/daytona/workspace/output --allow-all &
             ```
-            Then call expose(target="http:5000").
+            Then call expose(target="http:5000", access="public").
 
             ## Full IDE — code-server
 
@@ -3391,7 +3444,7 @@ class Tools:
 
             **One-step setup:**
             ```
-            expose(target="code-server")
+            expose(target="code-server", access="private")
             ```
             This installs code-server if missing, starts it on port 8080
             serving /home/daytona/workspace with no application-level auth, and
@@ -3404,7 +3457,7 @@ class Tools:
             ```
             nohup /tmp/lathe/code-server/bin/code-server --bind-addr 0.0.0.0:8080 --auth none /home/daytona/workspace &
             ```
-            Then call expose(target="http:8080").
+            Then call expose(target="http:8080", access="private").
             """),
         "delegate": textwrap.dedent("""\
             # Lathe — Delegate
@@ -3644,18 +3697,20 @@ class Tools:
 
             **Running services and exposing them:**
             The sandbox is a server. Background a web server with nohup, then
-            call expose(target="http:N") to get an HTTPS preview URL the user can open.
+            call expose(target="http:N", access="public" or "private") to get an HTTPS preview URL the user can open.
+            Public requests fall back to the direct signed bearer URL if wrapping
+            is unavailable or refused. Private requests never downgrade to public.
             The sandbox auto-stops on idle, which kills background processes —
             restart the server and call expose() again if needed.
 
             **File upload/download/browsing:**
             When the user wants to upload, download, or browse files, call
-            expose(target="dufs"). This installs and starts dufs automatically
+            expose(target="dufs", access="public" or "private"). This installs and starts dufs automatically
             and returns a URL with drag-and-drop upload/download — one tool call.
             See lathe(manpage="recipes") for custom configurations.
 
             **Browser IDE:**
-            When the user wants an IDE, call expose(target="code-server"). This
+            When the user wants an IDE, call expose(target="code-server", access="private"). This
             installs and starts code-server automatically and returns a URL —
             VS Code in the browser with terminal, extensions, and file editing.
             See lathe(manpage="recipes") for custom configurations.
@@ -3796,11 +3851,14 @@ class Tools:
             content = content.replace("{volume_note}", volume_note)
             content = content.replace("{destroy_volume_note}", destroy_volume_note)
             preview_note = (
-                "HTTP expose uses an owner-authenticated wrapper. Return only its URL; "
-                "never work around a wrapping failure by obtaining or sharing a direct signed URL. "
-                "The tool result states registration expiry; copying the URL does not grant access."
+                "HTTP expose requires an explicit public/private access choice. Public requests try the wrapper, "
+                "then fall back to a direct signed bearer URL if wrapping is unavailable or refused. "
+                "Private requests require a validated owner-authenticated wrapper result and never downgrade to public. "
+                "Choose private unless the user specifically requested public/world access."
                 if self.valves.preview_wrapper_url or self.valves.preview_wrapper_key else
-                "HTTP expose returns a direct signed bearer URL: anyone who copies it can access the service."
+                "HTTP expose requires an explicit public/private access choice. Only public direct signed bearer URLs "
+                "are available on this deployment; private requests fail closed. Choose private unless the user "
+                "specifically requested public/world access."
             )
             preview_note += f" Upstream HTTP access lasts up to {self.valves.preview_expiry_seconds / 3600:g} hour(s); call expose again to renew."
             content = content.replace("{preview_access_note}", preview_note)
@@ -4618,6 +4676,7 @@ class Tools:
     async def expose(
         self,
         target: str,
+        access: str,
         __user__: dict = {},
         __chat_id__: str = "",
         __event_emitter__=None,
@@ -4625,11 +4684,22 @@ class Tools:
         """
         Expose a sandbox service to the user. Pass "dufs" for a one-step file
         browser, "code-server" for a one-step IDE, "http:<port>" for a web
-        server you already started.
+        server you already started. Choose public or private access explicitly;
+        private requests never fall back to a public URL. Choose "private" unless
+        the user specifically asked for the service to be public or available to
+        the world. Convenience, shareability, or private-wrapper failure are not
+        permission to choose "public" or downgrade the user's privacy.
         :param target: What to expose — "dufs" for file upload/download, "code-server" for a browser IDE, or "http:<port>" (e.g. "http:5000", port range 3000–9999) for an HTTP service you started manually.
+        :param access: Required access level: "public" (anyone with the URL; direct signed URL fallback allowed) or "private" (owner authentication required; fails closed).
         """
         async def _run(client):
             target_stripped = target.strip().lower()
+            access_stripped = access.strip().lower()
+
+            if access_stripped not in ("public", "private"):
+                return (
+                    f"Error: access must be \"public\" or \"private\". Got: \"{access}\""
+                )
 
             if target_stripped not in ("dufs", "code-server") and not target_stripped.startswith("http:"):
                 return (
@@ -4668,14 +4738,16 @@ class Tools:
                             f"{result[:500]}\n\n"
                             f"This usually means the sandbox cannot reach the install host "
                             f"(egress filtering). See lathe(manpage=\"egress\") for workarounds, or "
-                            f"install {svc_name} manually and use expose(target=\"http:{svc_port}\")."
+                            f"install {svc_name} manually and use expose(target=\"http:{svc_port}\", access=\"{access_stripped}\")."
                         )
                     pid = _extract_pid(result)
                 else:
                     await _emit(__event_emitter__, f"Generating URL for port {svc_port}...")
 
                 await _emit(__event_emitter__, "Generating URL...")
-                url, access_note = await _http_preview(self.valves, sandbox_id, svc_port, __user__, client)
+                url, access_note = await _http_preview(
+                    self.valves, sandbox_id, svc_port, __user__, access_stripped, client,
+                )
 
                 await _emit(__event_emitter__, ready_status, done=True)
                 messages = _drain_harness_messages(self._chat_state, __chat_id__, _sb_warning)

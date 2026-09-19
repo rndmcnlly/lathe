@@ -51,7 +51,7 @@ To update an existing installation, use the `/api/v1/tools/id/lathe/update` endp
 | `daytona_api_key` | *(empty, password field)* | Daytona API key |
 | `daytona_api_url` | `https://app.daytona.io/api` | Control plane URL |
 | `daytona_proxy_url` | `https://proxy.app.daytona.io/toolbox` | Toolbox proxy URL |
-| `preview_wrapper_url` | *(empty)* | HTTPS registration endpoint for an owner-authenticated preview wrapper |
+| `preview_wrapper_url` | *(empty)* | HTTPS registration endpoint for a public or owner-authenticated preview wrapper |
 | `preview_wrapper_key` | *(empty, password field)* | Installation bearer credential for that wrapper |
 | `preview_expiry_seconds` | `86400` | Upstream HTTP signed-URL lifetime (60–86400 seconds); independent of wrapper registration expiry |
 | `deployment_label` | *(empty, must configure)* | Label key for sandbox tagging (e.g. `chat.example.com`) |
@@ -80,7 +80,7 @@ accepts works here. The keys `name`, `labels`, and `volumes` are managed by
 lathe (per-user lookup invariant and the `persistent_volume` valve) and are
 rejected with a clear error if you try to set them.
 
-### Owner-authenticated HTTP previews
+### HTTP preview access and wrapping
 
 > [!WARNING]
 > Without a preview wrapper, every HTTP URL returned by `expose()` is a bearer
@@ -90,32 +90,39 @@ rejected with a clear error if you try to set them.
 > file browser. After several months of personal and institutional use, this has
 > been Lathe's most significant recurring security sharp edge.
 
-Direct signed URLs can still be appropriate for personal or otherwise
-low-risk deployments. For shared, institutional, demonstrated, or recorded
-deployments, configure `preview_wrapper_url` and `preview_wrapper_key` so every
-HTTP exposure requires browser authentication and authorization under the
-deployment's access policy. Wrapping applies to arbitrary HTTP services, dufs,
-and code-server before a URL reaches the model or user. Lathe does not provide
-SSH access.
+Every `expose()` call requires the agent to choose `access="public"` or
+`access="private"`. Public requests try the configured wrapper first, then fall
+back to Daytona's direct signed bearer URL if wrapping is unavailable, refused,
+or malformed. Private requests require a validated `owner-authenticated`
+wrapper response and never downgrade to public. The model-facing contract tells
+the agent to choose private unless the user specifically requests public/world
+access; convenience or wrapper failure is not permission to disclose a service.
+
+Direct signed URLs can be appropriate for intentionally public, personal, or
+otherwise low-risk services. Configure `preview_wrapper_url` and
+`preview_wrapper_key` to add a distinct branded origin, cookie isolation, and,
+when the wrapper supports it, browser authentication. Wrapping applies to
+arbitrary HTTP services, dufs, and code-server before a URL reaches the model or
+user. Lathe does not provide SSH access.
 
 #### What a wrapper does
 
-A wrapper is an authenticated reverse proxy deployed outside Lathe. It keeps the
-Daytona-provided bearer URL on the server side, gives the browser a different
-public URL, authenticates the browser user, and authorizes access according to
-the deployment's community policy. A personal deployment might admit only the
-owner; an institutional deployment might admit an appropriate class, lab, or
-campus community. Copying or recording the wrapped URL does not bypass that
-authentication policy.
+A wrapper is a reverse proxy deployed outside the OWUI process. It keeps the
+Daytona-provided bearer URL on the server side and gives the browser a distinct
+public origin. A public wrapper provides branding and cookie isolation but URL
+possession still grants access. A private wrapper additionally authenticates the
+browser and authorizes access under the deployment's policy. A personal
+deployment might admit only the registered owner email; an institutional
+deployment might admit an appropriate class, lab, or campus community.
 
 Run the wrapper on a domain distinct from Open WebUI. This provides cookie and
 origin isolation between OWUI and arbitrary user-controlled services running in
-the sandbox. Lathe does not include a wrapper service because the only HTTP
-surface it controls lives inside the OWUI process. Adding proxy routes there
-would require manipulating OWUI internals and, more importantly, could expose
-OWUI-origin cookies or other same-origin authority to sandbox applications whose
-content is controlled by users and models. An external origin makes that class
-of ambient-authority failure structurally unavailable.
+the sandbox. This repository includes an optional Cloudflare Worker under
+[`preview-wrapper/`](preview-wrapper/) but deliberately deploys it as separate
+infrastructure. Adding proxy routes inside OWUI could expose OWUI-origin cookies
+or other same-origin authority to sandbox applications whose content is
+controlled by users and models. An external origin makes that class of
+ambient-authority failure structurally unavailable.
 
 Without a wrapper, Daytona's opaque preview URL is effectively the access token.
 This capability-URL model is reasonable when the operator understands that
@@ -124,8 +131,11 @@ service or its URL is visible. It is a poor default when demonstrations,
 institutional support, or routine screen sharing are part of the workflow.
 
 The wrapper receives the upstream URL and ownership from OWUI's injected
-`__user__` context. The model can select an exposure target or port, but it
-cannot supply the owner identity or substitute an arbitrary upstream URL.
+`__user__` context. The model can select an exposure target, port, and desired
+access level, but it cannot supply the owner identity or substitute an arbitrary
+upstream URL. For private access, the generic identity invariant is email-based:
+the wrapper authenticates the browser through OAuth/OIDC and matches the
+provider-verified email claim against the owner email supplied at registration.
 The wrapper is trusted infrastructure: its operator must explicitly authorize
 the Lathe installation and define its identity namespace, destination policy,
 public naming, replacement behavior, revocation, retention, and browser-login
@@ -145,19 +155,27 @@ the resolved service port. Lathe sends no sandbox-management credential to the
 wrapper; the installation credential establishes only the registrar's
 authority.
 
-A successful response contains:
+A successful response contains either public wrapping:
+
+```json
+{"url":"https://lathe-nonce.previews.example/","access_mode":"public-wrapped","expires_at":"2026-09-18T19:00:00Z"}
+```
+
+or owner-authenticated wrapping:
 
 ```json
 {"url":"https://owner-5000.previews.example/","access_mode":"owner-authenticated","expires_at":"2026-09-18T19:00:00Z"}
 ```
 
-Lathe verifies a distinct HTTPS destination, owner-authenticated access mode,
-and future timezone-qualified expiry. It rejects responses that reflect the
-upstream hostname or installation credential in the returned URL. It never
-follows registration redirects or exposes raw response/error text. Missing
-configuration or identity, registration failure, and malformed responses all
-fail closed. The wrapper remains trusted to implement its claims; valid JSON
-alone cannot prove that it enforces browser ownership.
+Lathe verifies a distinct HTTPS destination, an access mode matching the agent's
+request, and a future timezone-qualified expiry. It rejects responses that
+reflect the upstream hostname or installation credential in the returned URL.
+It never follows registration redirects or exposes raw response/error text.
+For public requests, any wrapper failure or mode mismatch falls back to the
+direct signed URL. For private requests, missing configuration or identity,
+registration failure, mode mismatch, and malformed responses all fail closed.
+The wrapper remains trusted to implement its claims; valid JSON alone cannot
+prove that it enforces browser ownership.
 
 #### Lifetime and browser behavior
 
@@ -210,7 +228,7 @@ flow, e.g. *"Visit https://example.com/setup to create your sandbox first."*
 | `view(path)` | Load an image into the model's visual context (PNG/JPEG/GIF/WebP, ≤ 4 MB, content-sniffed) |
 | `interpret(code, timeout)` | Run Python in a conversation-scoped persistent interpreter |
 | `delegate(task, context_files, max_steps, foreground_seconds)` | Dispatch a sub-agent to perform a multi-step task autonomously |
-| `expose(target)` | Expose an HTTP service, file browser, or browser IDE through an HTTPS preview |
+| `expose(target, access)` | Expose an HTTP service, file browser, or browser IDE with required `public` or `private` access |
 | `handoff()` | Prepare instructions for continuing work in a fresh conversation |
 | `destroy()` | Permanently delete the sandbox after interactive confirmation |
 
@@ -233,7 +251,8 @@ See [AGENTS.md](AGENTS.md#testing-policy) for contributor testing policy.
 
 For a focused protected-preview test, use `test_deployment.py --preview-only`
 with `LATHE_PREVIEW_WRAPPER_URL`, `LATHE_PREVIEW_WRAPPER_KEY`,
-`LATHE_PREVIEW_EXPECTED_URL`, and `LATHE_PREVIEW_REVOKE_URL` in the environment.
+`LATHE_PREVIEW_EXPECTED_URL`, `LATHE_PREVIEW_REVOKE_URL`, and optionally
+`LATHE_PREVIEW_ACCESS` (`private` by default) in the environment.
 For transient hostnames, use `LATHE_PREVIEW_EXPECTED_PATTERN` instead of the
 exact URL and `{label}` in the revoke URL; cleanup uses the validated returned
 hostname. The disposable suite refuses the production toolkit ID `lathe`.
@@ -248,6 +267,7 @@ a full dependency migration.
 | File | Purpose |
 |------|---------|
 | `lathe.py` | The OWUI toolkit (single file, deployed via OWUI admin API) |
+| `preview-wrapper/` | Optional Cloudflare Worker for branded, cookie-isolated preview origins |
 | `test_unit.py` | Offline behavioral contracts (pytest, no sandbox) |
 | `testing_support.py` | Shared public schema contract |
 | `test_integration.py` | Integration tests (live sandbox API) |

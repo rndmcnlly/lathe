@@ -411,7 +411,7 @@ async def test_rendered_manual(tools, volume, wrapped):
     overview = await tools.lathe()
     assert ("/home/daytona/volume" in overview) == volume
     assert "bash(" in overview and "delegate(" in overview
-    assert ("owner-authenticated wrapper" in overview) == wrapped
+    assert ("try the wrapper" in overview) == wrapped
     assert "overview" in await tools.lathe("nonexistent")
 
 
@@ -602,7 +602,8 @@ def preview(tools, sandbox, http):
     tools.valves.preview_wrapper_key = secret
     good = {"url": protected, "access_mode": "owner-authenticated", "expires_at": "2099-01-01T00:00:00Z"}
 
-    async def invoke(payload=None, status=200, target="http:5000", user=USER):
+    async def invoke(payload=None, status=200, target="http:5000", user=USER,
+                     access="private"):
         calls, events = [], []
         async def emit(event):
             events.append(event)
@@ -624,7 +625,7 @@ def preview(tools, sandbox, http):
             assert (request.method, request.url.path) == ("POST", "/sb/process/execute")
             return httpx.Response(200, json={"exitCode": 0, "result": "READY PID=123"})
         http(handler)
-        result = await tools.expose(target, __user__=user, __event_emitter__=emit)
+        result = await tools.expose(target, access, __user__=user, __event_emitter__=emit)
         return result, calls, json.dumps(events)
     return SimpleNamespace(invoke=invoke, upstream=upstream, protected=protected, secret=secret, good=good)
 
@@ -637,8 +638,30 @@ async def test_preview_uses_trusted_identity_and_hides_credentials(preview, targ
     registrations = [r for r in calls if r.url.host == "wrapper.test"]
     assert len(registrations) == 1
     assert json.loads(registrations[0].content) == {
-        "owner": {"subject": USER["id"], "email": USER["email"]}, "slot": slot, "upstream_url": preview.upstream}
+        "owner": {"subject": USER["id"], "email": USER["email"]}, "slot": slot,
+        "upstream_url": preview.upstream}
     assert registrations[0].headers["Authorization"] == "Bearer " + preview.secret
+
+
+async def test_public_preview_accepts_public_wrapper_result(preview):
+    payload = {**preview.good, "access_mode": "public-wrapped"}
+    result, calls, events = await preview.invoke(payload, access="public")
+    assert preview.protected in result and "Public wrapped preview" in result
+    assert all(s not in result + events for s in [preview.upstream, preview.secret])
+    assert len([r for r in calls if r.url.host == "wrapper.test"]) == 1
+
+
+@pytest.mark.parametrize("failure,status", [
+    ("timeout", 200), ("malformed", 200),
+    ({"access_mode": "owner-authenticated"}, 200), ({"error": "refused"}, 409),
+])
+async def test_public_preview_falls_back_to_direct_url(preview, failure, status):
+    payload = ({**preview.good, **failure} if isinstance(failure, dict) and status == 200
+               else failure)
+    result, calls, _ = await preview.invoke(payload, status, access="public")
+    assert preview.upstream in result and "Public direct preview" in result
+    assert preview.secret not in result
+    assert len([r for r in calls if r.url.host == "wrapper.test"]) == 1
 
 
 @pytest.mark.parametrize("failure", ["upstream", "public", "http", "leak", "expired", "naive", "500", "302", "malformed", "timeout"])
@@ -659,6 +682,8 @@ async def test_preview_failures_are_closed_and_redacted(preview, failure):
 
 
 async def test_preview_configuration_and_direct_mode(preview, tools):
+    result, calls, _ = await preview.invoke(access="secret")
+    assert result.startswith("Error:") and not calls
     result, calls, _ = await preview.invoke(user={"email": USER["email"]})
     assert result.startswith("Error:") and not calls
     tools.valves.preview_wrapper_key = ""
@@ -666,6 +691,8 @@ async def test_preview_configuration_and_direct_mode(preview, tools):
     assert result.startswith("Error:") and not calls
     tools.valves.preview_wrapper_url = ""
     result, calls, _ = await preview.invoke()
+    assert result.startswith("Error:") and preview.upstream not in result
+    result, calls, _ = await preview.invoke(access="public")
     assert preview.upstream in result and "bearer credential" in result
     assert not any(r.url.host == "wrapper.test" for r in calls)
     result, calls, _ = await preview.invoke(target="ssh")

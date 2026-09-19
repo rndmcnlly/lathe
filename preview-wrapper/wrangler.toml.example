@@ -1,0 +1,22 @@
+name = "lathe-preview-wrapper"
+main = "src/index.js"
+compatibility_date = "2026-09-01"
+workers_dev = false
+
+[[routes]]
+pattern = "WRAPPER_DOMAIN/*"
+zone_name = "WRAPPER_DOMAIN"
+
+[[routes]]
+pattern = "*.WRAPPER_DOMAIN/*"
+zone_name = "WRAPPER_DOMAIN"
+
+[[kv_namespaces]]
+binding = "SUBDOMAINS"
+id = "REPLACE_WITH_NAMESPACE_ID"
+
+[triggers]
+crons = ["17 6 * * *"]
+
+[vars]
+ZONE = "WRAPPER_DOMAIN"
