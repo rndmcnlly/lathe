@@ -552,7 +552,9 @@ try {
     }, exposeUrl);
     await cursorClick(page, "[data-capture-expose-link]");
     await page.goto(exposeUrl);
-    await page.waitForTimeout(6000);
+    await page.locator(".monaco-workbench").waitFor({ state: "visible", timeout: 15000 });
+    await page.keyboard.press("Control+Shift+E");
+    await page.waitForTimeout(1000);
     log("beat7", "VS Code visible; opening the agent-created proof file...");
 
     // Open the file Lathe created in chat through VS Code's Explorer. Seeing
