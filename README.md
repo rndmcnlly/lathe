@@ -159,13 +159,13 @@ installation credential establishes only the registrar's authority.
 A successful response contains either public wrapping:
 
 ```json
-{"url":"https://lathe-nonce.previews.example/","access_mode":"public-wrapped","expires_at":"2026-09-18T19:00:00Z"}
+{"url":"https://lathe-public-nonce.previews.example/","access_mode":"public-wrapped","expires_at":"2026-09-18T19:00:00Z"}
 ```
 
 or owner-authenticated wrapping:
 
 ```json
-{"url":"https://owner-5000.previews.example/","access_mode":"owner-authenticated","expires_at":"2026-09-18T19:00:00Z"}
+{"url":"https://lathe-private-nonce.previews.example/","access_mode":"owner-authenticated","expires_at":"2026-09-18T19:00:00Z"}
 ```
 
 Lathe verifies a distinct HTTPS destination, an access mode matching the agent's

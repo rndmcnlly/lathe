@@ -59,6 +59,16 @@ export default {
         );
       }
 
+      const labeledAccessMode = accessModeForLabel(label);
+      if (labeledAccessMode && labeledAccessMode !== registration.access_mode) {
+        return page(
+          "invalid registration",
+          "<p>The hostname access mode does not match its registration.</p>",
+          409,
+          env.ZONE,
+        );
+      }
+
       if (registration.access_mode === "owner-authenticated") {
         if (url.pathname === AUTH_CALLBACK_PATH) {
           return handleAuthCallback(request, url, registration, host, env);
@@ -118,9 +128,10 @@ async function handleRegister(request, env) {
   }
 
   const label = latheRegistration
-    ? `lathe-${randomLabel()}`
+    ? `lathe-${requestedAccess}-${randomLabel()}`
     : typeof body.subdomain === "string" ? body.subdomain.trim().toLowerCase() : "";
-  if (!LABEL_RE.test(label) || RESERVED.has(label)) {
+  if (!LABEL_RE.test(label) || RESERVED.has(label)
+      || (!latheRegistration && label.startsWith("lathe-"))) {
     return json({ error: `subdomain must match ${LABEL_RE} and avoid reserved names` }, 400);
   }
 
@@ -411,6 +422,12 @@ function randomLabel() {
   const bytes = new Uint8Array(8);
   crypto.getRandomValues(bytes);
   return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+function accessModeForLabel(label) {
+  if (label.startsWith("lathe-public-")) return "public-wrapped";
+  if (label.startsWith("lathe-private-")) return "owner-authenticated";
+  return null;
 }
 
 function randomToken(byteLength) {

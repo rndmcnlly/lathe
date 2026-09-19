@@ -23,8 +23,8 @@ share parent-domain cookies.
 Lathe supplies the owner email from OWUI's trusted injected user context. URL
 parameters, browser-submitted email, and the model are never identity
 authorities. OIDC state and opaque browser sessions are short-lived KV records
-scoped to one random preview hostname. The browser session uses a Secure,
-HttpOnly, SameSite=Lax, host-only `__Host-lathe_session` cookie.
+scoped to one mode-coded random preview hostname. The browser session uses a
+Secure, HttpOnly, SameSite=Lax, host-only `__Host-lathe_session` cookie.
 
 Public mode is not a confidentiality boundary: anyone possessing a public URL
 can access its service. Private mode is owner-authenticated. In both modes the
@@ -75,11 +75,12 @@ Content-Type: application/json
  "requested_access":"private"}
 ```
 
-The Worker generates a `lathe-{nonce}` label and returns:
+The Worker generates a `lathe-{access}-{nonce}` label, making the requested
+access policy visible without treating the label as authorization, and returns:
 
 ```json
-{"url":"https://lathe-{nonce}.previews.example.org/",
- "host":"lathe-{nonce}.previews.example.org",
+{"url":"https://lathe-private-{nonce}.previews.example.org/",
+ "host":"lathe-private-{nonce}.previews.example.org",
  "access_mode":"owner-authenticated",
  "expires_at":"2026-09-20T01:00:00Z"}
 ```
@@ -96,7 +97,10 @@ Other trusted producers may register an explicit label:
 `ttl` is optional and constrained to 60–86400 seconds. Lathe registrations must
 request exactly `public` or `private`; the response reports `public-wrapped` or
 `owner-authenticated` respectively. Generic explicit-label registrations remain
-public-only.
+public-only and cannot use the reserved `lathe-` prefix. At request time, the
+Worker also refuses any mode-coded Lathe hostname whose stored access mode does
+not agree with its `public` or `private` label. Legacy `lathe-{nonce}` leases
+remain valid until their existing TTL expires.
 
 ## Deploy
 

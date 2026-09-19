@@ -133,8 +133,9 @@ Two techniques for bugs that only manifest at runtime:
 
 `expose(target, access)` first asks Daytona for a signed upstream URL, then may
 register that credential with the separately deployed Cloudflare Worker in
-`preview-wrapper/`. The Worker maps a random `lathe-*` hostname to the upstream;
-Lathe returns only the wrapped hostname. Public requests may fall back to the
+`preview-wrapper/`. The Worker maps a random `lathe-public-*` or
+`lathe-private-*` hostname to the upstream; Lathe returns only the wrapped
+hostname. Public requests may fall back to the
 direct Daytona bearer URL, but private requests always fail closed.
 
 The private-preview identity chain crosses three systems and each has one
@@ -149,7 +150,8 @@ authority:
   registered owner email. Model input, URL parameters, and browser-submitted
   identity are never authorities.
 - The Worker is the authority for the browser session. OIDC state and opaque
-  sessions are short-lived KV records scoped to one random preview hostname;
+  sessions are short-lived KV records scoped to one mode-coded random preview
+  hostname;
   the browser receives a Secure, HttpOnly, SameSite=Lax, host-only `__Host-`
   cookie. Never use a parent-domain cookie across preview hosts.
 
