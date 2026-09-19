@@ -418,7 +418,7 @@ async def main():
         output = await client.send(
             "Call bash to run this exact command: "
             "nohup python3 -m http.server 8765 >/tmp/lathe-preview-test.log 2>&1 &\n"
-            f"Then call expose with target http:8765 and access {PREVIEW_ACCESS}. "
+            f"Then call expose with target http:8765, access {PREVIEW_ACCESS}, and tag deployment-test. "
             "Return the resulting URL."
         )
         require(any(call.get('name') == 'expose' for call in tool_calls(output)), 'Model did not call expose')
@@ -428,7 +428,7 @@ async def main():
         expected_note = ('Owner-authenticated private preview' if PREVIEW_ACCESS == 'private'
                          else 'Public wrapped preview')
         require(preview_url and expected_note in values,
-                'Protected preview result missing expected URL/access mode')
+                'Protected preview result missing expected URL/access note')
         require(PREVIEW_WRAPPER_KEY not in values, 'Installation credential leaked')
         require('daytonaproxy' not in values and '.proxy.daytona.work' not in values,
                 'Upstream hostname leaked')

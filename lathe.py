@@ -5,7 +5,7 @@ author_url: https://adamsmith.as
 description: Coding agent tools (lathe, bash, read, write, edit, glob, grep, view, interpret, delegate, onboard, expose, destroy) backed by per-user sandbox VMs with transparent lifecycle management.
 required_open_webui_version: 0.4.0
 requirements: httpx, httpx-ws, pydantic-ai-slim[openai]~=2.5, cachetools
-version: 0.29.1
+version: 0.29.4
 licence: MIT
 """
 
@@ -364,14 +364,14 @@ def _extract_pid(output: str) -> str:
 
 
 async def _http_preview(valves, sandbox_id: str, port: int, user: dict,
-                        requested_access: str,
-                        client: httpx.AsyncClient) -> tuple[str, str]:
-    """Obtain a signed URL and negotiate the requested disclosure level.
+                         access: str, tag: str,
+                         client: httpx.AsyncClient) -> tuple[str, str]:
+    """Obtain a signed URL and enforce the caller-selected disclosure level.
 
     Public requests fail open to the direct signed bearer URL when wrapping is
     unavailable or refused. Private requests fail closed unless the trusted
-    wrapper returns a validated owner-authenticated URL. Wrapper failures stay
-    inside this credential boundary so raw response bodies never reach the model.
+    wrapper successfully registers an owner-authenticated URL. Wrapper failures
+    stay inside this credential boundary so raw response bodies never reach the model.
     """
     endpoint = valves.preview_wrapper_url.strip()
     credential = valves.preview_wrapper_key
@@ -380,7 +380,7 @@ async def _http_preview(valves, sandbox_id: str, port: int, user: dict,
 
     # Private requests should fail before minting an upstream bearer URL when
     # the wrapper configuration or trusted caller identity is unusable.
-    if requested_access == "private":
+    if access == "private":
         endpoint_parts = urllib.parse.urlsplit(endpoint)
         if (not endpoint or not credential or endpoint_parts.scheme != "https"
                 or not endpoint_parts.hostname or endpoint_parts.username
@@ -419,7 +419,7 @@ async def _http_preview(valves, sandbox_id: str, port: int, user: dict,
         )
 
     if not wrapper_configured:
-        if requested_access == "public":
+        if access == "public":
             return direct_public("no wrapping service is configured")
         raise RuntimeError(
             "Private HTTP preview unavailable. No wrapping service is configured; no public URL was returned."
@@ -434,30 +434,26 @@ async def _http_preview(valves, sandbox_id: str, port: int, user: dict,
                 or not isinstance(user.get("id"), str) or not user["id"]
                 or not isinstance(user.get("email"), str) or not user["email"]):
             raise ValueError()
+        registration = {
+            "owner": {"subject": user["id"], "email": user["email"]},
+            "upstream_url": upstream,
+            "access": access,
+        }
+        if tag:
+            registration["tag"] = tag
         response = await client.post(
             endpoint,
             headers={"Authorization": f"Bearer {credential}"},
-            json={
-                "owner": {"subject": user["id"], "email": user["email"]},
-                "slot": str(port),
-                "upstream_url": upstream,
-                "requested_access": requested_access,
-            },
+            json=registration,
             timeout=30.0,
             follow_redirects=False,
         )
         response.raise_for_status()
         result = response.json()
         url = result["url"]
-        access_mode = result["access_mode"]
-        achieved_access = {
-            "public-wrapped": "public",
-            "owner-authenticated": "private",
-        }.get(access_mode)
         parsed = urllib.parse.urlsplit(url)
         expiry = datetime.fromisoformat(result["expires_at"].replace("Z", "+00:00"))
-        if (achieved_access != requested_access
-                or parsed.scheme != "https" or not parsed.hostname
+        if (parsed.scheme != "https" or not parsed.hostname
                 or parsed.username or parsed.password or parsed.fragment
                 or parsed.hostname == upstream_parts.hostname
                 or upstream_parts.hostname in urllib.parse.unquote(url)
@@ -465,14 +461,14 @@ async def _http_preview(valves, sandbox_id: str, port: int, user: dict,
                 or expiry.tzinfo is None or expiry <= datetime.now(timezone.utc)):
             raise ValueError()
     except Exception:
-        if requested_access == "public":
+        if access == "public":
             return direct_public("wrapping was unavailable or refused")
         raise RuntimeError(
             "Private HTTP preview unavailable. Protected preview registration failed; "
             "no public URL was returned. Ask the administrator to check the wrapping service."
         ) from None
 
-    if requested_access == "public":
+    if access == "public":
         access_note = (
             "Public wrapped preview: anyone who has this URL can access the service."
         )
@@ -3854,7 +3850,7 @@ class Tools:
             preview_note = (
                 "HTTP expose requires an explicit public/private access choice. Public requests try the wrapper, "
                 "then fall back to a direct signed bearer URL if wrapping is unavailable or refused. "
-                "Private requests require a validated owner-authenticated wrapper result and never downgrade to public. "
+                "Private requests require successful owner-authenticated wrapper registration and never downgrade to public. "
                 "Choose private unless the user specifically requested public/world access."
                 if self.valves.preview_wrapper_url or self.valves.preview_wrapper_key else
                 "HTTP expose requires an explicit public/private access choice. Only public direct signed bearer URLs "
@@ -4678,6 +4674,7 @@ class Tools:
         self,
         target: str,
         access: str,
+        tag: str = "",
         __user__: dict = {},
         __chat_id__: str = "",
         __event_emitter__=None,
@@ -4692,6 +4689,7 @@ class Tools:
         permission to choose "public" or downgrade the user's privacy.
         :param target: What to expose — "dufs" for file upload/download, "code-server" for a browser IDE, or "http:<port>" (e.g. "http:5000", port range 3000–9999) for an HTTP service you started manually.
         :param access: Required access level: "public" (anyone with the URL; direct signed URL fallback allowed) or "private" (owner authentication required; fails closed).
+        :param tag: Optional short display hint for the wrapper hostname, such as "vscode" or "files". Use lowercase letters, digits, and internal hyphens (max 32 characters). The deployment may ignore it or combine it with other administrator-selected fields; never treat the resulting hostname as proof of identity or purpose.
         """
         async def _run(client):
             target_stripped = target.strip().lower()
@@ -4700,6 +4698,13 @@ class Tools:
             if access_stripped not in ("public", "private"):
                 return (
                     f"Error: access must be \"public\" or \"private\". Got: \"{access}\""
+                )
+
+            tag_stripped = tag.strip().lower()
+            if tag_stripped and not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])?", tag_stripped):
+                return (
+                    "Error: tag must be empty or a lowercase DNS label using letters, "
+                    f"digits, and internal hyphens (max 32 characters). Got: \"{tag}\""
                 )
 
             if target_stripped not in ("dufs", "code-server") and not target_stripped.startswith("http:"):
@@ -4747,7 +4752,8 @@ class Tools:
 
                 await _emit(__event_emitter__, "Generating URL...")
                 url, access_note = await _http_preview(
-                    self.valves, sandbox_id, svc_port, __user__, access_stripped, client,
+                    self.valves, sandbox_id, svc_port, __user__, access_stripped,
+                    tag_stripped, client,
                 )
 
                 await _emit(__event_emitter__, ready_status, done=True)

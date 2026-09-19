@@ -45,7 +45,7 @@ function environment() {
   };
 }
 
-async function register(env, requestedAccess = "private") {
+async function register(env, access = "private", tag = "") {
   const response = await worker.fetch(new Request("https://preview.test/register", {
     method: "POST",
     headers: {
@@ -54,9 +54,9 @@ async function register(env, requestedAccess = "private") {
     },
     body: JSON.stringify({
       owner: { subject: "owui-user", email: " Owner@Example.org " },
-      slot: "5000",
       upstream_url: "https://signed-upstream.test/credential",
-      requested_access: requestedAccess,
+      access,
+      ...(tag ? { tag } : {}),
       ttl: 3600,
     }),
   }), env);
@@ -64,7 +64,7 @@ async function register(env, requestedAccess = "private") {
   return response.json();
 }
 
-test("Lathe registration requires an explicit access mode", async () => {
+test("Lathe registration requires an explicit access policy", async () => {
   const env = environment();
   const response = await worker.fetch(new Request("https://preview.test/register", {
     method: "POST",
@@ -74,19 +74,19 @@ test("Lathe registration requires an explicit access mode", async () => {
     },
     body: JSON.stringify({
       owner: { subject: "owui-user", email: "owner@example.org" },
-      slot: "5000",
       upstream_url: "https://signed-upstream.test/credential",
+      requested_access: "private",
     }),
   }), env);
   assert.equal(response.status, 400);
-  assert.match(await response.text(), /requested_access/);
+  assert.match(await response.text(), /access/);
   assert.equal(env.SUBDOMAINS.values.size, 0);
 });
 
 test("public registrations proxy without OIDC", async () => {
   const env = environment();
   const registration = await register(env, "public");
-  assert.equal(registration.access_mode, "public-wrapped");
+  assert.deepEqual(Object.keys(registration).sort(), ["expires_at", "host", "url"]);
   assert.match(new URL(registration.url).hostname, /^lathe-public-[0-9a-f]{16}\.preview\.test$/);
 
   globalThis.fetch = async (input) => {
@@ -101,7 +101,7 @@ test("public registrations proxy without OIDC", async () => {
 test("private flow matches verified email and isolates the wrapper session", async () => {
   const env = environment();
   const registration = await register(env);
-  assert.equal(registration.access_mode, "owner-authenticated");
+  assert.deepEqual(Object.keys(registration).sort(), ["expires_at", "host", "url"]);
   const host = new URL(registration.url).hostname;
   assert.match(host, /^lathe-private-[0-9a-f]{16}\.preview\.test$/);
   let forwardedCookie;
@@ -202,38 +202,43 @@ test("private flow rejects a different verified email", async () => {
   assert.equal(callback.headers.get("set-cookie"), null);
 });
 
-test("coded hostname fails closed when its registration mode disagrees", async () => {
+test("hostname templates expose selected hints and sanitize the final label", async () => {
   const env = environment();
-  const registration = await register(env, "public");
+  env.HOSTNAME_TEMPLATE = "Demo.{access}_{tag}.{email_user}";
+  const registration = await register(env, "private", "vscode");
   const host = new URL(registration.url).hostname;
   const stored = JSON.parse(await env.SUBDOMAINS.get(host));
-  stored.access_mode = "owner-authenticated";
-  await env.SUBDOMAINS.put(host, JSON.stringify(stored));
-
-  globalThis.fetch = async () => {
-    throw new Error("mismatched registration reached the network");
-  };
-  const response = await worker.fetch(new Request(registration.url), env);
-  assert.equal(response.status, 409);
-  assert.match(await response.text(), /access mode does not match/);
+  assert.match(host, /^demo-private-vscode-owner-[0-9a-f]{16}\.preview\.test$/);
+  assert.equal(stored.access, "private");
 });
 
-test("legacy Lathe hostname remains valid for its existing lease", async () => {
+test("hostname text never determines access policy", async () => {
+  const env = environment();
+  env.HOSTNAME_TEMPLATE = "private-{email}-{user_id}";
+  const registration = await register(env, "public");
+  assert.match(new URL(registration.url).hostname,
+    /^private-owner-example-org-owui-user-[0-9a-f]{16}\.preview\.test$/);
+  globalThis.fetch = async () => new Response("public content");
+  const response = await worker.fetch(new Request(registration.url), env);
+  assert.equal(response.status, 200);
+  assert.equal(await response.text(), "public content");
+});
+
+test("legacy registration records are rejected", async () => {
   const env = environment();
   const host = "lathe-0123456789abcdef.preview.test";
   await env.SUBDOMAINS.put(host, JSON.stringify({
+    version: 1,
     target: "https://signed-upstream.test/credential",
     access_mode: "public-wrapped",
     owner: null,
   }));
 
-  globalThis.fetch = async (input) => {
-    assert.equal(input.toString(), "https://signed-upstream.test/legacy");
-    return new Response("legacy content");
+  globalThis.fetch = async () => {
+    throw new Error("legacy registration reached the network");
   };
   const response = await worker.fetch(new Request(`https://${host}/legacy`), env);
-  assert.equal(response.status, 200);
-  assert.equal(await response.text(), "legacy content");
+  assert.equal(response.status, 404);
 });
 
 test("generic registrations cannot claim the Lathe hostname namespace", async () => {

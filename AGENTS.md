@@ -131,18 +131,18 @@ Two techniques for bugs that only manifest at runtime:
 
 ### Preview wrapper and private authentication
 
-`expose(target, access)` first asks Daytona for a signed upstream URL, then may
+`expose(target, access, tag)` first asks Daytona for a signed upstream URL, then may
 register that credential with the separately deployed Cloudflare Worker in
-`preview-wrapper/`. The Worker maps a random `lathe-public-*` or
-`lathe-private-*` hostname to the upstream; Lathe returns only the wrapped
-hostname. Public requests may fall back to the
+`preview-wrapper/`. The Worker maps a configurable, DNS-safed hostname prefix
+plus a mandatory random nonce to the upstream; Lathe returns only the wrapped
+hostname. The optional model-supplied tag is an untrusted display hint. Public requests may fall back to the
 direct Daytona bearer URL, but private requests always fail closed.
 
 The private-preview identity chain crosses three systems and each has one
 authority:
 
 - OWUI's injected `__user__` is the authority for the preview owner's email.
-  Lathe sends that trusted identity and the explicit requested access mode over
+  Lathe sends that trusted identity and the explicit required access policy over
   the registration control plane, authenticated by `preview_wrapper_key`.
 - Pocket ID at `auth.adamsmith.as` is the authority for the browser user's
   identity. The Worker uses OIDC authorization code + PKCE and authorizes only
@@ -150,7 +150,7 @@ authority:
   registered owner email. Model input, URL parameters, and browser-submitted
   identity are never authorities.
 - The Worker is the authority for the browser session. OIDC state and opaque
-  sessions are short-lived KV records scoped to one mode-coded random preview
+  sessions are short-lived KV records scoped to one random preview
   hostname;
   the browser receives a Secure, HttpOnly, SameSite=Lax, host-only `__Host-`
   cookie. Never use a parent-domain cookie across preview hosts.
@@ -163,7 +163,7 @@ cookie before forwarding requests upstream and must discard upstream attempts
 to set that cookie, since sandbox applications are untrusted relative to the
 wrapper's authentication boundary.
 
-Registration records contain the target, access mode, owner identity, and
+Registration records contain the target, access policy, owner identity, and
 absolute expiry. The sensitive upstream URL is never echoed by the Worker or
 included in auth redirects/errors. KV registration expiry remains the ultimate
 lease boundary; authentication does not keep a sandbox or service alive.

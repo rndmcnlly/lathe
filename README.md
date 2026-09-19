@@ -93,8 +93,8 @@ rejected with a clear error if you try to set them.
 Every `expose()` call requires the agent to choose `access="public"` or
 `access="private"`. Public requests try the configured wrapper first, then fall
 back to Daytona's direct signed bearer URL if wrapping is unavailable, refused,
-or malformed. Private requests require a validated `owner-authenticated`
-wrapper response and never downgrade to public. The model-facing contract tells
+or malformed. Private requests require successful owner-authenticated wrapper
+registration and never downgrade to public. The model-facing contract tells
 the agent to choose private unless the user specifically requests public/world
 access; convenience or wrapper failure is not permission to disclose a service.
 
@@ -131,15 +131,18 @@ service or its URL is visible. It is a poor default when demonstrations,
 institutional support, or routine screen sharing are part of the workflow.
 
 The wrapper receives the upstream URL and ownership from OWUI's injected
-`__user__` context. The model can select an exposure target, port, and desired
-access level, but it cannot supply the owner identity or substitute an arbitrary
-upstream URL. For private access, the generic identity invariant is email-based:
+`__user__` context. The model can select an exposure target, port, desired
+access level, and optional untrusted display tag, but it cannot supply the owner
+identity or substitute an arbitrary upstream URL. For private access, the generic identity invariant is email-based:
 the wrapper authenticates the browser through OAuth/OIDC and matches the
 provider-verified email claim against the owner email supplied at registration.
-The wrapper is trusted infrastructure: its operator must explicitly authorize
-the Lathe installation and define its identity namespace, destination policy,
-public naming, replacement behavior, revocation, retention, and browser-login
-policy.
+This integration can cross two administrative authorities. The Lathe/OWUI admin
+chooses a wrapper endpoint and installation credential. The preview-wrapper
+admin authorizes that Lathe installation and independently controls identity
+mapping, destination policy, public hostname templates, replacement behavior,
+revocation, retention, and browser-login policy. These may be the same person,
+but the protocol does not assume that they are. The model can suggest `tag`; it
+cannot choose the hostname template or which trusted identity fields it exposes.
 
 #### Registration contract
 
@@ -147,34 +150,30 @@ Lathe sends an HTTPS POST to `preview_wrapper_url` with
 `Authorization: Bearer <preview_wrapper_key>` and JSON:
 
 ```json
-{"owner":{"subject":"injected-owui-user-id","email":"owner@example.edu"},"slot":"5000","upstream_url":"https://temporary-upstream.example/","requested_access":"private"}
+{"owner":{"subject":"injected-owui-user-id","email":"owner@example.edu"},"upstream_url":"https://temporary-upstream.example/","access":"private","tag":"vscode"}
 ```
 
-`subject` and `email` come exclusively from trusted request context. `slot` is
-the resolved service port. `requested_access` is exactly `public` or `private`;
-Lathe accepts the result only when the wrapper reports the matching achieved
-mode. Lathe sends no sandbox-management credential to the wrapper; the
+`subject` and `email` come exclusively from trusted request context. `access`
+is exactly `public` or `private`; it is a
+requirement, not a preference. The wrapper either enforces it or fails the
+request. `tag` is an optional model-supplied display hint and may be ignored;
+neither Lathe nor the wrapper treats hostname text as an identity or access
+claim. Lathe sends no sandbox-management credential to the wrapper; the
 installation credential establishes only the registrar's authority.
 
-A successful response contains either public wrapping:
+A successful response contains the wrapped URL and its expiry:
 
 ```json
-{"url":"https://lathe-public-nonce.previews.example/","access_mode":"public-wrapped","expires_at":"2026-09-18T19:00:00Z"}
+{"url":"https://lathe-private-nonce.previews.example/","expires_at":"2026-09-18T19:00:00Z"}
 ```
 
-or owner-authenticated wrapping:
-
-```json
-{"url":"https://lathe-private-nonce.previews.example/","access_mode":"owner-authenticated","expires_at":"2026-09-18T19:00:00Z"}
-```
-
-Lathe verifies a distinct HTTPS destination, an access mode matching the agent's
-request, and a future timezone-qualified expiry. It rejects responses that
+Lathe verifies a distinct HTTPS destination and a future timezone-qualified
+expiry. It rejects responses that
 reflect the upstream hostname or installation credential in the returned URL.
 It never follows registration redirects or exposes raw response/error text.
-For public requests, any wrapper failure or mode mismatch falls back to the
+For public requests, any wrapper failure falls back to the
 direct signed URL. For private requests, missing configuration or identity,
-registration failure, mode mismatch, and malformed responses all fail closed.
+registration failure, and malformed responses all fail closed.
 The wrapper remains trusted to implement its claims; valid JSON alone cannot
 prove that it enforces browser ownership.
 

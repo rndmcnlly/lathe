@@ -5,6 +5,8 @@ const RESERVED = new Set([
 ]);
 
 const LABEL_RE = /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/;
+const TAG_RE = /^[a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])?$/;
+const NONCE_LENGTH = 16;
 const DEFAULT_TTL = 24 * 60 * 60;
 const MIN_TTL = 60;
 const MAX_TTL = 24 * 60 * 60;
@@ -59,17 +61,7 @@ export default {
         );
       }
 
-      const labeledAccessMode = accessModeForLabel(label);
-      if (labeledAccessMode && labeledAccessMode !== registration.access_mode) {
-        return page(
-          "invalid registration",
-          "<p>The hostname access mode does not match its registration.</p>",
-          409,
-          env.ZONE,
-        );
-      }
-
-      if (registration.access_mode === "owner-authenticated") {
+      if (registration.access === "private") {
         if (url.pathname === AUTH_CALLBACK_PATH) {
           return handleAuthCallback(request, url, registration, host, env);
         }
@@ -117,19 +109,46 @@ async function handleRegister(request, env) {
     return json({ error: "body must be JSON" }, 400);
   }
 
-  const latheRegistration = body.owner && typeof body.owner === "object"
-    && typeof body.slot === "string" && typeof body.upstream_url === "string";
-  const requestedAccess = body.requested_access;
-  if (latheRegistration && !["public", "private"].includes(requestedAccess)) {
-    return json({ error: "Lathe registrations require requested_access public or private" }, 400);
+  const latheRegistration = body.owner !== undefined || body.upstream_url !== undefined;
+  if (latheRegistration
+      && (!body.owner || typeof body.owner !== "object"
+        || typeof body.owner.subject !== "string"
+        || typeof body.owner.email !== "string"
+        || typeof body.upstream_url !== "string")) {
+    return json({ error: "Lathe registrations require owner and upstream_url" }, 400);
   }
-  if (!latheRegistration && requestedAccess !== undefined && requestedAccess !== "public") {
+  const access = body.access;
+  if (latheRegistration && !["public", "private"].includes(access)) {
+    return json({ error: "Lathe registrations require access public or private" }, 400);
+  }
+  if (!latheRegistration && access !== undefined && access !== "public") {
     return json({ error: "generic registrations support only public access" }, 409);
   }
 
-  const label = latheRegistration
-    ? `lathe-${requestedAccess}-${randomLabel()}`
-    : typeof body.subdomain === "string" ? body.subdomain.trim().toLowerCase() : "";
+  const tag = body.tag === undefined ? "" : body.tag;
+  if (latheRegistration && (typeof tag !== "string" || (tag && !TAG_RE.test(tag)))) {
+    return json({ error: "tag must be empty or a lowercase DNS label of at most 32 characters" }, 400);
+  }
+  if (!latheRegistration && body.tag !== undefined) {
+    return json({ error: "tag is only supported for Lathe registrations" }, 400);
+  }
+
+  let label;
+  if (latheRegistration) {
+    try {
+      label = renderLatheLabel(env.HOSTNAME_TEMPLATE || "lathe-{access}", {
+        access,
+        tag: tag || "preview",
+        email_user: safeLabelPart(body.owner.email.split("@", 1)[0], "user"),
+        email: safeLabelPart(body.owner.email, "user"),
+        user_id: safeLabelPart(body.owner.subject, "user"),
+      });
+    } catch {
+      return json({ error: "hostname template is invalid for this registration" }, 500);
+    }
+  } else {
+    label = typeof body.subdomain === "string" ? body.subdomain.trim().toLowerCase() : "";
+  }
   if (!LABEL_RE.test(label) || RESERVED.has(label)
       || (!latheRegistration && label.startsWith("lathe-"))) {
     return json({ error: `subdomain must match ${LABEL_RE} and avoid reserved names` }, 400);
@@ -163,8 +182,7 @@ async function handleRegister(request, env) {
     owner = { subject, email };
   }
 
-  const accessMode = requestedAccess === "private" ? "owner-authenticated" : "public-wrapped";
-  if (accessMode === "owner-authenticated" && !oidcConfigured(env)) {
+  if (access === "private" && !oidcConfigured(env)) {
     return json({ error: "private access is not configured" }, 503);
   }
 
@@ -172,11 +190,10 @@ async function handleRegister(request, env) {
   const nowS = Math.floor(Date.now() / 1000);
   const expiresS = nowS + ttl;
   const registration = {
-    version: 1,
+    version: 2,
     target: target.toString(),
-    access_mode: accessMode,
+    access: latheRegistration ? access : "public",
     owner,
-    slot: latheRegistration ? body.slot : null,
     registered_at: new Date(nowS * 1000).toISOString(),
     expires_at: expiresS,
   };
@@ -184,7 +201,7 @@ async function handleRegister(request, env) {
     expirationTtl: ttl,
     metadata: {
       producer: latheRegistration ? "lathe" : "generic",
-      access_mode: accessMode,
+      access: latheRegistration ? access : "public",
       owner_email: owner?.email ?? null,
     },
   });
@@ -192,7 +209,6 @@ async function handleRegister(request, env) {
   return json({
     url: `https://${host}/`,
     host,
-    access_mode: accessMode,
     expires_at: new Date(expiresS * 1000).toISOString(),
   });
 }
@@ -213,18 +229,12 @@ async function getRegistration(env, host) {
   if (!stored) return null;
   try {
     const registration = JSON.parse(stored);
-    if (registration && typeof registration.target === "string"
-        && ["public-wrapped", "owner-authenticated"].includes(registration.access_mode)) {
+    if (registration?.version === 2 && typeof registration.target === "string"
+        && ["public", "private"].includes(registration.access)) {
       return registration;
     }
   } catch {
-    // Pre-auth deployments stored only the target string. Keep those public.
-    try {
-      new URL(stored);
-      return { target: stored, access_mode: "public-wrapped", owner: null, expires_at: null };
-    } catch {
-      return null;
-    }
+    return null;
   }
   return null;
 }
@@ -424,10 +434,27 @@ function randomLabel() {
   return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
-function accessModeForLabel(label) {
-  if (label.startsWith("lathe-public-")) return "public-wrapped";
-  if (label.startsWith("lathe-private-")) return "owner-authenticated";
-  return null;
+function safeLabelPart(value, fallback) {
+  const safe = String(value ?? "")
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+  return safe || fallback;
+}
+
+function renderLatheLabel(template, values) {
+  if (typeof template !== "string" || !template) throw new Error("empty template");
+  const rendered = template.replace(/\{([a-z_]+)\}/g, (match, name) => {
+    if (!(name in values)) throw new Error("unknown template variable");
+    return values[name];
+  });
+  if (/[{}]/.test(rendered)) throw new Error("invalid template expression");
+  const prefix = safeLabelPart(rendered, "");
+  if (!prefix || !LABEL_RE.test(prefix)) throw new Error("invalid prefix");
+  if (prefix.length + 1 + NONCE_LENGTH > 63) throw new Error("prefix too long");
+  return `${prefix}-${randomLabel()}`;
 }
 
 function randomToken(byteLength) {

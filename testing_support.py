@@ -21,7 +21,8 @@ EXPECTED_SCHEMA = {
     "view": {"path": ("string", True, None)},
     "delegate": {"task": ("string", True, None), "context_files": ("array", False, []),
                  "max_steps": ("integer", False, 10), "foreground_seconds": ("integer", False, -1)},
-    "expose": {"target": ("string", True, None), "access": ("string", True, None)},
+    "expose": {"target": ("string", True, None), "access": ("string", True, None),
+               "tag": ("string", False, "")},
 }
 
 

@@ -600,10 +600,10 @@ def preview(tools, sandbox, http):
     upstream, protected, secret = "https://secret.preview.test/", "https://owner.preview.test/", "installation-secret"
     tools.valves.preview_wrapper_url = "https://wrapper.test/register"
     tools.valves.preview_wrapper_key = secret
-    good = {"url": protected, "access_mode": "owner-authenticated", "expires_at": "2099-01-01T00:00:00Z"}
+    good = {"url": protected, "expires_at": "2099-01-01T00:00:00Z"}
 
     async def invoke(payload=None, status=200, target="http:5000", user=USER,
-                     access="private"):
+                     access="private", tag=""):
         calls, events = [], []
         async def emit(event):
             events.append(event)
@@ -625,51 +625,59 @@ def preview(tools, sandbox, http):
             assert (request.method, request.url.path) == ("POST", "/sb/process/execute")
             return httpx.Response(200, json={"exitCode": 0, "result": "READY PID=123"})
         http(handler)
-        result = await tools.expose(target, access, __user__=user, __event_emitter__=emit)
+        result = await tools.expose(target, access, tag, __user__=user, __event_emitter__=emit)
         return result, calls, json.dumps(events)
     return SimpleNamespace(invoke=invoke, upstream=upstream, protected=protected, secret=secret, good=good)
 
 
-@pytest.mark.parametrize("target,slot", [("http:5000", "5000"), ("dufs", "5000"), ("code-server", "8080")])
-async def test_preview_uses_trusted_identity_and_hides_credentials(preview, target, slot):
+@pytest.mark.parametrize("target", ["http:5000", "dufs", "code-server"])
+async def test_preview_uses_trusted_identity_and_hides_credentials(preview, target):
     result, calls, events = await preview.invoke(target=target)
     assert preview.protected in result and "Owner-authenticated" in result
     assert all(s not in result + events for s in [preview.upstream, preview.secret])
     registrations = [r for r in calls if r.url.host == "wrapper.test"]
     assert len(registrations) == 1
     assert json.loads(registrations[0].content) == {
-        "owner": {"subject": USER["id"], "email": USER["email"]}, "slot": slot,
-        "upstream_url": preview.upstream, "requested_access": "private"}
+        "owner": {"subject": USER["id"], "email": USER["email"]},
+        "upstream_url": preview.upstream, "access": "private"}
     assert registrations[0].headers["Authorization"] == "Bearer " + preview.secret
 
 
+async def test_preview_tag_is_optional_untrusted_wrapper_hint(preview):
+    result, calls, _ = await preview.invoke(tag="vscode")
+    assert preview.protected in result
+    request = next(r for r in calls if r.url.host == "wrapper.test")
+    assert json.loads(request.content)["tag"] == "vscode"
+
+    result, calls, _ = await preview.invoke(tag="official.example")
+    assert result.startswith("Error: tag") and not calls
+
+
 async def test_public_preview_accepts_public_wrapper_result(preview):
-    payload = {**preview.good, "access_mode": "public-wrapped"}
-    result, calls, events = await preview.invoke(payload, access="public")
+    result, calls, events = await preview.invoke(access="public")
     assert preview.protected in result and "Public wrapped preview" in result
     assert all(s not in result + events for s in [preview.upstream, preview.secret])
     assert len([r for r in calls if r.url.host == "wrapper.test"]) == 1
     request = next(r for r in calls if r.url.host == "wrapper.test")
-    assert json.loads(request.content)["requested_access"] == "public"
+    assert json.loads(request.content)["access"] == "public"
 
 
 @pytest.mark.parametrize("failure,status", [
     ("timeout", 200), ("malformed", 200),
-    ({"access_mode": "owner-authenticated"}, 200), ({"error": "refused"}, 409),
+    ({"expires_at": "2099-01-01T00:00:00Z"}, 200), ({"error": "refused"}, 409),
 ])
 async def test_public_preview_falls_back_to_direct_url(preview, failure, status):
-    payload = ({**preview.good, **failure} if isinstance(failure, dict) and status == 200
-               else failure)
+    payload = failure
     result, calls, _ = await preview.invoke(payload, status, access="public")
     assert preview.upstream in result and "Public direct preview" in result
     assert preview.secret not in result
     assert len([r for r in calls if r.url.host == "wrapper.test"]) == 1
 
 
-@pytest.mark.parametrize("failure", ["upstream", "public", "http", "leak", "expired", "naive", "500", "302", "malformed", "timeout"])
+@pytest.mark.parametrize("failure", ["upstream", "missing-url", "http", "leak", "expired", "naive", "500", "302", "malformed", "timeout"])
 async def test_preview_failures_are_closed_and_redacted(preview, failure):
     changes = {
-        "upstream": {"url": preview.upstream}, "public": {"access_mode": "public"},
+        "upstream": {"url": preview.upstream}, "missing-url": {"url": None},
         "http": {"url": "http://insecure.test/"}, "leak": {"url": preview.protected + "?leak=" + preview.upstream},
         "expired": {"expires_at": "2000-01-01T00:00:00Z"}, "naive": {"expires_at": "2099-01-01T00:00:00"},
     }

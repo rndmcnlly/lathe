@@ -23,8 +23,15 @@ share parent-domain cookies.
 Lathe supplies the owner email from OWUI's trusted injected user context. URL
 parameters, browser-submitted email, and the model are never identity
 authorities. OIDC state and opaque browser sessions are short-lived KV records
-scoped to one mode-coded random preview hostname. The browser session uses a
+scoped to one random preview hostname. The browser session uses a
 Secure, HttpOnly, SameSite=Lax, host-only `__Host-lathe_session` cookie.
+
+The Lathe/OWUI administrator and preview-wrapper administrator are distinct
+roles, even when one person performs both. The Lathe admin configures the
+registration endpoint and credential. The wrapper admin controls
+`HOSTNAME_TEMPLATE` and therefore decides whether access policy, model-supplied
+tags, or trusted owner identifiers become public hostname text. Lathe and its
+model cannot override that template.
 
 Public mode is not a confidentiality boundary: anyone possessing a public URL
 can access its service. Private mode is owner-authenticated. In both modes the
@@ -71,17 +78,19 @@ Authorization: Bearer $REGISTER_TOKEN
 Content-Type: application/json
 
 {"owner":{"subject":"owui-user-id","email":"owner@example.org"},
- "slot":"5000","upstream_url":"https://signed-upstream.example/",
- "requested_access":"private"}
+ "upstream_url":"https://signed-upstream.example/",
+ "access":"private","tag":"vscode"}
 ```
 
-The Worker generates a `lathe-{access}-{nonce}` label, making the requested
-access policy visible without treating the label as authorization, and returns:
+The optional `tag` is an untrusted model-supplied display hint. The Worker uses
+`HOSTNAME_TEMPLATE` (default: `lathe-{access}`) and always appends a random
+16-hex-character nonce. For example, `{access}-{tag}` produces
+`private-vscode-{nonce}`. Hostname text is never an authorization claim; the
+stored registration remains authoritative. The Worker returns:
 
 ```json
 {"url":"https://lathe-private-{nonce}.previews.example.org/",
  "host":"lathe-private-{nonce}.previews.example.org",
- "access_mode":"owner-authenticated",
  "expires_at":"2026-09-20T01:00:00Z"}
 ```
 
@@ -95,12 +104,33 @@ Other trusted producers may register an explicit label:
 ```
 
 `ttl` is optional and constrained to 60–86400 seconds. Lathe registrations must
-request exactly `public` or `private`; the response reports `public-wrapped` or
-`owner-authenticated` respectively. Generic explicit-label registrations remain
-public-only and cannot use the reserved `lathe-` prefix. At request time, the
-Worker also refuses any mode-coded Lathe hostname whose stored access mode does
-not agree with its `public` or `private` label. Legacy `lathe-{nonce}` leases
-remain valid until their existing TTL expires.
+set `access` to exactly `public` or `private`; the Worker either enforces that
+policy or rejects the registration. Generic explicit-label registrations remain
+public-only and cannot use the reserved `lathe-` prefix. Previous request,
+response, and stored-record shapes are not accepted.
+
+### Hostname templates
+
+`HOSTNAME_TEMPLATE` may contain literal text and these variables:
+
+- `{access}`: required policy, `public` or `private`.
+- `{tag}`: model-supplied tag, or `preview` when omitted.
+- `{email_user}`: owner email before `@`.
+- `{email}`: complete owner email.
+- `{user_id}`: OWUI's injected owner subject.
+
+After substitution, the complete prefix is normalized to lowercase ASCII:
+non-alphanumeric runs (including dots, `@`, spaces, and underscores) become
+hyphens, and boundary hyphens are removed. The Worker rejects unknown variables,
+an empty result, or a rendered prefix too long to leave room for `-{nonce}` in a
+63-character DNS label. It never permits the template to control or omit the
+nonce suffix.
+
+DNS-safe is not private. `{email}`, `{email_user}`, and `{user_id}` can publish
+personal identifiers in DNS queries, browser history, logs, and certificate
+transparency systems. The preview-wrapper administrator, not the Lathe admin or
+model, decides whether those variables are appropriate for the deployment's
+population and threat model.
 
 ## Deploy
 
@@ -128,8 +158,8 @@ Worker, KV namespace, route, secret, and DNS records.
    additionally binds every OIDC state record to the exact random hostname, so
    one preview cannot complete another preview's sign-in.
 
-4. Set `OIDC_ISSUER` and `OIDC_CLIENT_ID` in `wrangler.toml`. Create both Worker
-   secrets, then deploy:
+4. Set `OIDC_ISSUER`, `OIDC_CLIENT_ID`, and the desired `HOSTNAME_TEMPLATE` in
+   `wrangler.toml`. Create both Worker secrets, then deploy:
 
    ```bash
    wrangler secret put REGISTER_TOKEN
