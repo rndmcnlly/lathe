@@ -5,12 +5,13 @@ author_url: https://adamsmith.as
 description: Coding agent tools (lathe, bash, read, write, edit, glob, grep, view, interpret, delegate, onboard, expose, destroy) backed by per-user sandbox VMs with transparent lifecycle management.
 required_open_webui_version: 0.4.0
 requirements: httpx, httpx-ws, pydantic-ai-slim[openai]~=2.5, cachetools
-version: 0.29.4
+version: 0.29.5
 licence: MIT
 """
 
 import asyncio
 import base64
+import hashlib
 import inspect
 import io
 import json
@@ -2815,6 +2816,86 @@ _DUFS_ENSURE_SCRIPT = (
     f'echo "READY PID=$PID"'
 )
 
+_TTYD_BIN = f"{_DURABLE_ROOT}/ttyd"
+_TTYD_PORT = 7681
+_TTYD_ROOT = "/home/daytona/workspace"
+
+# Resolve both assets from one release document, verify before installation,
+# then refuse to treat an unrelated listener on ttyd's port as success.
+_TTYD_ENSURE_SCRIPT = textwrap.dedent(f"""\
+    set -e
+    mkdir -p {_DURABLE_ROOT}
+    if ! test -x {_TTYD_BIN}; then
+      TMP=$(mktemp -d)
+      trap 'rm -rf "$TMP"' EXIT
+      curl -fsSL https://api.github.com/repos/tsl0922/ttyd/releases/latest -o "$TMP/release.json"
+      BIN_URL=$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(next(a["browser_download_url"] for a in d["assets"] if a["name"] == "ttyd.x86_64"))' "$TMP/release.json")
+      SUMS_URL=$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(next(a["browser_download_url"] for a in d["assets"] if a["name"] == "SHA256SUMS"))' "$TMP/release.json")
+      curl -fsSL "$BIN_URL" -o "$TMP/ttyd.x86_64"
+      curl -fsSL "$SUMS_URL" -o "$TMP/SHA256SUMS"
+      EXPECTED=$(python3 -c 'import pathlib,sys; print(next(line.split()[0] for line in pathlib.Path(sys.argv[1]).read_text().splitlines() if line.split() and line.split()[-1].lstrip("*") == "ttyd.x86_64"))' "$TMP/SHA256SUMS")
+      ACTUAL=$(sha256sum "$TMP/ttyd.x86_64" | cut -d' ' -f1)
+      test "$ACTUAL" = "$EXPECTED"
+      install -m 755 "$TMP/ttyd.x86_64" {_TTYD_BIN}
+    fi
+    if ss -tlnp | grep -q ':{_TTYD_PORT} '; then
+      ss -tlnp | grep ':{_TTYD_PORT} ' | grep -q ttyd \
+        || {{ echo 'Port {_TTYD_PORT} is occupied by a non-ttyd process' >&2; exit 1; }}
+    else
+      nohup {_TTYD_BIN} -W -p {_TTYD_PORT} -w {_TTYD_ROOT} /bin/bash \
+        > {_DURABLE_ROOT}/ttyd.log 2>&1 &
+      for i in 1 2 3 4 5; do
+        ss -tlnp | grep -q ':{_TTYD_PORT} ' && break
+        sleep 0.2
+      done
+    fi
+    PID=$(ss -tlnp | grep ':{_TTYD_PORT} ' | grep -o 'pid=[0-9]*' | head -1 | cut -d= -f2)
+    test -n "$PID"
+    echo "READY PID=$PID"
+    """)
+
+_SITE_STATE_DIR = f"{_DURABLE_ROOT}/site"
+
+
+def _site_port(site_root: str) -> int:
+    """Map a site root stably into the high unprivileged port range."""
+    digest = hashlib.sha256(site_root.encode("utf-8")).digest()
+    return 20000 + int.from_bytes(digest[:2], "big") % 40000
+
+
+def _build_site_ensure_script(site_root: str, port: int) -> str:
+    """Build an idempotent static-site server script for one absolute root."""
+    root = _shell_quote(site_root)
+    state_dir = f"{_SITE_STATE_DIR}/{port}"
+    return textwrap.dedent(f"""\
+        set -e
+        SITE_ROOT={root}
+        test -d "$SITE_ROOT" || {{ echo "Site directory does not exist: $SITE_ROOT" >&2; exit 1; }}
+        mkdir -p {state_dir}
+        PID=$(ss -tlnp | grep ':{port} ' | grep -o 'pid=[0-9]*' | head -1 | cut -d= -f2 || true)
+        if test -n "$PID"; then
+          CMD=$(tr '\\0' ' ' < "/proc/$PID/cmdline")
+          printf '%s' "$CMD" | grep -Fq 'python3 -m http.server {port}' \
+            || {{ echo 'Assigned site port {port} is occupied by another process' >&2; exit 1; }}
+          if test -f {state_dir}/root && test "$(cat {state_dir}/root)" = "$SITE_ROOT"; then
+            echo "READY PID=$PID"
+            exit 0
+          fi
+          echo 'Assigned site port {port} belongs to a different Lathe site (hash collision)' >&2
+          exit 1
+        fi
+        printf '%s' "$SITE_ROOT" > {state_dir}/root
+        nohup python3 -m http.server {port} --bind 0.0.0.0 --directory "$SITE_ROOT" \
+          > {state_dir}/log 2>&1 &
+        for i in 1 2 3 4 5; do
+          ss -tlnp | grep -q ':{port} ' && break
+          sleep 0.2
+        done
+        PID=$(ss -tlnp | grep ':{port} ' | grep -o 'pid=[0-9]*' | head -1 | cut -d= -f2)
+        test -n "$PID"
+        echo "READY PID=$PID"
+        """)
+
 _CS_BIN = f"{_DURABLE_ROOT}/code-server/bin/code-server"
 _CS_PORT = 8080
 _CS_ROOT = "/home/daytona/workspace"
@@ -3409,7 +3490,7 @@ class Tools:
 
             Tested scripts for bootstrapping common tools from a cold sandbox.
             These tools live in /tmp/lathe and survive sandbox stop/restart but not
-            destroy(). If /tmp/lathe/dufs or /tmp/lathe/code-server is missing, re-run the
+            destroy(). If /tmp/lathe/dufs, /tmp/lathe/ttyd, or /tmp/lathe/code-server is missing, re-run the
             install script.
 
             ## File browser — dufs
@@ -3433,6 +3514,32 @@ class Tools:
             nohup /tmp/lathe/dufs /home/daytona/workspace/output --allow-all &
             ```
             Then call expose(target="http:5000", access="public").
+
+            ## Static site — Python HTTP server
+
+            To serve an existing directory as a simple static website without
+            manually choosing a server or managing a background process:
+            ```
+            expose(target="site:/home/daytona/workspace/meow", access="private", tag="meow")
+            ```
+            The path must be absolute and already exist. Lathe assigns it a
+            stable path-derived port and starts an idempotent Python static
+            server. Different directories can remain live simultaneously;
+            repeated calls for the same path reuse its server. A detected port
+            collision is refused rather than replacing or exposing another site.
+
+            ## Focused terminal — ttyd
+
+            When the user asks for a browser terminal or shell without a full
+            IDE, use the private-only ttyd fast path:
+            ```
+            expose(target="ttyd", access="private", tag="terminal")
+            ```
+            This resolves the latest x86_64 release, verifies it against the
+            release's SHA256SUMS asset, installs it under /tmp/lathe, and starts
+            a writable shell in /home/daytona/workspace on port 7681. Public
+            access is refused because the terminal grants arbitrary command
+            execution and access to the sandbox environment.
 
             ## Full IDE — code-server
 
@@ -3695,6 +3802,8 @@ class Tools:
             **Running services and exposing them:**
             The sandbox is a server. Background a web server with nohup, then
             call expose(target="http:N", access="public" or "private") to get an HTTPS preview URL the user can open.
+            For a directory of static files, use expose(target="site:/absolute/path", ...)
+            instead; Lathe manages the server and port.
             Public requests fall back to the direct signed bearer URL if wrapping
             is unavailable or refused. Private requests never downgrade to public.
             The sandbox auto-stops on idle, which kills background processes —
@@ -3707,6 +3816,7 @@ class Tools:
             See lathe(manpage="recipes") for custom configurations.
 
             **Browser IDE:**
+            When the user wants a focused terminal, call expose(target="ttyd", access="private").
             When the user wants an IDE, call expose(target="code-server", access="private"). This
             installs and starts code-server automatically and returns a URL —
             VS Code in the browser with terminal, extensions, and file editing.
@@ -3760,8 +3870,8 @@ class Tools:
             ## Gotchas
 
             - Commands are non-interactive. No stdin prompts or curses UIs. Use
-              -y or equivalent flags. For an interactive terminal, expose
-              code-server and use its browser terminal.
+              -y or equivalent flags. For an interactive terminal, expose ttyd;
+              use code-server when the user also needs a browser IDE.
             - bash() auto-backgrounds commands that exceed ~30 seconds. When this
               happens, it returns a background descriptor with CMD and PID paths.
               Use foreground_seconds= to extend the wait (e.g. foreground_seconds=120
@@ -3805,7 +3915,7 @@ class Tools:
         "interpret": "Persistent Python REPL: state model, when to use vs bash, limitations.",
         "delegate": "Sub-agent delegation: foreground/background, sidecar files, agent teams, cost model.",
         "handoff": "Context handoff: writing a handoff document for continuing work in a new conversation.",
-        "recipes": "Bootstrap scripts for common tools: dufs (file browser), code-server (IDE).",
+        "recipes": "Bootstrap scripts for common tools: dufs (file browser), ttyd (terminal), code-server (IDE).",
         "background": "Background job sidecar files, and peek/poll/kill recipes.",
         "egress": "Egress restrictions, workarounds (dufs upload, browser-side fetch), Tier 3.",
         "version": "Show the installed Lathe toolkit version.",
@@ -4681,19 +4791,36 @@ class Tools:
     ) -> str:
         """
         Expose a sandbox service to the user. Pass "dufs" for a one-step file
-        browser, "code-server" for a one-step IDE, "http:<port>" for a web
+        browser, "site:/absolute/path" for a static website, "ttyd" for a private browser terminal, "code-server" for a one-step IDE, "http:<port>" for a web
         server you already started. Choose public or private access explicitly;
         private requests never fall back to a public URL. Choose "private" unless
         the user specifically asked for the service to be public or available to
         the world. Convenience, shareability, or private-wrapper failure are not
         permission to choose "public" or downgrade the user's privacy.
-        :param target: What to expose — "dufs" for file upload/download, "code-server" for a browser IDE, or "http:<port>" (e.g. "http:5000", port range 3000–9999) for an HTTP service you started manually.
+        :param target: What to expose — "dufs" for file upload/download, "site:/absolute/path" for an existing static-site directory, "ttyd" for a private browser terminal, "code-server" for a browser IDE, or "http:<port>" (e.g. "http:5000", port range 3000–9999) for an HTTP service you started manually.
         :param access: Required access level: "public" (anyone with the URL; direct signed URL fallback allowed) or "private" (owner authentication required; fails closed).
         :param tag: Optional short display hint for the wrapper hostname, such as "vscode" or "files". Use lowercase letters, digits, and internal hyphens (max 32 characters). The deployment may ignore it or combine it with other administrator-selected fields; never treat the resulting hostname as proof of identity or purpose.
         """
+        target_value = target.strip()
+        target_stripped = target_value.lower()
+        access_stripped = access.strip().lower()
+        site_root = None
+
+        if target_stripped.startswith("site:"):
+            site_root = target_value[len("site:"):].rstrip("/") or "/"
+            path_error = _require_abs_path(site_root, "site path")
+            if path_error:
+                return path_error
+
+        if target_stripped == "ttyd" and access_stripped != "private":
+            return (
+                "Error: ttyd is private-only because it provides arbitrary command "
+                "execution and access to the sandbox environment. Use access=\"private\". "
+                "An expert who deliberately needs an unauthenticated terminal may start "
+                "ttyd manually and expose target=\"http:7681\"."
+            )
+
         async def _run(client):
-            target_stripped = target.strip().lower()
-            access_stripped = access.strip().lower()
 
             if access_stripped not in ("public", "private"):
                 return (
@@ -4707,9 +4834,10 @@ class Tools:
                     f"digits, and internal hyphens (max 32 characters). Got: \"{tag}\""
                 )
 
-            if target_stripped not in ("dufs", "code-server") and not target_stripped.startswith("http:"):
+            if (target_stripped not in ("dufs", "ttyd", "code-server")
+                    and site_root is None and not target_stripped.startswith("http:")):
                 return (
-                    f"Error: target must be \"dufs\", \"code-server\", or \"http:<port>\" "
+                    f"Error: target must be \"dufs\", \"site:/absolute/path\", \"ttyd\", \"code-server\", or \"http:<port>\" "
                     f"(e.g. \"http:5000\"). Got: \"{target}\""
                 )
 
@@ -4774,6 +4902,41 @@ class Tools:
                         f"- **Download**: click any file\n"
                         f"- **Browse**: navigate folders\n\n"
                         f"dufs is serving {_DUFS_ROOT} on port {_DUFS_PORT} (PID {pid})."
+                    ),
+                )
+
+            if site_root is not None:
+                site_port = _site_port(site_root)
+                return await _ensure_and_sign(
+                    ensure_script=_build_site_ensure_script(site_root, site_port),
+                    script_timeout_ms=15000, http_timeout=30.0,
+                    svc_port=site_port, svc_name="static site",
+                    ready_status="Static site ready",
+                    fail_status="Static site setup failed",
+                    result_msg=lambda url, pid: (
+                        f"Static site URL: {url}\n\n"
+                        f"Give this URL to the user. Python is serving {site_root} "
+                        f"on port {site_port} (PID {pid}). The sandbox auto-stops "
+                        f"after ~{self.valves.auto_stop_minutes} min of inactivity, "
+                        f"which ends the server; call expose again to restart it."
+                    ),
+                )
+
+            if target_stripped == "ttyd":
+                return await _ensure_and_sign(
+                    ensure_script=_TTYD_ENSURE_SCRIPT,
+                    script_timeout_ms=60000, http_timeout=90.0,
+                    svc_port=_TTYD_PORT, svc_name="ttyd",
+                    ready_status="Terminal ready",
+                    fail_status="ttyd setup failed",
+                    result_msg=lambda url, pid: (
+                        f"Terminal URL: {url}\n\n"
+                        f"Give this private URL to the user. It provides a full writable "
+                        f"shell with access to the sandbox environment and files.\n\n"
+                        f"ttyd is serving {_TTYD_ROOT} on port {_TTYD_PORT} (PID {pid}). "
+                        f"The sandbox auto-stops after ~{self.valves.auto_stop_minutes} min "
+                        f"of inactivity, which ends the terminal process; call expose again "
+                        f"to restart it."
                     ),
                 )
 

@@ -86,7 +86,7 @@ rejected with a clear error if you try to set them.
 > Without a preview wrapper, every HTTP URL returned by `expose()` is a bearer
 > credential: anyone who sees or copies it can access the service until it
 > expires or stops working. A raw URL exposed in chat, a screen share, or a
-> recording can disclose a terminal-capable code-server session or a writable
+> recording can disclose a ttyd shell, terminal-capable code-server session, or a writable
 > file browser. After several months of personal and institutional use, this has
 > been Lathe's most significant recurring security sharp edge.
 
@@ -102,8 +102,11 @@ Direct signed URLs can be appropriate for intentionally public, personal, or
 otherwise low-risk services. Configure `preview_wrapper_url` and
 `preview_wrapper_key` to add a distinct branded origin, cookie isolation, and,
 when the wrapper supports it, browser authentication. Wrapping applies to
-arbitrary HTTP services, dufs, and code-server before a URL reaches the model or
-user. Lathe does not provide SSH access.
+arbitrary HTTP services, managed static sites, dufs, ttyd, and code-server before
+a URL reaches the model or user. `site:/absolute/path` starts a managed static
+server without requiring the model to choose a port or background process;
+multiple paths can remain live at once. The named `ttyd` target provides a
+lightweight browser shell and is private-only. Lathe does not provide SSH access.
 
 #### What a wrapper does
 

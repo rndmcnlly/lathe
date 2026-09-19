@@ -19,9 +19,13 @@ import traceback
 import uuid
 
 import httpx
+from httpx_ws import aconnect_ws
 from dotenv import load_dotenv
 
-from lathe import Tools, _extract_sandbox_list, _headers
+from lathe import (
+    Tools, _api, _extract_sandbox_list, _headers, _site_port,
+    _TTYD_ENSURE_SCRIPT, _TTYD_PORT,
+)
 
 
 load_dotenv()
@@ -226,6 +230,80 @@ async def main():
         except Exception:
             raise AssertionError("Direct signed-preview reachability failed") from None
 
+    async def ttyd_terminal_roundtrip():
+        output = await tools.bash(_TTYD_ENSURE_SCRIPT, foreground_seconds=90, **ctx)
+        require("READY PID=" in output, output)
+
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                _api(tools.valves, "/sandbox"),
+                params={"labels": json.dumps({DEPLOYMENT_LABEL: TEST_EMAIL})},
+                headers=_headers(tools.valves), timeout=30,
+            )
+            response.raise_for_status()
+            sandbox = next(
+                item for item in _extract_sandbox_list(response.json())
+                if item.get("labels", {}).get(DEPLOYMENT_LABEL) == TEST_EMAIL
+            )
+            response = await client.get(
+                _api(tools.valves, f"/sandbox/{sandbox['id']}/ports/{_TTYD_PORT}/signed-preview-url"),
+                params={"expiresInSeconds": 300}, headers=_headers(tools.valves), timeout=30,
+            )
+            response.raise_for_status()
+            preview = response.json()["url"]
+
+            page = await client.get(
+                preview, headers={"X-Daytona-Skip-Preview-Warning": "true"}, timeout=20,
+            )
+            require(page.status_code == 200 and "ttyd" in page.text.lower(),
+                    "ttyd page did not load through the signed preview")
+
+            parsed = httpx.URL(preview)
+            ws_url = parsed.copy_with(
+                scheme="wss", path="/ws",
+            )
+            canary_command = f"printf '{canary}\\n'\n"
+            async with aconnect_ws(
+                str(ws_url), client, subprotocols=["tty"],
+                headers={"X-Daytona-Skip-Preview-Warning": "true"},
+            ) as ws:
+                await ws.send_text('{"columns":80,"rows":24}')
+                await ws.send_bytes(b"0" + canary_command.encode())
+                deadline = time.monotonic() + 15
+                received = b""
+                while time.monotonic() < deadline and canary.encode() not in received:
+                    received += await asyncio.wait_for(ws.receive_bytes(), timeout=5)
+                require(canary.encode() in received, received[-500:])
+
+    async def parallel_static_sites():
+        import re
+
+        roots = [f"{WORKSPACE}/site-a", f"{WORKSPACE}/site-b"]
+        markers = [f"SITE_A_{canary}", f"SITE_B_{canary}"]
+        for root, marker in zip(roots, markers):
+            await tools.write(f"{root}/index.html", marker, **ctx)
+
+        outputs = await asyncio.gather(*(
+            tools.expose(f"site:{root}", "public", **ctx) for root in roots
+        ))
+        urls = []
+        for output, root in zip(outputs, roots):
+            require(f"port {_site_port(root)}" in output, output)
+            match = re.search(r"https://\S+", output)
+            require(match is not None, output)
+            urls.append(match.group())
+
+        async with httpx.AsyncClient() as client:
+            pages = await asyncio.gather(*(
+                client.get(url, headers={"X-Daytona-Skip-Preview-Warning": "true"}, timeout=20)
+                for url in urls
+            ))
+        for page, marker in zip(pages, markers):
+            require(page.status_code == 200 and marker in page.text, page.text[:200])
+
+        repeated = await tools.expose(f"site:{roots[0]}", "public", **ctx)
+        require(f"port {_site_port(roots[0])}" in repeated, repeated)
+
     async def volume_survives_recreation():
         await tools.write(volume_file, canary + "\n", **ctx)
         output = await tools.destroy(
@@ -265,6 +343,8 @@ async def main():
             ("onboarding and persistent interpreter", onboarding_and_interpreter),
             ("background completion notice", background_completion_notice),
             ("signed preview URL", expose_contract),
+            ("parallel static sites", parallel_static_sites),
+            ("ttyd page and websocket command", ttyd_terminal_roundtrip),
             ("persistent volume survives VM recreation", volume_survives_recreation),
             ("disabled auto-create policy", disabled_auto_create_is_respected),
         ]:

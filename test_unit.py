@@ -603,7 +603,7 @@ def preview(tools, sandbox, http):
     good = {"url": protected, "expires_at": "2099-01-01T00:00:00Z"}
 
     async def invoke(payload=None, status=200, target="http:5000", user=USER,
-                     access="private", tag=""):
+                     access="private", tag="", setup_failure=False):
         calls, events = [], []
         async def emit(event):
             events.append(event)
@@ -618,11 +618,14 @@ def preview(tools, sandbox, http):
                 return httpx.Response(status, json=good if payload is None else payload)
             if request.url.path.endswith("/signed-preview-url"):
                 assert request.method == "GET" and request.url.host == "api.test"
-                assert re.fullmatch(r"/sandbox/sb/ports/(5000|8080)/signed-preview-url", request.url.path)
+                port = int(request.url.path.split("/")[-2])
+                assert port in (5000, 7681, 8080) or 20000 <= port < 60000
                 assert request.url.params["expiresInSeconds"] == "86400"
                 return httpx.Response(200, json={"url": upstream})
             assert request.url.host == "proxy.test"
             assert (request.method, request.url.path) == ("POST", "/sb/process/execute")
+            if setup_failure:
+                return httpx.Response(200, json={"exitCode": 1, "result": "checksum mismatch"})
             return httpx.Response(200, json={"exitCode": 0, "result": "READY PID=123"})
         http(handler)
         result = await tools.expose(target, access, tag, __user__=user, __event_emitter__=emit)
@@ -630,7 +633,7 @@ def preview(tools, sandbox, http):
     return SimpleNamespace(invoke=invoke, upstream=upstream, protected=protected, secret=secret, good=good)
 
 
-@pytest.mark.parametrize("target", ["http:5000", "dufs", "code-server"])
+@pytest.mark.parametrize("target", ["http:5000", "dufs", "site:/Workspace/My Site", "ttyd", "code-server"])
 async def test_preview_uses_trusted_identity_and_hides_credentials(preview, target):
     result, calls, events = await preview.invoke(target=target)
     assert preview.protected in result and "Owner-authenticated" in result
@@ -641,6 +644,73 @@ async def test_preview_uses_trusted_identity_and_hides_credentials(preview, targ
         "owner": {"subject": USER["id"], "email": USER["email"]},
         "upstream_url": preview.upstream, "access": "private"}
     assert registrations[0].headers["Authorization"] == "Bearer " + preview.secret
+
+
+async def test_ttyd_is_private_only_before_io(tools, monkeypatch):
+    context = AsyncMock(side_effect=AssertionError("public ttyd reached I/O"))
+    monkeypatch.setattr(lathe, "_tool_context", context)
+    result = await tools.expose("ttyd", "public", __user__=USER)
+    assert result.startswith("Error: ttyd is private-only")
+    context.assert_not_called()
+
+
+async def test_ttyd_uses_verified_idempotent_fast_path(preview):
+    result, calls, _ = await preview.invoke(target="ttyd", tag="terminal")
+    assert "Terminal URL" in result and "full writable shell" in result
+    setup = next(r for r in calls if r.url.host == "proxy.test")
+    request = json.loads(setup.content)
+    script = request["command"]
+    assert request["timeout"] == 60000
+    assert "ttyd/releases/latest" in script
+    assert 'a["name"] == "ttyd.x86_64"' in script
+    assert 'a["name"] == "SHA256SUMS"' in script
+    assert 'test "$ACTUAL" = "$EXPECTED"' in script
+    assert "Port 7681 is occupied by a non-ttyd process" in script
+    assert script.count("nohup /tmp/lathe/ttyd") == 1
+    registration = next(r for r in calls if r.url.host == "wrapper.test")
+    assert json.loads(registration.content)["access"] == "private"
+
+
+async def test_ttyd_setup_failure_stops_before_preview(preview):
+    result, calls, _ = await preview.invoke(target="ttyd", setup_failure=True)
+    assert result.startswith("Error: ttyd setup failed")
+    assert "checksum mismatch" in result
+    assert not any(r.url.host == "wrapper.test" for r in calls)
+
+
+async def test_site_fast_path_preserves_path_and_manages_only_its_server(preview):
+    root = "/home/daytona/workspace/My Site"
+    port = lathe._site_port(root)
+    result, calls, _ = await preview.invoke(
+        target=f"site:{root}", tag="demo",
+    )
+    assert "Static site URL" in result
+    assert root in result
+    setup = next(r for r in calls if r.url.host == "proxy.test")
+    request = json.loads(setup.content)
+    script = request["command"]
+    assert request["timeout"] == 15000
+    assert f"SITE_ROOT='{root}'" in script
+    assert f"python3 -m http.server {port}" in script
+    assert f"Assigned site port {port} is occupied by another process" in script
+    assert "hash collision" in script
+    registration = next(r for r in calls if r.url.host == "wrapper.test")
+    assert json.loads(registration.content)["access"] == "private"
+
+
+def test_site_ports_are_stable_and_allow_parallel_sites():
+    first = lathe._site_port("/workspace/redesign-a")
+    assert first == lathe._site_port("/workspace/redesign-a")
+    assert first != lathe._site_port("/workspace/redesign-b")
+    assert 20000 <= first < 60000
+
+
+async def test_site_requires_absolute_path_before_io(tools, monkeypatch):
+    context = AsyncMock(side_effect=AssertionError("relative site reached I/O"))
+    monkeypatch.setattr(lathe, "_tool_context", context)
+    result = await tools.expose("site:relative/path", "private", __user__=USER)
+    assert result.startswith("Error: site path must be an absolute path")
+    context.assert_not_called()
 
 
 async def test_preview_tag_is_optional_untrusted_wrapper_hint(preview):
