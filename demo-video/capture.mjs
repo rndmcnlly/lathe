@@ -7,7 +7,7 @@
  * background a focused review while the main agent stops the IDE.
  *
  * Usage:  node capture.mjs
- * Env:    DEMO_OWUI_URL, DEMO_EMAIL, DEMO_PASS, DEMO_MODEL or OWUI_MODEL
+ * Env:    DEMO_OWUI_URL, DEMO_PASSKEY, DEMO_MODEL or OWUI_MODEL
  * Output: out/demo.webm
  */
 
@@ -30,11 +30,13 @@ try {
 } catch {}
 
 const OWUI_URL = (process.env.DEMO_OWUI_URL || "").replace(/\/+$/, "");
-const EMAIL = process.env.DEMO_EMAIL;
-const PASS = process.env.DEMO_PASS;
 const MODEL = process.env.DEMO_MODEL || process.env.OWUI_MODEL;
-if (!OWUI_URL || !EMAIL || !PASS || !MODEL) {
-  console.error("Set DEMO_OWUI_URL, DEMO_EMAIL, DEMO_PASS, and DEMO_MODEL");
+let PASSKEY;
+try {
+  PASSKEY = JSON.parse(process.env.DEMO_PASSKEY || "");
+} catch {}
+if (!OWUI_URL || !PASSKEY?.rpId || !PASSKEY?.id || !PASSKEY?.userHandle || !PASSKEY?.privateKey || !PASSKEY?.publicKey || !MODEL) {
+  console.error("Set DEMO_OWUI_URL, DEMO_PASSKEY, and DEMO_MODEL");
   process.exit(1);
 }
 const CHAT_URL = `${OWUI_URL}/?model=${encodeURIComponent(MODEL)}`;
@@ -382,30 +384,28 @@ const browser = await chromium.launch({ headless: true });
 // Auth is independent of Lathe — no reason to show it in the video.
 log("login", `Navigating to ${OWUI_URL}...`);
 const loginContext = await browser.newContext({ viewport: VIEWPORT });
+await loginContext.credentials.create(PASSKEY.rpId, PASSKEY);
+await loginContext.credentials.install();
 const loginPage = await loginContext.newPage();
 await loginPage.goto(`${OWUI_URL}/auth`);
 await loginPage.waitForLoadState("networkidle").catch(() => {});
 await loginPage.waitForTimeout(500);
 
-if (loginPage.url().includes("/auth")) {
-  log("login", "Signing in...");
-  const emailInput = 'input[placeholder="Enter Your Email"]';
-  const passInput = 'input[placeholder="Enter Your Password"]';
-  await loginPage.fill(emailInput, EMAIL);
-  await loginPage.fill(passInput, PASS);
-  await loginPage.click('button[type="submit"]');
-  await loginPage.waitForTimeout(500);
-
-  // Dismiss "What's New" modal if present
-  await loginPage.evaluate(() => {
-    for (const b of document.querySelectorAll("button"))
-      if (b.textContent.trim() === "Okay, Let's Go!") b.click();
-  });
-  await loginPage.waitForTimeout(500);
-  log("login", "Logged in");
-} else {
-  log("login", "Already logged in (cookies persisted)");
+if (loginPage.url().startsWith(OWUI_URL)) {
+  await loginPage.getByRole("button", { name: "Continue with Pocket ID", exact: true }).click();
+  await loginPage.waitForURL((url) => url.origin !== OWUI_URL, { timeout: 30000 });
 }
+log("login", "Signing in...");
+await loginPage.getByRole("button", { name: "Sign in", exact: true }).click();
+await loginPage.waitForURL((url) => url.origin === OWUI_URL && !url.pathname.startsWith("/auth"), { timeout: 30000 });
+
+// Dismiss "What's New" modal if present
+await loginPage.evaluate(() => {
+  for (const b of document.querySelectorAll("button"))
+    if (b.textContent.trim() === "Okay, Let's Go!") b.click();
+});
+await loginPage.waitForTimeout(500);
+log("login", "Logged in");
 
 // Extract auth token from localStorage (OWUI stores JWT there, not in cookies)
 const token = await loginPage.evaluate(() => localStorage.getItem("token"));

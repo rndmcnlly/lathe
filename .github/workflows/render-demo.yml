@@ -40,8 +40,7 @@ jobs:
         working-directory: demo-video
         env:
           DEMO_OWUI_URL: ${{ secrets.DEMO_OWUI_URL }}
-          DEMO_EMAIL: ${{ secrets.DEMO_EMAIL }}
-          DEMO_PASS: ${{ secrets.DEMO_PASS }}
+          DEMO_PASSKEY: ${{ secrets.DEMO_PASSKEY }}
           DEMO_MODEL: ${{ secrets.DEMO_MODEL }}
           DEMO_PROXY_DOMAINS: ${{ secrets.DEMO_PROXY_DOMAINS }}
         run: node capture.mjs
