@@ -31,6 +31,36 @@ can access its service. Private mode is owner-authenticated. In both modes the
 upstream bearer URL stays server-side. The proxy strips its auth cookie before
 forwarding to the sandbox and drops upstream attempts to set that cookie.
 
+## Identity Compatibility
+
+Private previews do not reuse or validate an Open WebUI browser session. The
+Worker is a separate OIDC relying party with its own confidential client and
+session. When OWUI already authenticates users through OIDC, the same provider
+is usually the right authority for the Worker: an existing provider session may
+make the second sign-in seamless, but the two applications remain isolated.
+
+The integration requires all of the following:
+
+- OWUI's injected user email and the provider's `email` claim identify the same
+  person and match after trimming and lowercase normalization.
+- The provider emits `email_verified: true`. A matching but unverified address
+  is rejected.
+- The provider supports OIDC discovery, authorization code flow with PKCE,
+  token exchange, and userinfo with the `openid email` scopes.
+- The provider accepts a single-label wildcard callback of
+  `https://*.WRAPPER_DOMAIN/_lathe/auth/callback`. This lets every random preview
+  origin receive its own host-only session cookie. Providers that prohibit
+  wildcard callbacks are not compatible with the current helper service.
+
+An OIDC client restriction may limit sign-in to the same group or community
+that can access OWUI. The Worker then applies the narrower per-preview rule:
+the authenticated email must equal the owner email registered by Lathe.
+
+OWUI installations using only local users do not have an external browser
+identity authority for this service to consult, so they cannot offer private
+previews through this helper without first adding an OIDC provider or broker.
+Public wrapped previews remain available without OIDC.
+
 ## Registration Contract
 
 Lathe uses the existing wrapper protocol:
@@ -82,17 +112,13 @@ Worker, KV namespace, route, secret, and DNS records.
 
 2. Paste the returned namespace ID into `wrangler.toml`.
 
-3. Create an OIDC client at your identity provider. Configure:
+3. Confirm that the identity system satisfies the compatibility contract above,
+   then create a confidential OIDC client with:
 
    - Callback URL: `https://*.WRAPPER_DOMAIN/_lathe/auth/callback`
    - Authorization code flow with PKCE enabled
    - Scopes/claims: `openid email`, including boolean `email_verified`
    - A confidential client secret
-
-   Every user who may own a private preview must have a verified email in the
-   provider. The Worker rejects `email_verified: false` even when the address
-   text matches; mark administrator-vetted Pocket ID accounts verified or
-   configure and complete Pocket ID's email-verification flow.
 
    Pocket ID supports the required single-label wildcard callback. The Worker
    additionally binds every OIDC state record to the exact random hostname, so
