@@ -392,7 +392,7 @@ await loginPage.waitForLoadState("networkidle").catch(() => {});
 await loginPage.waitForTimeout(500);
 
 if (loginPage.url().startsWith(OWUI_URL)) {
-  await loginPage.getByRole("button", { name: "Continue with Pocket ID", exact: true }).click();
+  await loginPage.getByRole("button", { name: "Continue with auth.adamsmith.as", exact: true }).click();
   await loginPage.waitForURL((url) => url.origin !== OWUI_URL, { timeout: 30000 });
 }
 log("login", "Signing in...");
