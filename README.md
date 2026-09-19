@@ -147,13 +147,14 @@ Lathe sends an HTTPS POST to `preview_wrapper_url` with
 `Authorization: Bearer <preview_wrapper_key>` and JSON:
 
 ```json
-{"owner":{"subject":"injected-owui-user-id","email":"owner@example.edu"},"slot":"5000","upstream_url":"https://temporary-upstream.example/"}
+{"owner":{"subject":"injected-owui-user-id","email":"owner@example.edu"},"slot":"5000","upstream_url":"https://temporary-upstream.example/","requested_access":"private"}
 ```
 
 `subject` and `email` come exclusively from trusted request context. `slot` is
-the resolved service port. Lathe sends no sandbox-management credential to the
-wrapper; the installation credential establishes only the registrar's
-authority.
+the resolved service port. `requested_access` is exactly `public` or `private`;
+Lathe accepts the result only when the wrapper reports the matching achieved
+mode. Lathe sends no sandbox-management credential to the wrapper; the
+installation credential establishes only the registrar's authority.
 
 A successful response contains either public wrapping:
 

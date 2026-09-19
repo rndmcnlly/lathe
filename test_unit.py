@@ -639,7 +639,7 @@ async def test_preview_uses_trusted_identity_and_hides_credentials(preview, targ
     assert len(registrations) == 1
     assert json.loads(registrations[0].content) == {
         "owner": {"subject": USER["id"], "email": USER["email"]}, "slot": slot,
-        "upstream_url": preview.upstream}
+        "upstream_url": preview.upstream, "requested_access": "private"}
     assert registrations[0].headers["Authorization"] == "Bearer " + preview.secret
 
 
@@ -649,6 +649,8 @@ async def test_public_preview_accepts_public_wrapper_result(preview):
     assert preview.protected in result and "Public wrapped preview" in result
     assert all(s not in result + events for s in [preview.upstream, preview.secret])
     assert len([r for r in calls if r.url.host == "wrapper.test"]) == 1
+    request = next(r for r in calls if r.url.host == "wrapper.test")
+    assert json.loads(request.content)["requested_access"] == "public"
 
 
 @pytest.mark.parametrize("failure,status", [

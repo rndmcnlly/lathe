@@ -1,11 +1,4 @@
 // Short-lived Cloudflare Worker proxy for cookie-isolated preview origins.
-//
-// Two roles in one worker:
-//   1. Apex: trusted producers POST /register with a bearer token to map a
-//      hostname to an upstream URL for up to 24 hours. That KV entry is the
-//      only per-service record.
-//   2. Wildcard hosts: proxy to the mapped target, stripping upstream Cookie
-//      Domain attributes so cookies stay host-only for the wrapping host.
 
 const RESERVED = new Set([
   "www", "auth", "chat", "api", "mail", "mx", "ns1", "ns2", "cdn", "app",
@@ -15,11 +8,18 @@ const LABEL_RE = /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/;
 const DEFAULT_TTL = 24 * 60 * 60;
 const MIN_TTL = 60;
 const MAX_TTL = 24 * 60 * 60;
+const AUTH_STATE_TTL = 10 * 60;
+const AUTH_CALLBACK_PATH = "/_lathe/auth/callback";
+const SESSION_COOKIE = "__Host-lathe_session";
+const STATE_PREFIX = "_lathe:state:";
+const SESSION_PREFIX = "_lathe:session:";
+
+let oidcConfigurationPromise;
 
 const json = (obj, status = 200) =>
   new Response(JSON.stringify(obj, null, 2), {
     status,
-    headers: { "content-type": "application/json" },
+    headers: { "content-type": "application/json", "cache-control": "no-store" },
   });
 
 export default {
@@ -48,8 +48,9 @@ export default {
       if (label.includes(".") || !LABEL_RE.test(label)) {
         return page("malformed host", "<p>The requested host is malformed.</p>", 400, env.ZONE);
       }
-      const target = await env.SUBDOMAINS.get(host);
-      if (!target) {
+
+      const registration = await getRegistration(env, host);
+      if (!registration) {
         return page(
           "unknown or expired",
           `<p><code>${escapeHtml(host)}</code> is not registered, or its lease expired.</p>`,
@@ -57,13 +58,23 @@ export default {
           env.ZONE,
         );
       }
-      return proxy(request, url, target, host, env.ZONE);
+
+      if (registration.access_mode === "owner-authenticated") {
+        if (url.pathname === AUTH_CALLBACK_PATH) {
+          return handleAuthCallback(request, url, registration, host, env);
+        }
+        if (!(await hasAuthorizedSession(request, registration, host, env))) {
+          return beginAuthentication(url, registration, host, env);
+        }
+      }
+
+      return proxy(request, url, registration.target, host, env.ZONE);
     }
 
     return page("off territory", "<p>This host is outside the zone.</p>", 421, env.ZONE);
   },
 
-  // KV entries carry their own expiration TTL; this job is a cleanup canary.
+  // Registration, auth-state, and session records all carry expiration TTLs.
   async scheduled(event, env, ctx) {
     const nowS = Math.floor(Date.now() / 1000);
     let live = 0;
@@ -98,13 +109,12 @@ async function handleRegister(request, env) {
 
   const latheRegistration = body.owner && typeof body.owner === "object"
     && typeof body.slot === "string" && typeof body.upstream_url === "string";
-  const requestedAccess = typeof body.requested_access === "string"
-    ? body.requested_access : "public";
-  if (requestedAccess !== "public") {
-    return json({
-      error: `requested access ${JSON.stringify(requestedAccess)} is unavailable`,
-      available_access: ["public"],
-    }, 409);
+  const requestedAccess = body.requested_access;
+  if (latheRegistration && !["public", "private"].includes(requestedAccess)) {
+    return json({ error: "Lathe registrations require requested_access public or private" }, 400);
+  }
+  if (!latheRegistration && requestedAccess !== undefined && requestedAccess !== "public") {
+    return json({ error: "generic registrations support only public access" }, 409);
   }
 
   const label = latheRegistration
@@ -132,22 +142,46 @@ async function handleRegister(request, env) {
     ttl = body.ttl;
   }
 
+  let owner = null;
+  if (latheRegistration) {
+    const subject = typeof body.owner.subject === "string" ? body.owner.subject.trim() : "";
+    const email = normalizeEmail(body.owner.email);
+    if (!subject || !email) {
+      return json({ error: "owner subject and email are required" }, 400);
+    }
+    owner = { subject, email };
+  }
+
+  const accessMode = requestedAccess === "private" ? "owner-authenticated" : "public-wrapped";
+  if (accessMode === "owner-authenticated" && !oidcConfigured(env)) {
+    return json({ error: "private access is not configured" }, 503);
+  }
+
   const host = `${label}.${env.ZONE}`;
-  const expiresS = Math.floor(Date.now() / 1000) + ttl;
-  await env.SUBDOMAINS.put(host, target.toString(), {
+  const nowS = Math.floor(Date.now() / 1000);
+  const expiresS = nowS + ttl;
+  const registration = {
+    version: 1,
+    target: target.toString(),
+    access_mode: accessMode,
+    owner,
+    slot: latheRegistration ? body.slot : null,
+    registered_at: new Date(nowS * 1000).toISOString(),
+    expires_at: expiresS,
+  };
+  await env.SUBDOMAINS.put(host, JSON.stringify(registration), {
     expirationTtl: ttl,
     metadata: {
-      registered: new Date().toISOString(),
       producer: latheRegistration ? "lathe" : "generic",
-      owner_email: latheRegistration ? body.owner.email : null,
-      slot: latheRegistration ? body.slot : null,
+      access_mode: accessMode,
+      owner_email: owner?.email ?? null,
     },
   });
 
   return json({
     url: `https://${host}/`,
     host,
-    access_mode: "public-wrapped",
+    access_mode: accessMode,
     expires_at: new Date(expiresS * 1000).toISOString(),
   });
 }
@@ -163,10 +197,237 @@ async function handleRevoke(request, env, rawLabel) {
   return json({ deleted: label });
 }
 
+async function getRegistration(env, host) {
+  const stored = await env.SUBDOMAINS.get(host);
+  if (!stored) return null;
+  try {
+    const registration = JSON.parse(stored);
+    if (registration && typeof registration.target === "string"
+        && ["public-wrapped", "owner-authenticated"].includes(registration.access_mode)) {
+      return registration;
+    }
+  } catch {
+    // Pre-auth deployments stored only the target string. Keep those public.
+    try {
+      new URL(stored);
+      return { target: stored, access_mode: "public-wrapped", owner: null, expires_at: null };
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
+function oidcConfigured(env) {
+  return Boolean(env.OIDC_ISSUER && env.OIDC_CLIENT_ID && env.OIDC_CLIENT_SECRET);
+}
+
+async function getOidcConfiguration(env) {
+  if (!oidcConfigured(env)) throw new Error("OIDC is not configured");
+  if (!oidcConfigurationPromise) {
+    const issuer = env.OIDC_ISSUER.replace(/\/$/, "");
+    oidcConfigurationPromise = fetch(`${issuer}/.well-known/openid-configuration`)
+      .then((response) => {
+        if (!response.ok) throw new Error("OIDC discovery failed");
+        return response.json();
+      })
+      .then((configuration) => {
+        if (configuration.issuer !== issuer || !configuration.authorization_endpoint
+            || !configuration.token_endpoint || !configuration.userinfo_endpoint) {
+          throw new Error("OIDC discovery response is invalid");
+        }
+        return configuration;
+      })
+      .catch((error) => {
+        oidcConfigurationPromise = undefined;
+        throw error;
+      });
+  }
+  return oidcConfigurationPromise;
+}
+
+async function beginAuthentication(url, registration, host, env) {
+  try {
+    const configuration = await getOidcConfiguration(env);
+    const remaining = registrationRemaining(registration);
+    if (remaining <= 0) throw new Error("registration expired");
+
+    const state = randomToken(24);
+    const verifier = randomToken(48);
+    const challenge = await sha256Base64Url(verifier);
+    const redirectUri = `https://${host}${AUTH_CALLBACK_PATH}`;
+    await env.SUBDOMAINS.put(STATE_PREFIX + state, JSON.stringify({
+      host,
+      return_to: url.pathname + url.search,
+      verifier,
+      redirect_uri: redirectUri,
+    }), { expirationTtl: Math.min(AUTH_STATE_TTL, remaining) });
+
+    const authorization = new URL(configuration.authorization_endpoint);
+    authorization.searchParams.set("client_id", env.OIDC_CLIENT_ID);
+    authorization.searchParams.set("redirect_uri", redirectUri);
+    authorization.searchParams.set("response_type", "code");
+    authorization.searchParams.set("scope", "openid email");
+    authorization.searchParams.set("state", state);
+    authorization.searchParams.set("code_challenge", challenge);
+    authorization.searchParams.set("code_challenge_method", "S256");
+    return Response.redirect(authorization.toString(), 302);
+  } catch {
+    return page("sign-in unavailable", "<p>Private preview sign-in is temporarily unavailable.</p>", 503, env.ZONE);
+  }
+}
+
+async function handleAuthCallback(request, url, registration, host, env) {
+  const state = url.searchParams.get("state") ?? "";
+  const code = url.searchParams.get("code") ?? "";
+  if (!state || !code || url.searchParams.has("error")) {
+    return page("sign-in failed", "<p>The identity provider did not complete sign-in.</p>", 401, env.ZONE);
+  }
+
+  const stateKey = STATE_PREFIX + state;
+  const stored = await env.SUBDOMAINS.get(stateKey);
+  if (!stored) {
+    return page("sign-in expired", "<p>This sign-in request expired or was already used.</p>", 401, env.ZONE);
+  }
+  await env.SUBDOMAINS.delete(stateKey);
+
+  let authState;
+  try {
+    authState = JSON.parse(stored);
+  } catch {
+    return page("sign-in failed", "<p>The sign-in state was invalid.</p>", 401, env.ZONE);
+  }
+  if (authState.host !== host || authState.redirect_uri !== `https://${host}${AUTH_CALLBACK_PATH}`
+      || typeof authState.verifier !== "string" || !safeReturnPath(authState.return_to)) {
+    return page("sign-in failed", "<p>The sign-in state did not match this preview.</p>", 401, env.ZONE);
+  }
+
+  try {
+    const configuration = await getOidcConfiguration(env);
+    const tokenResponse = await fetch(configuration.token_endpoint, {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "authorization_code",
+        code,
+        redirect_uri: authState.redirect_uri,
+        client_id: env.OIDC_CLIENT_ID,
+        client_secret: env.OIDC_CLIENT_SECRET,
+        code_verifier: authState.verifier,
+      }),
+    });
+    if (!tokenResponse.ok) throw new Error("token exchange failed");
+    const tokens = await tokenResponse.json();
+    if (typeof tokens.access_token !== "string" || !tokens.access_token) {
+      throw new Error("access token missing");
+    }
+
+    const userResponse = await fetch(configuration.userinfo_endpoint, {
+      headers: { authorization: `Bearer ${tokens.access_token}` },
+    });
+    if (!userResponse.ok) throw new Error("userinfo failed");
+    const claims = await userResponse.json();
+    const authenticatedEmail = normalizeEmail(claims.email);
+    const ownerEmail = normalizeEmail(registration.owner?.email);
+    if (claims.email_verified !== true || !authenticatedEmail || authenticatedEmail !== ownerEmail) {
+      return page(
+        "not authorized",
+        "<p>You signed in successfully, but this private preview belongs to another user.</p>",
+        403,
+        env.ZONE,
+      );
+    }
+
+    const remaining = registrationRemaining(registration);
+    if (remaining <= 0) throw new Error("registration expired");
+    const session = randomToken(32);
+    await env.SUBDOMAINS.put(SESSION_PREFIX + session, JSON.stringify({
+      host,
+      owner_email: ownerEmail,
+      subject: claims.sub,
+    }), { expirationTtl: remaining });
+
+    return new Response(null, {
+      status: 302,
+      headers: {
+        location: `https://${host}${authState.return_to}`,
+        "set-cookie": `${SESSION_COOKIE}=${session}; Path=/; Max-Age=${remaining}; Secure; HttpOnly; SameSite=Lax`,
+        "cache-control": "no-store",
+      },
+    });
+  } catch {
+    return page("sign-in failed", "<p>Could not complete private preview sign-in.</p>", 502, env.ZONE);
+  }
+}
+
+async function hasAuthorizedSession(request, registration, host, env) {
+  const token = readCookie(request.headers.get("cookie") ?? "", SESSION_COOKIE);
+  if (!token) return false;
+  const stored = await env.SUBDOMAINS.get(SESSION_PREFIX + token);
+  if (!stored) return false;
+  try {
+    const session = JSON.parse(stored);
+    return session.host === host
+      && normalizeEmail(session.owner_email) === normalizeEmail(registration.owner?.email);
+  } catch {
+    return false;
+  }
+}
+
+function registrationRemaining(registration) {
+  if (!Number.isInteger(registration.expires_at)) return DEFAULT_TTL;
+  return Math.max(0, registration.expires_at - Math.floor(Date.now() / 1000));
+}
+
+function normalizeEmail(value) {
+  return typeof value === "string" ? value.trim().toLowerCase() : "";
+}
+
+function safeReturnPath(value) {
+  return typeof value === "string" && value.startsWith("/") && !value.startsWith("//")
+    && !value.startsWith(AUTH_CALLBACK_PATH);
+}
+
+function readCookie(header, name) {
+  for (const part of header.split(";")) {
+    const [key, ...value] = part.trim().split("=");
+    if (key === name) return value.join("=");
+  }
+  return "";
+}
+
+function stripSessionCookie(header) {
+  return header.split(";")
+    .map((part) => part.trim())
+    .filter((part) => part && part.split("=", 1)[0] !== SESSION_COOKIE)
+    .join("; ");
+}
+
+function isSessionSetCookie(value) {
+  return value.trim().toLowerCase().startsWith(`${SESSION_COOKIE.toLowerCase()}=`);
+}
+
 function randomLabel() {
-  const bytes = new Uint8Array(10);
+  const bytes = new Uint8Array(8);
   crypto.getRandomValues(bytes);
-  return Array.from(bytes, (byte) => byte.toString(36).padStart(2, "0")).join("").slice(0, 16);
+  return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+function randomToken(byteLength) {
+  const bytes = new Uint8Array(byteLength);
+  crypto.getRandomValues(bytes);
+  return base64Url(bytes);
+}
+
+async function sha256Base64Url(value) {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
+  return base64Url(new Uint8Array(digest));
+}
+
+function base64Url(bytes) {
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 }
 
 async function proxy(request, url, target, publicHost, zone) {
@@ -182,6 +443,9 @@ async function proxy(request, url, target, publicHost, zone) {
   const headers = new Headers(request.headers);
   headers.set("X-Forwarded-Host", publicHost);
   headers.set("X-Forwarded-Proto", "https");
+  const cookies = stripSessionCookie(headers.get("cookie") ?? "");
+  if (cookies) headers.set("cookie", cookies);
+  else headers.delete("cookie");
 
   const resp = await fetch(upstream, {
     method: request.method,
@@ -199,10 +463,15 @@ async function proxy(request, url, target, publicHost, zone) {
     out.append(name, value);
   }
 
-  // Dropping Domain makes each cookie host-only for the public wrapper host.
-  const cookies = resp.headers.getAll("set-cookie");
-  for (const cookie of cookies) {
-    out.append("set-cookie", cookie.replace(/;\s*domain=[^;]*/gi, ""));
+  // Keep application cookies host-only, and prevent untrusted upstreams from
+  // setting the wrapper's authentication cookie.
+  const setCookies = resp.headers.getAll
+    ? resp.headers.getAll("set-cookie")
+    : resp.headers.getSetCookie ? resp.headers.getSetCookie() : [];
+  for (const cookie of setCookies) {
+    if (!isSessionSetCookie(cookie)) {
+      out.append("set-cookie", cookie.replace(/;\s*domain=[^;]*/gi, ""));
+    }
   }
 
   const location = out.get("location");
@@ -234,6 +503,6 @@ function page(title, bodyHtml, status, zone) {
       `<style>body{font-family:ui-monospace,monospace;margin:4rem auto;max-width:40rem;color:#222}` +
       `code{background:#eee;padding:0 .3em;border-radius:.2em}</style></head>` +
       `<body><h1>${escapeHtml(title)}</h1>${bodyHtml}</body></html>`,
-    { status, headers: { "content-type": "text/html; charset=utf-8" } },
+    { status, headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" } },
   );
 }

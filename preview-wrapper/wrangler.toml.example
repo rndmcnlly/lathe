@@ -20,3 +20,5 @@ crons = ["17 6 * * *"]
 
 [vars]
 ZONE = "WRAPPER_DOMAIN"
+OIDC_ISSUER = "https://id.example.com"
+OIDC_CLIENT_ID = "REPLACE_WITH_OIDC_CLIENT_ID"

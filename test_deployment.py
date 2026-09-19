@@ -425,7 +425,7 @@ async def main():
         values = '\n'.join(tool_outputs(output))
         urls = re.findall(r'https://[^\s]+', values)
         preview_url = next((u for u in urls if (re.fullmatch(PREVIEW_EXPECTED_PATTERN, u) if PREVIEW_EXPECTED_PATTERN else u == PREVIEW_EXPECTED_URL)), None)
-        expected_note = ('Owner-authenticated preview' if PREVIEW_ACCESS == 'private'
+        expected_note = ('Owner-authenticated private preview' if PREVIEW_ACCESS == 'private'
                          else 'Public wrapped preview')
         require(preview_url and expected_note in values,
                 'Protected preview result missing expected URL/access mode')

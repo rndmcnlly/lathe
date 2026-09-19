@@ -1,8 +1,8 @@
 # Lathe Preview Wrapper
 
 A small Cloudflare Worker for short-lived preview hostnames on a registrable
-domain distinct from Open WebUI. It provides branding and structural cookie
-isolation today, with an owner-email authorization seam for private previews.
+domain distinct from Open WebUI. Public previews use URL possession; private
+previews authenticate their registered owner through OIDC.
 
 ## Security Model
 
@@ -11,23 +11,25 @@ The wrapper separates two concerns:
 - **Registration control plane**: trusted producers authenticate with one
   `REGISTER_TOKEN` bearer secret and register an upstream URL for at most 24
   hours. Models and browsers never receive this secret.
-- **Browser data plane**: public registrations currently authorize possession
-  of the generated URL. Private registrations are not yet implemented and are
-  rejected rather than silently downgraded.
+- **Browser data plane**: public registrations authorize possession of the
+  generated URL. Private registrations redirect through OIDC authorization code
+  + PKCE and require an exact normalized match between the provider's verified
+  email claim and the owner email registered by Lathe.
 
 Run this Worker on a different registrable domain from OWUI. A subdomain of the
 OWUI domain does not provide the same cookie boundary: sibling applications can
 share parent-domain cookies.
 
-Lathe supplies the owner email from OWUI's trusted injected user context. The
-Worker stores that email in KV metadata. A future private mode will authenticate
-the browser through OAuth/OIDC and authorize only when the verified email claim
-matches the registered owner email. URL parameters, browser-submitted email,
-and the model are never identity authorities.
+Lathe supplies the owner email from OWUI's trusted injected user context. URL
+parameters, browser-submitted email, and the model are never identity
+authorities. OIDC state and opaque browser sessions are short-lived KV records
+scoped to one random preview hostname. The browser session uses a Secure,
+HttpOnly, SameSite=Lax, host-only `__Host-lathe_session` cookie.
 
-This first implementation is not a confidentiality boundary. It protects
-cookie namespaces and hides the upstream URL, but anyone possessing a public
-wrapped URL can access its service.
+Public mode is not a confidentiality boundary: anyone possessing a public URL
+can access its service. Private mode is owner-authenticated. In both modes the
+upstream bearer URL stays server-side. The proxy strips its auth cookie before
+forwarding to the sandbox and drops upstream attempts to set that cookie.
 
 ## Registration Contract
 
@@ -39,7 +41,8 @@ Authorization: Bearer $REGISTER_TOKEN
 Content-Type: application/json
 
 {"owner":{"subject":"owui-user-id","email":"owner@example.org"},
- "slot":"5000","upstream_url":"https://signed-upstream.example/"}
+ "slot":"5000","upstream_url":"https://signed-upstream.example/",
+ "requested_access":"private"}
 ```
 
 The Worker generates a `lathe-{nonce}` label and returns:
@@ -47,7 +50,7 @@ The Worker generates a `lathe-{nonce}` label and returns:
 ```json
 {"url":"https://lathe-{nonce}.previews.example.org/",
  "host":"lathe-{nonce}.previews.example.org",
- "access_mode":"public-wrapped",
+ "access_mode":"owner-authenticated",
  "expires_at":"2026-09-20T01:00:00Z"}
 ```
 
@@ -60,11 +63,10 @@ Other trusted producers may register an explicit label:
 {"subdomain":"demo-abc123","target":"https://service.example/","ttl":86400}
 ```
 
-`ttl` is optional and constrained to 60–86400 seconds. The current service can
-satisfy only public access. An optional `requested_access` value other than
-`public` receives HTTP 409 and creates no mapping. Lathe omits that field for
-compatibility with existing wrapper services; coordinated protocol negotiation
-is tracked in [issue #68](https://github.com/rndmcnlly/lathe/issues/68).
+`ttl` is optional and constrained to 60–86400 seconds. Lathe registrations must
+request exactly `public` or `private`; the response reports `public-wrapped` or
+`owner-authenticated` respectively. Generic explicit-label registrations remain
+public-only.
 
 ## Deploy
 
@@ -80,18 +82,36 @@ Worker, KV namespace, route, secret, and DNS records.
 
 2. Paste the returned namespace ID into `wrangler.toml`.
 
-3. Create a long random registration secret and deploy:
+3. Create an OIDC client at your identity provider. Configure:
+
+   - Callback URL: `https://*.WRAPPER_DOMAIN/_lathe/auth/callback`
+   - Authorization code flow with PKCE enabled
+   - Scopes/claims: `openid email`, including boolean `email_verified`
+   - A confidential client secret
+
+   Every user who may own a private preview must have a verified email in the
+   provider. The Worker rejects `email_verified: false` even when the address
+   text matches; mark administrator-vetted Pocket ID accounts verified or
+   configure and complete Pocket ID's email-verification flow.
+
+   Pocket ID supports the required single-label wildcard callback. The Worker
+   additionally binds every OIDC state record to the exact random hostname, so
+   one preview cannot complete another preview's sign-in.
+
+4. Set `OIDC_ISSUER` and `OIDC_CLIENT_ID` in `wrangler.toml`. Create both Worker
+   secrets, then deploy:
 
    ```bash
    wrangler secret put REGISTER_TOKEN
+   wrangler secret put OIDC_CLIENT_SECRET
    wrangler deploy
    ```
 
-4. In Cloudflare DNS, create proxied `A` records for `@` and `*`, both pointing
+5. In Cloudflare DNS, create proxied `A` records for `@` and `*`, both pointing
    to reserved TEST-NET address `192.0.2.1`. Worker routes own the requests; no
    origin exists at that address.
 
-5. Configure Lathe's `preview_wrapper_url` as
+6. Configure Lathe's `preview_wrapper_url` as
    `https://WRAPPER_DOMAIN/register` and `preview_wrapper_key` as the same
    registration secret.
 
@@ -103,6 +123,8 @@ and logs live/deleted record counts. No per-preview DNS record is created.
 - Preserves method, body, path, and query string.
 - Adds `X-Forwarded-Host` and `X-Forwarded-Proto`.
 - Removes `Domain=` from upstream `Set-Cookie`, making cookies host-only.
+- Removes `__Host-lathe_session` before proxying request cookies upstream and
+  discards upstream attempts to set it.
 - Rewrites same-origin absolute redirects to the public wrapper hostname.
 - Passes WebSocket upgrade responses through without reconstruction.
 

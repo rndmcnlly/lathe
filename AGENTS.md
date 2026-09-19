@@ -128,6 +128,43 @@ Two techniques for bugs that only manifest at runtime:
   Cloudflare Worker infrastructure, not imported by the OWUI toolkit. Keep the
   toolkit single-file while maintaining the wrapper contract and deployment
   guide beside it.
+
+### Preview wrapper and private authentication
+
+`expose(target, access)` first asks Daytona for a signed upstream URL, then may
+register that credential with the separately deployed Cloudflare Worker in
+`preview-wrapper/`. The Worker maps a random `lathe-*` hostname to the upstream;
+Lathe returns only the wrapped hostname. Public requests may fall back to the
+direct Daytona bearer URL, but private requests always fail closed.
+
+The private-preview identity chain crosses three systems and each has one
+authority:
+
+- OWUI's injected `__user__` is the authority for the preview owner's email.
+  Lathe sends that trusted identity and the explicit requested access mode over
+  the registration control plane, authenticated by `preview_wrapper_key`.
+- Pocket ID at `auth.adamsmith.as` is the authority for the browser user's
+  identity. The Worker uses OIDC authorization code + PKCE and authorizes only
+  an exact normalized match between Pocket ID's verified email claim and the
+  registered owner email. Model input, URL parameters, and browser-submitted
+  identity are never authorities.
+- The Worker is the authority for the browser session. OIDC state and opaque
+  sessions are short-lived KV records scoped to one random preview hostname;
+  the browser receives a Secure, HttpOnly, SameSite=Lax, host-only `__Host-`
+  cookie. Never use a parent-domain cookie across preview hosts.
+
+Private OIDC callbacks return to the same random preview hostname (Pocket ID
+supports a single-label wildcard callback). Validate state against that exact
+host before exchanging the code. Clamp auth state and session expiry to the
+preview registration's remaining lifetime. The proxy must remove its auth
+cookie before forwarding requests upstream and must discard upstream attempts
+to set that cookie, since sandbox applications are untrusted relative to the
+wrapper's authentication boundary.
+
+Registration records contain the target, access mode, owner identity, and
+absolute expiry. The sensitive upstream URL is never echoed by the Worker or
+included in auth redirects/errors. KV registration expiry remains the ultimate
+lease boundary; authentication does not keep a sandbox or service alive.
 - **`_tool_context(emitter, fn)`** — execution wrapper for all tools except `destroy`. Opens `httpx.AsyncClient`, calls `fn(client)`, catches exceptions.
 - **`_ensure_sandbox(valves, email, client, emitter)`** — called at top of every `_run`. Transparent create/start/recover/poll.
 - **`destroy`** — manages its own client; does not use `_ensure_sandbox`.

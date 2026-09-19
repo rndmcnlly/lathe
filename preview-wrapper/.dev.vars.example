@@ -1,3 +1,5 @@
 # Copy to .dev.vars for local development. For production use:
 # wrangler secret put REGISTER_TOKEN
 REGISTER_TOKEN=change-me-long-random
+# wrangler secret put OIDC_CLIENT_SECRET
+OIDC_CLIENT_SECRET=change-me-oidc-client-secret
