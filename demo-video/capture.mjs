@@ -470,6 +470,8 @@ const context = await browser.newContext({
   viewport: VIEWPORT,
   recordVideo: { dir: VIDEO_TMP, size: VIEWPORT },
 });
+await context.credentials.create(PASSKEY.rpId, PASSKEY);
+await context.credentials.install();
 await context.addCookies(cookies);
 const page = await context.newPage();
 
@@ -552,6 +554,11 @@ try {
     }, exposeUrl);
     await cursorClick(page, "[data-capture-expose-link]");
     await page.goto(exposeUrl);
+    const previewOrigin = new URL(exposeUrl).origin;
+    if (new URL(page.url()).origin !== previewOrigin) {
+      await page.getByRole("button", { name: "Sign in", exact: true }).click();
+      await page.waitForURL((url) => url.origin === previewOrigin, { timeout: 30000 });
+    }
     await page.locator(".monaco-workbench").waitFor({ state: "visible", timeout: 15000 });
     await page.keyboard.press("Control+Shift+E");
     await page.waitForTimeout(1000);
