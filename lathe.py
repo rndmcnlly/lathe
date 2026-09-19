@@ -5,7 +5,7 @@ author_url: https://adamsmith.as
 description: Coding agent tools (lathe, bash, read, write, edit, glob, grep, view, interpret, delegate, onboard, expose, destroy) backed by per-user sandbox VMs with transparent lifecycle management.
 required_open_webui_version: 0.4.0
 requirements: httpx, httpx-ws, pydantic-ai-slim[openai]~=2.5, cachetools
-version: 0.29.5
+version: 0.29.6
 licence: MIT
 """
 
@@ -3485,83 +3485,56 @@ class Tools:
             outer model later reads, or vice versa. This is useful for
             parallel data pipelines.
             """),
-        "recipes": textwrap.dedent("""\
-            # Lathe — Recipes
+        "services": textwrap.dedent("""\
+            # Lathe — Service Details
 
-            Tested scripts for bootstrapping common tools from a cold sandbox.
-            These tools live in /tmp/lathe and survive sandbox stop/restart but not
-            destroy(). If /tmp/lathe/dufs, /tmp/lathe/ttyd, or /tmp/lathe/code-server is missing, re-run the
-            install script.
+            Use the expose() tool description or the overview's target table for
+            normal one-step operation. This page is for implementation details,
+            recovery, and configurations outside the named fast paths.
 
-            ## File browser — dufs
+            ## Lifecycle and state
 
-            When the user asks to upload files, download files, browse files,
-            or transfer files, the answer is expose(target="dufs", access="public" or "private"). Do NOT
-            attempt to relay file contents through the conversation — give the
-            user a URL they can use directly in their browser.
+            Named targets install and start themselves when called. Call the same
+            expose() target again after sandbox sleep or a failed process; there is
+            no separate install command. Binaries and logs under /tmp/lathe survive
+            stop/restart but not destroy(). A preview registration neither keeps the
+            sandbox awake nor restarts its process.
 
-            **One-step setup:**
-            ```
-            expose(target="dufs", access="public")
-            ```
-            This installs dufs if missing, starts it on port 5000 serving
-            /home/daytona/workspace with full upload/download, and returns a
-            preview URL. Safe to call again after sandbox restart.
+            - dufs: port 5000; binary /tmp/lathe/dufs; log /tmp/lathe/dufs.log.
+            - ttyd: port 7681; binary /tmp/lathe/ttyd; log /tmp/lathe/ttyd.log.
+            - code-server: port 8080; install /tmp/lathe/code-server; log
+              /tmp/lathe/code-server.log.
+            - site:/absolute/path: stable path-derived port in 20000–59999; state
+              and logs under /tmp/lathe/site/<port>/.
 
-            **Custom directory or read-only access:**
-            For non-default configurations, install and start dufs manually:
-            ```
-            nohup /tmp/lathe/dufs /home/daytona/workspace/output --allow-all &
-            ```
-            Then call expose(target="http:5000", access="public").
+            Multiple site: paths can run simultaneously. The same path reuses its
+            server. A path-hash collision or unrelated listener on an assigned port
+            fails rather than replacing or exposing the wrong process.
 
-            ## Static site — Python HTTP server
-
-            To serve an existing directory as a simple static website without
-            manually choosing a server or managing a background process:
-            ```
-            expose(target="site:/home/daytona/workspace/meow", access="private", tag="meow")
-            ```
-            The path must be absolute and already exist. Lathe assigns it a
-            stable path-derived port and starts an idempotent Python static
-            server. Different directories can remain live simultaneously;
-            repeated calls for the same path reuse its server. A detected port
-            collision is refused rather than replacing or exposing another site.
-
-            ## Focused terminal — ttyd
-
-            When the user asks for a browser terminal or shell without a full
-            IDE, use the private-only ttyd fast path:
-            ```
-            expose(target="ttyd", access="private", tag="terminal")
-            ```
-            This resolves the latest x86_64 release, verifies it against the
-            release's SHA256SUMS asset, installs it under /tmp/lathe, and starts
-            a writable shell in /home/daytona/workspace on port 7681. Public
-            access is refused because the terminal grants arbitrary command
-            execution and access to the sandbox environment.
-
-            ## Full IDE — code-server
-
-            When the user asks for an IDE, editor, or VS Code in the browser,
-            use code-server.
-
-            **One-step setup:**
-            ```
-            expose(target="code-server", access="private")
-            ```
-            This installs code-server if missing, starts it on port 8080
-            serving /home/daytona/workspace with no application-level auth, and
-            returns a preview URL. Safe to call again after sandbox restart.
+            ttyd is private-only because it grants arbitrary shell access. Its
+            binary is resolved from the latest GitHub release and verified against
+            that release's SHA256SUMS before installation.
 
             {preview_access_note}
 
-            **Custom configuration:**
-            For non-default settings, install and start code-server manually:
+            ## Manual configurations
+
+            Named targets intentionally cover common configurations. For a custom
+            service, start it with bash() and expose its port with http:<port>.
+            This includes custom dufs roots or permissions, ttyd options, and
+            code-server flags. The generic route does not inherit named-target
+            policy: the caller remains responsible for process lifecycle and the
+            explicit public/private access choice.
+
+            Example custom code-server process:
             ```
             nohup /tmp/lathe/code-server/bin/code-server --bind-addr 0.0.0.0:8080 --auth none /home/daytona/workspace &
             ```
-            Then call expose(target="http:8080", access="private").
+            Then expose target="http:8080" with private access.
+
+            If a named target fails, report its returned setup error rather than
+            silently substituting another service or weaker access mode. Use bash()
+            to inspect the corresponding log only when diagnosis is needed.
             """),
         "delegate": textwrap.dedent("""\
             # Lathe — Delegate
@@ -3799,28 +3772,23 @@ class Tools:
 
             ## Key workflows
 
-            **Running services and exposing them:**
-            The sandbox is a server. Background a web server with nohup, then
-            call expose(target="http:N", access="public" or "private") to get an HTTPS preview URL the user can open.
-            For a directory of static files, use expose(target="site:/absolute/path", ...)
-            instead; Lathe manages the server and port.
+            **Choosing browser access:**
+
+            | User need | expose target | Access constraint |
+            |---|---|---|
+            | Upload, download, or browse files | dufs | public or private |
+            | Serve an existing static directory | site:/absolute/path | public or private |
+            | Lightweight interactive shell | ttyd | private only |
+            | Full editor, terminal, and extensions | code-server | normally private |
+            | Already-running custom web service | http:<port> | public or private |
+
+            Named targets install, start, and recover their services. For
+            http:<port>, start the service yourself before calling expose().
             Public requests fall back to the direct signed bearer URL if wrapping
             is unavailable or refused. Private requests never downgrade to public.
             The sandbox auto-stops on idle, which kills background processes —
-            restart the server and call expose() again if needed.
-
-            **File upload/download/browsing:**
-            When the user wants to upload, download, or browse files, call
-            expose(target="dufs", access="public" or "private"). This installs and starts dufs automatically
-            and returns a URL with drag-and-drop upload/download — one tool call.
-            See lathe(manpage="recipes") for custom configurations.
-
-            **Browser IDE:**
-            When the user wants a focused terminal, call expose(target="ttyd", access="private").
-            When the user wants an IDE, call expose(target="code-server", access="private"). This
-            installs and starts code-server automatically and returns a URL —
-            VS Code in the browser with terminal, extensions, and file editing.
-            See lathe(manpage="recipes") for custom configurations.
+            call the same named target again to recover. See
+            lathe(manpage="services") only for custom configuration or diagnosis.
 
             **Project context:**
             Call onboard() at the start of a conversation to get a directory
@@ -3915,7 +3883,7 @@ class Tools:
         "interpret": "Persistent Python REPL: state model, when to use vs bash, limitations.",
         "delegate": "Sub-agent delegation: foreground/background, sidecar files, agent teams, cost model.",
         "handoff": "Context handoff: writing a handoff document for continuing work in a new conversation.",
-        "recipes": "Bootstrap scripts for common tools: dufs (file browser), ttyd (terminal), code-server (IDE).",
+        "services": "Advanced service details: lifecycle, ports, logs, manual configuration, and recovery.",
         "background": "Background job sidecar files, and peek/poll/kill recipes.",
         "egress": "Egress restrictions, workarounds (dufs upload, browser-side fetch), Tier 3.",
         "version": "Show the installed Lathe toolkit version.",
@@ -4790,16 +4758,11 @@ class Tools:
         __event_emitter__=None,
     ) -> str:
         """
-        Expose a sandbox service to the user. Pass "dufs" for a one-step file
-        browser, "site:/absolute/path" for a static website, "ttyd" for a private browser terminal, "code-server" for a one-step IDE, "http:<port>" for a web
-        server you already started. Choose public or private access explicitly;
-        private requests never fall back to a public URL. Choose "private" unless
-        the user specifically asked for the service to be public or available to
-        the world. Convenience, shareability, or private-wrapper failure are not
-        permission to choose "public" or downgrade the user's privacy.
-        :param target: What to expose — "dufs" for file upload/download, "site:/absolute/path" for an existing static-site directory, "ttyd" for a private browser terminal, "code-server" for a browser IDE, or "http:<port>" (e.g. "http:5000", port range 3000–9999) for an HTTP service you started manually.
-        :param access: Required access level: "public" (anyone with the URL; direct signed URL fallback allowed) or "private" (owner authentication required; fails closed).
-        :param tag: Optional short display hint for the wrapper hostname, such as "vscode" or "files". Use lowercase letters, digits, and internal hyphens (max 32 characters). The deployment may ignore it or combine it with other administrator-selected fields; never treat the resulting hostname as proof of identity or purpose.
+        Expose a sandbox service. Named targets manage startup and recovery;
+        http:<port> requires an already-running service. ttyd is private-only.
+        :param target: Choose by need: "dufs" for file transfer, "site:/absolute/path" for static files, "ttyd" for a lightweight shell, "code-server" for a full IDE, or "http:<port>" for an existing service (port 3000–9999).
+        :param access: Required policy: "private" authenticates the owner and fails closed; "public" allows anyone with the URL and may fall back to a direct bearer URL. Choose private unless the user explicitly requests public/world access.
+        :param tag: Optional untrusted hostname hint, such as "vscode" or "files": lowercase letters, digits, and internal hyphens, max 32 characters. The deployment may ignore it. Hostname text never proves identity or purpose.
         """
         target_value = target.strip()
         target_stripped = target_value.lower()

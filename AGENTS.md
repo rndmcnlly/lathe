@@ -108,7 +108,7 @@ Rule: **never trust raw signature annotations at runtime.** Resolve via `typing.
 
 ## Cold-start bootstrap
 
-The runtime agent must bootstrap from a blank Daytona sandbox. Recipes live in `lathe(manpage="recipes")`. Constraints: egress-allowlisted hosts only, no hardcoded version URLs (resolve via GitHub API), install to `/tmp`, x86_64 Linux (`*-musl` static builds preferred).
+The runtime agent must bootstrap from a blank Daytona sandbox. Advanced service details live in `lathe(manpage="services")`. Constraints: egress-allowlisted hosts only, no hardcoded version URLs (resolve via GitHub API), install to `/tmp`, x86_64 Linux (`*-musl` static builds preferred).
 
 ## Demo video
 

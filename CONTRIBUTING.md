@@ -21,7 +21,7 @@ Every line of code in this repo was written by an AI coding agent, directed by a
 
 ## Good first contributions
 
-- New recipes for the `lathe(manpage="recipes")` system — tested bootstrap scripts for tools that work within Daytona's sandbox constraints.
+- New service integrations for `lathe(manpage="services")` — tested bootstrap paths that work within Daytona's sandbox constraints.
 - Bug reports with reproduction steps (even better: a failing test case).
 - Documentation improvements routed to the right audience.
 - Improvements to the demo video pipeline.
