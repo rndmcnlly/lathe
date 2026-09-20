@@ -4,9 +4,11 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "capture": "node capture.mjs"
+    "capture": "node capture.mjs",
+    "test": "node --test"
   },
   "dependencies": {
+    "fflate": "^0.8.3",
     "playwright": "1.61.1"
   }
 }

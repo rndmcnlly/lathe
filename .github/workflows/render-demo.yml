@@ -1,6 +1,8 @@
 name: Render demo video
 
 on:
+  schedule:
+    - cron: '17 14 * * 3'
   push:
     paths:
       - 'lathe.py'
@@ -32,30 +34,64 @@ jobs:
         working-directory: demo-video
         run: npm ci
 
+      - name: Test scenario interpreter
+        working-directory: demo-video
+        run: npm test
+
       - name: Install Playwright Chromium
         working-directory: demo-video
         run: npx playwright install --with-deps chromium
 
       - name: Run capture
+        id: capture
+        continue-on-error: true
         working-directory: demo-video
         env:
           DEMO_OWUI_URL: ${{ secrets.DEMO_OWUI_URL }}
           DEMO_PASSKEY: ${{ secrets.DEMO_PASSKEY }}
           DEMO_MODEL: ${{ secrets.DEMO_MODEL }}
           DEMO_PROXY_DOMAINS: ${{ secrets.DEMO_PROXY_DOMAINS }}
-        run: node capture.mjs
+        run: npm run capture
 
-      - name: Upload rendered artifact
+      - name: Upload capture evidence
+        if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: demo-video-${{ github.sha }}
-          path: demo-video/out/demo.webm
-          if-no-files-found: error
+          path: demo-video/out/
+          if-no-files-found: warn
           retention-days: 30
+
+      - name: Write capture summary
+        if: always()
+        env:
+          CAPTURE_OUTCOME: ${{ steps.capture.outcome }}
+        run: |
+          if test -f demo-video/out/capture-report.json; then
+            STATUS=$(jq -r '.status // "unknown"' demo-video/out/capture-report.json)
+            DOMAIN=$(jq -r '.failure_domain // "none"' demo-video/out/capture-report.json)
+            STEP=$(jq -r '.failed_step // "none"' demo-video/out/capture-report.json)
+          else
+            STATUS=missing-report
+            DOMAIN=infrastructure
+            STEP=bootstrap
+          fi
+          {
+            echo '## Demo synthetic monitor'
+            echo
+            echo "- Capture command: $CAPTURE_OUTCOME"
+            echo "- Qualification: $STATUS"
+            echo "- Failure domain: $DOMAIN"
+            echo "- First failing step: $STEP"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Enforce qualification
+        if: always() && steps.capture.outcome != 'success'
+        run: exit 1
 
   publish:
     needs: capture
-    if: github.ref_name == github.event.repository.default_branch
+    if: github.event_name != 'schedule' && github.ref_name == github.event.repository.default_branch
     runs-on: ubuntu-latest
     concurrency:
       group: demo-video-publication
@@ -78,4 +114,9 @@ jobs:
           if ! gh release view demo-video-latest >/dev/null 2>&1; then
             gh release create demo-video-latest --title "Demo Video (latest)" --notes "Auto-captured Playwright demo session." --latest=false
           fi
+          test "$(jq -r '.status' release/capture-report.json)" = accepted
           gh release upload demo-video-latest release/demo.webm --clobber
+          for screenshot in release/screenshots/*.png; do
+            test -e "$screenshot" || continue
+            gh release upload demo-video-latest "$screenshot" --clobber
+          done

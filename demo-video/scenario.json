@@ -1,0 +1,195 @@
+{
+  "id": "lathe-shared-workspace",
+  "version": 1,
+  "steps": [
+    {
+      "id": "auth.owui",
+      "do": "auth.ensure-owui",
+      "required": true,
+      "intent": "Establish Open WebUI authentication outside the recording",
+      "failureDomain": "authentication"
+    },
+    {
+      "id": "sandbox.prewarm",
+      "do": "sandbox.prewarm",
+      "required": false,
+      "intent": "Wake the sandbox and clear prior demo state",
+      "failureDomain": "infrastructure"
+    },
+    {
+      "id": "capture.start",
+      "do": "capture.start",
+      "required": true,
+      "intent": "Begin the clean narrative frame",
+      "failureDomain": "infrastructure"
+    },
+    {
+      "id": "chat.open",
+      "do": "chat.open",
+      "required": true,
+      "intent": "Show a fresh Open WebUI conversation",
+      "screenshot": "fresh-chat",
+      "failureDomain": "ui_drift"
+    },
+    {
+      "id": "lathe.enable",
+      "do": "owui.enable-tool",
+      "required": true,
+      "intent": "Make Lathe available to the model",
+      "screenshot": "lathe-enabled",
+      "failureDomain": "ui_drift"
+    },
+    {
+      "id": "workspace.create",
+      "do": "chat.send",
+      "required": true,
+      "intent": "Clone Lathe and create the relay artifact",
+      "with": {
+        "prompt": "Clone https://github.com/rndmcnlly/lathe into {{checkout}}, replacing any previous checkout there. Create RELAY.md in that checkout with exactly two lines. Line 1: Lathe: What do you call a chat agent and an editor sharing one sandbox? Line 2: You: Then explain in three short bullets: what Lathe lets a model do, where the work runs, and what persists between conversations.",
+        "timeoutMs": 180000
+      },
+      "failureDomain": "model_behavior"
+    },
+    {
+      "id": "workspace.prove-created",
+      "do": "chat.await-tool-result",
+      "required": true,
+      "intent": "Establish file creation from tool evidence rather than assistant prose",
+      "screenshot": "workspace-created",
+      "with": {
+        "tools": ["bash", "write"],
+        "argumentContains": "RELAY.md"
+      },
+      "failureDomain": "model_behavior"
+    },
+    {
+      "id": "editor.request",
+      "do": "chat.send",
+      "required": true,
+      "intent": "Ask Lathe to expose a private browser editor",
+      "with": {
+        "prompt": "Give me a private browser-based VS Code editor for this repo. Share it as a markdown link with a short label instead of exposing the raw URL, then summarize the access and expiry information reported by the tool.",
+        "timeoutMs": 180000
+      },
+      "failureDomain": "model_behavior"
+    },
+    {
+      "id": "editor.prove-exposed",
+      "do": "chat.await-tool-result",
+      "required": true,
+      "intent": "Establish that expose completed",
+      "screenshot": "private-editor-ready",
+      "with": {
+        "tools": ["expose"],
+        "argumentContains": "code-server",
+        "outputContains": "https://"
+      },
+      "failureDomain": "lathe_behavior"
+    },
+    {
+      "id": "editor.open",
+      "do": "editor.open-via-explorer",
+      "fallback": ["editor.open-via-quick-open", "editor.open-via-terminal"],
+      "required": true,
+      "intent": "Present the same relay artifact in VS Code",
+      "screenshot": "shared-file-in-editor",
+      "with": { "path": "{{checkout}}/RELAY.md" },
+      "failureDomain": "ui_drift"
+    },
+    {
+      "id": "editor.edit",
+      "do": "editor.replace-line",
+      "fallback": ["editor.replace-line-via-terminal"],
+      "required": true,
+      "intent": "Edit the shared artifact from the browser editor",
+      "screenshot": "relay-edited",
+      "with": { "line": 2, "text": "You: A shared state of mind." },
+      "failureDomain": "ui_drift"
+    },
+    {
+      "id": "chat.return",
+      "do": "chat.return",
+      "required": true,
+      "intent": "Return to the original conversation",
+      "failureDomain": "ui_drift"
+    },
+    {
+      "id": "relay.read",
+      "do": "chat.send",
+      "required": true,
+      "intent": "Have Lathe observe the editor's filesystem edit",
+      "with": {
+        "prompt": "Read {{checkout}}/RELAY.md and briefly report the text after 'You:'.",
+        "timeoutMs": 60000
+      },
+      "failureDomain": "model_behavior"
+    },
+    {
+      "id": "relay.prove-read",
+      "do": "chat.await-tool-result",
+      "required": true,
+      "intent": "Prove the edit through the read tool result",
+      "screenshot": "relay-confirmed",
+      "with": {
+        "tools": ["read", "bash"],
+        "argumentContains": "RELAY.md",
+        "outputContains": "A shared state of mind."
+      },
+      "failureDomain": "lathe_behavior"
+    },
+    {
+      "id": "delegate.start",
+      "do": "chat.send",
+      "required": true,
+      "intent": "Start a bounded architecture review in the background",
+      "with": {
+        "prompt": "Start a focused review of lines 1320-1470 in {{checkout}}/lathe.py using delegate with max_steps=5 and foreground_seconds=0. Ask for one strength and one tradeoff in the _standard_tool wrapper design, citing function names. Return control immediately.",
+        "timeoutMs": 60000
+      },
+      "failureDomain": "model_behavior"
+    },
+    {
+      "id": "delegate.prove-backgrounded",
+      "do": "chat.await-tool-result",
+      "required": true,
+      "intent": "Prove delegation from its tool result rather than a cinematic line",
+      "screenshot": "delegation-backgrounded",
+      "with": {
+        "tools": ["delegate"],
+        "outputContains": "Backgrounded"
+      },
+      "failureDomain": "lathe_behavior"
+    },
+    {
+      "id": "concurrency.work",
+      "do": "chat.send",
+      "required": true,
+      "intent": "Show that the main agent remains useful while delegated work runs",
+      "with": {
+        "prompt": "While the sub-agent works, use bash yourself, not delegate, to stop code-server and verify that port 8080 is no longer listening. Then check the background sub-agent's status once, without polling or waiting more than five seconds. Summarize any available review result in no more than four bullets.",
+        "timeoutMs": 90000
+      },
+      "failureDomain": "model_behavior"
+    },
+    {
+      "id": "concurrency.prove-main-agent",
+      "do": "chat.await-tool-result",
+      "required": true,
+      "intent": "Prove the main agent independently used bash during delegated work",
+      "screenshot": "concurrent-review-complete",
+      "with": {
+        "tools": ["bash"],
+        "argumentContains": "8080"
+      },
+      "failureDomain": "model_behavior"
+    },
+    {
+      "id": "closing.hold",
+      "do": "camera.hold",
+      "required": false,
+      "intent": "Leave the completed result readable",
+      "with": { "milliseconds": 5000 },
+      "failureDomain": "editorial_qualification"
+    }
+  ]
+}
