@@ -231,7 +231,8 @@ def test_write_roundtrip(tmp_path, content):
 
 @pytest.mark.parametrize("start,stop,selected", [
     (1, 0, list(range(1, 11))), (3, 5, [3, 4]), (-3, 0, [8, 9, 10]),
-    (-5, -3, [6, 7]), (0, 3, [1, 2]), (5, 3, []), (50, 0, []),
+    (-5, -3, [6, 7]), (-5, 9, [6, 7, 8]), (3, -3, [3, 4, 5, 6, 7]),
+    (0, 3, [1, 2]), (5, 3, []), (50, 0, []),
 ])
 def test_read_ranges(tmp_path, start, stop, selected):
     path = tmp_path / "lines.txt"
@@ -260,6 +261,30 @@ def test_read_limit_and_missing_file(tmp_path):
     assert script_call("EDIT", "edit_file", str(path), "x", "y", False).startswith("Error:")
     path.write_text("x\n" * 3000)
     assert len(script_call("READ", "read_file", str(path), 1, 0).splitlines()[1:]) == 2000
+
+
+def test_positive_read_streams_without_unbounded_read(tmp_path):
+    path = tmp_path / "large.txt"
+    path.write_text("".join(f"line{i}\n" for i in range(100_000)))
+    source = lathe._READ_SCRIPT + f'''
+import builtins
+_real_open = builtins.open
+class GuardedFile:
+    def __init__(self, file): self.file = file
+    def __enter__(self): return self
+    def __exit__(self, *args): return self.file.__exit__(*args)
+    def __iter__(self): return iter(self.file)
+    def read(self, size=-1):
+        if size < 0: raise AssertionError("unbounded read")
+        return self.file.read(size)
+def guarded_open(*args, **kwargs): return GuardedFile(_real_open(*args, **kwargs))
+builtins.open = guarded_open
+print(read_file({str(path)!r}, 50_000, 50_003))
+'''
+    result = run_script(source)
+    assert "100000 lines total" in result
+    assert result.splitlines()[1:] == [
+        "50000: line49999", "50001: line50000", "50002: line50001"]
 
 
 @pytest.fixture
@@ -310,6 +335,34 @@ def test_search_budget_conserves_matches(tree, kind, total, budget):
 def test_grep_invalid_regex_and_no_hits(tree):
     assert script_call("GREP", "grep_hierarchy", str(tree), "[", "**/*", 10).startswith("Error:")
     assert script_call("GREP", "grep_hierarchy", str(tree), "absent", "**/*", 10).startswith("0 matches")
+
+
+@pytest.mark.parametrize("kind", ["GLOB", "GREP"])
+def test_search_rejects_brace_expansion_and_accepts_comma_alternatives(tree, kind):
+    function = kind.lower() + "_hierarchy"
+    prefix = (str(tree),) if kind == "GLOB" else (str(tree), "needle")
+    result = script_call(kind, function, *prefix, "**/*.{py,txt}", 100)
+    assert result.startswith("Error:")
+    assert "brace expansion is not supported" in result
+    alternative = script_call(kind, function, *prefix, "**/*.py,**/*.txt", 100)
+    assert str(tree / "a.py") in alternative
+    assert str(tree / "b.txt") in alternative
+
+
+def test_grep_skips_binary_and_bounds_large_file_matches(tmp_path):
+    binary = tmp_path / "binary.dat"
+    binary.write_bytes(b"needle\0" + b"x" * 1_000_000)
+    large = tmp_path / "large.txt"
+    large.write_text("needle\n" * 50_000 + "late marker\n")
+
+    dense = script_call("GREP", "grep_hierarchy", str(tmp_path), "needle", "**/*", 5)
+    assert dense.splitlines()[0].startswith("50000 matches across 1 files")
+    assert len(dense.splitlines()[1:]) <= 5
+    assert str(binary) not in dense
+
+    late = script_call("GREP", "grep_hierarchy", str(tmp_path), "late marker", "**/*", 5)
+    assert f"{large}:50001: late marker" in late
+    assert str(binary) not in late
 
 
 @pytest.mark.parametrize("name,kwargs", [
