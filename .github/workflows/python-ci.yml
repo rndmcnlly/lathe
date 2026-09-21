@@ -11,6 +11,9 @@ permissions:
 
 jobs:
   test:
+    strategy:
+      matrix:
+        python-version: ['3.11', '3.14']
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -20,10 +23,12 @@ jobs:
 
       - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
         with:
-          python-version: '3.11'
+          python-version: ${{ matrix.python-version }}
           enable-cache: true
+          cache-suffix: py${{ matrix.python-version }}
 
       - name: Check lockfile
+        if: matrix.python-version == '3.11'
         run: uv lock --check
 
       - name: Run offline tests

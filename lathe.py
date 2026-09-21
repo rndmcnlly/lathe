@@ -565,6 +565,7 @@ def _human_size(n: int) -> str:
 # so the logic lives in one place.
 
 _GLOB_COMMON = r'''
+import fnmatch
 import os
 import sys
 from pathlib import Path
@@ -573,23 +574,21 @@ from pathlib import Path
 def _parse_pattern(pattern):
     """Parse comma-separated glob string into (positive, negative) lists.
 
-    Commas inside {braces} are part of glob syntax, not delimiters.
-    !-prefixed terms go into the negative list.
+    Braces are deliberately unsupported rather than silently treated as
+    literals. !-prefixed terms go into the negative list.
     """
-    terms, current, depth = [], [], 0
-    for ch in pattern:
-        if ch == "{": depth += 1
-        elif ch == "}": depth -= 1
-        elif ch == "," and depth == 0:
-            terms.append("".join(current).strip())
-            current = []
-            continue
-        current.append(ch)
-    terms.append("".join(current).strip())
+    if "{" in pattern or "}" in pattern:
+        raise ValueError(
+            "brace expansion is not supported; use comma-separated globs instead"
+        )
+    terms = [term.strip() for term in pattern.split(",")]
     positive, negative = [], []
     for term in terms:
         if not term:
             continue
+        glob = term[1:] if term.startswith("!") else term
+        if any("**" in part and part != "**" for part in glob.split(os.sep)):
+            raise ValueError("recursive wildcard ** must be a complete path component")
         if term.startswith("!"):
             negative.append(term[1:])
         else:
@@ -606,33 +605,132 @@ def _resolve_glob(base, g):
     as the root and glob relative to it, so the agent can glob
     anywhere on the filesystem, not just within the workspace.
     """
-    if not g.startswith("/"):
-        return base, g
+    absolute = g.startswith("/")
     parts = g.split(os.sep)
-    root_parts = []
+    prefix = []
     for i, part in enumerate(parts):
-        if any(c in part for c in ("*", "?", "[", "{")):
+        if any(c in part for c in ("*", "?", "[")):
             break
-        root_parts.append(part)
+        prefix.append(part)
     else:
-        root_dir = Path(g).resolve()
-        return root_dir, "**/*"
-    root_dir = Path(os.sep.join(root_parts) or os.sep).resolve()
+        path = Path(g) if absolute else base / g
+        if path.is_dir():
+            return path.resolve(), "**/*"
+        return path.parent.resolve(), path.name
+    if absolute:
+        root_dir = Path(os.sep.join(prefix) or os.sep).resolve()
+    else:
+        root_dir = (base / os.sep.join(prefix)).resolve()
     rel = os.sep.join(parts[i:])
     return root_dir, rel
 
 
-def _collect_files(base, globs):
-    """Glob all patterns and return a set of resolved absolute file paths."""
-    result = set()
+def _glob_matches(path, pattern):
+    """Match slash-separated path components with explicit ** semantics."""
+    path_parts = path.replace(os.sep, "/").split("/") if path else []
+    pattern_parts = pattern.replace(os.sep, "/").split("/")
+    memo = {}
+
+    def match(path_i, pattern_i):
+        key = (path_i, pattern_i)
+        if key in memo:
+            return memo[key]
+        if pattern_i == len(pattern_parts):
+            result = path_i == len(path_parts)
+        elif pattern_parts[pattern_i] == "**":
+            result = match(path_i, pattern_i + 1) or (
+                path_i < len(path_parts) and match(path_i + 1, pattern_i)
+            )
+        else:
+            result = (
+                path_i < len(path_parts)
+                and fnmatch.fnmatchcase(path_parts[path_i], pattern_parts[pattern_i])
+                and match(path_i + 1, pattern_i + 1)
+            )
+        memo[key] = result
+        return result
+
+    return match(0, 0)
+
+
+def _iter_tree_files(root, max_depth=None, depth=1):
+    """Yield files depth-first without retaining the traversed tree."""
+    try:
+        entries = os.scandir(root)
+    except OSError:
+        return
+    with entries:
+        for entry in entries:
+            try:
+                if entry.is_dir(follow_symlinks=False):
+                    if max_depth is None or depth < max_depth:
+                        yield from _iter_tree_files(entry.path, max_depth, depth + 1)
+                elif entry.is_file():
+                    yield os.path.abspath(entry.path)
+            except OSError:
+                continue
+
+
+def _prepare_globs(base, globs):
+    prepared = []
     for g in globs:
         root, rel = _resolve_glob(base, g)
-        if not root.is_dir():
+        if root.is_dir():
+            prepared.append((str(root), rel))
+    return prepared
+
+
+def _is_excluded(filepath, negative_globs):
+    for root, pattern in negative_globs:
+        try:
+            rel = os.path.relpath(filepath, root)
+        except ValueError:
             continue
-        for p in root.glob(rel):
-            if p.is_file():
-                result.add(str(p.resolve()))
-    return result
+        if rel != os.pardir and not rel.startswith(os.pardir + os.sep):
+            if _glob_matches(rel, pattern):
+                return True
+    return False
+
+
+def _matches_any(filepath, globs):
+    for root, pattern in globs:
+        rel = os.path.relpath(filepath, root)
+        if rel != os.pardir and not rel.startswith(os.pardir + os.sep):
+            if _glob_matches(rel, pattern):
+                return True
+    return False
+
+
+def _traversal_roots(globs):
+    """Return non-overlapping roots so each candidate file is visited once."""
+    roots = []
+    for root in sorted({root for root, _ in globs}, key=lambda p: (p.count(os.sep), p)):
+        if not any(os.path.commonpath((root, kept)) == kept for kept in roots):
+            roots.append(root)
+    return roots
+
+
+def _iter_matching_files(base, positive, negative):
+    """Yield included files once without retaining candidates."""
+    negative_globs = _prepare_globs(base, negative)
+    positive_globs = _prepare_globs(base, positive)
+    for root in _traversal_roots(positive_globs):
+        max_depth = 0
+        for glob_root, pattern in positive_globs:
+            if os.path.commonpath((glob_root, root)) != root:
+                continue
+            parts = pattern.split(os.sep)
+            if "**" in parts:
+                max_depth = None
+                break
+            root_depth = len(os.path.relpath(glob_root, root).split(os.sep))
+            if glob_root == root:
+                root_depth = 0
+            max_depth = max(max_depth, root_depth + len(parts))
+        for filepath in _iter_tree_files(root, max_depth):
+            if (_matches_any(filepath, positive_globs)
+                    and not _is_excluded(filepath, negative_globs)):
+                yield filepath
 '''
 
 # ── hierarchical glob (runs on sandbox) ──────────────────────────────
@@ -647,17 +745,38 @@ def glob_hierarchy(base_dir, pattern, max_lines):
     if not base.is_dir():
         return f"Error: not a directory: {base_dir}"
 
-    positive, negative = _parse_pattern(pattern)
+    try:
+        positive, negative = _parse_pattern(pattern)
+    except ValueError as e:
+        return f"Error: invalid glob pattern {pattern!r}: {e}"
     if not positive:
         return f"Error: pattern must include at least one positive glob (got {pattern!r})"
 
-    included = _collect_files(base, positive)
-    if negative:
-        included -= _collect_files(base, negative)
-    matches = sorted(included)
+    matches = []
+    match_count = 0
+    common_path = None
+    for filepath in _iter_matching_files(base, positive, negative):
+        match_count += 1
+        common_path = filepath if common_path is None else os.path.commonpath((common_path, filepath))
+        if len(matches) < max_lines:
+            matches.append(filepath)
 
-    if not matches:
+    if match_count == 0:
         return f"0 matches for {pattern!r} in {base}"
+
+    # Detailed paths cannot fit in the output budget, so retaining a full trie
+    # would only consume memory for information the caller cannot receive.
+    if match_count > max_lines:
+        effective_base = common_path
+        if not os.path.isdir(effective_base):
+            effective_base = os.path.dirname(effective_base)
+        header = (
+            f"{match_count} matches for {pattern!r} in {effective_base} "
+            f"(budget: {max_lines} lines, some directories collapsed)"
+        )
+        return header + f"\n{effective_base}/ ({match_count} matches)"
+
+    matches.sort()
 
     # ── Compute effective base for trie rendering ────────────────
     # When all results are under the workspace, effective_base == base.
@@ -822,40 +941,72 @@ def grep_hierarchy(base_dir, regex, files_pattern, max_lines):
     except re.error as e:
         return f"Error: invalid regex {regex!r}: {e}"
 
-    positive, negative = _parse_pattern(files_pattern)
+    try:
+        positive, negative = _parse_pattern(files_pattern)
+    except ValueError as e:
+        return f"Error: invalid files pattern {files_pattern!r}: {e}"
     if not positive:
         return f"Error: files pattern must include at least one positive glob (got {files_pattern!r})"
 
-    included = _collect_files(base, positive)
-    if negative:
-        included -= _collect_files(base, negative)
-    files = sorted(included)
-
-    if not files:
-        return f"0 files match {files_pattern!r} in {base}"
-
     # ── Scan files for matches ───────────────────────────────────
     file_matches = {}
+    files_scanned = 0
+    matched_files = 0
+    matched_common_path = None
+    fully_collapsed = False
     total_matches = 0
 
-    for filepath in files:
+    for filepath in _iter_matching_files(base, positive, negative):
+        files_scanned += 1
         try:
+            with open(filepath, "rb") as raw:
+                header = raw.read(8192)
+            if b"\0" in header:
+                continue
             with open(filepath, "r", errors="replace") as f:
                 hits = []
+                hit_count = 0
                 for i, line in enumerate(f, 1):
                     if pat.search(line):
-                        text = line.rstrip("\n\r")
-                        if len(text) > _MAX_LINE_WIDTH:
-                            text = text[:_MAX_LINE_WIDTH] + "..."
-                        hits.append((i, text))
-                if hits:
-                    file_matches[filepath] = hits
-                    total_matches += len(hits)
+                        hit_count += 1
+                        if len(hits) < max_lines:
+                            text = line.rstrip("\n\r")
+                            if len(text) > _MAX_LINE_WIDTH:
+                                text = text[:_MAX_LINE_WIDTH] + "..."
+                            hits.append((i, text))
+            if hit_count:
+                matched_files += 1
+                matched_common_path = (
+                    filepath if matched_common_path is None
+                    else os.path.commonpath((matched_common_path, filepath))
+                )
+                total_matches += hit_count
+                if not fully_collapsed and len(file_matches) < max_lines:
+                    file_matches[filepath] = {"hits": hits, "count": hit_count}
+                else:
+                    # Once matching files exceed the output budget, no detailed
+                    # trie can be rendered. Keep exact aggregates only.
+                    fully_collapsed = True
+                    file_matches.clear()
         except (OSError, UnicodeDecodeError):
             continue
 
-    if not file_matches:
-        return f"0 matches for {regex!r} in {len(files)} files"
+    if files_scanned == 0:
+        return f"0 files match {files_pattern!r} in {base}"
+
+    if matched_files == 0:
+        return f"0 matches for {regex!r} in {files_scanned} files"
+
+    if fully_collapsed:
+        effective_base = matched_common_path
+        if not os.path.isdir(effective_base):
+            effective_base = os.path.dirname(effective_base)
+        header = (
+            f"{total_matches} matches across {matched_files} files for {regex!r} "
+            f"(budget: {max_lines} lines, some entries collapsed)"
+        )
+        files_label = "file" if matched_files == 1 else "files"
+        return header + f"\n{effective_base}/ ({total_matches} matches in {matched_files} {files_label})"
 
     # ── Compute effective base for trie rendering ────────────────
     matched_paths = list(file_matches.keys())
@@ -872,12 +1023,13 @@ def grep_hierarchy(base_dir, regex, files_pattern, max_lines):
         "n_files": 0, "n_matches": 0,
     }
 
-    for filepath, hits in sorted(file_matches.items()):
+    for filepath, match_data in sorted(file_matches.items()):
+        hit_count = match_data["count"]
         rel = os.path.relpath(filepath, effective_base)
         parts = rel.split(os.sep)
         node = root
         node["n_files"] += 1
-        node["n_matches"] += len(hits)
+        node["n_matches"] += hit_count
 
         for part in parts[:-1]:
             if part not in node["children"]:
@@ -887,9 +1039,9 @@ def grep_hierarchy(base_dir, regex, files_pattern, max_lines):
                 }
             node = node["children"][part]
             node["n_files"] += 1
-            node["n_matches"] += len(hits)
+            node["n_matches"] += hit_count
 
-        node["files"][filepath] = hits
+        node["files"][filepath] = match_data
 
     # ── Two-level budget-driven expansion ────────────────────────
     dir_expanded = {id(root)}
@@ -900,13 +1052,14 @@ def grep_hierarchy(base_dir, regex, files_pattern, max_lines):
         if id(node) not in dir_expanded:
             return 1
         total = 0
-        for fp, hits in node["files"].items():
+        for fp, match_data in node["files"].items():
+            hit_count = match_data["count"]
             if fp in file_expanded:
                 limit = file_partial.get(fp)
-                if limit is not None and limit < len(hits):
+                if limit is not None and limit < hit_count:
                     total += limit + 1
                 else:
-                    total += len(hits)
+                    total += hit_count
             else:
                 total += 1
         for child in node["children"].values():
@@ -923,9 +1076,9 @@ def grep_hierarchy(base_dir, regex, files_pattern, max_lines):
     def _file_candidates(node):
         if id(node) not in dir_expanded:
             return
-        for fp, hits in node["files"].items():
+        for fp, match_data in node["files"].items():
             if fp not in file_expanded:
-                yield (len(hits), "file", fp, hits)
+                yield (match_data["count"], "file", fp, match_data)
         for child in node["children"].values():
             yield from _file_candidates(child)
 
@@ -970,8 +1123,8 @@ def grep_hierarchy(base_dir, regex, files_pattern, max_lines):
                 break
 
         if best_type == "file":
-            _, _, fp, hits = best_file
-            n_hits = len(hits)
+            _, _, fp, match_data = best_file
+            n_hits = match_data["count"]
 
             if n_hits <= 1:
                 file_expanded.add(fp)
@@ -1004,15 +1157,17 @@ def grep_hierarchy(base_dir, regex, files_pattern, max_lines):
             return
 
         for fp in sorted(node["files"]):
-            hits = node["files"][fp]
+            match_data = node["files"][fp]
+            hits = match_data["hits"]
+            hit_count = match_data["count"]
             if fp not in file_expanded:
-                output.append(f"{fp} ({len(hits)} matches)")
+                output.append(f"{fp} ({hit_count} matches)")
                 continue
             limit = file_partial.get(fp)
-            if limit is not None and limit < len(hits):
+            if limit is not None and limit < hit_count:
                 for line_num, text in hits[:limit]:
                     output.append(f"{fp}:{line_num}: {text}")
-                output.append(f"{fp}: ... and {len(hits) - limit} more matches")
+                output.append(f"{fp}: ... and {hit_count - limit} more matches")
             else:
                 for line_num, text in hits:
                     output.append(f"{fp}:{line_num}: {text}")
@@ -1060,42 +1215,53 @@ def read_file(path, start, stop):
     if not os.path.exists(path):
         return f"Error: File not found: {path}"
 
-    try:
-        with open(path, "r", errors="replace") as f:
-            content = f.read()
-    except OSError as e:
-        return f"Error: Cannot read {path}: {e}"
+    # Negative endpoints need the final line count before their indices can be
+    # resolved. Preserve their existing behavior; positive ranges retain only
+    # the requested (capped) lines while streaming the file.
+    if start < 0 or stop < 0:
+        try:
+            with open(path, "r", errors="replace") as f:
+                content = f.read()
+        except OSError as e:
+            return f"Error: Cannot read {path}: {e}"
 
-    lines = content.split("\n")
-    if lines and lines[-1] == "":
-        lines = lines[:-1]
-    total_lines = len(lines)
+        lines = content.split("\n")
+        if lines and lines[-1] == "":
+            lines = lines[:-1]
+        total_lines = len(lines)
 
-    # Resolve start to 0-based index.
-    if start == 0:
-        start_idx = 0
-    elif start > 0:
-        start_idx = start - 1
+        start_idx = max(0, total_lines + start) if start < 0 else max(0, start - 1)
+        if stop < 0:
+            end_idx = max(0, total_lines + stop)
+        elif stop > 0:
+            end_idx = stop - 1
+        else:
+            end_idx = total_lines
+        start_idx = max(0, min(start_idx, total_lines))
+        end_idx = max(start_idx, min(end_idx, total_lines))
+        end_idx = min(end_idx, start_idx + 2000)
+        selected = lines[start_idx:end_idx]
     else:
-        start_idx = max(0, total_lines + start)
+        start_idx = max(0, start - 1) if start else 0
+        requested_end = stop - 1 if stop else None
+        selected = []
+        total_lines = 0
+        try:
+            with open(path, "r", errors="replace") as f:
+                for line_idx, line in enumerate(f):
+                    total_lines = line_idx + 1
+                    if (line_idx >= start_idx
+                            and (requested_end is None or line_idx < requested_end)
+                            and len(selected) < 2000):
+                        selected.append(line[:-1] if line.endswith("\n") else line)
+        except OSError as e:
+            return f"Error: Cannot read {path}: {e}"
+        start_idx = min(start_idx, total_lines)
+        if requested_end is None:
+            end_idx = min(total_lines, start_idx + 2000)
+        else:
+            end_idx = max(start_idx, min(requested_end, total_lines, start_idx + 2000))
 
-    # Resolve stop to 0-based exclusive index.
-    if stop == 0:
-        end_idx = total_lines
-    elif stop > 0:
-        end_idx = stop - 1
-    else:
-        end_idx = max(0, total_lines + stop)
-
-    # Clamp to valid range.
-    start_idx = max(0, min(start_idx, total_lines))
-    end_idx = max(start_idx, min(end_idx, total_lines))
-
-    # Cap at 2000 lines.
-    if end_idx - start_idx > 2000:
-        end_idx = start_idx + 2000
-
-    selected = lines[start_idx:end_idx]
     numbered = "\n".join(
         f"{start_idx + i + 1}: {line}"
         for i, line in enumerate(selected)
@@ -1548,7 +1714,7 @@ async def _core_glob(valves, sandbox_id: str, client: httpx.AsyncClient, *,
     Dense directories are collapsed with match counts; narrow the
     pattern or increase max_lines to expand them.
 
-    :param pattern: Comma-separated globs, !-prefix to exclude. Examples: '**/*.py', 'src/**/*.ts,!**/node_modules/**'.
+    :param pattern: Comma-separated globs, !-prefix to exclude. Supports *, ?, character classes, and ** as a complete component for directory recursion; brace expansion is not supported. Examples: '**/*.py', 'src/**/*.ts,!**/node_modules/**'.
     :param max_lines: Max output lines (default: 100).
     """
     clamped = max(1, min(500, max_lines))
@@ -1571,7 +1737,7 @@ async def _core_grep(valves, sandbox_id: str, client: httpx.AsyncClient, *,
     narrow the file scope or increase max_lines to expand them.
 
     :param pattern: Regex to search for (e.g. 'import.*asyncio', 'TODO|FIXME').
-    :param files: File scope as comma-separated globs (default: '**/*'). !-prefix to exclude.
+    :param files: File scope as comma-separated globs (default: '**/*'). !-prefix to exclude. Supports *, ?, character classes, and ** as a complete component for directory recursion; brace expansion is not supported.
     :param max_lines: Max output lines (default: 100).
     """
     clamped = max(1, min(500, max_lines))
