@@ -317,6 +317,44 @@ def test_search_scope_and_absolute_paths(tree, tmp_path_factory, kind):
     assert str(outside / "other.py") in search(f"{outside}/*.py")
 
 
+@pytest.mark.parametrize("kind", ["GLOB", "GREP"])
+def test_wildcard_free_directories_are_recursive_and_files_remain_exact(tmp_path, kind):
+    root = tmp_path.resolve()
+    files = {
+        "src/top.py": "needle top\n",
+        "src/nested/deep.py": "needle deep\n",
+        "src/nested/other.txt": "needle other\n",
+        "outside.py": "needle outside\n",
+    }
+    for name, content in files.items():
+        path = root / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content)
+
+    def search(pattern):
+        args = (str(root), pattern, 100) if kind == "GLOB" else (
+            str(root), "needle", pattern, 100)
+        return script_call(kind, kind.lower() + "_hierarchy", *args)
+
+    for directory_pattern in ("src", str(root / "src")):
+        result = search(directory_pattern)
+        assert str(root / "src/top.py") in result
+        assert str(root / "src/nested/deep.py") in result
+        assert str(root / "src/nested/other.txt") in result
+        assert str(root / "outside.py") not in result
+
+    for file_pattern in ("src/top.py", str(root / "src/top.py")):
+        result = search(file_pattern)
+        assert str(root / "src/top.py") in result
+        assert str(root / "src/nested/deep.py") not in result
+
+    for exclusion in ("!src", f"!{root / 'src'}"):
+        result = search(f"**/*,{exclusion}")
+        assert str(root / "outside.py") in result
+        assert str(root / "src/top.py") not in result
+        assert str(root / "src/nested/deep.py") not in result
+
+
 @pytest.mark.parametrize("kind,total", [("GLOB", 13), ("GREP", 22)])
 @pytest.mark.parametrize("budget", [4, 8, 100])
 def test_search_budget_conserves_matches(tree, kind, total, budget):

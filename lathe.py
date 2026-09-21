@@ -614,6 +614,8 @@ def _resolve_glob(base, g):
         prefix.append(part)
     else:
         path = Path(g) if absolute else base / g
+        if path.is_dir():
+            return path.resolve(), "**/*"
         return path.parent.resolve(), path.name
     if absolute:
         root_dir = Path(os.sep.join(prefix) or os.sep).resolve()
