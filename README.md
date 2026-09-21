@@ -42,7 +42,11 @@ curl -X POST "https://your-owui.example.com/api/v1/tools/create" \
 
 Then configure the admin Valves (below) through the OWUI UI or API.
 
-To update an existing installation, use the `/api/v1/tools/id/lathe/update` endpoint with the same payload shape.
+## Updating
+
+Open WebUI stores the uploaded copy of `lathe.py`; it does not track this repository or update the toolkit automatically. Check the installed version with `lathe(manpage="version")`, or inspect the `version:` field in the installed tool source's frontmatter.
+
+To apply updates, review and download the current `lathe.py` from the `main` branch, then replace the tool source in Open WebUI. API installations can use `/api/v1/tools/id/lathe/update` with the same payload shape as installation. Lathe has no built-in update or notification mechanism. See the [security policy](SECURITY.md#supported-versions) for support and security-fix details.
 
 ## Valves (admin configuration)
 

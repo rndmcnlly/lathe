@@ -2,7 +2,11 @@
 
 ## Supported versions
 
-Only the latest version of `lathe.py` on the `main` branch is supported. There are no versioned releases of the toolkit itself — deployments pull from `main`.
+Lathe does not publish independently versioned toolkit releases. The supported version is the current `lathe.py` on the `main` branch: security fixes are made there, and older copies are not supported after a fix is available.
+
+Open WebUI stores the source uploaded by an administrator. An installation does not track `main` or update automatically. To identify the installed copy, call `lathe(manpage="version")`; an administrator can also inspect the `version:` field in the installed tool's source frontmatter.
+
+To obtain a security fix, review and download the current [`lathe.py`](https://github.com/rndmcnlly/lathe/blob/main/lathe.py), then explicitly replace the installed tool source in Open WebUI. The [administrator README](README.md#updating) documents the update endpoint. Lathe has no built-in update check or security notification mechanism, so administrators must check the repository for updates.
 
 ## Reporting a vulnerability
 
