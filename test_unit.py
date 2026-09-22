@@ -669,6 +669,78 @@ async def test_stale_discovery_never_resurrects_sandbox(tools, transport, state,
     assert calls == ["/sandbox", "/sandbox/sb"]
 
 
+async def test_concurrent_first_calls_converge_by_unique_name(tools, transport):
+    tools.valves.persistent_volume = False
+    label_lookups = 0
+    create_calls = 0
+    both_looked_up = asyncio.Event()
+    calls = []
+    winner = {
+        "id": "winner", "name": "test/owner@example.test", "state": "started",
+        "labels": {"test": USER["email"]},
+    }
+
+    async def handler(request):
+        nonlocal label_lookups, create_calls
+        calls.append((request.method, request.url.path))
+        if (request.method, request.url.path) == ("GET", "/sandbox"):
+            label_lookups += 1
+            if label_lookups == 2:
+                both_looked_up.set()
+            await both_looked_up.wait()
+            return httpx.Response(200, json=[])
+        if (request.method, request.url.path) == ("POST", "/sandbox"):
+            create_calls += 1
+            if create_calls == 1:
+                return httpx.Response(200, json=winner)
+            return httpx.Response(409, text="Sandbox with name already exists")
+        if (request.method, request.url.path) == (
+            "GET", "/sandbox/test/owner@example.test",
+        ):
+            return httpx.Response(200, json=winner)
+        assert (request.method, request.url.path) == ("POST", "/winner/process/execute")
+        return httpx.Response(200, json={"exitCode": 0, "result": "ready"})
+
+    async with (
+        httpx.AsyncClient(transport=transport(handler)) as first,
+        httpx.AsyncClient(transport=transport(handler)) as second,
+    ):
+        results = await asyncio.gather(
+            lathe._ensure_sandbox(tools.valves, USER["email"], first),
+            lathe._ensure_sandbox(tools.valves, USER["email"], second),
+        )
+
+    assert results == [("winner", "[Sandbox was created — this is a fresh environment with no prior files]")] * 2
+    assert label_lookups == 2 and create_calls == 2
+    assert calls.count(("GET", "/sandbox/test/owner@example.test")) == 1
+
+
+async def test_create_conflict_without_authoritative_winner_is_retryable(tools, transport):
+    tools.valves.persistent_volume = False
+    calls = []
+
+    def handler(request):
+        calls.append((request.method, request.url.path))
+        if (request.method, request.url.path) == ("GET", "/sandbox"):
+            return httpx.Response(200, json=[])
+        if (request.method, request.url.path) == ("POST", "/sandbox"):
+            return httpx.Response(409, text="Sandbox with name already exists")
+        assert (request.method, request.url.path) == (
+            "GET", "/sandbox/test/owner@example.test",
+        )
+        return httpx.Response(404)
+
+    async with httpx.AsyncClient(transport=transport(handler)) as client:
+        with pytest.raises(RuntimeError, match="Retry this tool call"):
+            await lathe._ensure_sandbox(tools.valves, USER["email"], client)
+
+    assert calls == [
+        ("GET", "/sandbox"),
+        ("POST", "/sandbox"),
+        ("GET", "/sandbox/test/owner@example.test"),
+    ]
+
+
 @pytest.mark.parametrize("state", ["deleting", "destroying"])
 async def test_deletion_in_progress_never_creates_replacement(tools, transport, clock, state):
     calls = []
