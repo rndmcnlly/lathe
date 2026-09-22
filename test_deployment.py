@@ -365,6 +365,18 @@ def tool_outputs(output):
     return results
 
 
+def require_single_dispatch(output, expected):
+    """Require one target tool, allowing Lathe's advised first-use overview."""
+    names = [call.get("name") for call in tool_calls(output)]
+    require(
+        names.count(expected) == 1
+        and names.count("lathe") <= 1
+        and names[-1:] == [expected]
+        and set(names) <= {"lathe", expected},
+        output,
+    )
+
+
 def verify_journey(output, destination, marker):
     """Require observed discovery, delegation, and a subsequent inspection.
 
@@ -500,9 +512,9 @@ async def main():
             "Do not do the task yourself or call any other tool.",
             timeout=240,
         )
-        require([call.get("name") for call in tool_calls(output)] == ["delegate"], output)
+        require_single_dispatch(output, "delegate")
         output = await client.send(f"Call read exactly once for {destination}.")
-        require([call.get("name") for call in tool_calls(output)] == ["read"], output)
+        require_single_dispatch(output, "read")
         require(any(canary in value for value in tool_outputs(output)), output)
 
     async def protected_preview_dispatch():
