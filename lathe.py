@@ -3270,7 +3270,7 @@ async def _ensure_sandbox(valves, email: str, client: httpx.AsyncClient, emitter
         else:
             resp.raise_for_status()
             sandbox = resp.json()
-        warning = "[Sandbox was created — this is a fresh environment with no prior files]"
+            warning = "[Sandbox was created — this is a fresh environment with no prior files]"
 
     sandbox_id = sandbox["id"]
     state = sandbox.get("state", "unknown")

@@ -710,7 +710,10 @@ async def test_concurrent_first_calls_converge_by_unique_name(tools, transport):
             lathe._ensure_sandbox(tools.valves, USER["email"], second),
         )
 
-    assert results == [("winner", "[Sandbox was created — this is a fresh environment with no prior files]")] * 2
+    assert sorted(results, key=lambda result: result[1] or "") == [
+        ("winner", None),
+        ("winner", "[Sandbox was created — this is a fresh environment with no prior files]"),
+    ]
     assert label_lookups == 2 and create_calls == 2
     assert calls.count(("GET", "/sandbox/test/owner@example.test")) == 1
 
