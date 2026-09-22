@@ -202,22 +202,26 @@ def test_single_dispatch_allows_only_optional_first_use_overview(suite, expected
             suite.require_single_dispatch(invalid, expected)
 
 
-def test_launcher_pins_digest_and_exposes_only_loopback(tmp_path, monkeypatch):
+def test_launcher_tracks_moving_slim_and_exposes_only_loopback(tmp_path, monkeypatch):
     import subprocess
     commands = []
     monkeypatch.setenv("LATHE_TEST_DEPLOYMENT_LABEL", "lathe-ci-run-2")
-    monkeypatch.setattr(monitor.httpx, "get", lambda *a, **kw: httpx.Response(200,
-        request=httpx.Request("GET", "https://api.github.com/releases/latest"),
-        json={"tag_name": "v1.2.3", "prerelease": False, "draft": False}))
+    monkeypatch.setattr(monitor.httpx, "get", lambda *a, **kw: pytest.fail(
+        "moving :slim launch must not resolve a versioned GitHub release"))
     def docker(*args, **kw):
         commands.append(args)
         data = json.dumps([{"RepoDigests": ["ghcr.io/open-webui/open-webui@sha256:abc"],
                             "Id": "sha256:abc", "Architecture": "amd64"}]) if args[0] == "image" else ""
         return subprocess.CompletedProcess(args, 0, data, "")
     monkeypatch.setattr(monitor, "docker", docker)
-    monitor.launch(tmp_path)
+    metadata = monitor.launch(tmp_path)
     run = commands[-1]
-    assert run[-1] == "ghcr.io/open-webui/open-webui@sha256:abc"
+    image = "ghcr.io/open-webui/open-webui:slim"
+    assert commands[0] == ("pull", image)
+    assert run[-1] == image
+    assert metadata["image"] == image
+    assert metadata["image_digest"] == "ghcr.io/open-webui/open-webui@sha256:abc"
+    assert "owui_release" not in metadata
     assert run[run.index("--publish") + 1] == "127.0.0.1:0:8080"
     assert "LATHE_TEST_DEPLOYMENT_LABEL" in run
     assert not any("chat.adamsmith.as" in arg for arg in run)

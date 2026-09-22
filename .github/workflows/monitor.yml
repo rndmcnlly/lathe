@@ -43,7 +43,6 @@ jobs:
         env:
           DAYTONA_API_KEY: ${{ secrets.DAYTONA_API_KEY }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-          GITHUB_TOKEN: ${{ github.token }}
         run: uv run --locked python monitor_e2e.py
       - name: Verify host-writable evidence
         if: always()

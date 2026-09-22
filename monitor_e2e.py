@@ -267,21 +267,13 @@ def cleanup(directory):
 
 
 def launch(directory, *, docker_args=()):
-    """Resolve latest stable, pin its digest, then launch a loopback-only host."""
-    headers = {"Authorization": f"Bearer {os.environ['GITHUB_TOKEN']}"} if os.environ.get("GITHUB_TOKEN") else {}
-    response = httpx.get("https://api.github.com/repos/open-webui/open-webui/releases/latest",
-                         headers=headers, timeout=30)
-    response.raise_for_status()
-    release = response.json()
-    tag = release["tag_name"]
-    if release.get("prerelease") or release.get("draft") or not re.fullmatch(r"v\d+\.\d+\.\d+", tag):
-        raise RuntimeError("Latest OWUI release is not a stable version")
-    image = f"ghcr.io/open-webui/open-webui:{tag}-slim"
+    """Pull moving OWUI slim, record its digest, then launch loopback-only."""
+    image = "ghcr.io/open-webui/open-webui:slim"
     print(f"Pulling {image}", flush=True)
     docker("pull", image, timeout=900)
     info = json.loads(docker("image", "inspect", image).stdout)[0]
     digest = next(d for d in info["RepoDigests"] if d.startswith("ghcr.io/open-webui/open-webui@"))
-    metadata = {"owui_release": tag, "image": image, "image_digest": digest,
+    metadata = {"image": image, "image_digest": digest,
                 "image_id": info["Id"], "architecture": info["Architecture"],
                 "lathe_sha256": hashlib.sha256((ROOT / "lathe.py").read_bytes()).hexdigest(),
                 "git_sha": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip(),
@@ -297,7 +289,7 @@ def launch(directory, *, docker_args=()):
            "--env", "ENABLE_SIGNUP=true", "--env", "WEBUI_AUTH=true",
            "--env", "SCARF_NO_ANALYTICS=true", "--env", "DO_NOT_TRACK=true",
            "--env", "CHAT_RESPONSE_MAX_TOOL_CALL_ITERATIONS=12",
-           "--env", "HF_HUB_OFFLINE=1", *docker_args, digest)
+           "--env", "HF_HUB_OFFLINE=1", *docker_args, image)
     return metadata
 
 

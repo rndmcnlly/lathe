@@ -29,11 +29,13 @@ For a local run, export those two variables and start Docker, then run:
 uv run --locked python monitor_e2e.py
 ```
 
-The monitor ignores `.env` and existing `OWUI_*` configuration. It resolves the
-latest stable Open WebUI GitHub release, pulls its `-slim` image, records the
-digest and platform, and launches that digest. Docker publishes port 8080 only
-on a randomly assigned loopback port. SQLite and other OWUI state live in the
-disposable container's storage. There is no reusable data volume.
+The monitor ignores `.env` and existing `OWUI_*` configuration. It pulls and
+launches the moving `ghcr.io/open-webui/open-webui:slim` tag so upstream drift is
+part of the contract under test. After pulling, it records the exact resolved
+digest, image ID, and platform as forensic evidence; it does not use those values
+to pin a version. Docker publishes port 8080 only on a randomly assigned loopback
+port. SQLite and other OWUI state live in the disposable container's storage.
+There is no reusable data volume.
 
 `bootstrap()` creates the first admin headlessly and configures a native-tool
 workspace model. Its base model is `openrouter/pareto-code`. OWUI's workspace
@@ -120,7 +122,7 @@ Actions uploads `monitor-artifacts/` on success or failure for 14 days:
 
 | File | Evidence |
 |---|---|
-| `environment.json` | OWUI release/image digest/platform, Lathe SHA-256, checkout SHA, router policy, owned label |
+| `environment.json` | Moving OWUI image tag plus resolved digest/ID/platform, Lathe SHA-256, checkout SHA, router policy, owned label |
 | `trace.jsonl` | Scenarios, prompts, tool calls/outputs, statuses, provider errors, serving models and usage, independent reads |
 | `summary.json` | Result, first failing scenario, concrete models, inference count |
 | `suite.log`, `owui.log` | Deployment-suite output and container logs |
