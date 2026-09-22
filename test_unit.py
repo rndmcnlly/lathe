@@ -648,7 +648,10 @@ async def test_background_bash_poll_deadline(tools, http, clock, monkeypatch):
     assert tools._chat_state["chat"]["pending"] == []
 
 
-@pytest.mark.parametrize("state,status", [("destroying", 200), ("destroyed", 200), ("started", 404)])
+@pytest.mark.parametrize("state,status", [
+    ("deleting", 200), ("deleted", 200), ("destroying", 200),
+    ("destroyed", 200), ("started", 404),
+])
 async def test_stale_discovery_never_resurrects_sandbox(tools, transport, state, status):
     tools.valves.auto_create_sandbox = False
     tools.valves.sandbox_missing_message = "provision externally"
@@ -665,6 +668,197 @@ async def test_stale_discovery_never_resurrects_sandbox(tools, transport, state,
         with pytest.raises(RuntimeError, match="provision externally"):
             await lathe._ensure_sandbox(tools.valves, USER["email"], client)
     assert calls == ["/sandbox", "/sandbox/sb"]
+
+
+@pytest.mark.parametrize("state,expected_warning,start_calls", [
+    ("started", None, 0),
+    ("stopped", "running processes were lost", 1),
+    ("archived", "running processes were lost", 1),
+    ("paused", "resumed from paused state", 1),
+])
+async def test_lifecycle_ready_and_restartable_states(
+    tools, transport, clock, state, expected_warning, start_calls,
+):
+    observations = iter([state, "started"] if start_calls else [state])
+    calls = []
+
+    def handler(request):
+        calls.append((request.method, request.url.path))
+        if request.url.path == "/sandbox":
+            return httpx.Response(200, json=[{
+                "id": "sb", "labels": {"test": USER["email"]},
+            }])
+        if request.url.path == "/sandbox/sb" and request.method == "GET":
+            return httpx.Response(200, json={"id": "sb", "state": next(observations)})
+        if request.url.path == "/sandbox/sb/start":
+            return httpx.Response(200, json={"id": "sb", "state": "starting"})
+        assert request.url.path == "/sb/process/execute"
+        return httpx.Response(200, json={"exitCode": 0, "result": "ready"})
+
+    async with httpx.AsyncClient(transport=transport(handler)) as client:
+        sandbox_id, warning = await lathe._ensure_sandbox(
+            tools.valves, USER["email"], client,
+        )
+
+    assert sandbox_id == "sb"
+    assert (expected_warning is None and warning is None) or expected_warning in warning
+    assert calls.count(("POST", "/sandbox/sb/start")) == start_calls
+    assert (clock() > 0) == bool(start_calls)
+
+
+@pytest.mark.parametrize("initial,terminal", [
+    ("stopping", "stopped"),
+    ("archiving", "archived"),
+])
+async def test_lifecycle_transition_restarts_after_terminal_state(
+    tools, transport, clock, initial, terminal,
+):
+    # Daytona's read model may briefly remain at the terminal state after the
+    # start request. That must not cause duplicate start requests.
+    states = iter([initial, terminal, terminal, "starting", "started"])
+    calls = []
+
+    def handler(request):
+        calls.append((request.method, request.url.path))
+        if request.url.path == "/sandbox":
+            return httpx.Response(200, json=[{
+                "id": "sb", "labels": {"test": USER["email"]},
+            }])
+        if request.url.path == "/sandbox/sb" and request.method == "GET":
+            return httpx.Response(200, json={"id": "sb", "state": next(states)})
+        if request.url.path == "/sandbox/sb/start":
+            return httpx.Response(200, json={"id": "sb", "state": "starting"})
+        assert request.url.path == "/sb/process/execute"
+        return httpx.Response(200, json={"exitCode": 0, "result": "ready"})
+
+    async with httpx.AsyncClient(transport=transport(handler)) as client:
+        sandbox_id, warning = await lathe._ensure_sandbox(
+            tools.valves, USER["email"], client,
+        )
+
+    assert sandbox_id == "sb"
+    assert "running processes were lost" in warning
+    assert calls[:7] == [
+        ("GET", "/sandbox"),
+        ("GET", "/sandbox/sb"),
+        ("GET", "/sandbox/sb"),
+        ("POST", "/sandbox/sb/start"),
+        ("GET", "/sandbox/sb"),
+        ("GET", "/sandbox/sb"),
+        ("GET", "/sandbox/sb"),
+    ]
+    assert calls.count(("POST", "/sandbox/sb/start")) == 1
+    assert clock() > 0
+
+
+@pytest.mark.parametrize("state", [
+    "unknown", "pending_build", "pulling_snapshot", "building_snapshot", "creating",
+    "starting", "resuming", "restoring", "resizing", "snapshotting", "forking",
+])
+async def test_lifecycle_in_flight_states_wait_without_starting(
+    tools, transport, clock, state,
+):
+    observations = iter([state, "started"])
+    calls = []
+
+    def handler(request):
+        calls.append((request.method, request.url.path))
+        if request.url.path == "/sandbox":
+            return httpx.Response(200, json=[{
+                "id": "sb", "labels": {"test": USER["email"]},
+            }])
+        if request.url.path == "/sandbox/sb":
+            return httpx.Response(200, json={"id": "sb", "state": next(observations)})
+        assert request.url.path == "/sb/process/execute"
+        return httpx.Response(200, json={"exitCode": 0, "result": "ready"})
+
+    async with httpx.AsyncClient(transport=transport(handler)) as client:
+        assert await lathe._ensure_sandbox(
+            tools.valves, USER["email"], client,
+        ) == ("sb", None)
+
+    assert ("POST", "/sandbox/sb/start") not in calls
+    assert clock() > 0
+
+
+async def test_lifecycle_pausing_waits_then_resumes(tools, transport, clock):
+    observations = iter(["pausing", "paused", "resuming", "started"])
+    calls = []
+
+    def handler(request):
+        calls.append((request.method, request.url.path))
+        if request.url.path == "/sandbox":
+            return httpx.Response(200, json=[{
+                "id": "sb", "labels": {"test": USER["email"]},
+            }])
+        if request.url.path == "/sandbox/sb" and request.method == "GET":
+            return httpx.Response(200, json={"id": "sb", "state": next(observations)})
+        if request.url.path == "/sandbox/sb/start":
+            return httpx.Response(200, json={"id": "sb", "state": "resuming"})
+        assert request.url.path == "/sb/process/execute"
+        return httpx.Response(200, json={"exitCode": 0, "result": "ready"})
+
+    async with httpx.AsyncClient(transport=transport(handler)) as client:
+        assert await lathe._ensure_sandbox(
+            tools.valves, USER["email"], client,
+        ) == ("sb", "[Sandbox was resumed from paused state]")
+
+    assert calls.count(("POST", "/sandbox/sb/start")) == 1
+    assert clock() > 0
+
+
+@pytest.mark.parametrize("state,details,message", [
+    ("build_failed", {}, "snapshot build failed"),
+    ("error", {"recoverable": False, "errorReason": "broken host"}, "broken host"),
+    ("new_daytona_state", {}, "unsupported Daytona lifecycle state"),
+])
+async def test_lifecycle_terminal_failures_are_immediate(
+    tools, transport, clock, state, details, message,
+):
+    def handler(request):
+        if request.url.path == "/sandbox":
+            return httpx.Response(200, json=[{
+                "id": "sb", "labels": {"test": USER["email"]},
+            }])
+        assert (request.method, request.url.path) == ("GET", "/sandbox/sb")
+        return httpx.Response(200, json={"id": "sb", "state": state, **details})
+
+    async with httpx.AsyncClient(transport=transport(handler)) as client:
+        with pytest.raises(RuntimeError, match=message):
+            await lathe._ensure_sandbox(tools.valves, USER["email"], client)
+    assert clock() == 0
+
+
+async def test_lifecycle_recoverable_error_recovers_once(tools, transport, clock):
+    observations = iter([
+        {"state": "error", "recoverable": True, "errorReason": "runner lost"},
+        {"state": "restoring"},
+        {"state": "started"},
+    ])
+    calls = []
+
+    def handler(request):
+        calls.append((request.method, request.url.path))
+        if request.url.path == "/sandbox":
+            return httpx.Response(200, json=[{
+                "id": "sb", "labels": {"test": USER["email"]},
+            }])
+        if request.url.path == "/sandbox/sb" and request.method == "GET":
+            return httpx.Response(200, json={"id": "sb", **next(observations)})
+        if request.url.path in ("/sandbox/sb/recover", "/sandbox/sb/start"):
+            return httpx.Response(200, json={"id": "sb"})
+        assert request.url.path == "/sb/process/execute"
+        return httpx.Response(200, json={"exitCode": 0, "result": "ready"})
+
+    async with httpx.AsyncClient(transport=transport(handler)) as client:
+        sandbox_id, warning = await lathe._ensure_sandbox(
+            tools.valves, USER["email"], client,
+        )
+
+    assert sandbox_id == "sb" and "recovered from error" in warning
+    assert calls.count(("POST", "/sandbox/sb/recover")) == 1
+    assert calls.count(("POST", "/sandbox/sb/start")) == 1
+    assert clock() > 0
 
 
 async def test_duplicate_sandbox_association_refuses_use_and_destroy(tools, http):

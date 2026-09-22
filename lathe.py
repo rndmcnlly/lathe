@@ -5,7 +5,7 @@ author_url: https://adamsmith.as
 description: Coding agent tools (lathe, bash, read, write, edit, glob, grep, view, interpret, delegate, onboard, expose, destroy) backed by per-user sandbox VMs with transparent lifecycle management.
 required_open_webui_version: 0.11.0
 requirements: httpx, httpx-ws, pydantic-ai-slim[openai]~=2.5, cachetools
-version: 0.30.0
+version: 0.30.1
 licence: MIT
 """
 
@@ -127,7 +127,7 @@ async def _get_live_sandbox(valves, sandbox_id: str, client: httpx.AsyncClient) 
         return None
     resp.raise_for_status()
     sandbox = resp.json()
-    if sandbox.get("state") in ("destroying", "destroyed"):
+    if sandbox.get("state") in ("deleting", "deleted", "destroying", "destroyed"):
         return None
     return sandbox
 
@@ -3140,6 +3140,19 @@ async def _wait_for_toolbox(valves, sandbox_id: str, client: httpx.AsyncClient, 
     raise RuntimeError("Sandbox started but toolbox daemon did not become responsive (30s)")
 
 
+_SANDBOX_START_STATES = frozenset({"stopped", "paused", "archived"})
+_SANDBOX_WAIT_STATES = frozenset({
+    # Provisioning: never interrupt creation with a start request.
+    "unknown", "pending_build", "pulling_snapshot", "building_snapshot", "creating",
+    # Start/resume and lifecycle operations converge without intervention.
+    "starting", "resuming", "restoring", "stopping", "pausing", "archiving",
+    "resizing", "snapshotting", "forking",
+})
+_SANDBOX_DELETION_STATES = frozenset({
+    "deleting", "deleted", "destroying", "destroyed",
+})
+
+
 async def _ensure_sandbox(valves, email: str, client: httpx.AsyncClient, emitter=None) -> tuple[str, str | None]:
     """Find or create a running sandbox for this user.
 
@@ -3231,56 +3244,87 @@ async def _ensure_sandbox(valves, email: str, client: httpx.AsyncClient, emitter
     sandbox_id = sandbox["id"]
     state = sandbox.get("state", "unknown")
 
-    # 3. Ensure it's running
-    if state == "started":
-        await _wait_for_toolbox(valves, sandbox_id, client, emitter)
-        await _emit(emitter, "Sandbox ready", done=True)
-        return sandbox_id, warning
-
-    if state in ("stopped", "archived"):
-        await _emit(emitter, "Preparing sandbox...")
-        resp = await client.post(
-            _api(valves, f"/sandbox/{sandbox_id}/start"),
-            headers=_headers(valves),
-            timeout=30.0,
-        )
-        resp.raise_for_status()
-        if not warning:
-            warning = (
-                "[Sandbox was restarted from archived state — running processes were lost]"
-                if state == "archived" else
-                "[Sandbox was restarted — running processes were lost]"
-            )
-
-    elif state == "error" and sandbox.get("recoverable"):
-        await _emit(emitter, "Preparing sandbox...")
-        resp = await client.post(
-            _api(valves, f"/sandbox/{sandbox_id}/recover"),
-            headers=_headers(valves),
-            timeout=30.0,
-        )
-        resp.raise_for_status()
-        resp = await client.post(
-            _api(valves, f"/sandbox/{sandbox_id}/start"),
-            headers=_headers(valves),
-            timeout=30.0,
-        )
-        resp.raise_for_status()
-        if not warning:
-            warning = "[Sandbox was recovered from error — check that expected files and processes still exist]"
-
-    elif state in ("starting", "stopping", "archiving"):
-        await _emit(emitter, "Preparing sandbox...")
-    else:
-        if state == "error":
-            raise RuntimeError(
-                f"Sandbox is in non-recoverable error state: {sandbox.get('errorReason', 'unknown')}"
-            )
-
-    # 4. Poll until started
+    # 4. Drive every observed lifecycle state toward started. The same policy
+    # runs before and during polling so stopping -> stopped and archiving ->
+    # archived issue the start request that their terminal states require.
     deadline = time.time() + 120
     poll_interval = 1.0
+    info = sandbox
+    recovery_attempted = False
+    start_requested = False
+    preparing_emitted = False
     while time.time() < deadline:
+        state = info.get("state", "unknown")
+
+        if state == "started":
+            await _wait_for_toolbox(valves, sandbox_id, client, emitter)
+            await _emit(emitter, "Sandbox ready", done=True)
+            return sandbox_id, warning
+
+        if not preparing_emitted:
+            await _emit(emitter, "Preparing sandbox...")
+            preparing_emitted = True
+
+        if state in _SANDBOX_START_STATES and not start_requested:
+            resp = await client.post(
+                _api(valves, f"/sandbox/{sandbox_id}/start"),
+                headers=_headers(valves),
+                timeout=30.0,
+            )
+            resp.raise_for_status()
+            start_requested = True
+            if not warning:
+                if state == "archived":
+                    warning = "[Sandbox was restarted from archived state — running processes were lost]"
+                elif state == "paused":
+                    warning = "[Sandbox was resumed from paused state]"
+                else:
+                    warning = "[Sandbox was restarted — running processes were lost]"
+
+        if state == "error":
+            if info.get("recoverable") and not recovery_attempted:
+                recovery_attempted = True
+                resp = await client.post(
+                    _api(valves, f"/sandbox/{sandbox_id}/recover"),
+                    headers=_headers(valves),
+                    timeout=30.0,
+                )
+                resp.raise_for_status()
+                resp = await client.post(
+                    _api(valves, f"/sandbox/{sandbox_id}/start"),
+                    headers=_headers(valves),
+                    timeout=30.0,
+                )
+                resp.raise_for_status()
+                start_requested = True
+                if not warning:
+                    warning = "[Sandbox was recovered from error — check that expected files and processes still exist]"
+            else:
+                reason = info.get("errorReason", "unknown")
+                detail = " after recovery was attempted" if recovery_attempted else ""
+                raise RuntimeError(
+                    f"Sandbox is in a non-recoverable error state{detail}: {reason}. "
+                    "Ask the Daytona administrator to inspect or replace this sandbox."
+                )
+
+        elif state == "build_failed":
+            raise RuntimeError(
+                "Sandbox snapshot build failed. Ask the Daytona administrator to "
+                "inspect the failed build and replace or retry this sandbox."
+            )
+
+        elif state in _SANDBOX_DELETION_STATES:
+            raise RuntimeError(
+                f"Sandbox is being deleted (state: {state}). Retry after deletion completes "
+                "so Lathe can provision a replacement."
+            )
+
+        elif state not in _SANDBOX_START_STATES and state not in _SANDBOX_WAIT_STATES:
+            raise RuntimeError(
+                f"Sandbox has unsupported Daytona lifecycle state '{state}'. "
+                "Ask the administrator to inspect the sandbox and update Lathe if this state is expected."
+            )
+
         await asyncio.sleep(poll_interval)
         resp = await client.get(
             _api(valves, f"/sandbox/{sandbox_id}"),
@@ -3289,17 +3333,6 @@ async def _ensure_sandbox(valves, email: str, client: httpx.AsyncClient, emitter
         )
         resp.raise_for_status()
         info = resp.json()
-        state = info.get("state", "unknown")
-
-        if state == "started":
-            await _wait_for_toolbox(valves, sandbox_id, client, emitter)
-            await _emit(emitter, "Sandbox ready", done=True)
-            return sandbox_id, warning
-
-        if state == "error":
-            raise RuntimeError(
-                f"Sandbox entered error state: {info.get('errorReason', 'unknown')}"
-            )
 
         poll_interval = min(poll_interval * 1.2, 5.0)
 
