@@ -1,3 +1,12 @@
+export function matchesToolExpectation(event, expected) {
+  const contains = (value, text) => !text || JSON.stringify(value).toLowerCase().includes(text.toLowerCase());
+  return expected.tools.includes(event.tool)
+    && contains(event.arguments, expected.argumentContains)
+    && contains(event.output, expected.outputContains)
+    && (!expected.outputLineEquals || event.output.split(/\r?\n/).some((line) =>
+      line.replace(/^\d+: /, "") === expected.outputLineEquals));
+}
+
 export function normalizedToolEvents(payload) {
   const calls = [];
   const results = new Map();

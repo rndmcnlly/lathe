@@ -1,0 +1,61 @@
+name: Isolated live monitor
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '17 9 * * 1'
+  push:
+    branches: [main]
+    paths:
+      - 'lathe.py'
+      - 'test_deployment.py'
+      - 'testing_support.py'
+      - 'monitor_e2e.py'
+      - 'test_monitor.py'
+      - 'pyproject.toml'
+      - 'uv.lock'
+      - '.github/workflows/monitor.yml'
+
+permissions:
+  contents: read
+
+# The OWUI toolkit ID is fixed. Serialize monitor runs; never cancel cleanup.
+concurrency:
+  group: lathe-live-monitor
+  cancel-in-progress: false
+
+jobs:
+  monitor:
+    if: github.repository == 'rndmcnlly/lathe' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff # v6
+        with:
+          enable-cache: true
+      - name: Offline contracts
+        run: uv run --locked pytest test_unit.py test_monitor.py
+      - name: Disposable Open WebUI, real inference, real Daytona
+        timeout-minutes: 35
+        env:
+          DAYTONA_API_KEY: ${{ secrets.DAYTONA_API_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: uv run --locked python monitor_e2e.py
+      - name: Last-resort teardown
+        if: always()
+        env:
+          DAYTONA_API_KEY: ${{ secrets.DAYTONA_API_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        run: uv run --locked python monitor_e2e.py --cleanup
+      - name: Sanitized execution evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: monitor-${{ github.run_id }}-${{ github.run_attempt }}
+          path: monitor-artifacts/
+          retention-days: 14
+          if-no-files-found: warn

@@ -33,16 +33,22 @@ from dotenv import load_dotenv
 from testing_support import EXPECTED_SCHEMA, normalize_schema
 
 
-load_dotenv()
+if os.environ.get("LATHE_ISOLATED_CI") != "1":
+    load_dotenv()
 
 OWUI_BASE = os.environ.get("OWUI_URL", "").rstrip("/")
 OWUI_TOKEN = os.environ.get("OWUI_TOKEN", "")
 MODEL = os.environ.get("OWUI_MODEL", "")
 DAYTONA_API_KEY = os.environ.get("DAYTONA_API_KEY", "")
 TOOL_ID = os.environ.get("LATHE_TEST_TOOL_ID", "lathe_test")
-DEPLOYMENT_LABEL = "lathe-owui-deployment-test"
+DEPLOYMENT_LABEL = os.environ.get("LATHE_TEST_DEPLOYMENT_LABEL", "lathe-owui-deployment-test")
+if not (DEPLOYMENT_LABEL == "lathe-owui-deployment-test"
+        or re.fullmatch(r"lathe-ci-[a-z0-9-]{1,48}", DEPLOYMENT_LABEL)):
+    raise ValueError("Deployment tests require a suite-owned staging label")
 SOURCE_PATH = Path(__file__).with_name("lathe.py")
 VERBOSE = False
+# Optional observer for the disposable monitor, without headers or credentials.
+TRACE = lambda kind, **data: None
 PREVIEW_WRAPPER_URL = os.environ.get("LATHE_PREVIEW_WRAPPER_URL", "")
 PREVIEW_WRAPPER_KEY = os.environ.get("LATHE_PREVIEW_WRAPPER_KEY", "")
 PREVIEW_EXPECTED_URL = os.environ.get("LATHE_PREVIEW_EXPECTED_URL", "")
@@ -83,13 +89,16 @@ class Results:
 
     async def run(self, name, fn):
         self.scenarios += 1
+        TRACE("scenario_start", name=name)
         print(f"\n-- {name} --")
         try:
             await fn()
+            TRACE("scenario_pass", name=name)
             print(f"  PASS: {name}")
             return True
         except Exception as exc:
             self.failed += 1
+            TRACE("scenario_fail", name=name, error=f"{type(exc).__name__}: {exc}")
             print(f"  FAIL: {name}: {type(exc).__name__}: {exc}")
             return False
 
@@ -130,13 +139,13 @@ async def deploy_staging_tool():
             "daytona_api_url": "https://app.daytona.io/api",
             "daytona_proxy_url": "https://proxy.app.daytona.io/toolbox",
             "deployment_label": DEPLOYMENT_LABEL,
-            "auto_stop_minutes": 15,
-            "auto_archive_minutes": 60,
-            "auto_delete_minutes": 60,
+            "auto_stop_minutes": 5,
+            "auto_archive_minutes": 5,
+            "auto_delete_minutes": 0,
             "persistent_volume": False,
             "auto_create_sandbox": True,
             "sandbox_missing_message": "",
-            "sandbox_create_overrides": "{}",
+            "sandbox_create_overrides": '{"ttlMinutes":30}',
             "foreground_timeout_seconds": 30,
             "preview_wrapper_url": PREVIEW_WRAPPER_URL,
             "preview_wrapper_key": PREVIEW_WRAPPER_KEY,
@@ -189,14 +198,22 @@ async def cleanup_test_sandboxes():
         "Content-Type": "application/json",
     }
     async with httpx.AsyncClient() as client:
-        response = await client.get(
-            "https://app.daytona.io/api/sandbox",
-            headers=headers,
-            timeout=30,
-        )
-        response.raise_for_status()
-        payload = response.json()
-        sandboxes = payload if isinstance(payload, list) else payload.get("items", [])
+        sandboxes = []
+        cursor = None
+        seen = set()
+        while True:
+            response = await client.get(
+                "https://app.daytona.io/api/sandbox", headers=headers,
+                params={"cursor": cursor} if cursor else {}, timeout=30,
+            )
+            response.raise_for_status()
+            payload = response.json()
+            sandboxes.extend(payload if isinstance(payload, list) else payload.get("items", []))
+            cursor = payload.get("cursor") if isinstance(payload, dict) else None
+            if not cursor:
+                break
+            require(cursor not in seen, "Daytona repeated a pagination cursor")
+            seen.add(cursor)
         for sandbox in sandboxes:
             if DEPLOYMENT_LABEL not in sandbox.get("labels", {}):
                 continue
@@ -206,7 +223,20 @@ async def cleanup_test_sandboxes():
                 headers=headers,
                 timeout=30,
             )
-            response.raise_for_status()
+            if response.status_code != 404:
+                response.raise_for_status()
+            for _ in range(60):
+                response = await client.get(
+                    f"https://app.daytona.io/api/sandbox/{sandbox['id']}",
+                    headers=headers, timeout=30,
+                )
+                if response.status_code == 404:
+                    break
+                response.raise_for_status()
+                await asyncio.sleep(1)
+            else:
+                raise RuntimeError(f"Staging sandbox {sandbox['id']} did not finish deletion")
+            TRACE("sandbox_deleted", id=sandbox["id"])
 
 
 class OWUIClient:
@@ -216,6 +246,10 @@ class OWUIClient:
         self.session_id = None
         self.events = []
         self.done = asyncio.Event()
+        self.max_calls = None
+        self.budget_error = None
+        self.last_output = []
+        self.traced_results = 0
 
         @self.sio.event
         async def connect():
@@ -230,6 +264,21 @@ class OWUIClient:
             if event != "events" or not isinstance(data, dict):
                 return
             inner = data.get("data", {})
+            detail = inner.get("data", {})
+            if inner.get("type") == "chat:completion" and "output" in detail:
+                self.last_output = detail["output"]
+                completed = [item for item in self.last_output
+                             if item.get("type") == "function_call_output"
+                             and item.get("status") == "completed"]
+                if len(completed) > self.traced_results:
+                    fresh = completed[self.traced_results:]
+                    ids = {item.get("call_id") for item in fresh}
+                    TRACE("tool_progress", output=[item for item in self.last_output
+                          if item.get("call_id") in ids])
+                    self.traced_results = len(completed)
+                if self.max_calls and len(tool_calls(self.last_output)) > self.max_calls:
+                    self.budget_error = "Outer tool-call budget exceeded"
+                    self.done.set()
             if inner.get("type") == "chat:completion" and inner.get("data", {}).get("done"):
                 self.done.set()
 
@@ -248,9 +297,14 @@ class OWUIClient:
         if self.sio.connected:
             await self.sio.disconnect()
 
-    async def send(self, prompt, *, timeout=180):
+    async def send(self, prompt, *, timeout=180, max_calls=None):
         self.events.clear()
         self.done.clear()
+        self.max_calls = max_calls
+        self.budget_error = None
+        self.last_output = []
+        self.traced_results = 0
+        TRACE("prompt", prompt=prompt, timeout=timeout, max_calls=max_calls)
         payload = {
             "model": MODEL,
             "messages": [{"role": "user", "content": prompt}],
@@ -260,19 +314,27 @@ class OWUIClient:
             "session_id": self.session_id,
             "tool_ids": [self.tool_id],
         }
-        async with httpx.AsyncClient() as client:
-            response = await client.post(
-                f"{OWUI_BASE}/api/chat/completions",
-                headers=auth_headers(),
-                json=payload,
-                timeout=30,
-            )
-            if response.is_error:
-                raise RuntimeError(
-                    f"OWUI completion HTTP {response.status_code}: {response.text[:1000]}"
-                )
-            response.raise_for_status()
-        await asyncio.wait_for(self.done.wait(), timeout=timeout)
+        try:
+            async with asyncio.timeout(timeout):
+                async with httpx.AsyncClient() as client:
+                    response = await client.post(
+                        f"{OWUI_BASE}/api/chat/completions",
+                        headers=auth_headers(),
+                        json=payload,
+                        timeout=30,
+                    )
+                    if response.is_error:
+                        raise RuntimeError(
+                            f"OWUI completion HTTP {response.status_code}: {response.text[:1000]}"
+                        )
+                    response.raise_for_status()
+                await self.done.wait()
+                require(not self.budget_error, self.budget_error)
+        finally:
+            TRACE("chat_output", output=self.last_output,
+                  statuses=[e for e in self.events if e.get("event") == "events"
+                            and (e.get("data") or {}).get("data", {}).get("type")
+                            in ("status", "chat:error")])
 
         output = []
         for event in self.events:
@@ -301,6 +363,36 @@ def tool_outputs(output):
             value = "".join(part.get("text", "") for part in value if isinstance(part, dict))
         results.append(str(value))
     return results
+
+
+def verify_journey(output, destination, marker):
+    """Require observed discovery, delegation, and a subsequent inspection.
+
+    Filesystem effects are checked separately through Daytona. In particular,
+    assistant prose is never evidence that the overview or file was inspected.
+    """
+    calls = tool_calls(output)
+    require(len(calls) <= 12, "Agent exceeded 12 outer tool calls")
+    results = {item.get("call_id"): item for item in output
+               if item.get("type") == "function_call_output"}
+    overview_seen = False
+    delegated = False
+    inspected = False
+    for call in calls:
+        args = call.get("arguments") or "{}"
+        args = json.loads(args) if isinstance(args, str) else args
+        values = tool_outputs([results[call["call_id"]]]) if call.get("call_id") in results else []
+        if call.get("name") == "lathe" and args.get("manpage", "overview") == "overview":
+            overview_seen = any(value.strip() and not value.startswith(("Error:", "Unknown manpage"))
+                                for value in values)
+        if call.get("name") == "delegate":
+            require(overview_seen, "Delegation happened before overview discovery")
+            delegated = True
+        if delegated and call.get("name") in ("read", "bash", "interpret"):
+            inspected |= destination in json.dumps(args) and any(marker in value for value in values)
+    require(overview_seen, "Agent did not consult the overview")
+    require(delegated, "Agent did not use delegation")
+    require(inspected, "Agent did not inspect the copied result after delegation")
 
 
 async def main():
@@ -433,6 +525,41 @@ async def main():
         require('daytonaproxy' not in values and '.proxy.daytona.work' not in values,
                 'Upstream hostname leaked')
 
+    async def agent_experience():
+        source = f"/home/daytona/workspace/journey-{uuid.uuid4().hex}.txt"
+        destination = source + ".copy"
+        marker = f"JOURNEY_{uuid.uuid4().hex}"
+        output = await client.send(
+            "You are using this coding environment for the first time. Consult its built-in "
+            "overview before starting. "
+            f"Create {source} containing exactly {marker} with no extra whitespace. "
+            f"Ask a subagent to make an exact copy at {destination}, then inspect the copied "
+            "contents yourself to verify the result. Wait for the work to finish. "
+            "Use at most 12 tool calls and finish within 4 minutes.",
+            timeout=240, max_calls=12,
+        )
+        verify_journey(output, destination, marker)
+        # Bypass both the model's claims and Lathe's output formatting.
+        async with httpx.AsyncClient() as http:
+            headers = {"Authorization": f"Bearer {DAYTONA_API_KEY}"}
+            response = await http.get("https://app.daytona.io/api/sandbox",
+                params={"labels": json.dumps({DEPLOYMENT_LABEL: "monitor@lathe.invalid"})},
+                headers=headers, timeout=30)
+            response.raise_for_status()
+            data = response.json()
+            matches = [s for s in (data if isinstance(data, list) else data.get("items", []))
+                       if s.get("labels", {}).get(DEPLOYMENT_LABEL) == "monitor@lathe.invalid"]
+            require(len(matches) == 1, "Expected one monitor sandbox")
+            sandbox = matches[0]
+            require(not sandbox.get("volumes"), "Monitor sandbox has persistent volumes")
+            for filename in (source, destination):
+                response = await http.get(
+                    f"https://proxy.app.daytona.io/toolbox/{sandbox['id']}/files/download",
+                    params={"path": filename}, headers=headers, timeout=30)
+                response.raise_for_status()
+                require(response.content == marker.encode(), f"Exact canary mismatch: {filename}")
+                TRACE("independent_read", path=filename, content=response.text, sandbox_id=sandbox["id"])
+
     try:
         if deploy:
             print(f"Deploying local lathe.py to isolated toolkit {TOOL_ID!r}...")
@@ -453,6 +580,8 @@ async def main():
             ])
         if preview_enabled:
             scenarios.append((f"model to OWUI to {PREVIEW_ACCESS} wrapped expose", protected_preview_dispatch))
+        if os.environ.get("LATHE_ISOLATED_CI") == "1":
+            scenarios.append(("first-time agent experience", agent_experience))
         for name, scenario in scenarios:
             if not await results.run(name, scenario):
                 break
@@ -461,6 +590,7 @@ async def main():
             await client.close()
         except Exception as exc:
             cleanup_failed = True
+            TRACE("cleanup_error", error=f"Socket cleanup: {exc}")
             print(f"Socket cleanup failed: {exc}")
         if preview_enabled:
             try:
@@ -475,16 +605,19 @@ async def main():
                     response.raise_for_status()
             except Exception:
                 cleanup_failed = True
+                TRACE("cleanup_error", error="Preview registration cleanup failed")
                 print("Preview registration cleanup failed")
         try:
             await cleanup_test_sandboxes()
         except Exception as exc:
             cleanup_failed = True
+            TRACE("cleanup_error", error=f"Sandbox cleanup: {exc}")
             print(f"Sandbox cleanup warning: {exc}")
         try:
             await delete_staging_tool()
         except Exception as exc:
             cleanup_failed = True
+            TRACE("cleanup_error", error=f"Toolkit cleanup: {exc}")
             print(f"Toolkit cleanup warning: {exc}")
 
     elapsed = time.monotonic() - started

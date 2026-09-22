@@ -1,7 +1,20 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { normalizedToolEvents } from "./evidence.mjs";
+import { normalizedToolEvents, matchesToolExpectation } from "./evidence.mjs";
+
+test("read-back rejects trailing text left by a wrapped-row edit", () => {
+  const expected = { tools: ["read", "bash"], argumentContains: "RELAY.md",
+    outputLineEquals: "You: A shared state of mind." };
+  const event = { tool: "read", arguments: { path: "/tmp/RELAY.md" } };
+  for (const output of ["2: You: A shared state of mind.\n", "You: A shared state of mind."]) {
+    assert.equal(matchesToolExpectation({ ...event, output }, expected), true);
+  }
+  for (const output of ["2: You: A shared state of mind.model do, where the work runs",
+    "The file says You: A shared state of mind.", "You: A shared state of mind. extra"]) {
+    assert.equal(matchesToolExpectation({ ...event, output }, expected), false);
+  }
+});
 
 test("normalizes OpenAI tool calls and paired results", () => {
   const payload = {

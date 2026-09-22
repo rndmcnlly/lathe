@@ -17,6 +17,6 @@ dependencies = [
 dev = ["pytest>=8", "pytest-asyncio>=1"]
 
 [tool.pytest.ini_options]
-testpaths = ["test_unit.py"]
+testpaths = ["test_unit.py", "test_monitor.py"]
 asyncio_mode = "auto"
 addopts = "-q"
