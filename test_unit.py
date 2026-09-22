@@ -975,7 +975,7 @@ async def test_real_delegate_execution_and_completion(tools, sandbox, http, monk
         for scope, body in requests:
             assert scope["path"] == "/api/chat/completions"
             assert dict(scope["headers"])[b"authorization"] == b"Bearer user-token"
-            assert body["model"] == "selected-model" and body["chat_id"] == "chat"
+            assert body["model"] == "selected-model" and "chat_id" not in body
     finally:
         release.set()
         tasks = asyncio.all_tasks() - existing_tasks
