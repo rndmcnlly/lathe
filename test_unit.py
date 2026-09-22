@@ -1198,7 +1198,7 @@ def test_managed_archive_install_is_release_consistent_verified_and_atomic(
           esac
         done
         case "$URL" in
-          https://api.github.com/repos/*/releases/latest) cp {shlex.quote(str(release_path))} "$OUT" ;;
+          https://api.github.com/repos/*/releases/latest) sleep 0.2; cp {shlex.quote(str(release_path))} "$OUT" ;;
           {shlex.quote(asset_url)}) cp {shlex.quote(str(archive))} "$OUT" ;;
           *) exit 90 ;;
         esac
@@ -1209,16 +1209,34 @@ def test_managed_archive_install_is_release_consistent_verified_and_atomic(
     fake_ss.chmod(0o755)
 
     env = {**os.environ, "PATH": f"{fake_bin}:{os.environ['PATH']}"}
-    result = subprocess.run(
-        ["bash", "-c", script], text=True, capture_output=True, env=env, timeout=20,
-    )
+    if fault == "stale" and service == "code-server":
+        processes = [
+            subprocess.Popen(
+                ["bash", "-c", script], text=True,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env,
+            )
+            for _ in range(2)
+        ]
+        completed = [
+            subprocess.CompletedProcess(process.args, process.wait(timeout=20), *process.communicate())
+            for process in processes
+        ]
+        assert all(result.returncode == 0 for result in completed), completed
+        result = completed[0]
+    else:
+        result = subprocess.run(
+            ["bash", "-c", script], text=True, capture_output=True, env=env, timeout=20,
+        )
     calls = curl_log.read_text().splitlines()
     assert "/releases/latest" in calls[0]
     if fault in (None, "stale"):
         assert result.returncode == 0, result.stderr
         assert installed.read_text() == "#!/bin/sh\nexit 0\n"
         assert os.access(installed, os.X_OK)
-        assert len(calls) == 2 and asset_url in calls[1]
+        expected_calls = 4 if fault == "stale" and service == "code-server" else 2
+        assert len(calls) == expected_calls and all(
+            asset_url in call for call in calls if "/releases/latest" not in call
+        )
     else:
         assert result.returncode != 0
         assert not installed.exists()
