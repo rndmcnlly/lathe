@@ -5,7 +5,7 @@ author_url: https://adamsmith.as
 description: Coding agent tools (lathe, bash, read, write, edit, glob, grep, view, interpret, delegate, onboard, expose, destroy) backed by per-user sandbox VMs with transparent lifecycle management.
 required_open_webui_version: 0.11.0
 requirements: httpx, httpx-ws, pydantic-ai-slim[openai]~=2.5, cachetools
-version: 0.30.3
+version: 0.30.4
 licence: MIT
 """
 
@@ -1895,7 +1895,8 @@ async def _core_view(valves, sandbox_id: str, client: httpx.AsyncClient, *,
 
 
 def _build_bash_script(command: str, user_pairs: list[tuple[str, str]],
-                       pid_path: str, log_path: str) -> str:
+                       pid_path: str, log_path: str, keep_path: str,
+                       lease_path: str) -> str:
     """Build the bash wrapper script with sidecar file setup."""
     user_env_lines = "".join(
         f"export {k}={_shell_quote(v)}\n" for k, v in user_pairs
@@ -1903,17 +1904,151 @@ def _build_bash_script(command: str, user_pairs: list[tuple[str, str]],
     return (
         "#!/usr/bin/env bash\n"
         "set -e -o pipefail\n"
+        "rm -f -- \"${BASH_SOURCE[0]}\"\n"
+        + f": > {_shell_quote(lease_path)}\n"
         "export DEBIAN_FRONTEND=noninteractive "
         "GIT_TERMINAL_PROMPT=0 "
         "PIP_NO_INPUT=1 "
         "NPM_CONFIG_YES=true "
         "CI=true\n"
         + user_env_lines
+        + "_lathe_record_jobs() {\n"
+        + "  _lathe_ec=$?\n"
+        + f"  : > {_shell_quote(keep_path)}\n"
+        + f"  for _lathe_pid in $(jobs -pr); do kill -0 \"$_lathe_pid\" 2>/dev/null && echo \"$_lathe_pid\" >> {_shell_quote(keep_path)}; done\n"
+        + "  return $_lathe_ec\n"
+        + "}\n"
+        + "trap _lathe_record_jobs EXIT\n"
         + f"echo $BASHPID > {_shell_quote(pid_path)}\n"
         + f"exec > >(tee {_shell_quote(log_path)}) 2>&1\n"
         + command
         + "\n"
     )
+
+
+_BASH_COMPLETION_LEASE_SECONDS = 660
+
+
+def _build_bash_reap_script(preserve_log_for: str | None = None,
+                            release_lease_for: str | None = None) -> str:
+    """Build the sandbox-side completed-command scrubber."""
+    return textwrap.dedent(f"""\
+        import os
+        import time
+
+        root = {_EPHEMERAL_ROOT + '/cmd'!r}
+        preserve = {preserve_log_for!r}
+        release = {release_lease_for!r}
+        if os.path.isdir(root):
+            for command_id in os.listdir(root):
+                command_dir = os.path.join(root, command_id)
+                lease_path = os.path.join(command_dir, "lease")
+                if command_id == release:
+                    try:
+                        os.unlink(lease_path)
+                    except OSError:
+                        pass
+                else:
+                    try:
+                        if time.time() - os.path.getmtime(lease_path) < {_BASH_COMPLETION_LEASE_SECONDS}:
+                            continue
+                    except OSError:
+                        pass
+                if not any(os.path.isfile(os.path.join(command_dir, name))
+                           for name in ("exit", "keep", "spill")):
+                    continue
+                keep_path = os.path.join(command_dir, "keep")
+                live = False
+                try:
+                    with open(keep_path) as f:
+                        pids = [int(line) for line in f if line.strip().isdigit()]
+                except OSError:
+                    pids = []
+                for pid in pids:
+                    try:
+                        os.kill(pid, 0)
+                        live = True
+                        break
+                    except (OSError, ValueError):
+                        pass
+                for name in ("sh", "pid", "exit"):
+                    try:
+                        os.unlink(os.path.join(command_dir, name))
+                    except OSError:
+                        pass
+                if command_id == preserve and os.path.isfile(os.path.join(command_dir, "log")):
+                    open(os.path.join(command_dir, "spill"), "a").close()
+                else:
+                    for name in ("log", "spill"):
+                        try:
+                            os.unlink(os.path.join(command_dir, name))
+                        except OSError:
+                            pass
+                if live:
+                    print("retain " + command_id)
+                else:
+                    try:
+                        os.unlink(keep_path)
+                    except OSError:
+                        pass
+                    print("delete " + command_id)
+        """)
+
+
+async def _reap_bash_commands(valves, sandbox_id: str, client: httpx.AsyncClient,
+                              preserve_log_for: str | None = None,
+                              release_lease_for: str | None = None) -> None:
+    """Scrub completed sidecars and delete sessions with no live background jobs."""
+    try:
+        result = await _run_sandbox_script(
+            valves, sandbox_id, client,
+            _build_bash_reap_script(preserve_log_for, release_lease_for),
+            error_prefix="bash cleanup failed",
+        )
+        if result.startswith("Error:"):
+            logger.warning("%s", result)
+            return
+        for line in result.splitlines():
+            action, _, command_id = line.partition(" ")
+            if action != "delete" or not command_id:
+                continue
+            response = await client.delete(
+                _toolbox(valves, sandbox_id, f"/process/session/lathe-cmd-{command_id}"),
+                headers=_headers(valves), timeout=30.0,
+            )
+            if response.status_code not in (204, 404):
+                logger.warning("bash cleanup: session %s returned HTTP %s",
+                               command_id, response.status_code)
+                continue
+            if command_id != preserve_log_for:
+                response = await client.delete(
+                    _toolbox(valves, sandbox_id, "/files/"),
+                    params={"path": _bash_sidecar_dir(command_id), "recursive": "true"},
+                    headers=_headers(valves), timeout=30.0,
+                )
+                if response.status_code not in (204, 404):
+                    logger.warning("bash cleanup: sidecar %s returned HTTP %s",
+                                   command_id, response.status_code)
+    except Exception as exc:
+        logger.warning("bash cleanup failed: %s", exc)
+
+
+async def _discard_bash_setup(valves, sandbox_id: str, client: httpx.AsyncClient,
+                              command_id: str, session_created: bool) -> None:
+    """Best-effort cleanup when a command could not be launched."""
+    try:
+        await client.delete(
+            _toolbox(valves, sandbox_id, "/files/"),
+            params={"path": _bash_sidecar_dir(command_id), "recursive": "true"},
+            headers=_headers(valves), timeout=30.0,
+        )
+        if session_created:
+            await client.delete(
+                _toolbox(valves, sandbox_id, f"/process/session/lathe-cmd-{command_id}"),
+                headers=_headers(valves), timeout=30.0,
+            )
+    except Exception as exc:
+        logger.warning("bash setup cleanup failed: %s", exc)
 
 
 def _format_bash_result(output: str, exit_code: int | None,
@@ -1930,7 +2065,7 @@ def _format_bash_result(output: str, exit_code: int | None,
         bg_notice = (
             f"\n\n[Backgrounded after {elapsed}s — command is still running]\n"
             f"CMD={cmd_id}\n"
-            f"Ref {_EPHEMERAL_ROOT}/cmd/$CMD/{{sh,pid,log,exit}}\n"
+            f"Ref {_EPHEMERAL_ROOT}/cmd/$CMD/{{pid,log,exit}}\n"
             f"See lathe(manpage=\"background\") for peek/poll/kill recipes.\n"
             f"Tell the user the command is running. Don't poll until they ask or "
             f"you have a concrete reason to expect completion."
@@ -1989,53 +2124,52 @@ async def _core_bash(valves, sandbox_id: str, client: httpx.AsyncClient, *,
     pid_path = f"{cmd_dir}/pid"
     exit_path = f"{cmd_dir}/exit"
     script_path = f"{cmd_dir}/sh"
+    keep_path = f"{cmd_dir}/keep"
+    lease_path = f"{cmd_dir}/lease"
 
-    script = _build_bash_script(command, user_pairs, pid_path, log_path)
-
-    # Upload the script (creates parent dirs automatically)
-    await client.post(
-        _toolbox(valves, sandbox_id, "/files/upload"),
-        params={"path": script_path},
-        headers={"Authorization": f"Bearer {valves.daytona_api_key}"},
-        files={"file": ("file", io.BytesIO(script.encode("utf-8")), "application/octet-stream")},
-        timeout=60.0,
+    await _reap_bash_commands(valves, sandbox_id, client)
+    script = _build_bash_script(
+        command, user_pairs, pid_path, log_path, keep_path, lease_path,
     )
 
-    # ── Create a per-command session ─────────────────────────────
-    # Each bash() call gets its own session so commands never
-    # queue behind each other.  This is critical: a shared
-    # session serialises commands, so monitoring a backgrounded
-    # build via tail/cat would block until the build finishes.
     session_id = f"lathe-cmd-{cmd_id}"
-    resp = await client.post(
-        _toolbox(valves, sandbox_id, f"/process/session"),
-        headers=_headers(valves),
-        json={"sessionId": session_id},
-        timeout=30.0,
-    )
-    if resp.status_code not in (200, 409):
+    session_created = False
+    try:
+        # Each command gets a session so concurrent calls never queue.
+        resp = await client.post(
+            _toolbox(valves, sandbox_id, "/files/upload"),
+            params={"path": script_path},
+            headers={"Authorization": f"Bearer {valves.daytona_api_key}"},
+            files={"file": ("file", io.BytesIO(script.encode("utf-8")), "application/octet-stream")},
+            timeout=60.0,
+        )
         resp.raise_for_status()
+        resp = await client.post(
+            _toolbox(valves, sandbox_id, "/process/session"),
+            headers=_headers(valves), json={"sessionId": session_id}, timeout=30.0,
+        )
+        if resp.status_code not in (200, 201, 409):
+            resp.raise_for_status()
+        session_created = True
 
-    # ── Execute asynchronously in the session ────────────────────
-    # The actual command writes exit code to a sidecar file so
-    # the agent can check completion even after backgrounding.
-    # Session exec has no cwd parameter, so we cd explicitly.
-    exec_command = (
-        f"cd {_shell_quote(workdir)} && "
-        f"bash {script_path}; EC=$?; "
-        f"echo $EC > {_shell_quote(exit_path)}; "
-        f"(exit $EC)"
-    )
-    resp = await client.post(
-        _toolbox(valves, sandbox_id, f"/process/session/{session_id}/exec"),
-        headers=_headers(valves),
-        json={
-            "command": exec_command,
-            "runAsync": True,
-        },
-        timeout=30.0,
-    )
-    resp.raise_for_status()
+        # Session exec has no cwd parameter, so change directory explicitly.
+        exec_command = (
+            f"cd {_shell_quote(workdir)} && "
+            f"bash {script_path}; EC=$?; "
+            f"echo $EC > {_shell_quote(exit_path)}; "
+            f"(exit $EC)"
+        )
+        resp = await client.post(
+            _toolbox(valves, sandbox_id, f"/process/session/{session_id}/exec"),
+            headers=_headers(valves),
+            json={"command": exec_command, "runAsync": True}, timeout=30.0,
+        )
+        resp.raise_for_status()
+    except BaseException:
+        await _discard_bash_setup(
+            valves, sandbox_id, client, cmd_id, session_created,
+        )
+        raise
     session_cmd_id = resp.json().get("cmdId", "")
 
     # ── Foreground polling window ────────────────────────────────
@@ -2086,14 +2220,6 @@ async def _core_bash(valves, sandbox_id: str, client: httpx.AsyncClient, *,
             last_status_at = now
 
     # ── Fetch logs ──────────────────────────────────────────────
-    # NOTE: We intentionally do NOT delete the session here.
-    # Daytona session deletion kills all processes spawned within
-    # it, including children backgrounded with nohup/&. Since
-    # "nohup server & ... expose()" is the primary workflow for
-    # exposing services, deleting the session would silently kill
-    # the server the user just asked for. Sessions are lightweight
-    # and the sandbox itself is reaped on idle, so accumulation
-    # is not a practical concern.
     logs_resp = await client.get(
         _toolbox(valves, sandbox_id, f"/process/session/{session_id}/command/{session_cmd_id}/logs"),
         headers=_headers(valves),
@@ -2116,10 +2242,16 @@ async def _core_bash(valves, sandbox_id: str, client: httpx.AsyncClient, *,
 
     # Command finished within foreground window
     spill_path = log_path if was_truncated else None
-    return _format_bash_result(
+    formatted = _format_bash_result(
         output, exit_code, was_truncated, meta,
         spill_path=spill_path,
     )
+    await _reap_bash_commands(
+        valves, sandbox_id, client,
+        preserve_log_for=cmd_id if was_truncated else None,
+        release_lease_for=cmd_id,
+    )
+    return formatted
 
 
 # ── Background bash completion polling ───────────────────────────────
@@ -2187,6 +2319,9 @@ async def _poll_bg_bash(valves, sandbox_id: str, session_id: str,
                 logger.debug("bg-poll: failed to fetch log tail: %s", e)
 
             notice = _format_bg_bash_notice(cmd_id, exit_code, elapsed, tail)
+            await _reap_bash_commands(
+                valves, sandbox_id, poll_client, release_lease_for=cmd_id,
+            )
             _push_bg_notice(chat_state, chat_id, notice)
 
         except Exception as e:
@@ -3607,7 +3742,7 @@ class Tools:
     # lathe() method, NOT str.format().  Known placeholders today:
     # {tool_catalog}, {volume_note}, {destroy_volume_note}.  Unknown
     # placeholders pass through unchanged (no KeyError), and literal
-    # braces in shell/JSON/regex snippets (${VAR}, {sh,pid,log,exit},
+    # braces in shell/JSON/regex snippets (${VAR}, {pid,log,exit},
     # {"key":"value"}, {n,m}) are always safe.  If you add a new dynamic
     # placeholder, register a corresponding .replace() call in lathe().
     _MANPAGES: dict[str, str] = {
@@ -3678,7 +3813,7 @@ class Tools:
 
             Where CMD=/dev/shm/lathe/cmd/<id>:
 
-              CMD/sh    — the full wrapper script that was executed
+              CMD/sh    — the wrapper script, unlinked as soon as execution starts
               CMD/pid   — PID of the bash process (written before exec)
               CMD/log   — stdout+stderr, written live via tee
               CMD/exit  — exit code; present only when the process ends
@@ -3686,7 +3821,15 @@ class Tools:
             Absence of CMD/exit means the process is still running *or* the
             sandbox was restarted (in which case the PID is stale). To
             distinguish the two, check whether the PID is still alive.
-            Sidecars remain available until the sandbox stops or restarts.
+            While a command runs, its sidecar remains available for monitoring.
+            Once Lathe observes completion, it removes the wrapper, PID, exit status,
+            and log, then deletes the Daytona session unless a live shell-backgrounded
+            job still depends on it. A short lease prevents another OWUI worker from
+            racing the background completion poller. A retained service session is
+            reduced to only a PID marker and is
+            reaped by a later bash() call after the job exits. A truncated foreground
+            command's full log remains readable until the next bash() call. Sandbox
+            stop or restart clears all sidecars and sessions.
 
             ## Recipes
 
@@ -4153,7 +4296,8 @@ class Tools:
               is already done.
             - bash() output is truncated to the last 2000 lines / 50 KB. If
               truncated, the full output is available in the log file at
-              /dev/shm/lathe/cmd/<id>/log — use read() to inspect specific sections.
+              /dev/shm/lathe/cmd/<id>/log until the next bash() call — use read()
+              to inspect specific sections before running another command.
             - edit() requires an exact string match (including whitespace). If
               the match is ambiguous, provide more surrounding context or use
               replace_all=true.
