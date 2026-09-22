@@ -201,7 +201,7 @@ def test_launcher_pins_digest_and_exposes_only_loopback(tmp_path, monkeypatch):
     assert not any("type=volume" in arg for arg in run)
 
 
-def test_inner_monitor_writes_artifacts_as_host_user(monkeypatch):
+def test_inner_monitor_invokes_host_identity_contract(monkeypatch):
     import os
     import subprocess
 
