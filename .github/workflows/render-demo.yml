@@ -3,11 +3,6 @@ name: Render demo video
 on:
   schedule:
     - cron: '17 14 * * 3'
-  push:
-    paths:
-      - 'lathe.py'
-      - 'demo-video/**'
-      - '.github/workflows/render-demo.yml'
   workflow_dispatch:
 
 permissions:
