@@ -179,6 +179,29 @@ def test_journey_oracle_rejects_plausible_false_success(suite, fault):
         suite.verify_journey(output, "/copy.txt", "FRESH_CANARY")
 
 
+@pytest.mark.parametrize("expected", ["delegate", "read"])
+def test_single_dispatch_allows_only_optional_first_use_overview(suite, expected):
+    def call(name, arguments=None):
+        item = {"type": "function_call", "name": name}
+        if arguments is not None:
+            item["arguments"] = arguments
+        return item
+
+    suite.require_single_dispatch([call(expected)], expected)
+    suite.require_single_dispatch([call("lathe"), call(expected)], expected)
+    for invalid in (
+        [call("lathe")],
+        [call(expected), call("lathe")],
+        [call("lathe"), call("lathe"), call(expected)],
+        [call("lathe", '{"manpage":"services"}'), call(expected)],
+        [call("lathe", {"manpage": "version"}), call(expected)],
+        [call("bash"), call(expected)],
+        [call(expected), call(expected)],
+    ):
+        with pytest.raises(AssertionError):
+            suite.require_single_dispatch(invalid, expected)
+
+
 def test_launcher_pins_digest_and_exposes_only_loopback(tmp_path, monkeypatch):
     import subprocess
     commands = []
