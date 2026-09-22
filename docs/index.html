@@ -192,7 +192,7 @@
         <li><strong>User environment variables are credentials entrusted to the agent.</strong> Lathe injects them into model-directed shell commands. The model can print them, inspect process environments, or read generated command wrappers. Use scoped, revocable credentials.</li>
         <li><strong>Choose the preview's access mode.</strong> Every HTTP exposure is explicitly public or private. Public requests may fall back to a direct signed bearer URL if wrapping is unavailable; private requests require owner authentication and never downgrade to public. Upstream access defaults to 24 hours; the tool reports wrapper expiry separately.</li>
         <li><strong>Auto-delete and volume retention are separate.</strong> By default, neither the sandbox nor its persistent volume is automatically deleted. An admin can set sandbox deletion intervals, but a separately managed persistent volume survives sandbox destruction.</li>
-        <li><strong>Updates are manual.</strong> Open WebUI stores the uploaded copy of <code>lathe.py</code>. An installed deployment does not receive fixes merely because the GitHub repository changed.</li>
+        <li><strong>Updates are manual.</strong> Open WebUI stores the uploaded copy of <code>lathe.py</code>. An installed deployment does not receive fixes merely because the GitHub repository changed, and Lathe has no built-in update or notification mechanism.</li>
     </ul>
 </section>
 
@@ -205,10 +205,14 @@
         <a href="https://docs.openwebui.com/features/extensibility/plugin/tools/">Open WebUI Tool</a>.
         It runs inside Open WebUI and receives an account-wide Daytona API key, so
         administrators should review the source and record the installed version.
+        The installed copy reports it through <code>lathe(manpage="version")</code>;
+        administrators can also inspect the source frontmatter's <code>version:</code> field.
     </p>
     <p>
         The <a href="https://github.com/rndmcnlly/lathe#readme">administrator README</a>
-        covers installation, valves, security, and verification.
+        covers installation, manual updates, valves, security, and verification.
+        The <a href="https://github.com/rndmcnlly/lathe/blob/main/SECURITY.md">security policy</a>
+        defines support and explains how to obtain security fixes.
     </p>
 </section>
 
