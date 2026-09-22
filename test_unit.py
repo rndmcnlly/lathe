@@ -649,8 +649,7 @@ async def test_background_bash_poll_deadline(tools, http, clock, monkeypatch):
 
 
 @pytest.mark.parametrize("state,status", [
-    ("deleting", 200), ("deleted", 200), ("destroying", 200),
-    ("destroyed", 200), ("started", 404),
+    ("deleted", 200), ("destroyed", 200), ("started", 404),
 ])
 async def test_stale_discovery_never_resurrects_sandbox(tools, transport, state, status):
     tools.valves.auto_create_sandbox = False
@@ -668,6 +667,28 @@ async def test_stale_discovery_never_resurrects_sandbox(tools, transport, state,
         with pytest.raises(RuntimeError, match="provision externally"):
             await lathe._ensure_sandbox(tools.valves, USER["email"], client)
     assert calls == ["/sandbox", "/sandbox/sb"]
+
+
+@pytest.mark.parametrize("state", ["deleting", "destroying"])
+async def test_deletion_in_progress_never_creates_replacement(tools, transport, clock, state):
+    calls = []
+
+    def handler(request):
+        calls.append((request.method, request.url.path))
+        assert request.method == "GET"
+        if request.url.path == "/sandbox":
+            return httpx.Response(200, json=[{
+                "id": "sb", "labels": {"test": USER["email"]},
+            }])
+        assert request.url.path == "/sandbox/sb"
+        return httpx.Response(200, json={"id": "sb", "state": state})
+
+    async with httpx.AsyncClient(transport=transport(handler)) as client:
+        with pytest.raises(RuntimeError, match="Retry after deletion completes"):
+            await lathe._ensure_sandbox(tools.valves, USER["email"], client)
+
+    assert calls == [("GET", "/sandbox"), ("GET", "/sandbox/sb")]
+    assert clock() == 0
 
 
 @pytest.mark.parametrize("state,expected_warning,start_calls", [

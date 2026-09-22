@@ -127,7 +127,7 @@ async def _get_live_sandbox(valves, sandbox_id: str, client: httpx.AsyncClient) 
         return None
     resp.raise_for_status()
     sandbox = resp.json()
-    if sandbox.get("state") in ("deleting", "deleted", "destroying", "destroyed"):
+    if sandbox.get("state") in ("deleted", "destroyed"):
         return None
     return sandbox
 
