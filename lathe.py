@@ -3112,6 +3112,7 @@ def _build_code_server_ensure_script(install_root: str = _DURABLE_ROOT,
           VERSION=${{VERSION%-linux-amd64.tar.gz}}
           STAGED="$TMP/unpack/code-server-$VERSION-linux-amd64"
           test -x "$STAGED/bin/code-server"
+          rm -rf {_shell_quote(install_dir)}
           python3 -c 'import os,sys; os.rename(sys.argv[1], sys.argv[2])' \
             "$STAGED" {_shell_quote(install_dir)}
         fi

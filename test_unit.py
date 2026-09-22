@@ -1122,7 +1122,7 @@ async def test_ttyd_setup_failure_stops_before_preview(preview):
 
 
 @pytest.mark.parametrize("service", ["dufs", "code-server"])
-@pytest.mark.parametrize("fault", [None, "release", "digest"])
+@pytest.mark.parametrize("fault", [None, "stale", "release", "digest"])
 def test_managed_archive_install_is_release_consistent_verified_and_atomic(
     tmp_path, service, fault,
 ):
@@ -1153,6 +1153,13 @@ def test_managed_archive_install_is_release_consistent_verified_and_atomic(
         script = lathe._build_code_server_ensure_script(str(install_root), str(tmp_path))
         installed = install_root / "code-server/bin/code-server"
         port = 8080
+
+    if fault == "stale":
+        if service == "dufs":
+            installed.write_text("incomplete")
+        else:
+            installed.parent.mkdir(parents=True)
+            (installed.parent.parent / "partial-download").write_text("incomplete")
 
     archive = fixtures / "asset.tar.gz"
     with tarfile.open(archive, "w:gz") as bundle:
@@ -1207,7 +1214,7 @@ def test_managed_archive_install_is_release_consistent_verified_and_atomic(
     )
     calls = curl_log.read_text().splitlines()
     assert "/releases/latest" in calls[0]
-    if fault is None:
+    if fault in (None, "stale"):
         assert result.returncode == 0, result.stderr
         assert installed.read_text() == "#!/bin/sh\nexit 0\n"
         assert os.access(installed, os.X_OK)
