@@ -5,7 +5,7 @@ author_url: https://adamsmith.as
 description: Coding agent tools (lathe, bash, read, write, edit, glob, grep, view, interpret, delegate, onboard, expose, destroy) backed by per-user sandbox VMs with transparent lifecycle management.
 required_open_webui_version: 0.11.0
 requirements: httpx, httpx-ws, pydantic-ai-slim[openai]~=2.5, cachetools
-version: 0.30.4
+version: 0.30.5
 licence: MIT
 """
 
@@ -2820,17 +2820,22 @@ def _build_delegate_system_prompt(max_steps: int, *, has_volume: bool = True) ->
         "- /home/daytona/volume is persistent storage that survives sandbox destruction.\n"
         if has_volume else ""
     )
+    step_word = "step" if max_steps == 1 else "steps"
     return textwrap.dedent(f"""\
         You are a focused sub-agent with direct access to a Linux sandbox.
         You have been delegated a specific task by the calling agent.
 
         ## Step budget
 
-        You have {max_steps} steps total. Each step is one inference call (thinking +
+        You have {max_steps} {step_word} total. Each step is one inference call (thinking +
         tool calls count as one step). When you stop calling tools and produce a
         text response, that is your final step.
 
         Plan accordingly:
+        - With a one-step budget, finish directly from the task and reference files.
+          No tools are available. If the task requires sandbox access or changes,
+          state that it cannot be completed with max_steps=1 and that the caller
+          should retry with max_steps>=2. Do not claim unperformed work was completed.
         - For a {max_steps}-step budget, reserve at least the last step for writing
           your summary. Do not start new investigation branches when you are near
           the limit.
@@ -4008,6 +4013,12 @@ class Tools:
             it can prioritize producing a useful summary over starting new
             work.
 
+            A one-step delegation is context-only: the sub-agent receives the task
+            and any context_files, but no tools. Use max_steps=1 for single-shot
+            analysis of supplied material. Tasks requiring sandbox inspection or
+            changes need max_steps>=2 so one request can call tools and another can
+            produce the final response.
+
             ## Foreground vs. background execution
 
             Like bash(), delegate() has a foreground window controlled by
@@ -4804,7 +4815,7 @@ class Tools:
         file paths for monitoring, exactly like bash() does for long commands.
         :param task: What the sub-agent should accomplish. Be specific — it cannot ask clarifying questions. Include any context (error messages, prior findings, instructions) directly in the task description.
         :param context_files: Absolute sandbox file paths to inject into the sub-agent's prompt (e.g. AGENTS.md, SKILL.md, config files). Fetched at delegation time — the sub-agent sees their contents without spending steps reading them.
-        :param max_steps: Maximum inference calls the sub-agent may make (default: 10, max: 30).
+        :param max_steps: Maximum inference calls the sub-agent may make (default: 10, max: 30). With max_steps=1, it receives the task and context_files but no tools, so it must answer directly from that supplied context. Use at least 2 for tasks requiring sandbox access or changes.
         :param foreground_seconds: Seconds to wait before auto-backgrounding (default: 30, max: 300). Set 0 for immediate background (fire-and-forget). Omit or set -1 to use the default.
         """
         type_err = _check_tool_params(
@@ -4910,13 +4921,15 @@ class Tools:
                 # _tool_context closes `client` when _run() returns, so tools
                 # and sidecars use a client retained by the delegate task.
                 bg_client = await agent_clients.enter_async_context(httpx.AsyncClient())
-                tools = _build_delegate_tools(
-                    self.valves, sandbox_id, bg_client, user_pairs,
-                    chat_state=self._chat_state, chat_id=__chat_id__,
-                )
-
                 user_message = _build_delegate_prompt(task, file_sections)
                 clamped_steps = max(1, min(30, max_steps))
+                tools = (
+                    _build_delegate_tools(
+                        self.valves, sandbox_id, bg_client, user_pairs,
+                        chat_state=self._chat_state, chat_id=__chat_id__,
+                    )
+                    if clamped_steps > 1 else []
+                )
                 agent = Agent(
                     model,
                     system_prompt=_build_delegate_system_prompt(
