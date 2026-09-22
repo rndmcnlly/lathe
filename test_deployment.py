@@ -367,12 +367,20 @@ def tool_outputs(output):
 
 def require_single_dispatch(output, expected):
     """Require one target tool, allowing Lathe's advised first-use overview."""
-    names = [call.get("name") for call in tool_calls(output)]
+    calls = tool_calls(output)
+    names = [call.get("name") for call in calls]
+    lathe_calls = [call for call in calls if call.get("name") == "lathe"]
+    overview_only = True
+    if lathe_calls:
+        args = lathe_calls[0].get("arguments") or "{}"
+        args = json.loads(args) if isinstance(args, str) else args
+        overview_only = args.get("manpage", "overview") == "overview"
     require(
         names.count(expected) == 1
         and names.count("lathe") <= 1
         and names[-1:] == [expected]
-        and set(names) <= {"lathe", expected},
+        and set(names) <= {"lathe", expected}
+        and overview_only,
         output,
     )
 

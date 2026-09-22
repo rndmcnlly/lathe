@@ -181,8 +181,11 @@ def test_journey_oracle_rejects_plausible_false_success(suite, fault):
 
 @pytest.mark.parametrize("expected", ["delegate", "read"])
 def test_single_dispatch_allows_only_optional_first_use_overview(suite, expected):
-    def call(name):
-        return {"type": "function_call", "name": name}
+    def call(name, arguments=None):
+        item = {"type": "function_call", "name": name}
+        if arguments is not None:
+            item["arguments"] = arguments
+        return item
 
     suite.require_single_dispatch([call(expected)], expected)
     suite.require_single_dispatch([call("lathe"), call(expected)], expected)
@@ -190,6 +193,8 @@ def test_single_dispatch_allows_only_optional_first_use_overview(suite, expected
         [call("lathe")],
         [call(expected), call("lathe")],
         [call("lathe"), call("lathe"), call(expected)],
+        [call("lathe", '{"manpage":"services"}'), call(expected)],
+        [call("lathe", {"manpage": "version"}), call(expected)],
         [call("bash"), call(expected)],
         [call(expected), call(expected)],
     ):
