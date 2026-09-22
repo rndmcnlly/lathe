@@ -5,7 +5,7 @@ author_url: https://adamsmith.as
 description: Coding agent tools (lathe, bash, read, write, edit, glob, grep, view, interpret, delegate, onboard, expose, destroy) backed by per-user sandbox VMs with transparent lifecycle management.
 required_open_webui_version: 0.11.0
 requirements: httpx, httpx-ws, pydantic-ai-slim[openai]~=2.5, cachetools
-version: 0.30.1
+version: 0.30.2
 licence: MIT
 """
 
@@ -3214,12 +3214,13 @@ async def _ensure_sandbox(valves, email: str, client: httpx.AsyncClient, emitter
         # invariant. _parse_create_overrides already rejects those keys,
         # but forcing them here is belt-and-suspenders.
         overrides = _parse_create_overrides(valves.sandbox_create_overrides)
+        sandbox_name = f"{label_key}/{email}"
         create_json: dict = {
             "autoStopInterval": valves.auto_stop_minutes,
             "autoArchiveInterval": valves.auto_archive_minutes,
             "autoDeleteInterval": valves.auto_delete_minutes,
             **overrides,
-            "name": f"{label_key}/{email}",
+            "name": sandbox_name,
             "labels": {label_key: email},
         }
         if valves.persistent_volume:
@@ -3237,9 +3238,39 @@ async def _ensure_sandbox(valves, email: str, client: httpx.AsyncClient, emitter
             json=create_json,
             timeout=30.0,
         )
-        resp.raise_for_status()
-        sandbox = resp.json()
-        warning = "[Sandbox was created — this is a fresh environment with no prior files]"
+        if resp.status_code == 409:
+            # Daytona's control-plane source makes (organizationId, name) unique
+            # and translates duplicate inserts to 409; labels only have a
+            # non-unique GIN index.
+            # Evidence: https://github.com/daytonaio/daytona/blob/b5a5d9e78d76c8bcf351f2049620250e0f34eea4/apps/api/src/sandbox/entities/sandbox.entity.ts#L31-L55
+            # and https://github.com/daytonaio/daytona/blob/b5a5d9e78d76c8bcf351f2049620250e0f34eea4/apps/api/src/sandbox/services/sandbox.service.ts#L711-L713
+            # Resolve the winning cross-process create by that unique name, not
+            # the eventually consistent label index that allowed the race.
+            lookup = await client.get(
+                _api(valves, f"/sandbox/{urllib.parse.quote(sandbox_name, safe='')}"),
+                headers=_headers(valves),
+                timeout=30.0,
+            )
+            if lookup.status_code == 404:
+                raise RuntimeError(
+                    "Sandbox creation conflicted, but Daytona did not return the "
+                    "winning sandbox by its unique name. Retry this tool call; if "
+                    "the conflict persists, ask the Daytona administrator to inspect "
+                    f"sandbox name {sandbox_name}."
+                )
+            lookup.raise_for_status()
+            sandbox = lookup.json()
+            if (sandbox.get("name") != sandbox_name
+                    or sandbox.get("labels", {}).get(label_key) != email):
+                raise RuntimeError(
+                    f"Daytona sandbox name {sandbox_name} is already in use without "
+                    f"the expected {label_key}={email} association. Lathe will not "
+                    "select it. Ask the Daytona administrator to reconcile that name."
+                )
+        else:
+            resp.raise_for_status()
+            sandbox = resp.json()
+            warning = "[Sandbox was created — this is a fresh environment with no prior files]"
 
     sandbox_id = sandbox["id"]
     state = sandbox.get("state", "unknown")
