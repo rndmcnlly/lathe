@@ -531,6 +531,15 @@ async def test_completed_bash_retention_is_bounded(tools, monkeypatch, tmp_path,
     monkeypatch.setattr(lathe, "_EPHEMERAL_ROOT", str(root))
     command_root = root / "cmd"
     command_root.mkdir(parents=True)
+    proc_root = tmp_path / "proc"
+    proc_root.mkdir()
+    original_reap_builder = lathe._build_bash_reap_script
+    monkeypatch.setattr(
+        lathe, "_build_bash_reap_script",
+        lambda preserve_log_for=None, release_lease_for=None: original_reap_builder(
+            preserve_log_for, release_lease_for, str(proc_root),
+        ),
+    )
 
     def sidecar(command_id, *, pid="", spill=False, lease=False):
         directory = command_root / command_id
@@ -546,17 +555,31 @@ async def test_completed_bash_retention_is_bounded(tools, monkeypatch, tmp_path,
         return directory
 
     ordinary = sidecar("ordinary")
-    retained = sidecar("retained", pid=f"{os.getpid()}\n")
+    retained_pid = os.getpid()
+    retained_start = "123456"
+    retained_proc = proc_root / str(retained_pid)
+    retained_proc.mkdir()
+    retained_proc.joinpath("stat").write_text(
+        f"{retained_pid} (test process) " + " ".join(
+            ["S"] + ["0"] * 18 + [retained_start]
+        )
+    )
+    retained = sidecar("retained", pid=f"{retained_pid}:{retained_start}\n")
     old_spill = sidecar("old-spill", spill=True)
     leased = sidecar("leased", lease=True)
     deleted_sessions = []
+    delete_attempts = {}
 
     def handler(request):
         if (request.method, request.url.path) == ("POST", "/sb/process/execute"):
             command = shlex.split(json.loads(request.content)["command"])
             return httpx.Response(200, json={"exitCode": 0, "result": run_script(command[2])})
         if request.method == "DELETE" and "/process/session/" in request.url.path:
-            deleted_sessions.append(request.url.path.rsplit("/", 1)[-1])
+            session = request.url.path.rsplit("/", 1)[-1]
+            delete_attempts[session] = delete_attempts.get(session, 0) + 1
+            if session == "lathe-cmd-ordinary" and delete_attempts[session] == 1:
+                return httpx.Response(503)
+            deleted_sessions.append(session)
             return httpx.Response(204)
         assert (request.method, request.url.path) == ("DELETE", "/sb/files/")
         shutil.rmtree(request.url.params["path"])
@@ -564,23 +587,37 @@ async def test_completed_bash_retention_is_bounded(tools, monkeypatch, tmp_path,
 
     async with httpx.AsyncClient(transport=transport(handler)) as client:
         await lathe._reap_bash_commands(tools.valves, "sb", client)
-        assert not ordinary.exists() and not old_spill.exists()
+        assert {p.name for p in ordinary.iterdir()} == {"reap"}
+        assert not old_spill.exists()
         assert leased.exists()
         assert {p.name for p in retained.iterdir()} == {"keep"}
         assert "lathe-cmd-retained" not in deleted_sessions
-        assert {"lathe-cmd-ordinary", "lathe-cmd-old-spill"} <= set(deleted_sessions)
+        assert "lathe-cmd-old-spill" in deleted_sessions
+
+        await lathe._reap_bash_commands(tools.valves, "sb", client)
+        assert not ordinary.exists()
+        assert delete_attempts["lathe-cmd-ordinary"] == 2
 
         current = sidecar("current")
         await lathe._reap_bash_commands(
             tools.valves, "sb", client, preserve_log_for="current",
         )
-        assert {p.name for p in current.iterdir()} == {"log", "spill"}
+        assert {p.name for p in current.iterdir()} == {"log", "spill", "reap"}
         assert "plaintext" not in "".join(p.read_text() for p in current.iterdir())
 
         await lathe._reap_bash_commands(
             tools.valves, "sb", client, release_lease_for="leased",
         )
         assert not leased.exists()
+
+        # A reused PID with a different process start time is not retained.
+        retained_proc.joinpath("stat").write_text(
+            f"{retained_pid} (replacement) " + " ".join(
+                ["S"] + ["0"] * 18 + ["999999"]
+            )
+        )
+        await lathe._reap_bash_commands(tools.valves, "sb", client)
+        assert not retained.exists()
 
         await lathe._reap_bash_commands(tools.valves, "sb", client)
         assert not current.exists()

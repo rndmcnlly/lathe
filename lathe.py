@@ -1915,7 +1915,13 @@ def _build_bash_script(command: str, user_pairs: list[tuple[str, str]],
         + "_lathe_record_jobs() {\n"
         + "  _lathe_ec=$?\n"
         + f"  : > {_shell_quote(keep_path)}\n"
-        + f"  for _lathe_pid in $(jobs -pr); do kill -0 \"$_lathe_pid\" 2>/dev/null && echo \"$_lathe_pid\" >> {_shell_quote(keep_path)}; done\n"
+        + "  for _lathe_pid in $(jobs -pr); do\n"
+        + "    if kill -0 \"$_lathe_pid\" 2>/dev/null && test -r \"/proc/$_lathe_pid/stat\"; then\n"
+        + "      _lathe_stat=$(cat \"/proc/$_lathe_pid/stat\")\n"
+        + "      read -ra _lathe_fields <<< \"${_lathe_stat##*) }\"\n"
+        + f"      echo \"$_lathe_pid:${{_lathe_fields[19]}}\" >> {_shell_quote(keep_path)}\n"
+        + "    fi\n"
+        + "  done\n"
         + "  return $_lathe_ec\n"
         + "}\n"
         + "trap _lathe_record_jobs EXIT\n"
@@ -1926,17 +1932,19 @@ def _build_bash_script(command: str, user_pairs: list[tuple[str, str]],
     )
 
 
-_BASH_COMPLETION_LEASE_SECONDS = 660
+_BASH_COMPLETION_LEASE_SECONDS = 960
 
 
 def _build_bash_reap_script(preserve_log_for: str | None = None,
-                            release_lease_for: str | None = None) -> str:
+                            release_lease_for: str | None = None,
+                            proc_root: str = "/proc") -> str:
     """Build the sandbox-side completed-command scrubber."""
     return textwrap.dedent(f"""\
         import os
         import time
 
         root = {_EPHEMERAL_ROOT + '/cmd'!r}
+        proc_root = {proc_root!r}
         preserve = {preserve_log_for!r}
         release = {release_lease_for!r}
         if os.path.isdir(root):
@@ -1955,21 +1963,26 @@ def _build_bash_reap_script(preserve_log_for: str | None = None,
                     except OSError:
                         pass
                 if not any(os.path.isfile(os.path.join(command_dir, name))
-                           for name in ("exit", "keep", "spill")):
+                           for name in ("exit", "keep", "spill", "reap")):
                     continue
                 keep_path = os.path.join(command_dir, "keep")
                 live = False
                 try:
                     with open(keep_path) as f:
-                        pids = [int(line) for line in f if line.strip().isdigit()]
+                        identities = [line.strip().split(":", 1) for line in f
+                                      if ":" in line]
                 except OSError:
-                    pids = []
-                for pid in pids:
+                    identities = []
+                for raw_pid, expected_start in identities:
                     try:
+                        pid = int(raw_pid)
                         os.kill(pid, 0)
-                        live = True
-                        break
-                    except (OSError, ValueError):
+                        stat = open(os.path.join(proc_root, str(pid), "stat")).read()
+                        fields = stat[stat.rfind(")") + 2:].split()
+                        if len(fields) > 19 and fields[19] == expected_start:
+                            live = True
+                            break
+                    except (OSError, ValueError, IndexError):
                         pass
                 for name in ("sh", "pid", "exit"):
                     try:
@@ -1991,6 +2004,7 @@ def _build_bash_reap_script(preserve_log_for: str | None = None,
                         os.unlink(keep_path)
                     except OSError:
                         pass
+                    open(os.path.join(command_dir, "reap"), "a").close()
                     print("delete " + command_id)
         """)
 
