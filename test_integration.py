@@ -23,7 +23,7 @@ from httpx_ws import aconnect_ws
 from dotenv import load_dotenv
 
 from lathe import (
-    Tools, _api, _extract_sandbox_list, _headers, _site_port,
+    Tools, _api, _extract_sandbox_list, _headers, _site_port, _toolbox,
     _CS_BIN, _CS_ENSURE_SCRIPT, _DUFS_BIN, _DUFS_ENSURE_SCRIPT,
     _TTYD_ENSURE_SCRIPT, _TTYD_PORT,
 )
@@ -214,6 +214,83 @@ async def main():
         require("Background job completed" in output, output)
         require("background-finished" in output, output)
 
+    async def bounded_command_retention():
+        output = await tools.bash(
+            "nohup python3 -m http.server 8766 >/tmp/lathe-retention-http.log 2>&1 &",
+            **ctx,
+        )
+        require("Exit code:" not in output, output)
+        for index in range(20):
+            output = await tools.bash(f"printf 'retention-{index}'", **ctx)
+            require(f"retention-{index}" in output, output)
+
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                _api(tools.valves, "/sandbox"),
+                params={"labels": json.dumps({DEPLOYMENT_LABEL: TEST_EMAIL})},
+                headers=_headers(tools.valves), timeout=30,
+            )
+            response.raise_for_status()
+            sandbox = next(
+                item for item in _extract_sandbox_list(response.json())
+                if item.get("labels", {}).get(DEPLOYMENT_LABEL) == TEST_EMAIL
+            )
+            sandbox_id = sandbox["id"]
+
+            response = await client.get(
+                _toolbox(tools.valves, sandbox_id, "/process/session"),
+                headers=_headers(tools.valves), timeout=30,
+            )
+            response.raise_for_status()
+            sessions = [
+                session for session in response.json()
+                if str(session.get("sessionId", session.get("id", ""))).startswith("lathe-cmd-")
+            ]
+            inspect_script = (
+                "import json,os; root='/dev/shm/lathe/cmd'; "
+                "print(json.dumps({d: sorted(os.listdir(root+'/'+d)) for d in os.listdir(root)} "
+                "if os.path.isdir(root) else {}))"
+            )
+            response = await client.post(
+                _toolbox(tools.valves, sandbox_id, "/process/execute"),
+                headers=_headers(tools.valves),
+                json={"command": f"python3 -c {json.dumps(inspect_script)}", "timeout": 5000},
+                timeout=15,
+            )
+            response.raise_for_status()
+            sidecars = json.loads(response.json()["result"].strip())
+            require(len(sessions) == 1, f"expected one service session, got {len(sessions)}")
+            require(len(sidecars) == 1 and next(iter(sidecars.values())) == ["keep"], sidecars)
+            print(f"  measured after 21 completed commands: {len(sessions)} retained session, {len(sidecars)} minimal sidecar")
+
+            response = await client.post(
+                _toolbox(tools.valves, sandbox_id, "/process/execute"),
+                headers=_headers(tools.valves),
+                json={"command": "curl -fsS http://127.0.0.1:8766 >/dev/null", "timeout": 5000},
+                timeout=15,
+            )
+            response.raise_for_status()
+            require(response.json().get("exitCode") == 0, "retained HTTP service was killed")
+            await client.post(
+                _toolbox(tools.valves, sandbox_id, "/process/execute"),
+                headers=_headers(tools.valves),
+                json={"command": "pkill -f '[h]ttp.server 8766'; sleep 1", "timeout": 5000},
+                timeout=15,
+            )
+
+        await tools.bash("true", **ctx)
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                _toolbox(tools.valves, sandbox_id, "/process/session"),
+                headers=_headers(tools.valves), timeout=30,
+            )
+            response.raise_for_status()
+            sessions = [
+                session for session in response.json()
+                if session.get("sessionId", "").startswith("lathe-cmd-")
+            ]
+            require(not sessions, f"exited service session was not reaped: {sessions}")
+
     async def expose_contract():
         import re
         await tools.bash(
@@ -352,6 +429,7 @@ async def main():
             ("core tool roundtrip", core_tool_roundtrip),
             ("view tool roundtrip", view_tool_roundtrip),
             ("onboarding and persistent interpreter", onboarding_and_interpreter),
+            ("bounded command retention", bounded_command_retention),
             ("background completion notice", background_completion_notice),
             ("signed preview URL", expose_contract),
             ("parallel static sites", parallel_static_sites),

@@ -14,6 +14,7 @@ import os
 from pathlib import Path
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import tarfile
@@ -511,12 +512,140 @@ def test_bash_script_preserves_environment_and_failure(tmp_path):
     pairs = lathe._parse_env_vars(json.dumps({"SECRET": value}))
     script = lathe._build_bash_script(
         'printf "%s" "$SECRET"; false; printf should-not-run', pairs,
-        str(tmp_path / "pid"), str(tmp_path / "log"))
-    result = subprocess.run(["bash"], input=script, text=True, capture_output=True, timeout=10)
+        str(tmp_path / "pid"), str(tmp_path / "log"), str(tmp_path / "keep"),
+        str(tmp_path / "lease"))
+    script_path = tmp_path / "wrapper"
+    script_path.write_text(script)
+    result = subprocess.run(["bash", str(script_path)], text=True, capture_output=True, timeout=10)
     assert result.returncode != 0
     assert result.stdout == value
     assert (tmp_path / "log").read_text() == value
+    assert not script_path.exists()
+    assert (tmp_path / "keep").read_text() == ""
+    assert (tmp_path / "lease").is_file()
     # macOS ships Bash 3 (no BASHPID); Linux sidecar PIDs are a live-suite concern.
+
+
+async def test_completed_bash_retention_is_bounded(tools, monkeypatch, tmp_path, transport):
+    root = tmp_path / "lathe"
+    monkeypatch.setattr(lathe, "_EPHEMERAL_ROOT", str(root))
+    command_root = root / "cmd"
+    command_root.mkdir(parents=True)
+    proc_root = tmp_path / "proc"
+    proc_root.mkdir()
+    original_reap_builder = lathe._build_bash_reap_script
+    monkeypatch.setattr(
+        lathe, "_build_bash_reap_script",
+        lambda preserve_log_for=None, release_lease_for=None: original_reap_builder(
+            preserve_log_for, release_lease_for, str(proc_root),
+        ),
+    )
+
+    def sidecar(command_id, *, pid="", spill=False, lease=False):
+        directory = command_root / command_id
+        directory.mkdir()
+        (directory / "exit").write_text("0\n")
+        (directory / "keep").write_text(pid)
+        (directory / "sh").write_text("export SECRET=plaintext\n")
+        (directory / "log").write_text("command output\n")
+        if spill:
+            (directory / "spill").touch()
+        if lease:
+            (directory / "lease").touch()
+        return directory
+
+    ordinary = sidecar("ordinary")
+    retained_pid = os.getpid()
+    retained_start = "123456"
+    retained_proc = proc_root / str(retained_pid)
+    retained_proc.mkdir()
+    retained_proc.joinpath("stat").write_text(
+        f"{retained_pid} (test process) " + " ".join(
+            ["S"] + ["0"] * 18 + [retained_start]
+        )
+    )
+    retained = sidecar("retained", pid=f"{retained_pid}:{retained_start}\n")
+    old_spill = sidecar("old-spill", spill=True)
+    leased = sidecar("leased", lease=True)
+    deleted_sessions = []
+    delete_attempts = {}
+
+    def handler(request):
+        if (request.method, request.url.path) == ("POST", "/sb/process/execute"):
+            command = shlex.split(json.loads(request.content)["command"])
+            return httpx.Response(200, json={"exitCode": 0, "result": run_script(command[2])})
+        if request.method == "DELETE" and "/process/session/" in request.url.path:
+            session = request.url.path.rsplit("/", 1)[-1]
+            delete_attempts[session] = delete_attempts.get(session, 0) + 1
+            if session == "lathe-cmd-ordinary" and delete_attempts[session] == 1:
+                return httpx.Response(503)
+            deleted_sessions.append(session)
+            return httpx.Response(204)
+        assert (request.method, request.url.path) == ("DELETE", "/sb/files/")
+        shutil.rmtree(request.url.params["path"])
+        return httpx.Response(204)
+
+    async with httpx.AsyncClient(transport=transport(handler)) as client:
+        await lathe._reap_bash_commands(tools.valves, "sb", client)
+        assert {p.name for p in ordinary.iterdir()} == {"reap"}
+        assert not old_spill.exists()
+        assert leased.exists()
+        assert {p.name for p in retained.iterdir()} == {"keep"}
+        assert "lathe-cmd-retained" not in deleted_sessions
+        assert "lathe-cmd-old-spill" in deleted_sessions
+
+        await lathe._reap_bash_commands(tools.valves, "sb", client)
+        assert not ordinary.exists()
+        assert delete_attempts["lathe-cmd-ordinary"] == 2
+
+        current = sidecar("current")
+        await lathe._reap_bash_commands(
+            tools.valves, "sb", client, preserve_log_for="current",
+        )
+        assert {p.name for p in current.iterdir()} == {"log", "spill", "reap"}
+        assert "plaintext" not in "".join(p.read_text() for p in current.iterdir())
+
+        await lathe._reap_bash_commands(
+            tools.valves, "sb", client, release_lease_for="leased",
+        )
+        assert not leased.exists()
+
+        # A reused PID with a different process start time is not retained.
+        retained_proc.joinpath("stat").write_text(
+            f"{retained_pid} (replacement) " + " ".join(
+                ["S"] + ["0"] * 18 + ["999999"]
+            )
+        )
+        await lathe._reap_bash_commands(tools.valves, "sb", client)
+        assert not retained.exists()
+
+        await lathe._reap_bash_commands(tools.valves, "sb", client)
+        assert not current.exists()
+
+
+async def test_bash_launch_failure_discards_session_and_wrapper(tools, sandbox, http):
+    requests = []
+
+    def handler(request):
+        requests.append((request.method, request.url.path))
+        if (request.method, request.url.path) == ("POST", "/sb/process/execute"):
+            return httpx.Response(200, json={"exitCode": 0, "result": ""})
+        if (request.method, request.url.path) == ("POST", "/sb/files/upload"):
+            return httpx.Response(200)
+        if (request.method, request.url.path) == ("POST", "/sb/process/session"):
+            return httpx.Response(201)
+        if request.method == "POST" and request.url.path.endswith("/exec"):
+            return httpx.Response(500, text="launch failed")
+        if request.method == "DELETE":
+            return httpx.Response(204)
+        pytest.fail(f"unexpected request: {request.method} {request.url.path}")
+
+    http(handler)
+    result = await tools.bash("true", __user__=USER)
+    assert result.startswith("API error: HTTP 500")
+    assert any(method == "DELETE" and path == "/sb/files/" for method, path in requests)
+    assert any(method == "DELETE" and "/process/session/lathe-cmd-" in path
+               for method, path in requests)
 
 
 @pytest.mark.parametrize("text", ["", "short\ntext", "x\n" * 3000, ("é" * 100 + "\n") * 600])
@@ -626,7 +755,7 @@ async def test_background_bash_poll_delivers_once(tools, sandbox, http, clock):
         return httpx.Response(200, text="final output")
     http(handler)
     await lathe._poll_bg_bash(tools.valves, "sb", "session", "cmd", "job", 0, tools._chat_state, "chat")
-    assert len(requests) == 4
+    assert len(requests) == 5
     # Observe delivery through an ordinary wrapper, not by draining its queue.
     assert await tools.read("/file", __user__=USER, __chat_id__="other") == "caller output"
     result = await tools.read("/file", __user__=USER, __chat_id__="chat")
