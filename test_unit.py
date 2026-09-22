@@ -1529,6 +1529,67 @@ async def test_delegate_setup_exception_closes_every_owned_client(
     assert [client.close_calls for client in clients] == [1] * len(clients)
 
 
+async def test_one_step_delegate_answers_from_context_without_tools(
+    tools, sandbox, http, monkeypatch, tmp_path,
+):
+    source = tmp_path / "large-context.txt"
+    source.write_text("decisive evidence\n")
+    root = tmp_path / "sidecars"
+    monkeypatch.setattr(lathe, "_EPHEMERAL_ROOT", str(root))
+    tools._chat_state["chat"] = {"init": True, "pending": []}
+
+    def execute(request):
+        if request.method == "GET" and request.url.path == "/sb/files/download":
+            assert request.url.params["path"] == str(source)
+            return httpx.Response(200, text=source.read_text())
+        assert (request.method, request.url.path) == ("POST", "/sb/process/execute")
+        command = shlex.split(json.loads(request.content)["command"])
+        return httpx.Response(200, json={"exitCode": 0, "result": run_script(command[2])})
+
+    clients = http(execute)
+    requests = []
+
+    async def app(scope, receive, send):
+        body = b""
+        while True:
+            message = await receive()
+            body += message.get("body", b"")
+            if not message.get("more_body"):
+                break
+        payload = json.loads(body)
+        requests.append(payload)
+        assert not payload.get("tools")
+        messages = json.dumps(payload["messages"])
+        assert "decisive evidence" in messages
+        assert "With a one-step budget" in messages
+        response = {
+            "id": "completion", "object": "chat.completion", "created": 0,
+            "model": "selected-model", "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "context-only answer"},
+                "finish_reason": "stop",
+            }],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+        }
+        await send({"type": "http.response.start", "status": 200,
+                    "headers": [(b"content-type", b"application/json")]})
+        await send({"type": "http.response.body", "body": json.dumps(response).encode()})
+
+    result = await tools.delegate(
+        "Analyze the supplied file", context_files=[str(source)], max_steps=1,
+        foreground_seconds=5, __user__=USER, __chat_id__="chat",
+        __model__={"id": "selected-model"}, __request__=delegate_request(app),
+    )
+
+    assert "context-only answer" in result
+    assert "1 step(s), 0 tool call(s)" in result
+    assert len(requests) == 1
+    sidecars = next((root / "delegate").iterdir())
+    assert (sidecars / "result").read_text() == "context-only answer"
+    assert json.loads((sidecars / "usage").read_text())["tool_calls"] == 0
+    assert [client.close_calls for client in clients[:3]] == [1, 1, 1]
+
+
 @pytest.mark.parametrize("background,fail", [(False, False), (True, False), (True, True)])
 async def test_real_delegate_execution_and_completion(tools, sandbox, http, monkeypatch, tmp_path, background, fail):
     """Real Agent, tool cores and files; observe completion as the caller does."""
