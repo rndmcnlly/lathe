@@ -174,22 +174,68 @@ def test_delegate_interface(module):
                        tool.tool_def.parameters_json_schema["properties"].values())
 
 
-@pytest.mark.parametrize("name,kwargs", [
-    ("read", {"path": "/x", "start": "2"}),
-    ("edit", {"path": "/x", "old_string": "a", "new_string": "b", "replace_all": "false"}),
-    ("glob", {"pattern": "*", "max_lines": "4"}),
-    ("grep", {"pattern": "x", "max_lines": []}),
-    ("interpret", {"code": "1", "timeout": "2"}),
-    ("bash", {"command": "true", "foreground_seconds": "0"}),
-    ("delegate", {"task": "x", "context_files": "/x"}),
-    ("delegate", {"task": "x", "max_steps": "2"}),
+@pytest.mark.parametrize("name,kwargs,location,expected,actual", [
+    ("lathe", {"manpage": 7}, "manpage", "str", "int"),
+    ("onboard", {"path": 7}, "path", "str", "int"),
+    ("bash", {"command": 7}, "command", "str", "int"),
+    ("bash", {"command": "true", "workdir": 7}, "workdir", "str", "int"),
+    ("bash", {"command": "true", "foreground_seconds": True}, "foreground_seconds", "int", "bool"),
+    ("read", {"path": 7}, "path", "str", "int"),
+    ("read", {"path": "/x", "start": True}, "start", "int", "bool"),
+    ("read", {"path": "/x", "stop": True}, "stop", "int", "bool"),
+    ("write", {"path": 7, "content": "x"}, "path", "str", "int"),
+    ("write", {"path": "/x", "content": 7}, "content", "str", "int"),
+    ("edit", {"path": 7, "old_string": "a", "new_string": "b"}, "path", "str", "int"),
+    ("edit", {"path": "/x", "old_string": 7, "new_string": "b"}, "old_string", "str", "int"),
+    ("edit", {"path": "/x", "old_string": "a", "new_string": 7}, "new_string", "str", "int"),
+    ("edit", {"path": "/x", "old_string": "a", "new_string": "b", "replace_all": 0}, "replace_all", "bool", "int"),
+    ("glob", {"pattern": 7}, "pattern", "str", "int"),
+    ("glob", {"pattern": "*", "max_lines": True}, "max_lines", "int", "bool"),
+    ("grep", {"pattern": 7}, "pattern", "str", "int"),
+    ("grep", {"pattern": "x", "files": 7}, "files", "str", "int"),
+    ("grep", {"pattern": "x", "max_lines": True}, "max_lines", "int", "bool"),
+    ("interpret", {"code": 7}, "code", "str", "int"),
+    ("interpret", {"code": "1", "timeout": True}, "timeout", "int", "bool"),
+    ("view", {"path": 7}, "path", "str", "int"),
+    ("delegate", {"task": 7}, "task", "str", "int"),
+    ("delegate", {"task": "x", "context_files": "/x"}, "context_files", "list[str]", "str"),
+    ("delegate", {"task": "x", "context_files": [7]}, "context_files[0]", "str", "int"),
+    ("delegate", {"task": "x", "max_steps": True}, "max_steps", "int", "bool"),
+    ("delegate", {"task": "x", "foreground_seconds": True}, "foreground_seconds", "int", "bool"),
+    ("expose", {"target": 7, "access": "private"}, "target", "str", "int"),
+    ("expose", {"target": "dufs", "access": 7}, "access", "str", "int"),
+    ("expose", {"target": "dufs", "access": "private", "tag": 7}, "tag", "str", "int"),
 ])
-async def test_bad_types_rejected_before_io(module, monkeypatch, name, kwargs):
+async def test_bad_types_rejected_before_io(
+    module, monkeypatch, name, kwargs, location, expected, actual,
+):
     context = AsyncMock(side_effect=AssertionError("invalid input reached I/O"))
     monkeypatch.setattr(module, "_tool_context", context)
     result = await getattr(module.Tools(), name)(**kwargs)
-    assert "expected type" in result
+    assert result == f"Error: parameter '{location}' expected type {expected}, got {actual}"
+    assert "7" not in result
     context.assert_not_called()
+
+
+@pytest.mark.parametrize("name,kwargs", [
+    ("onboard", {"path": "/workspace"}),
+    ("bash", {"command": "true", "workdir": "/workspace", "foreground_seconds": 0}),
+    ("read", {"path": "/x", "start": 1, "stop": 0}),
+    ("edit", {"path": "/x", "old_string": "a", "new_string": "b", "replace_all": False}),
+    ("view", {"path": "/image"}),
+    ("delegate", {"task": "x", "context_files": ["/x"], "max_steps": 1,
+                  "foreground_seconds": 0}),
+    ("expose", {"target": "dufs", "access": "private", "tag": "files"}),
+])
+async def test_valid_types_pass_wrapper_boundary(module, monkeypatch, name, kwargs):
+    context = AsyncMock(return_value="accepted")
+    monkeypatch.setattr(module, "_tool_context", context)
+    assert await getattr(module.Tools(), name)(**kwargs) == "accepted"
+    context.assert_awaited_once()
+
+
+async def test_valid_lathe_string_passes_wrapper_boundary(module):
+    assert "Lathe toolkit version:" in await module.Tools().lathe("version")
 
 
 async def test_loaded_wrapper_dispatches_typed_arguments(module, monkeypatch, tmp_path):

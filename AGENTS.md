@@ -90,20 +90,21 @@ Unit tests can't catch broken HTTP paths or OWUI integration bugs. Real deployme
 
 OWUI performs **zero type coercion at dispatch**: after `json.loads`, the parsed dict is splatted directly into the tool function with no validation against the schema. If a model sends `{"offset": "80"}` instead of `{"offset": 80}`, the string passes through unchanged.
 
-Rather than coercing bad types leniently (which silently masks upstream bugs), lathe enforces types **strictly at the wrapper boundary**. `_check_tool_params()` validates that each non-string param has the correct runtime type before the core function ever sees it. Wrong types get a clear error message returned to the model.
+Rather than coercing bad types leniently (which silently masks upstream bugs), lathe enforces types **strictly at the wrapper boundary**. `_check_tool_params()` resolves the wrapper or core annotations with `get_type_hints()`, then recursively validates every visible parameter using exact runtime types before the core function ever sees it. Strings reject non-strings, integers reject booleans, booleans are exact, and parameterized containers such as `list[str]` validate each member. Wrong types get a clear error naming the parameter or indexed member and expected type without echoing its value.
 
 - **`_standard_tool` methods**: type check is automatic (built into the factory).
-- **Hand-written methods** (`bash`, `delegate`): call `_check_tool_params()` explicitly before entering `_run()`.
+- **Hand-written methods** (`lathe`, `onboard`, `bash`, `view`, `delegate`, `expose`): call `_check_tool_params()` before any parameter use or I/O.
 - **`_core_*` functions**: trust their type signatures. No coercion code.
 
 `test_bad_types_rejected_before_io` invokes the actual wrappers with wrong types
-(string for int, string for bool, etc.) in both loading modes.
+(including non-string strings, bool-for-int, and invalid `list[str]` members) in
+both loading modes and proves they do not enter `_tool_context`.
 
 ### Annotations arrive stringized (PEP 563)
 
 OWUI's tool loader (`open_webui/utils/plugin.py`) has `from __future__ import annotations` and execs tool source with a bare `exec()`, which **inherits the caller's `__future__` flags**. So lathe's module compiles under PEP 563: `inspect.signature(core_fn).parameters[...].annotation` returns the **string** `'int'`, not the class `int`. Feeding that to `isinstance()` raises `isinstance() arg 2 must be a type, a tuple of types, or a union` (the prod bug fixed in 0.23.2: every typed-param tool crashed; `bash` survived only because it passes a literal `int`).
 
-Rule: **never trust raw signature annotations at runtime.** Resolve via `typing.get_type_hints(fn)` (which resolves the strings back to real classes against module globals), as `_standard_tool` now does for both `tool_annotations` and `__annotations__`. `_check_tool_params` also guards: a non-`type` `base_type` is skipped, never passed to `isinstance()`. This only reproduces under OWUI's loader, not a normal file import or top-level `exec`: verify fixes inside the OWUI process or load the real source with future annotations enabled. The `module` fixture does the latter for interface and wrapper-dispatch tests.
+Rule: **never trust raw signature annotations at runtime.** Resolve via `typing.get_type_hints(fn)` (which resolves the strings back to real classes against module globals), as `_standard_tool` does for the generated schema annotations and `_check_tool_params` does for runtime validation. This only reproduces under OWUI's loader, not a normal file import or top-level `exec`: verify fixes inside the OWUI process or load the real source with future annotations enabled. The `module` fixture does the latter for interface and wrapper-dispatch tests.
 
 
 ## Cold-start bootstrap

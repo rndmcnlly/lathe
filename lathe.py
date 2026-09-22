@@ -5,7 +5,7 @@ author_url: https://adamsmith.as
 description: Coding agent tools (lathe, bash, read, write, edit, glob, grep, view, interpret, delegate, onboard, expose, destroy) backed by per-user sandbox VMs with transparent lifecycle management.
 required_open_webui_version: 0.11.0
 requirements: httpx, httpx-ws, pydantic-ai-slim[openai]~=2.5, cachetools
-version: 0.29.8
+version: 0.29.9
 licence: MIT
 """
 
@@ -1450,33 +1450,60 @@ async def _run_sandbox_script(valves, sandbox_id: str, client: httpx.AsyncClient
 
 
 
-def _check_tool_params(kwargs: dict, annotations: dict) -> str | None:
+def _type_name(annotation) -> str:
+    """Render the supported runtime annotations without implementation noise."""
+    origin = typing.get_origin(annotation)
+    if origin is list:
+        args = typing.get_args(annotation)
+        member = _type_name(args[0]) if args else "Any"
+        return f"list[{member}]"
+    return getattr(annotation, "__name__", str(annotation))
+
+
+def _check_param_type(name: str, value, expected_type) -> str | None:
+    """Recursively validate one value using exact runtime type semantics."""
+    origin = typing.get_origin(expected_type)
+    if origin is list:
+        if type(value) is not list:
+            return (
+                f"Error: parameter '{name}' expected type {_type_name(expected_type)}, "
+                f"got {type(value).__name__}"
+            )
+        args = typing.get_args(expected_type)
+        if args:
+            for index, member in enumerate(value):
+                error = _check_param_type(f"{name}[{index}]", member, args[0])
+                if error:
+                    return error
+        return None
+
+    # All current tool annotations resolve to concrete classes. Keep this guard
+    # so a future unsupported annotation cannot reach type() comparison after an
+    # unusual loader has left it unresolved.
+    if not isinstance(expected_type, type):
+        return None
+    if type(value) is not expected_type:
+        return (
+            f"Error: parameter '{name}' expected type {_type_name(expected_type)}, "
+            f"got {type(value).__name__}"
+        )
+    return None
+
+
+def _check_tool_params(kwargs: dict, annotated_fn) -> str | None:
     """Strict type check for tool params at the wrapper boundary.
 
-    Returns an error string if any param has the wrong runtime type,
-    or None if all params are valid.  Only checks params that appear
-    in both kwargs and annotations.  Skips str params (everything
-    arrives as a string at minimum).
+    Resolve annotations through get_type_hints() for PEP 563 safety, then
+    recursively require exact runtime types. Error messages identify locations
+    and types but never include parameter values.
     """
-    for name, expected_type in annotations.items():
-        if name not in kwargs or expected_type is str:
+    annotations = typing.get_type_hints(annotated_fn)
+    for name, value in kwargs.items():
+        if name not in annotations:
             continue
-        value = kwargs[name]
-        # get_origin resolves list[str] -> list, etc.
-        base_type = typing.get_origin(expected_type) or expected_type
-        # Defensive: under OWUI's loader, annotations may arrive stringized
-        # (PEP 563) or otherwise unresolved.  A non-type base_type would make
-        # isinstance() raise "arg 2 must be a type".  Skip rather than crash:
-        # callers (_standard_tool) now resolve via get_type_hints, but a
-        # hand-written caller could still pass an unresolved annotation.
-        if not isinstance(base_type, type):
-            continue
-        if not isinstance(value, base_type):
-            return (
-                f"Error: parameter '{name}' expected type "
-                f"{expected_type.__name__ if hasattr(expected_type, '__name__') else str(expected_type)}"
-                f", got {type(value).__name__}: {value!r}"
-            )
+        error = _check_param_type(name, value, annotations[name])
+        if error:
+            return error
     return None
 
 
@@ -1541,8 +1568,8 @@ def _standard_tool(core_fn, *, emit_start: str, emit_done: str,
 
     # Names of tool params for extracting kwargs at call time
     tool_param_names = [p.name for p in tool_params]
-    # Annotation map for strict type checking at the boundary.
-    #
+    # Resolve annotations for the generated OWUI schema. Runtime validation
+    # independently resolves the same core function through _check_tool_params.
     # We resolve via get_type_hints(core_fn), NOT the raw
     # inspect.Parameter.annotation, because OWUI's tool loader
     # (open_webui.utils.plugin.load_tool_module_by_id) execs tool source
@@ -1553,11 +1580,6 @@ def _standard_tool(core_fn, *, emit_start: str, emit_done: str,
     # isinstance() raise "arg 2 must be a type".  get_type_hints() resolves
     # those strings back to real classes against the module globals.
     _core_hints = typing.get_type_hints(core_fn)
-    tool_annotations = {
-        p.name: _core_hints.get(p.name, p.annotation)
-        for p in tool_params
-        if p.name in _core_hints or p.annotation is not inspect.Parameter.empty
-    }
 
     async def _method(self, *args, **kwargs):
         # Bind positional + keyword args to the synthetic signature.
@@ -1576,7 +1598,7 @@ def _standard_tool(core_fn, *, emit_start: str, emit_done: str,
         tool_kwargs = {k: ba[k] for k in tool_param_names if k in ba}
 
         # Strict type check at the wrapper boundary.
-        type_err = _check_tool_params(tool_kwargs, tool_annotations)
+        type_err = _check_tool_params(tool_kwargs, core_fn)
         if type_err:
             return type_err
 
@@ -4006,6 +4028,10 @@ class Tools:
         Manual for the lathe toolkit. Call lathe(manpage="overview") before your first tool use in a new conversation to learn the sandbox model, available workflows, and gotchas. Costs one tool call, saves many.
         :param manpage: Which manual page to return. Use "overview" for big-picture orientation, "version" for the installed version.
         """
+        type_err = _check_tool_params({"manpage": manpage}, type(self).lathe)
+        if type_err:
+            return type_err
+
         tool_catalog = _build_tool_catalog(self)
 
         if manpage == "version":
@@ -4208,6 +4234,10 @@ class Tools:
         Use read() on a skill's SKILL.md path to load its full instructions later.
         :param path: Absolute path to the project root (e.g. /home/daytona/workspace/myproject).
         """
+        type_err = _check_tool_params({"path": path}, type(self).onboard)
+        if type_err:
+            return type_err
+
         async def _run(client):
             email = _get_email(__user__)
             sandbox_id, _sb_warning = await _ensure_sandbox(self.valves, email, client, __event_emitter__)
@@ -4267,10 +4297,10 @@ class Tools:
         __chat_id__: str = "",
         __event_emitter__=None,
     ) -> str:
-        # Strict type check at the wrapper boundary.
         type_err = _check_tool_params(
-            {"foreground_seconds": foreground_seconds},
-            {"foreground_seconds": int},
+            {"command": command, "workdir": workdir,
+             "foreground_seconds": foreground_seconds},
+            type(self).bash,
         )
         if type_err:
             return type_err
@@ -4377,6 +4407,10 @@ class Tools:
         __metadata__: dict = {},
         __event_emitter__=None,
     ) -> str:
+        type_err = _check_tool_params({"path": path}, type(self).view)
+        if type_err:
+            return type_err
+
         # Capability gate: refuse cleanly when the current model cannot
         # accept image input.  Checked BEFORE _ensure_sandbox so a refusal
         # never spins up a VM.  __metadata__["model"] reflects the user's
@@ -4446,11 +4480,10 @@ class Tools:
         :param max_steps: Maximum inference calls the sub-agent may make (default: 10, max: 30).
         :param foreground_seconds: Seconds to wait before auto-backgrounding (default: 30, max: 300). Set 0 for immediate background (fire-and-forget). Omit or set -1 to use the default.
         """
-        # Strict type check at the wrapper boundary.
         type_err = _check_tool_params(
-            {"context_files": context_files, "max_steps": max_steps,
+            {"task": task, "context_files": context_files, "max_steps": max_steps,
              "foreground_seconds": foreground_seconds},
-            {"context_files": list, "max_steps": int, "foreground_seconds": int},
+            type(self).delegate,
         )
         if type_err:
             return type_err
@@ -4853,6 +4886,13 @@ class Tools:
         :param access: Required policy: "private" authenticates the owner and fails closed; "public" allows anyone with the URL and may fall back to a direct bearer URL. Choose private unless the user explicitly requests public/world access.
         :param tag: Optional untrusted hostname hint, such as "vscode" or "files": lowercase letters, digits, and internal hyphens, max 32 characters. The deployment may ignore it. Hostname text never proves identity or purpose.
         """
+        type_err = _check_tool_params(
+            {"target": target, "access": access, "tag": tag},
+            type(self).expose,
+        )
+        if type_err:
+            return type_err
+
         target_value = target.strip()
         target_stripped = target_value.lower()
         access_stripped = access.strip().lower()
