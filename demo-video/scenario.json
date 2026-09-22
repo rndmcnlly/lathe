@@ -1,6 +1,6 @@
 {
   "id": "lathe-shared-workspace",
-  "version": 1,
+  "version": 2,
   "steps": [
     {
       "id": "auth.owui",
@@ -45,7 +45,7 @@
       "required": true,
       "intent": "Clone Lathe and create the relay artifact",
       "with": {
-        "prompt": "Clone https://github.com/rndmcnlly/lathe into {{checkout}}, replacing any previous checkout there. Create RELAY.md in that checkout with exactly two lines. Line 1: Lathe: What do you call a chat agent and an editor sharing one sandbox? Line 2: You: Then explain in three short bullets: what Lathe lets a model do, where the work runs, and what persists between conversations.",
+        "prompt": "Clone https://github.com/rndmcnlly/lathe into {{checkout}}, replacing any previous checkout there. Create RELAY.md in that checkout containing exactly this two-line text:\n\n```text\nLathe: What do you call a chat agent and an editor sharing one sandbox?\nYou:\n```\n\nAfter saving the file, explain here in chat (not in the file) in three short bullets: what Lathe lets a model do, where the work runs, and what persists between conversations.",
         "timeoutMs": 180000
       },
       "failureDomain": "model_behavior"
@@ -133,7 +133,8 @@
       "with": {
         "tools": ["read", "bash"],
         "argumentContains": "RELAY.md",
-        "outputContains": "A shared state of mind."
+        "outputContains": "A shared state of mind.",
+        "outputLineEquals": "You: A shared state of mind."
       },
       "failureDomain": "lathe_behavior"
     },

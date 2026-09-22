@@ -4,11 +4,13 @@ Single-file Open WebUI toolkit (`lathe.py`) with a three-tier test suite. Read `
 
 ## Documentation routing
 
-- **Users** → docs site at [lathe.tools](https://lathe.tools) (`docs/`)
-- **OWUI admins** → `README.md` (install, valves, security)
+- **Users** → public landing page at [lathe.tools](https://lathe.tools) (`docs/`), for users considering the toolkit and asking their admins to install it
+- **OWUI admins and maintainers** → repository-root Markdown: `README.md` (install, valves, security), `CI-MONITOR.md` (live CI operation)
 - **Agents** → this file
 
-Implementation internals belong in `docs/` or code comments, not the README.
+`docs/` is exclusively the public, user-facing landing page. Admin-facing and
+implementation documentation belongs in repository-root Markdown or code
+comments; keep detailed internals out of the installation README.
 
 ## Credentials and tests
 
@@ -67,6 +69,15 @@ itself. Delegate-specific differences are explicit in the local test.
 Run each live suite only once at a time: its fixed staging identity is shared
 across invocations. Integration retains one named test volume for reuse;
 deployment disables volumes. Neither belongs in default pytest collection.
+
+`monitor_e2e.py` runs deployment checks plus one naturalistic AX journey in a
+fresh Docker Open WebUI instance, using real OpenRouter and Daytona. It ignores
+`.env`, uses only environment-supplied provider keys, and never targets an
+existing OWUI host. CI assigns a unique `lathe-ci-*` deployment label per run;
+cleanup must match that exact label. Sandboxes have no persistent volume,
+delete on idle stop after five minutes, and have a 30-minute wall-clock TTL.
+`test_monitor.py` protects isolation and sanitized evidence offline. See
+`CI-MONITOR.md` for workflow operation and future demo-video reuse.
 
 When replacing coverage, verify a few plausible injected faults are detected.
 Use in-memory module copies or disposable workspaces, never mutate a deployed

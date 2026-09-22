@@ -9,7 +9,7 @@ import { fileURLToPath } from "node:url";
 import { chromium } from "playwright";
 import { strFromU8, strToU8, unzipSync, zipSync } from "fflate";
 
-import { normalizedToolEvents } from "./evidence.mjs";
+import { normalizedToolEvents, matchesToolExpectation } from "./evidence.mjs";
 import { runScenario } from "./interpreter.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -21,7 +21,8 @@ mkdirSync(resolve(OUT_DIR, "screenshots"), { recursive: true });
 mkdirSync(resolve(OUT_DIR, "diagnostics"), { recursive: true });
 mkdirSync(VIDEO_TMP, { recursive: true });
 
-try {
+const LOCAL_TOKEN = process.env.DEMO_LOCAL_TOKEN;
+if (!LOCAL_TOKEN) try {
   for (const line of readFileSync(resolve(__dirname, "..", ".env"), "utf-8").split("\n")) {
     const match = line.match(/^([A-Za-z_]\w*)=(.*)$/);
     if (match && !(match[1] in process.env)) process.env[match[1]] = match[2];
@@ -34,7 +35,20 @@ const MODEL = (process.env.DEMO_MODEL || process.env.OWUI_MODEL || "")
   .replace(/^(["'])(.*)\1$/, "$2");
 let PASSKEY;
 try { PASSKEY = JSON.parse(process.env.DEMO_PASSKEY || ""); } catch {}
-if (!OWUI_URL || !MODEL || !PASSKEY?.rpId || !PASSKEY?.id || !PASSKEY?.privateKey) {
+if (LOCAL_TOKEN) {
+  const local = new URL(OWUI_URL);
+  if (local.protocol !== "http:" || local.hostname !== "127.0.0.1") {
+    throw new Error("Disposable-token capture requires a loopback Open WebUI URL");
+  }
+  SCENARIO.id = "lathe-local-public-workspace";
+  const editor = SCENARIO.steps.find((step) => step.id === "editor.request");
+  editor.intent = "Ask Lathe for a public, locally wrapped browser editor";
+  editor.with.prompt = "Give me a public browser-based VS Code editor for this repo. I explicitly want public access. Share it as a markdown link with a short label, then summarize the access and expiry information reported by the tool.";
+  const evidence = SCENARIO.steps.find((step) => step.id === "editor.prove-exposed");
+  evidence.screenshot = "public-wrapped-editor-ready";
+  evidence.with.outputContains = "Public wrapped preview";
+}
+if (!OWUI_URL || !MODEL || (!LOCAL_TOKEN && (!PASSKEY?.rpId || !PASSKEY?.id || !PASSKEY?.privateKey))) {
   const message = "Set DEMO_OWUI_URL, DEMO_PASSKEY, and DEMO_MODEL";
   const now = new Date().toISOString();
   await writeFile(resolve(OUT_DIR, "capture-report.json"), `${JSON.stringify({
@@ -255,7 +269,7 @@ async function enableLathe(page, { tutorial = false } = {}) {
   await tools.waitFor({ state: "visible", timeout: 5000 });
   if (tutorial) await tutorialClick(page, tools, 650);
   else await tools.click();
-  const row = page.getByRole("button", { name: /Lathe$/ }).last();
+  const row = page.getByRole("button", { name: /Lathe(?: Test)?$/ }).last();
   await row.waitFor({ state: "visible", timeout: 5000 });
   const toggle = row.locator('button[role="switch"]');
   await toggle.waitFor({ state: "visible", timeout: 5000 });
@@ -337,7 +351,7 @@ async function ensurePreviewAuth(page, previewOrigin) {
       await page.waitForTimeout(750);
     }
   }
-  await failUnknownAuth(page, "Private preview");
+  await failUnknownAuth(page, "Preview");
 }
 
 function chatIdFromUrl(url) {
@@ -354,20 +368,13 @@ async function fetchChat(state) {
   return response.json();
 }
 
-function contains(value, expected) {
-  return !expected || JSON.stringify(value).toLowerCase().includes(expected.toLowerCase());
-}
-
 async function awaitToolResult(state, expected) {
   const deadline = Date.now() + 4000;
   let observed = [];
   while (Date.now() < deadline) {
     const events = normalizedToolEvents(await fetchChat(state));
     observed = events.slice(state.toolBaseline);
-    const match = observed.find((event) =>
-      expected.tools.includes(event.tool)
-      && contains(event.arguments, expected.argumentContains)
-      && contains(event.output, expected.outputContains));
+    const match = observed.find((event) => matchesToolExpectation(event, expected));
     if (match) return match;
     await state.page.waitForTimeout(500);
   }
@@ -395,8 +402,9 @@ function findExposeUrl(page) {
 
 async function openPreview(state) {
   if (state.previewReady) return;
-  const url = await findExposeUrl(state.page);
+  const url = state.previewUrl || await findExposeUrl(state.page);
   if (!url) throw new Error("No trusted HTTPS preview URL found in the response");
+  state.previewUrl = url;
   await state.page.goto(url);
   await ensurePreviewAuth(state.page, new URL(url).origin);
   state.previewReady = true;
@@ -468,7 +476,9 @@ async function sanitizeTrace(path) {
 
 let browser;
 try {
-  browser = await chromium.launch({ headless: true });
+  browser = await chromium.launch({ headless: true, args: LOCAL_TOKEN ? [
+    "--host-resolver-rules=MAP *.lathe-preview.test 127.0.0.1, MAP lathe-preview.test 127.0.0.1",
+  ] : [] });
 } catch (error) {
   const now = new Date().toISOString();
   await writeFile(resolve(OUT_DIR, "capture-report.json"), `${JSON.stringify({
@@ -528,11 +538,21 @@ const state = {
 
 const adapter = {
   "auth.ensure-owui": async () => {
-    state.loginContext = await browser.newContext({ viewport: VIEWPORT });
-    await state.loginContext.credentials.create(PASSKEY.rpId, PASSKEY);
-    await state.loginContext.credentials.install();
+    state.loginContext = await browser.newContext({ viewport: VIEWPORT, ignoreHTTPSErrors: Boolean(LOCAL_TOKEN),
+      storageState: LOCAL_TOKEN ? { cookies: [], origins: [{ origin: OWUI_URL,
+        localStorage: [{ name: "token", value: LOCAL_TOKEN }] }] } : undefined });
+    if (!LOCAL_TOKEN) {
+      await state.loginContext.credentials.create(PASSKEY.rpId, PASSKEY);
+      await state.loginContext.credentials.install();
+    }
     state.loginPage = await state.loginContext.newPage();
-    state.token = await ensureOwuiAuth(state.loginPage);
+    if (LOCAL_TOKEN) {
+      await state.loginPage.goto(CHAT_URL);
+      await state.loginPage.locator(target("owui.chat-input")).waitFor({ state: "visible", timeout: 30000 });
+      state.token = LOCAL_TOKEN;
+    } else {
+      state.token = await ensureOwuiAuth(state.loginPage);
+    }
     state.cookies = await state.loginContext.cookies();
     return { observations: ["auth.state=owui-authenticated"] };
   },
@@ -563,15 +583,22 @@ const adapter = {
     state.loginContext = null;
     state.context = await browser.newContext({
       viewport: VIEWPORT,
+      ignoreHTTPSErrors: Boolean(LOCAL_TOKEN),
+      storageState: LOCAL_TOKEN ? { cookies: [], origins: [{ origin: OWUI_URL,
+        localStorage: [{ name: "token", value: LOCAL_TOKEN }] }] } : undefined,
       recordVideo: { dir: VIDEO_TMP, size: VIEWPORT },
     });
     await state.context.tracing.start({ screenshots: true, snapshots: true, sources: false });
-    await state.context.credentials.create(PASSKEY.rpId, PASSKEY);
-    await state.context.credentials.install();
+    if (!LOCAL_TOKEN) {
+      await state.context.credentials.create(PASSKEY.rpId, PASSKEY);
+      await state.context.credentials.install();
+    }
     await state.context.addCookies(state.cookies);
     state.page = await state.context.newPage();
-    await state.page.goto(`${OWUI_URL}/auth`);
-    await state.page.evaluate((token) => localStorage.setItem("token", token), state.token);
+    if (!LOCAL_TOKEN) {
+      await state.page.goto(`${OWUI_URL}/auth`);
+      await state.page.evaluate((token) => localStorage.setItem("token", token), state.token);
+    }
     return { observations: ["capture.state=recording"] };
   },
 
@@ -653,8 +680,15 @@ const adapter = {
     await state.page.keyboard.type(String(line));
     await state.page.keyboard.press("Enter");
     await state.page.keyboard.press("Home");
-    await state.page.keyboard.press("Shift+End");
-    await state.page.keyboard.type(text, { delay: 55 });
+    // Select the logical line, including its newline, not just a wrapped row.
+    // The command palette also avoids OS/browser conflicts with Ctrl/Cmd+L.
+    await state.page.keyboard.press("F1");
+    const commandInput = state.page.locator(".quick-input-widget input").first();
+    await commandInput.waitFor({ state: "visible", timeout: 2500 });
+    await commandInput.fill(">Expand Line Selection");
+    await commandInput.press("Enter");
+    await state.page.waitForTimeout(250);
+    await state.page.keyboard.type(text + "\n", { delay: 55 });
     await state.page.keyboard.press("Control+S");
     await state.page.waitForTimeout(1200);
     return { observations: [`editor.replaced-line=${line}`] };

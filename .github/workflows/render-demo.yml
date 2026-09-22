@@ -19,6 +19,9 @@ concurrency:
 
 jobs:
   capture:
+    # This legacy workflow still targets a configured hosted OWUI. Branch demos
+    # use demo_local.py until this workflow is migrated to the disposable stack.
+    if: github.ref_name == github.event.repository.default_branch
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
