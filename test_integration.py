@@ -24,6 +24,7 @@ from dotenv import load_dotenv
 
 from lathe import (
     Tools, _api, _extract_sandbox_list, _headers, _site_port,
+    _CS_BIN, _CS_ENSURE_SCRIPT, _DUFS_BIN, _DUFS_ENSURE_SCRIPT,
     _TTYD_ENSURE_SCRIPT, _TTYD_PORT,
 )
 
@@ -275,6 +276,16 @@ async def main():
                     received += await asyncio.wait_for(ws.receive_bytes(), timeout=5)
                 require(canary.encode() in received, received[-500:])
 
+    async def verified_service_bootstrap():
+        for name, script, binary, timeout in [
+            ("dufs", _DUFS_ENSURE_SCRIPT, _DUFS_BIN, 90),
+            ("code-server", _CS_ENSURE_SCRIPT, _CS_BIN, 300),
+        ]:
+            output = await tools.bash(script, foreground_seconds=timeout, **ctx)
+            require("READY PID=" in output, output)
+            output = await tools.bash(f"test -x {binary} && {binary} --version", **ctx)
+            require("Exit code:" not in output, f"{name} bootstrap did not install a working executable: {output}")
+
     async def parallel_static_sites():
         import re
 
@@ -344,6 +355,7 @@ async def main():
             ("background completion notice", background_completion_notice),
             ("signed preview URL", expose_contract),
             ("parallel static sites", parallel_static_sites),
+            ("verified dufs and code-server cold-start bootstrap", verified_service_bootstrap),
             ("ttyd page and websocket command", ttyd_terminal_roundtrip),
             ("persistent volume survives VM recreation", volume_survives_recreation),
             ("disabled auto-create policy", disabled_auto_create_is_respected),

@@ -7,6 +7,7 @@ its files and state. Live Daytona and OWUI checks remain explicit scripts.
 import __future__
 import asyncio
 import base64
+import hashlib
 import inspect
 import json
 import os
@@ -15,6 +16,8 @@ import re
 import shlex
 import subprocess
 import sys
+import tarfile
+import textwrap
 from types import ModuleType, SimpleNamespace
 import typing
 from unittest.mock import AsyncMock
@@ -1116,6 +1119,129 @@ async def test_ttyd_setup_failure_stops_before_preview(preview):
     assert result.startswith("Error: ttyd setup failed")
     assert "checksum mismatch" in result
     assert not any(r.url.host == "wrapper.test" for r in calls)
+
+
+@pytest.mark.parametrize("service", ["dufs", "code-server"])
+@pytest.mark.parametrize("fault", [None, "stale", "release", "digest"])
+def test_managed_archive_install_is_release_consistent_verified_and_atomic(
+    tmp_path, service, fault,
+):
+    install_root = tmp_path / "lathe"
+    install_root.mkdir()
+    fixtures = tmp_path / "fixtures"
+    fixtures.mkdir()
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+
+    if service == "dufs":
+        repo, tag = "sigoden/dufs", "v9.8.7"
+        asset_name = f"dufs-{tag}-x86_64-unknown-linux-musl.tar.gz"
+        staged = fixtures / "dufs"
+        staged.write_text("#!/bin/sh\nexit 0\n")
+        staged.chmod(0o755)
+        archive_members = [(staged, "dufs")]
+        script = lathe._build_dufs_ensure_script(str(install_root), str(tmp_path))
+        installed = install_root / "dufs"
+        port = 5000
+    else:
+        repo, tag = "coder/code-server", "v9.8.7"
+        asset_name = "code-server-9.8.7-linux-amd64.tar.gz"
+        staged = fixtures / "code-server"
+        staged.write_text("#!/bin/sh\nexit 0\n")
+        staged.chmod(0o755)
+        archive_members = [(staged, "code-server-9.8.7-linux-amd64/bin/code-server")]
+        script = lathe._build_code_server_ensure_script(str(install_root), str(tmp_path))
+        installed = install_root / "code-server/bin/code-server"
+        port = 8080
+
+    if fault == "stale":
+        if service == "dufs":
+            installed.write_text("incomplete")
+        else:
+            installed.parent.mkdir(parents=True)
+            (installed.parent.parent / "partial-download").write_text("incomplete")
+
+    archive = fixtures / "asset.tar.gz"
+    with tarfile.open(archive, "w:gz") as bundle:
+        for source, arcname in archive_members:
+            bundle.add(source, arcname=arcname)
+    digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+    asset_url = f"https://github.com/{repo}/releases/download/{tag}/{asset_name}"
+    release = {
+        "url": f"https://api.github.com/repos/{repo}/releases/12345",
+        "tag_name": tag,
+        "assets": [
+            {"name": "decoy.tar.gz", "browser_download_url": "https://invalid.test/decoy", "digest": "sha256:" + "0" * 64},
+            {"name": asset_name, "browser_download_url": asset_url, "digest": f"sha256:{digest}"},
+        ],
+    }
+    if fault == "release":
+        release["assets"][1]["browser_download_url"] = asset_url.replace(f"/{tag}/", "/v0.0.0/")
+    elif fault == "digest":
+        release["assets"][1]["digest"] = "sha256:" + "0" * 64
+    release_path = fixtures / "release.json"
+    release_path.write_text(json.dumps(release))
+
+    curl_log = tmp_path / "curl.log"
+    fake_curl = fake_bin / "curl"
+    fake_curl.write_text(textwrap.dedent(f"""\
+        #!/bin/sh
+        set -e
+        printf '%s\\n' "$*" >> {shlex.quote(str(curl_log))}
+        URL=""
+        OUT=""
+        while test "$#" -gt 0; do
+          case "$1" in
+            -o) OUT=$2; shift 2 ;;
+            -*) shift ;;
+            *) URL=$1; shift ;;
+          esac
+        done
+        case "$URL" in
+          https://api.github.com/repos/*/releases/latest) sleep 0.2; cp {shlex.quote(str(release_path))} "$OUT" ;;
+          {shlex.quote(asset_url)}) cp {shlex.quote(str(archive))} "$OUT" ;;
+          *) exit 90 ;;
+        esac
+        """))
+    fake_curl.chmod(0o755)
+    fake_ss = fake_bin / "ss"
+    fake_ss.write_text(f"#!/bin/sh\nprintf '%s\\n' 'LISTEN 0 128 0.0.0.0:{port} users:((\"{service}\",pid=123,fd=3))'\n")
+    fake_ss.chmod(0o755)
+
+    env = {**os.environ, "PATH": f"{fake_bin}:{os.environ['PATH']}"}
+    if fault == "stale" and service == "code-server":
+        processes = [
+            subprocess.Popen(
+                ["bash", "-c", script], text=True,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env,
+            )
+            for _ in range(2)
+        ]
+        completed = [
+            subprocess.CompletedProcess(process.args, process.wait(timeout=20), *process.communicate())
+            for process in processes
+        ]
+        assert all(result.returncode == 0 for result in completed), completed
+        result = completed[0]
+    else:
+        result = subprocess.run(
+            ["bash", "-c", script], text=True, capture_output=True, env=env, timeout=20,
+        )
+    calls = curl_log.read_text().splitlines()
+    assert "/releases/latest" in calls[0]
+    if fault in (None, "stale"):
+        assert result.returncode == 0, result.stderr
+        assert installed.read_text() == "#!/bin/sh\nexit 0\n"
+        assert os.access(installed, os.X_OK)
+        expected_calls = 4 if fault == "stale" and service == "code-server" else 2
+        assert len(calls) == expected_calls and all(
+            asset_url in call for call in calls if "/releases/latest" not in call
+        )
+    else:
+        assert result.returncode != 0
+        assert not installed.exists()
+        assert not any(path.name.startswith(".install.") for path in install_root.iterdir())
+        assert len(calls) == (1 if fault == "release" else 2)
 
 
 async def test_site_fast_path_preserves_path_and_manages_only_its_server(preview):

@@ -5,7 +5,7 @@ author_url: https://adamsmith.as
 description: Coding agent tools (lathe, bash, read, write, edit, glob, grep, view, interpret, delegate, onboard, expose, destroy) backed by per-user sandbox VMs with transparent lifecycle management.
 required_open_webui_version: 0.11.0
 requirements: httpx, httpx-ws, pydantic-ai-slim[openai]~=2.5, cachetools
-version: 0.30.2
+version: 0.30.3
 licence: MIT
 """
 
@@ -2927,24 +2927,89 @@ _DUFS_BIN = f"{_DURABLE_ROOT}/dufs"
 _DUFS_PORT = 5000  # dufs default
 _DUFS_ROOT = "/home/daytona/workspace"
 
-# Single idempotent script: install if missing, start if not listening.
-# Exit 0 = ready (prints READY); non-zero = install or start failed.
-_DUFS_ENSURE_SCRIPT = (
-    f'set -e; mkdir -p {_DURABLE_ROOT}; '
-    f'if ! test -x {_DUFS_BIN}; then '
-    f'  TAG=$(curl -sf https://api.github.com/repos/sigoden/dufs/releases/latest '
-    f'    | python3 -c "import sys,json; print(json.load(sys.stdin)[\'tag_name\'])") '
-    f'  && curl -sL "https://github.com/sigoden/dufs/releases/download/${{TAG}}/'
-    f'dufs-${{TAG}}-x86_64-unknown-linux-musl.tar.gz" '
-    f'  | tar xz -C {_DURABLE_ROOT} && chmod +x {_DUFS_BIN}; '
-    f'fi; '
-    f'if ! ss -tlnp | grep -q ":{_DUFS_PORT} "; then '
-    f'  nohup {_DUFS_BIN} {_DUFS_ROOT} --allow-all > {_DURABLE_ROOT}/dufs.log 2>&1 & '
-    f'  sleep 0.5; '
-    f'fi; '
-    f'PID=$(ss -tlnp | grep ":{_DUFS_PORT} " | grep -o "pid=[0-9]*" | head -1 | cut -d= -f2); '
-    f'echo "READY PID=$PID"'
-)
+def _build_verified_archive_install(repo: str, product: str,
+                                    install_root: str) -> str:
+    """Build the shared GitHub release-asset verification and install block."""
+    return textwrap.dedent(f"""\
+        TMP=$(mktemp -d {_shell_quote(install_root + '/.install.XXXXXX')})
+        trap 'rm -rf "$TMP"' EXIT
+        curl -fsSL https://api.github.com/repos/{repo}/releases/latest -o "$TMP/release.json"
+        python3 - "$TMP/release.json" "$TMP/asset.json" <<'PY'
+        import json
+        import re
+        import sys
+
+        repo = {repo!r}
+        product = {product!r}
+        release = json.load(open(sys.argv[1]))
+        tag = release.get("tag_name")
+        canonical = release.get("url")
+        if not isinstance(tag, str) or not re.fullmatch(r"[A-Za-z0-9._-]+", tag):
+            raise SystemExit("invalid release tag")
+        if not isinstance(canonical, str) or not re.fullmatch(
+            rf"https://api\\.github\\.com/repos/{{re.escape(repo)}}/releases/[1-9][0-9]*",
+            canonical,
+        ):
+            raise SystemExit("release document has no canonical release ID")
+        if product == "dufs":
+            name = f"dufs-{{tag}}-x86_64-unknown-linux-musl.tar.gz"
+        else:
+            if not tag.startswith("v") or len(tag) == 1:
+                raise SystemExit("invalid code-server release tag")
+            name = f"code-server-{{tag[1:]}}-linux-amd64.tar.gz"
+        matches = [asset for asset in release.get("assets", []) if asset.get("name") == name]
+        if len(matches) != 1:
+            raise SystemExit(f"expected exactly one release asset named {{name}}")
+        asset = matches[0]
+        expected_url = f"https://github.com/{{repo}}/releases/download/{{tag}}/{{name}}"
+        if asset.get("browser_download_url") != expected_url:
+            raise SystemExit("release asset URL is inconsistent with its release")
+        digest = asset.get("digest")
+        if not isinstance(digest, str) or not re.fullmatch(r"sha256:[0-9a-f]{{64}}", digest):
+            raise SystemExit("release asset has no valid SHA-256 digest")
+        json.dump({{"name": name, "url": expected_url, "sha256": digest[7:]}}, open(sys.argv[2], "w"))
+        PY
+        ASSET_URL=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["url"])' "$TMP/asset.json")
+        EXPECTED=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["sha256"])' "$TMP/asset.json")
+        curl -fsSL "$ASSET_URL" -o "$TMP/archive.tar.gz"
+        ACTUAL=$(sha256sum "$TMP/archive.tar.gz" | cut -d' ' -f1)
+        test "$ACTUAL" = "$EXPECTED"
+        mkdir "$TMP/unpack"
+        tar -xzf "$TMP/archive.tar.gz" -C "$TMP/unpack"
+        """)
+
+
+def _build_dufs_ensure_script(install_root: str = _DURABLE_ROOT,
+                              serve_root: str = _DUFS_ROOT) -> str:
+    """Build dufs' idempotent, verified install and startup script."""
+    binary = f"{install_root}/dufs"
+    script = textwrap.dedent(f"""\
+        set -e
+        mkdir -p {_shell_quote(install_root)}
+        if ! test -x {_shell_quote(binary)}; then
+        """)
+    script += _build_verified_archive_install("sigoden/dufs", "dufs", install_root)
+    script += textwrap.dedent(f"""\
+          test -f "$TMP/unpack/dufs"
+          chmod 755 "$TMP/unpack/dufs"
+          python3 -c 'import os,sys; os.replace(sys.argv[1], sys.argv[2])' \
+            "$TMP/unpack/dufs" {_shell_quote(binary)}
+        fi
+        if ! ss -tlnp | grep -q ':{_DUFS_PORT} '; then
+          nohup {_shell_quote(binary)} {_shell_quote(serve_root)} --allow-all > {_shell_quote(install_root + '/dufs.log')} 2>&1 &
+          for i in 1 2 3 4 5; do
+            ss -tlnp | grep -q ':{_DUFS_PORT} ' && break
+            sleep 0.2
+          done
+        fi
+        PID=$(ss -tlnp | grep ':{_DUFS_PORT} ' | grep -o 'pid=[0-9]*' | head -1 | cut -d= -f2)
+        test -n "$PID"
+        echo "READY PID=$PID"
+        """)
+    return script
+
+
+_DUFS_ENSURE_SCRIPT = _build_dufs_ensure_script()
 
 _TTYD_BIN = f"{_DURABLE_ROOT}/ttyd"
 _TTYD_PORT = 7681
@@ -3030,20 +3095,58 @@ _CS_BIN = f"{_DURABLE_ROOT}/code-server/bin/code-server"
 _CS_PORT = 8080
 _CS_ROOT = "/home/daytona/workspace"
 
-_CS_ENSURE_SCRIPT = (
-    f'set -e; mkdir -p {_DURABLE_ROOT}; '
-    f'if ! test -x {_CS_BIN}; then '
-    f'  curl -fsSL https://code-server.dev/install.sh '
-    f'  | sh -s -- --method=standalone --prefix={_DURABLE_ROOT}/code-server; '
-    f'fi; '
-    f'if ! ss -tlnp | grep -q ":{_CS_PORT} "; then '
-    f'  nohup {_CS_BIN} --bind-addr 0.0.0.0:{_CS_PORT} --auth none {_CS_ROOT} '
-    f'  > {_DURABLE_ROOT}/code-server.log 2>&1 & '
-    f'  sleep 1; '
-    f'fi; '
-    f'PID=$(ss -tlnp | grep ":{_CS_PORT} " | grep -o "pid=[0-9]*" | head -1 | cut -d= -f2); '
-    f'echo "READY PID=$PID"'
-)
+def _build_code_server_ensure_script(install_root: str = _DURABLE_ROOT,
+                                     serve_root: str = _CS_ROOT) -> str:
+    """Build code-server's idempotent, verified install and startup script."""
+    install_dir = f"{install_root}/code-server"
+    binary = f"{install_dir}/bin/code-server"
+    script = textwrap.dedent(f"""\
+        set -e
+        mkdir -p {_shell_quote(install_root)}
+        if ! test -x {_shell_quote(binary)}; then
+        """)
+    script += _build_verified_archive_install("coder/code-server", "code-server", install_root)
+    script += textwrap.dedent(f"""\
+          NAME=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["name"])' "$TMP/asset.json")
+          VERSION=${{NAME#code-server-}}
+          VERSION=${{VERSION%-linux-amd64.tar.gz}}
+          STAGED="$TMP/unpack/code-server-$VERSION-linux-amd64"
+          test -x "$STAGED/bin/code-server"
+          python3 - "$STAGED" {_shell_quote(install_dir)} {_shell_quote(install_root + '/.code-server-install.lock')} <<'PY'
+        import fcntl
+        import os
+        import shutil
+        import sys
+
+        staged, destination, lock_path = sys.argv[1:]
+        with open(lock_path, "w") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            binary = os.path.join(destination, "bin", "code-server")
+            if os.access(binary, os.X_OK):
+                raise SystemExit(0)
+            if os.path.isdir(destination) and not os.path.islink(destination):
+                shutil.rmtree(destination)
+            elif os.path.lexists(destination):
+                os.unlink(destination)
+            os.rename(staged, destination)
+        PY
+        fi
+        if ! ss -tlnp | grep -q ':{_CS_PORT} '; then
+          nohup {_shell_quote(binary)} --bind-addr 0.0.0.0:{_CS_PORT} --auth none {_shell_quote(serve_root)} \
+            > {_shell_quote(install_root + '/code-server.log')} 2>&1 &
+          for i in 1 2 3 4 5 6 7 8 9 10; do
+            ss -tlnp | grep -q ':{_CS_PORT} ' && break
+            sleep 0.5
+          done
+        fi
+        PID=$(ss -tlnp | grep ':{_CS_PORT} ' | grep -o 'pid=[0-9]*' | head -1 | cut -d= -f2)
+        test -n "$PID"
+        echo "READY PID=$PID"
+        """)
+    return script
+
+
+_CS_ENSURE_SCRIPT = _build_code_server_ensure_script()
 
 
 async def _ensure_volume(valves, volume_name: str, client: httpx.AsyncClient) -> str:
@@ -3705,9 +3808,10 @@ class Tools:
             server. A path-hash collision or unrelated listener on an assigned port
             fails rather than replacing or exposing the wrong process.
 
-            ttyd is private-only because it grants arbitrary shell access. Its
-            binary is resolved from the latest GitHub release and verified against
-            that release's SHA256SUMS before installation.
+            Managed dufs, ttyd, and code-server artifacts are resolved from one
+            saved GitHub release document and verified before atomic installation.
+            dufs and code-server use GitHub's immutable release-asset SHA-256 digest;
+            ttyd uses that release's upstream SHA256SUMS asset.
 
             {preview_access_note}
 
@@ -5052,7 +5156,7 @@ class Tools:
             if target_stripped == "dufs":
                 return await _ensure_and_sign(
                     ensure_script=_DUFS_ENSURE_SCRIPT,
-                    script_timeout_ms=30000, http_timeout=60.0,
+                    script_timeout_ms=60000, http_timeout=90.0,
                     svc_port=_DUFS_PORT, svc_name="dufs",
                     ready_status="File browser ready",
                     fail_status="dufs setup failed",
@@ -5104,7 +5208,7 @@ class Tools:
             if target_stripped == "code-server":
                 return await _ensure_and_sign(
                     ensure_script=_CS_ENSURE_SCRIPT,
-                    script_timeout_ms=60000, http_timeout=120.0,
+                    script_timeout_ms=240000, http_timeout=270.0,
                     svc_port=_CS_PORT, svc_name="code-server",
                     ready_status="IDE ready",
                     fail_status="code-server setup failed",
