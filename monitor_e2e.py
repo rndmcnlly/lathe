@@ -301,6 +301,15 @@ def launch(directory, *, docker_args=()):
     return metadata
 
 
+def run_inside():
+    """Run the monitor with host ownership for bind-mounted artifacts."""
+    return docker(
+        "exec", "--user", f"{os.getuid()}:{os.getgid()}", CONTAINER,
+        "python", "/monitor/monitor_e2e.py", "--inside", "--artifacts", "/artifacts",
+        check=False, timeout=1500,
+    )
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--inside", action="store_true", help=argparse.SUPPRESS)
@@ -338,8 +347,7 @@ def main():
     result = 1
     try:
         launch(directory)
-        run = docker("exec", CONTAINER, "python", "/monitor/monitor_e2e.py",
-                     "--inside", "--artifacts", "/artifacts", check=False, timeout=1500)
+        run = run_inside()
         output = sanitize(run.stdout + run.stderr)
         (directory / "suite.log").write_text(output)
         print(output, flush=True)

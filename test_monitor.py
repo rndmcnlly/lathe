@@ -201,6 +201,28 @@ def test_launcher_pins_digest_and_exposes_only_loopback(tmp_path, monkeypatch):
     assert not any("type=volume" in arg for arg in run)
 
 
+def test_inner_monitor_writes_artifacts_as_host_user(monkeypatch):
+    import os
+    import subprocess
+
+    observed = []
+
+    def docker(*args, **kwargs):
+        observed.append((args, kwargs))
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(monitor, "docker", docker)
+    monitor.run_inside()
+    args, kwargs = observed[0]
+    assert args[:4] == (
+        "exec", "--user", f"{os.getuid()}:{os.getgid()}", monitor.CONTAINER,
+    )
+    assert args[-4:] == (
+        "/monitor/monitor_e2e.py", "--inside", "--artifacts", "/artifacts",
+    )
+    assert kwargs == {"check": False, "timeout": 1500}
+
+
 @pytest.mark.parametrize("over_budget", [False, True])
 async def test_socket_delivery_preserves_tool_evidence_and_enforces_budget(suite, monkeypatch, over_budget):
     observed = []
