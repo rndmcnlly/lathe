@@ -5,12 +5,13 @@ author_url: https://adamsmith.as
 description: Coding agent tools (lathe, bash, read, write, edit, glob, grep, view, interpret, delegate, onboard, expose, destroy) backed by per-user sandbox VMs with transparent lifecycle management.
 required_open_webui_version: 0.11.0
 requirements: httpx, httpx-ws, pydantic-ai-slim[openai]~=2.5, cachetools
-version: 0.29.9
+version: 0.30.0
 licence: MIT
 """
 
 import asyncio
 import base64
+import contextlib
 import hashlib
 import inspect
 import io
@@ -4521,48 +4522,8 @@ class Tools:
             except AttributeError:
                 return "Error: delegate() could not extract authentication token from request."
 
-            # ASGI transport — in-process call to OWUI's FastAPI app.
-            # Uses /api/chat/completions which handles all model types:
-            # direct connection models, workspace models, AND pipe/manifold
-            # models (which have custom routing like Anthropic caching).
-            # The /openai/chat/completions endpoint only knows about raw
-            # connection models and cannot route pipe models.
-            #
-            app = __request__.app
-            transport = httpx.ASGITransport(app=app)
-            inner_client = httpx.AsyncClient(transport=transport, base_url="http://localhost")
-
-            from pydantic_ai import Agent, UsageLimits
-            from pydantic_ai.models.openai import OpenAIChatModel
-            from pydantic_ai.providers.openai import OpenAIProvider
-
-            provider = OpenAIProvider(
-                base_url="http://localhost/api",
-                api_key=token,
-                http_client=inner_client,
-            )
-            model = OpenAIChatModel(model_id, provider=provider)
-
-            # ── Collect user env vars for sub-agent bash ─────────────
-            user_valves = __user__.get("valves")
-            user_pairs: list[tuple[str, str]] = []
-            if user_valves:
-                raw_env = getattr(user_valves, "env_vars", "") or ""
-                user_pairs = _parse_env_vars(raw_env)
-
-            # ── Background-safe client for the sub-agent ─────────────
-            # _tool_context closes `client` when _run() returns, which
-            # happens immediately when we background.  The sub-agent's
-            # tool closures and sidecar writes need a client that stays
-            # open for the lifetime of the background task.  We create
-            # bg_client here; _run_agent closes it in its finally block.
-            bg_client = httpx.AsyncClient()
-
-            # ── Build sub-agent tools ────────────────────────────────
-            tools = _build_delegate_tools(self.valves, sandbox_id, bg_client, user_pairs,
-                                            chat_state=self._chat_state, chat_id=__chat_id__)
-
-            # ── Fetch context_files from sandbox ─────────────────────
+            # Fetch and validate context before allocating the clients owned by
+            # the delegate. The outer tool client remains owned by _tool_context.
             file_sections: list[str] = []
             if context_files:
                 for fpath in context_files:
@@ -4584,40 +4545,81 @@ class Tools:
                     resp.raise_for_status()
                     file_sections.append(f"### {fpath}\n\n{resp.text}")
 
-            # ── Build the prompt ─────────────────────────────────────
-            user_message = _build_delegate_prompt(task, file_sections)
+            # ASGI transport — in-process call to OWUI's FastAPI app.
+            # Uses /api/chat/completions which handles all model types:
+            # direct connection models, workspace models, AND pipe/manifold
+            # models (which have custom routing like Anthropic caching).
+            # The /openai/chat/completions endpoint only knows about raw
+            # connection models and cannot route pipe models.
+            #
+            # These clients belong to setup until the agent task is launched.
+            # AsyncExitStack closes every client if any setup stage raises;
+            # after launch, _run_agent owns the stack until completion.
+            agent_clients = contextlib.AsyncExitStack()
+            try:
+                app = __request__.app
+                transport = httpx.ASGITransport(app=app)
+                inner_client = await agent_clients.enter_async_context(
+                    httpx.AsyncClient(transport=transport, base_url="http://localhost")
+                )
 
-            # ── Create and run the agent ─────────────────────────────
-            clamped_steps = max(1, min(30, max_steps))
+                from pydantic_ai import Agent, UsageLimits
+                from pydantic_ai.models.openai import OpenAIChatModel
+                from pydantic_ai.providers.openai import OpenAIProvider
 
-            agent = Agent(
-                model,
-                system_prompt=_build_delegate_system_prompt(clamped_steps, has_volume=self.valves.persistent_volume),
-                tools=tools,
-                output_type=str,
-            )
+                provider = OpenAIProvider(
+                    base_url="http://localhost/api",
+                    api_key=token,
+                    http_client=inner_client,
+                )
+                model = OpenAIChatModel(model_id, provider=provider)
 
-            # ── Sidecar directory on the sandbox ─────────────────────
-            delegate_id = str(uuid.uuid4())
-            delegate_dir = _delegate_sidecar_dir(delegate_id)
-            log_path = f"{delegate_dir}/log"
-            result_path = f"{delegate_dir}/result"
-            error_path = f"{delegate_dir}/error"
-            usage_path = f"{delegate_dir}/usage"
-            task_path = f"{delegate_dir}/task"
+                # ── Collect user env vars for sub-agent bash ─────────
+                user_valves = __user__.get("valves")
+                user_pairs: list[tuple[str, str]] = []
+                if user_valves:
+                    raw_env = getattr(user_valves, "env_vars", "") or ""
+                    user_pairs = _parse_env_vars(raw_env)
 
-            # Write the task file immediately
-            await _core_write(
-                self.valves, sandbox_id, client,
-                path=task_path, content=task,
-            )
-            # Initialize empty log file
-            await _core_write(
-                self.valves, sandbox_id, client,
-                path=log_path, content="",
-            )
+                # _tool_context closes `client` when _run() returns, so tools
+                # and sidecars use a client retained by the delegate task.
+                bg_client = await agent_clients.enter_async_context(httpx.AsyncClient())
+                tools = _build_delegate_tools(
+                    self.valves, sandbox_id, bg_client, user_pairs,
+                    chat_state=self._chat_state, chat_id=__chat_id__,
+                )
 
-            await _emit(__event_emitter__, "Sub-agent starting...")
+                user_message = _build_delegate_prompt(task, file_sections)
+                clamped_steps = max(1, min(30, max_steps))
+                agent = Agent(
+                    model,
+                    system_prompt=_build_delegate_system_prompt(
+                        clamped_steps, has_volume=self.valves.persistent_volume,
+                    ),
+                    tools=tools,
+                    output_type=str,
+                )
+
+                delegate_id = str(uuid.uuid4())
+                delegate_dir = _delegate_sidecar_dir(delegate_id)
+                log_path = f"{delegate_dir}/log"
+                result_path = f"{delegate_dir}/result"
+                error_path = f"{delegate_dir}/error"
+                usage_path = f"{delegate_dir}/usage"
+                task_path = f"{delegate_dir}/task"
+
+                await _core_write(
+                    self.valves, sandbox_id, client,
+                    path=task_path, content=task,
+                )
+                await _core_write(
+                    self.valves, sandbox_id, client,
+                    path=log_path, content="",
+                )
+                await _emit(__event_emitter__, "Sub-agent starting...")
+            except BaseException:
+                await agent_clients.aclose()
+                raise
 
             # ── Foreground timeout ───────────────────────────────────
             # The signature default is -1 (meaning "use the module default").
@@ -4798,8 +4800,7 @@ class Tools:
                             error=agent_result.get("error"),
                         )
                         _push_bg_notice(self._chat_state, __chat_id__, notice)
-                    await inner_client.aclose()
-                    await bg_client.aclose()
+                    await agent_clients.aclose()
 
             # ── Launch and wait with foreground timeout ───────────────
             # We run _run_agent as a background task. During the foreground
@@ -4807,7 +4808,11 @@ class Tools:
             # inline. Otherwise, we return a background descriptor and the
             # task continues.
 
-            bg_task = asyncio.ensure_future(_run_agent())
+            try:
+                bg_task = asyncio.ensure_future(_run_agent())
+            except BaseException:
+                await agent_clients.aclose()
+                raise
 
             # Wait for completion or timeout
             try:

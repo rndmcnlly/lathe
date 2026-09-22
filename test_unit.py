@@ -77,11 +77,24 @@ def http(monkeypatch, transport):
     constructor = httpx.AsyncClient
     clients = []
 
+    class TrackedAsyncClient(constructor):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.close_calls = 0
+
+        async def aclose(self):
+            self.close_calls += 1
+            await super().aclose()
+
+        async def __aexit__(self, exc_type, exc_value, traceback):
+            self.close_calls += 1
+            await super().__aexit__(exc_type, exc_value, traceback)
+
     def install(handler):
         def create(*args, **kwargs):
             # Delegate's in-process model transport must remain real.
             kwargs.setdefault("transport", transport(handler))
-            client = constructor(*args, **kwargs)
+            client = TrackedAsyncClient(*args, **kwargs)
             clients.append(client)
             return client
         monkeypatch.setattr(lathe, "httpx", SimpleNamespace(**{**vars(httpx), "AsyncClient": create}))
@@ -916,6 +929,61 @@ async def test_preview_configuration_and_direct_mode(preview, tools):
     assert result.startswith("Error:") and not calls
 
 
+def delegate_request(app=lambda scope, receive, send: None):
+    return SimpleNamespace(
+        app=app,
+        state=SimpleNamespace(token=SimpleNamespace(credentials="user-token")),
+    )
+
+
+@pytest.mark.parametrize("context_files,missing", [(["relative"], False), (["/missing"], True)])
+async def test_delegate_context_rejection_closes_every_created_client(
+    tools, sandbox, http, context_files, missing,
+):
+    def respond(request):
+        assert missing and request.url.path == "/sb/files/download"
+        return httpx.Response(404)
+
+    clients = http(respond)
+    result = await tools.delegate(
+        "task", context_files=context_files, __user__=USER,
+        __request__=delegate_request(), __model__={"id": "model"},
+    )
+    assert result.startswith("Error:")
+    assert len(clients) == 1
+    assert [client.close_calls for client in clients] == [1]
+
+
+@pytest.mark.parametrize("stage", ["provider", "tool", "prompt", "agent", "sidecar"])
+async def test_delegate_setup_exception_closes_every_owned_client(
+    tools, sandbox, http, monkeypatch, stage,
+):
+    clients = http(lambda request: pytest.fail(f"unexpected request: {request.url}"))
+
+    def fail(*args, **kwargs):
+        raise RuntimeError(f"{stage} setup failed")
+
+    if stage == "provider":
+        import pydantic_ai.providers.openai
+        monkeypatch.setattr(pydantic_ai.providers.openai, "OpenAIProvider", fail)
+    elif stage == "tool":
+        monkeypatch.setattr(lathe, "_build_delegate_tools", fail)
+    elif stage == "prompt":
+        monkeypatch.setattr(lathe, "_build_delegate_prompt", fail)
+    elif stage == "agent":
+        monkeypatch.setattr(sys.modules["pydantic_ai"], "Agent", fail)
+    else:
+        monkeypatch.setattr(lathe, "_core_write", AsyncMock(side_effect=RuntimeError("sidecar setup failed")))
+
+    result = await tools.delegate(
+        "task", __user__=USER, __request__=delegate_request(),
+        __model__={"id": "model"},
+    )
+    assert result == f"Error: {stage} setup failed"
+    assert len(clients) == (2 if stage == "provider" else 3)
+    assert [client.close_calls for client in clients] == [1] * len(clients)
+
+
 @pytest.mark.parametrize("background,fail", [(False, False), (True, False), (True, True)])
 async def test_real_delegate_execution_and_completion(tools, sandbox, http, monkeypatch, tmp_path, background, fail):
     """Real Agent, tool cores and files; observe completion as the caller does."""
@@ -981,6 +1049,8 @@ async def test_real_delegate_execution_and_completion(tools, sandbox, http, monk
             foreground_seconds=0 if background else 5, __user__=USER, __chat_id__="chat",
             __model__={"id": "wrong-model"}, __metadata__={"model": {"id": "selected-model"}},
             __request__=request, __event_emitter__=emit)
+        delegate_clients = clients[:3]
+        assert len(delegate_clients) == 3
         directories = list((root / "delegate").iterdir())
         assert len(directories) == 1, result
         sidecars = directories[0]
@@ -991,7 +1061,7 @@ async def test_real_delegate_execution_and_completion(tools, sandbox, http, monk
             descriptor = re.search(r"^DELEGATE=(.+)$", result, re.MULTILINE)
             assert descriptor and sidecars.name == descriptor[1], result
             assert not (sidecars / "result").exists() and not (sidecars / "error").exists()
-            assert any(client.is_closed for client in clients)
+            assert [client.close_calls for client in delegate_clients] == [1, 0, 0]
             assert notice not in await read_in("chat")
         else:
             assert "verified result" in result and "1 tool call(s)" in result
@@ -1001,8 +1071,9 @@ async def test_real_delegate_execution_and_completion(tools, sandbox, http, monk
                 while notice not in (delivered := await read_in("chat")):
                     await asyncio.sleep(0)
                 assert delivered.count(notice) == 1
-            while not all(client.is_closed for client in clients):
+            while not all(client.is_closed for client in delegate_clients):
                 await asyncio.sleep(0)
+        assert [client.close_calls for client in delegate_clients] == [1, 1, 1]
         if background:
             assert len(emissions) == emission_count, "delegate emitted to a closed foreground stream"
         assert notice not in await read_in("chat")
@@ -1029,7 +1100,8 @@ async def test_real_delegate_execution_and_completion(tools, sandbox, http, monk
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
         for client in clients:
-            await client.aclose()
+            if not client.is_closed:
+                await client.aclose()
 
 
 if __name__ == "__main__":
