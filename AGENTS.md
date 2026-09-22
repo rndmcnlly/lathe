@@ -121,6 +121,27 @@ Two techniques for bugs that only manifest at runtime:
 - **Temporary diagnostic tool** — add a throwaway method to `Tools` that dumps OWUI dunder params (`__model__`, `__request__`, etc.), make one call, read the output, remove before committing.
 - **Local scripts** — `uv run --script` files that hit the OWUI API directly using `.env` credentials, isolating pydantic-ai ↔ OWUI from the toolkit context.
 
+### OWUI compatibility boundary
+
+The frontmatter minimum is a behavioral floor, not a broad version matrix.
+OWUI 0.11.0 is the current floor because `view()` requires its tool-image
+history conversion; that release also contains null-safe chat metadata handling,
+so the old 0.9.5 delegate `chat_id` mutation is intentionally absent. Raise the
+floor only for a concrete required behavior or verified incompatibility, backed
+by upstream source or release evidence.
+
+`delegate()` is coupled to OWUI-injected request and model metadata. It extracts
+the caller token from request state, chooses the selected model from metadata,
+and uses `__request__.app` with `httpx.ASGITransport` to call OWUI's in-process
+`/api/chat/completions` route. That route is required to preserve OWUI routing
+for connection, workspace, pipe, and manifold models; these injected objects and
+the route are not a separately versioned public API.
+
+`test_deployment.py` qualifies the exact local source against the single OWUI
+instance selected by `OWUI_URL`; it is not a minimum-version matrix. It checks
+loader/schema behavior and model-mediated dispatch, including `view()` image
+lifting and `delegate()` through the injected context and in-process route.
+
 ## Architecture
 
 - **Single file** — everything in `lathe.py`. Resist splitting.

@@ -8,7 +8,7 @@ A single-file Open WebUI toolkit that gives any model a coding agent's tool surf
 
 Lathe registers fourteen tools that models can call in [Native function calling mode](https://docs.openwebui.com/features/extensibility/plugin/tools/). When a user's model calls a tool, Lathe creates, starts, or resumes a cloud sandbox VM via the Daytona control plane and toolbox APIs. All sandbox operations go outbound from your OWUI server.
 
-Lathe does not import `open_webui.*`, use OWUI file storage, or modify models, prompts, users, or other configuration. It does depend on OWUI integration surfaces. In particular, `delegate()` reads the injected request token and selected-model metadata, takes the FastAPI application from `__request__.app`, and sends the sub-agent's OpenAI-compatible requests through that application to `/api/chat/completions` in process. This preserves OWUI routing for connection, workspace, pipe, and manifold models, but these injected objects and the internal route are not a separately versioned public API.
+Lathe does not import `open_webui.*`, use OWUI file storage, or modify models, prompts, users, or other configuration. The `delegate()` tool does depend on runtime context injected by OWUI, an integration boundary that may change between OWUI releases.
 
 ## Security and trust model
 
@@ -24,9 +24,9 @@ Lathe does not import `open_webui.*`, use OWUI file storage, or modify models, p
 2. **Open WebUI ≥ 0.11.0** with Native function calling mode enabled
 3. Models that support tool/function calling (`view()` additionally needs a vision-capable model)
 
-The 0.11.0 floor is behavioral: it is the first release whose tool-result history conversion reliably returns images from `view()` to OpenAI-compatible vision models on later turns. It also includes null-safe chat metadata handling needed by `delegate()`'s API-style requests, so Lathe no longer carries the older 0.9.5 `chat_id` mutation workaround.
+The 0.11.0 floor is behavioral: it is the first release with the image-history behavior required by `view()` and it provides the OWUI runtime behavior required by `delegate()`.
 
-This floor identifies the oldest release with the required known behavior, not a promise that every OWUI patch release is tested. The deployment suite qualifies the exact local Lathe source against the administrator-selected `OWUI_URL`: it exercises OWUI loading and schema generation, normal model-mediated tool dispatch, `view()` image lifting, and `delegate()` through the injected request context and in-process `/api/chat/completions` route. Future floor changes should follow a concrete required behavior or verified incompatibility, with upstream source or release evidence and this deployment path used to validate the change.
+This floor identifies the oldest release with the required known behavior, not a promise that every OWUI patch release is tested. Compatibility is checked against the OWUI instance configured for the deployment suite.
 
 ## Installation
 
@@ -255,7 +255,7 @@ The tiers cover different boundaries:
 
 - The offline suite checks local behavior without provisioning resources. Use `uv run pytest -k delegate` for a focused selection; `uv run python test_unit.py` is also supported.
 - `test_integration.py` verifies the live Daytona API using an isolated test identity. It retains one named test volume for reuse and deletes test sandboxes on exit. Cleanup failure makes the run fail.
-- `test_deployment.py` temporarily deploys local `lathe.py` to the isolated OWUI toolkit ID `lathe_test`, never `lathe`. It configures a separate Daytona label with persistent volumes disabled, checks exact source and complete loaded schema parity, then exercises model-mediated `bash`, `write`, `read`, `interpret`, `view`, and `delegate` dispatch against the OWUI instance configured by `OWUI_URL`. The delegate scenario covers injected request/model metadata and in-process OWUI model routing; it does not bypass OWUI by calling the provider directly. The suite deletes the staging toolkit and sandboxes on exit, including after failures and `--no-deploy` runs. Use `--no-deploy` to test an already staged copy that may be deleted afterward, or `LATHE_TEST_TOOL_ID` to choose another staging ID.
+- `test_deployment.py` is a disposable end-to-end OWUI smoke test for local source, loaded schema, and model-mediated dispatch, including `view()` and `delegate()`. It uses isolated staging identities and cleans them up on exit.
 
 Run only one instance of each live suite at a time: staging identities are shared.
 See [AGENTS.md](AGENTS.md#testing-policy) for contributor testing policy.
