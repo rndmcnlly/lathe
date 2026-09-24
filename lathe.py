@@ -2876,7 +2876,6 @@ def _build_delegate_system_prompt(max_steps: int, *, has_volume: bool = True) ->
 #   view()     — data-URI image returns only fire through OWUI's tool
 #                middleware; the sub-agent's pydantic-ai result channel is
 #                plain text, so the base64 would flood its context
-_DELEGATE_WITHHELD = {"lathe", "onboard", "expose", "destroy", "delegate", "handoff", "view"}
 
 
 # ── handoff() instructions ──────────────────────────────────────────
