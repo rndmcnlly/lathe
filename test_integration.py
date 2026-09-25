@@ -96,14 +96,36 @@ async def _delete_test_sandboxes(tools: Tools):
             if sandbox.get("labels", {}).get(DEPLOYMENT_LABEL) == TEST_EMAIL
         ]
         for sandbox in matches:
+            sid = sandbox["id"]
             response = await client.delete(
-                f"{tools.valves.daytona_api_url}/sandbox/{sandbox['id']}",
+                f"{tools.valves.daytona_api_url}/sandbox/{sid}",
                 params={"force": "true"},
                 headers=_headers(tools.valves),
                 timeout=30,
             )
-            if response.status_code != 404:
+            if response.status_code == 409:
+                # Only a deletion already in progress may be treated as success.
+                current = await client.get(
+                    f"{tools.valves.daytona_api_url}/sandbox/{sid}",
+                    headers=_headers(tools.valves), timeout=30,
+                )
+                if current.status_code != 404:
+                    current.raise_for_status()
+                    require(current.json().get("state") in ("deleting", "destroying"),
+                            f"Sandbox {sid} delete conflicted outside deletion")
+            elif response.status_code != 404:
                 response.raise_for_status()
+            for _ in range(60):
+                current = await client.get(
+                    f"{tools.valves.daytona_api_url}/sandbox/{sid}",
+                    headers=_headers(tools.valves), timeout=30,
+                )
+                if current.status_code == 404:
+                    break
+                current.raise_for_status()
+                await asyncio.sleep(1)
+            else:
+                raise AssertionError(f"Sandbox {sid} did not finish deletion")
 
 
 async def main():
@@ -309,9 +331,6 @@ async def main():
             raise AssertionError("Direct signed-preview reachability failed") from None
 
     async def ttyd_terminal_roundtrip():
-        output = await tools.bash(_TTYD_ENSURE_SCRIPT, foreground_seconds=90, **ctx)
-        require("READY PID=" in output, output)
-
         async with httpx.AsyncClient() as client:
             response = await client.get(
                 _api(tools.valves, "/sandbox"),
@@ -323,6 +342,17 @@ async def main():
                 item for item in _extract_sandbox_list(response.json())
                 if item.get("labels", {}).get(DEPLOYMENT_LABEL) == TEST_EMAIL
             )
+            # Named expose runs its ensure script through /process/execute.
+            # bash() uses a short-lived command session, whose teardown sends
+            # SIGTERM to ttyd even after the script reports a listening PID.
+            response = await client.post(
+                _toolbox(tools.valves, sandbox["id"], "/process/execute"),
+                headers=_headers(tools.valves),
+                json={"command": _TTYD_ENSURE_SCRIPT, "timeout": 60000}, timeout=90,
+            )
+            response.raise_for_status()
+            data = response.json()
+            require(data.get("exitCode") == 0 and "READY PID=" in data.get("result", ""), data)
             response = await client.get(
                 _api(tools.valves, f"/sandbox/{sandbox['id']}/ports/{_TTYD_PORT}/signed-preview-url"),
                 params={"expiresInSeconds": 300}, headers=_headers(tools.valves), timeout=30,
@@ -334,7 +364,8 @@ async def main():
                 preview, headers={"X-Daytona-Skip-Preview-Warning": "true"}, timeout=20,
             )
             require(page.status_code == 200 and "ttyd" in page.text.lower(),
-                    "ttyd page did not load through the signed preview")
+                    f"ttyd page did not load through the signed preview: HTTP {page.status_code}, "
+                    f"content-type {page.headers.get('content-type', 'unknown')}")
 
             parsed = httpx.URL(preview)
             ws_url = parsed.copy_with(
