@@ -1,6 +1,6 @@
 {
   "id": "lathe-shared-workspace",
-  "version": 2,
+  "version": 3,
   "steps": [
     {
       "id": "auth.owui",
@@ -38,6 +38,30 @@
       "intent": "Make Lathe available to the model",
       "screenshot": "lathe-enabled",
       "failureDomain": "ui_drift"
+    },
+    {
+      "id": "version.request",
+      "do": "chat.send",
+      "required": true,
+      "intent": "Ask which installed Lathe version this demo uses",
+      "with": {
+        "prompt": "Before we begin, call lathe(manpage=\"version\") and tell me which version of Lathe we're using.",
+        "timeoutMs": 60000
+      },
+      "failureDomain": "model_behavior"
+    },
+    {
+      "id": "version.prove-installed",
+      "do": "chat.await-tool-result",
+      "required": true,
+      "intent": "Show the installed toolkit version in the recorded conversation",
+      "screenshot": "lathe-version",
+      "with": {
+        "tools": ["lathe"],
+        "argumentContains": "version",
+        "outputContains": "Lathe toolkit version:"
+      },
+      "failureDomain": "lathe_behavior"
     },
     {
       "id": "workspace.create",

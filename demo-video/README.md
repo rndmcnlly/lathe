@@ -31,6 +31,10 @@ The recorded activation beat deliberately animates a tutorial cursor through
 that choreography when changing selectors: activation is instructional content,
 not incidental browser mechanics.
 
+The first recorded question asks Lathe for its installed version. The capture
+requires a matching `lathe(manpage="version")` result and saves a version frame,
+so the video identifies the deployed toolkit rather than the checkout version.
+
 ## Weekly monitor
 
 GitHub Actions runs the production scenario every Wednesday at 14:17 UTC. Scheduled runs retain evidence and report health, but never publish the canonical demo. A required contract failure fails the workflow and identifies its category and first failing step in the job summary.

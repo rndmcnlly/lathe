@@ -1,7 +1,24 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import test from "node:test";
 
 import { resolveTemplates, runScenario, validateScenario } from "./interpreter.mjs";
+
+test("recorded conversation establishes the deployed Lathe version before workspace work", () => {
+  const scenario = JSON.parse(readFileSync(new URL("./scenario.json", import.meta.url), "utf8"));
+  const steps = scenario.steps;
+  const request = steps.findIndex((step) => step.id === "version.request");
+  const proof = steps.findIndex((step) => step.id === "version.prove-installed");
+  assert.ok(request > steps.findIndex((step) => step.id === "lathe.enable"));
+  assert.equal(proof, request + 1);
+  assert.ok(proof < steps.findIndex((step) => step.id === "workspace.create"));
+  assert.match(steps[request].with.prompt, /lathe\(manpage="version"\)/);
+  assert.equal(steps[proof].required, true);
+  assert.equal(steps[proof].screenshot, "lathe-version");
+  assert.deepEqual(steps[proof].with, {
+    tools: ["lathe"], argumentContains: "version", outputContains: "Lathe toolkit version:",
+  });
+});
 
 test("validates instructions before execution", () => {
   assert.throws(
