@@ -120,6 +120,10 @@ after symlink resolution. Dufs and code-server each use one fixed port, so a
 running instance with another root must stop before switching roots. Both
 `ttyd` and `code-server` are private-only. The code-server folder is an initial
 working folder, not confinement: its terminal can access the full sandbox.
+Managed dufs allows upload, delete, search, ZIP download, and file hashes,
+but not symlinks outside its served root. A running dufs instance started with
+broader permissions must be stopped before Lathe will expose it again. Static
+sites use Python's HTTP server and can follow symlinks inside the site directory.
 Lathe does not provide SSH access.
 
 #### What a wrapper does

@@ -1388,6 +1388,35 @@ def test_managed_archive_install_is_release_consistent_verified_and_atomic(
         assert len(calls) == (1 if fault == "release" else 2)
 
 
+def test_dufs_launch_keeps_file_operations_without_outside_symlinks(tmp_path):
+    install_root = tmp_path / "lathe"
+    install_root.mkdir()
+    binary = install_root / "dufs"
+    args_path = tmp_path / "args"
+    binary.write_text(f"#!/bin/sh\nprintf '%s\\n' \"$@\" > {shlex.quote(str(args_path))}\n")
+    binary.chmod(0o755)
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    ss = fake_bin / "ss"
+    ss.write_text(
+        f"#!/bin/sh\n"
+        f"test -f {shlex.quote(str(args_path))} || exit 0\n"
+        "printf '%s\\n' 'LISTEN 0 128 0.0.0.0:5000 users:((\"dufs\",pid=123,fd=3))'\n"
+    )
+    ss.chmod(0o755)
+    script = lathe._build_dufs_ensure_script(str(install_root), str(tmp_path))
+    script = script.replace("/home/daytona/workspace", str(tmp_path))
+    result = subprocess.run(
+        ["bash", "-c", script], capture_output=True, text=True, timeout=5,
+        env={**os.environ, "PATH": f"{fake_bin}:{os.environ['PATH']}"},
+    )
+    assert result.returncode == 0, result.stderr
+    assert args_path.read_text().splitlines() == [
+        str(tmp_path), "--allow-upload", "--allow-delete", "--allow-search",
+        "--allow-archive", "--allow-hash",
+    ]
+
+
 async def test_site_fast_path_preserves_path_and_manages_only_its_server(preview):
     root = "/home/daytona/workspace/My Site"
     port = lathe._site_port(root)

@@ -363,6 +363,37 @@ async def main():
             output = await tools.bash(f"test -x {binary} && {binary} --version", **ctx)
             require("Exit code:" not in output, f"{name} bootstrap did not install a working executable: {output}")
 
+    async def dufs_rooted_browser_policy():
+        token = uuid.uuid4().hex
+        inside = f"dufs-inside-{token}.txt"
+        outside = f"dufs-outside-{token}.txt"
+        link = f"dufs-escape-{token}"
+        await tools.write(f"{WORKSPACE}/{inside}", canary, **ctx)
+        await tools.write(f"{VOLUME}/{outside}", canary, **ctx)
+        try:
+            result = await tools.bash(f"ln -s {VOLUME} {WORKSPACE}/{link}", **ctx)
+            require("Exit code:" not in result, result)
+            output = await tools.expose("dufs", "public", **ctx)
+            require("File browser URL:" in output, output)
+            import re
+            match = re.search(r"https://\S+", output)
+            require(match is not None, output)
+            base = httpx.URL(match.group())
+            headers = {"X-Daytona-Skip-Preview-Warning": "true"}
+            async with httpx.AsyncClient() as client:
+                inside_page = await client.get(base.copy_with(path=f"/{inside}"), headers=headers, timeout=20)
+                require(inside_page.status_code == 200 and inside_page.text == canary,
+                        f"dufs normal file: HTTP {inside_page.status_code}: {inside_page.text[:200]}")
+                escaped = await client.get(base.copy_with(path=f"/{link}/{outside}"), headers=headers, timeout=20)
+                require(escaped.status_code == 404,
+                        f"dufs followed a symlink outside root: HTTP {escaped.status_code}")
+                deleted = await client.delete(base.copy_with(path=f"/{inside}"), headers=headers, timeout=20)
+                require(deleted.is_success, f"dufs delete returned HTTP {deleted.status_code}")
+                check = await tools.read(f"{WORKSPACE}/{inside}", **ctx)
+                require("Error: File not found" in check, check)
+        finally:
+            await tools.bash(f"rm -f {WORKSPACE}/{link} {WORKSPACE}/{inside} {VOLUME}/{outside}", **ctx)
+
     async def parallel_static_sites():
         import re
 
@@ -434,6 +465,7 @@ async def main():
             ("signed preview URL", expose_contract),
             ("parallel static sites", parallel_static_sites),
             ("verified dufs and code-server cold-start bootstrap", verified_service_bootstrap),
+            ("dufs rooted browser symlink and delete policy", dufs_rooted_browser_policy),
             ("ttyd page and websocket command", ttyd_terminal_roundtrip),
             ("persistent volume survives VM recreation", volume_survives_recreation),
             ("disabled auto-create policy", disabled_auto_create_is_respected),

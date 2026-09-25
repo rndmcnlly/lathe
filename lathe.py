@@ -5,7 +5,7 @@ author_url: https://adamsmith.as
 description: Coding agent tools (lathe, bash, read, write, edit, glob, grep, view, interpret, delegate, onboard, expose, destroy) backed by per-user sandbox VMs with transparent lifecycle management.
 required_open_webui_version: 0.11.0
 requirements: httpx, httpx-ws, pydantic-ai-slim[openai]~=2.5, cachetools
-version: 0.30.6
+version: 0.30.7
 licence: MIT
 """
 
@@ -3172,9 +3172,19 @@ def _build_dufs_ensure_script(install_root: str = _DURABLE_ROOT,
             || {{ echo 'dufs is serving a different root' >&2; exit 1; }}
           test -f {_shell_quote(install_root + '/dufs.root')} && test "$(cat {_shell_quote(install_root + '/dufs.root')})" = {_shell_quote(serve_root)} \
             || {{ echo 'dufs is already serving a different root' >&2; exit 1; }}
+          if printf '%s' "$CMD" | grep -Eq -- '(^| )--allow-(all|symlink)( |$)'; then
+            echo 'Running dufs permits outside-root symlinks; stop it and call expose again' >&2
+            exit 1
+          fi
+          for FLAG in --allow-upload --allow-delete --allow-search --allow-archive --allow-hash; do
+            printf '%s' "$CMD" | grep -Eq -- "(^| )$FLAG( |$)" \
+              || {{ echo 'Running dufs lacks the managed file-browser options; stop it and call expose again' >&2; exit 1; }}
+          done
         else
           printf '%s' {_shell_quote(serve_root)} > {_shell_quote(install_root + '/dufs.root')}
-          nohup {_shell_quote(binary)} {_shell_quote(serve_root)} --allow-all > {_shell_quote(install_root + '/dufs.log')} 2>&1 &
+          nohup {_shell_quote(binary)} {_shell_quote(serve_root)} \
+            --allow-upload --allow-delete --allow-search --allow-archive --allow-hash \
+            > {_shell_quote(install_root + '/dufs.log')} 2>&1 &
           for i in 1 2 3 4 5; do
             ss -tlnp | grep -q ':{_DUFS_PORT} ' && break
             sleep 0.2
@@ -4010,6 +4020,11 @@ class Tools:
             workspace itself. Each uses one fixed port: a different root cannot
             replace a running instance. code-server's root is its initial folder,
             not filesystem confinement: its terminal can access the whole sandbox.
+            Managed dufs permits upload, delete, search, folder ZIP downloads, and
+            file hashes; it refuses symlinks pointing outside the served root. An
+            older running dufs process with broader permissions must be stopped
+            before expose() will return a URL. Static sites use Python's HTTP
+            server, which can follow symlinks inside the served directory.
 
             Managed dufs, ttyd, and code-server artifacts are resolved from one
             saved GitHub release document and verified before atomic installation.
