@@ -5,7 +5,7 @@ author_url: https://adamsmith.as
 description: Coding agent tools (lathe, bash, read, write, edit, glob, grep, view, interpret, delegate, onboard, expose, destroy) backed by per-user sandbox VMs with transparent lifecycle management.
 required_open_webui_version: 0.11.0
 requirements: httpx, httpx-ws, pydantic-ai-slim[openai]~=2.5, cachetools
-version: 0.30.5
+version: 0.30.6
 licence: MIT
 """
 
@@ -3080,6 +3080,20 @@ _DUFS_BIN = f"{_DURABLE_ROOT}/dufs"
 _DUFS_PORT = 5000  # dufs default
 _DUFS_ROOT = "/home/daytona/workspace"
 
+
+def _service_root_check(root: str) -> str:
+    """Validate the real sandbox directory before starting a rooted service."""
+    return textwrap.dedent(f"""\
+        python3 - {_shell_quote(root)} <<'PY'
+        import os
+        import sys
+        root = os.path.realpath(sys.argv[1])
+        workspace = os.path.realpath('/home/daytona/workspace')
+        if not os.path.isdir(root) or os.path.commonpath((root, workspace)) != workspace:
+            raise SystemExit('Service root must be an existing directory within /home/daytona/workspace')
+        PY
+        """)
+
 def _build_verified_archive_install(repo: str, product: str,
                                     install_root: str) -> str:
     """Build the shared GitHub release-asset verification and install block."""
@@ -3138,6 +3152,7 @@ def _build_dufs_ensure_script(install_root: str = _DURABLE_ROOT,
     binary = f"{install_root}/dufs"
     script = textwrap.dedent(f"""\
         set -e
+        {_service_root_check(serve_root).rstrip()}
         mkdir -p {_shell_quote(install_root)}
         if ! test -x {_shell_quote(binary)}; then
         """)
@@ -3148,7 +3163,17 @@ def _build_dufs_ensure_script(install_root: str = _DURABLE_ROOT,
           python3 -c 'import os,sys; os.replace(sys.argv[1], sys.argv[2])' \
             "$TMP/unpack/dufs" {_shell_quote(binary)}
         fi
-        if ! ss -tlnp | grep -q ':{_DUFS_PORT} '; then
+        PID=$(ss -tlnp | grep ':{_DUFS_PORT} ' | grep -o 'pid=[0-9]*' | head -1 | cut -d= -f2 || true)
+        if test -n "$PID"; then
+          CMD=$(tr '\\0' ' ' < "/proc/$PID/cmdline")
+          printf '%s' "$CMD" | grep -Fq {_shell_quote(binary)} \
+            || {{ echo 'Port {_DUFS_PORT} is occupied by another process' >&2; exit 1; }}
+          printf '%s' "$CMD" | grep -Fq {_shell_quote(serve_root)} \
+            || {{ echo 'dufs is serving a different root' >&2; exit 1; }}
+          test -f {_shell_quote(install_root + '/dufs.root')} && test "$(cat {_shell_quote(install_root + '/dufs.root')})" = {_shell_quote(serve_root)} \
+            || {{ echo 'dufs is already serving a different root' >&2; exit 1; }}
+        else
+          printf '%s' {_shell_quote(serve_root)} > {_shell_quote(install_root + '/dufs.root')}
           nohup {_shell_quote(binary)} {_shell_quote(serve_root)} --allow-all > {_shell_quote(install_root + '/dufs.log')} 2>&1 &
           for i in 1 2 3 4 5; do
             ss -tlnp | grep -q ':{_DUFS_PORT} ' && break
@@ -3218,7 +3243,7 @@ def _build_site_ensure_script(site_root: str, port: int) -> str:
     return textwrap.dedent(f"""\
         set -e
         SITE_ROOT={root}
-        test -d "$SITE_ROOT" || {{ echo "Site directory does not exist: $SITE_ROOT" >&2; exit 1; }}
+        {_service_root_check(site_root).rstrip()}
         mkdir -p {state_dir}
         PID=$(ss -tlnp | grep ':{port} ' | grep -o 'pid=[0-9]*' | head -1 | cut -d= -f2 || true)
         if test -n "$PID"; then
@@ -3255,6 +3280,7 @@ def _build_code_server_ensure_script(install_root: str = _DURABLE_ROOT,
     binary = f"{install_dir}/bin/code-server"
     script = textwrap.dedent(f"""\
         set -e
+        {_service_root_check(serve_root).rstrip()}
         mkdir -p {_shell_quote(install_root)}
         if ! test -x {_shell_quote(binary)}; then
         """)
@@ -3284,7 +3310,17 @@ def _build_code_server_ensure_script(install_root: str = _DURABLE_ROOT,
             os.rename(staged, destination)
         PY
         fi
-        if ! ss -tlnp | grep -q ':{_CS_PORT} '; then
+        PID=$(ss -tlnp | grep ':{_CS_PORT} ' | grep -o 'pid=[0-9]*' | head -1 | cut -d= -f2 || true)
+        if test -n "$PID"; then
+          CMD=$(tr '\\0' ' ' < "/proc/$PID/cmdline")
+          printf '%s' "$CMD" | grep -Fq {_shell_quote(binary)} \
+            || {{ echo 'Port {_CS_PORT} is occupied by another process' >&2; exit 1; }}
+          printf '%s' "$CMD" | grep -Fq {_shell_quote(serve_root)} \
+            || {{ echo 'code-server is serving a different root' >&2; exit 1; }}
+          test -f {_shell_quote(install_root + '/code-server.root')} && test "$(cat {_shell_quote(install_root + '/code-server.root')})" = {_shell_quote(serve_root)} \
+            || {{ echo 'code-server is already serving a different root' >&2; exit 1; }}
+        else
+          printf '%s' {_shell_quote(serve_root)} > {_shell_quote(install_root + '/code-server.root')}
           nohup {_shell_quote(binary)} --bind-addr 0.0.0.0:{_CS_PORT} --auth none {_shell_quote(serve_root)} \
             > {_shell_quote(install_root + '/code-server.log')} 2>&1 &
           for i in 1 2 3 4 5 6 7 8 9 10; do
@@ -3297,6 +3333,7 @@ def _build_code_server_ensure_script(install_root: str = _DURABLE_ROOT,
         echo "READY PID=$PID"
         """)
     return script
+
 
 
 _CS_ENSURE_SCRIPT = _build_code_server_ensure_script()
@@ -3958,9 +3995,9 @@ class Tools:
             stop/restart but not destroy(). A preview registration neither keeps the
             sandbox awake nor restarts its process.
 
-            - dufs: port 5000; binary /tmp/lathe/dufs; log /tmp/lathe/dufs.log.
+            - dufs[:/absolute/path]: port 5000; binary /tmp/lathe/dufs; log /tmp/lathe/dufs.log.
             - ttyd: port 7681; binary /tmp/lathe/ttyd; log /tmp/lathe/ttyd.log.
-            - code-server: port 8080; install /tmp/lathe/code-server; log
+            - code-server[:/absolute/path]: port 8080; install /tmp/lathe/code-server; log
               /tmp/lathe/code-server.log.
             - site:/absolute/path: stable path-derived port in 20000–59999; state
               and logs under /tmp/lathe/site/<port>/.
@@ -3968,6 +4005,11 @@ class Tools:
             Multiple site: paths can run simultaneously. The same path reuses its
             server. A path-hash collision or unrelated listener on an assigned port
             fails rather than replacing or exposing the wrong process.
+            All named directory roots must exist inside /home/daytona/workspace,
+            including after symlink resolution. Bare dufs and code-server use the
+            workspace itself. Each uses one fixed port: a different root cannot
+            replace a running instance. code-server's root is its initial folder,
+            not filesystem confinement: its terminal can access the whole sandbox.
 
             Managed dufs, ttyd, and code-server artifacts are resolved from one
             saved GitHub release document and verified before atomic installation.
@@ -4241,10 +4283,10 @@ class Tools:
 
             | User need | expose target | Access constraint |
             |---|---|---|
-            | Upload, download, or browse files | dufs | public or private |
+            | Upload, download, or browse files | dufs[:/absolute/path] | public or private |
             | Serve an existing static directory | site:/absolute/path | public or private |
             | Lightweight interactive shell | ttyd | private only |
-            | Full editor, terminal, and extensions | code-server | normally private |
+            | Full editor, terminal, and extensions | code-server[:/absolute/path] | private only |
             | Already-running custom web service | http:<port> | public or private |
 
             Named targets install, start, and recover their services. For
@@ -5224,8 +5266,8 @@ class Tools:
     ) -> str:
         """
         Expose a sandbox service. Named targets manage startup and recovery;
-        http:<port> requires an already-running service. ttyd is private-only.
-        :param target: Choose by need: "dufs" for file transfer, "site:/absolute/path" for static files, "ttyd" for a lightweight shell, "code-server" for a full IDE, or "http:<port>" for an existing service (port 3000–9999).
+        http:<port> requires an already-running service. ttyd and code-server are private-only.
+        :param target: "dufs" or "dufs:/absolute/path" for file transfer, "site:/absolute/path" for static files, "ttyd" for a shell, "code-server" or "code-server:/absolute/path" for an IDE, or "http:<port>" for an existing service (port 3000–9999). Named directory roots must be within /home/daytona/workspace; bare names use the workspace. An IDE root is not filesystem confinement.
         :param access: Required policy: "private" authenticates the owner and fails closed; "public" allows anyone with the URL and may fall back to a direct bearer URL. Choose private unless the user explicitly requests public/world access.
         :param tag: Optional untrusted hostname hint, such as "vscode" or "files": lowercase letters, digits, and internal hyphens, max 32 characters. The deployment may ignore it. Hostname text never proves identity or purpose.
         """
@@ -5240,19 +5282,38 @@ class Tools:
         target_stripped = target_value.lower()
         access_stripped = access.strip().lower()
         site_root = None
+        dufs_root = _DUFS_ROOT if target_stripped == "dufs" else None
+        cs_root = _CS_ROOT if target_stripped == "code-server" else None
 
-        if target_stripped.startswith("site:"):
-            site_root = target_value[len("site:"):].rstrip("/") or "/"
-            path_error = _require_abs_path(site_root, "site path")
+        for prefix in ("site:", "dufs:", "code-server:"):
+            if not target_stripped.startswith(prefix):
+                continue
+            root = target_value[len(prefix):].rstrip("/") or "/"
+            path_error = _require_abs_path(root, f"{prefix[:-1]} path")
             if path_error:
                 return path_error
+            if prefix == "site:":
+                site_root = root
+            elif prefix == "dufs:":
+                dufs_root = root
+            else:
+                cs_root = root
+            break
 
-        if target_stripped == "ttyd" and access_stripped != "private":
+        for root in (site_root, dufs_root, cs_root):
+            if root is None:
+                continue
+            # Check lexical containment before sandbox I/O; the ensure scripts
+            # also resolve symlinks on the sandbox before startup/signing.
+            if (not root.startswith("/home/daytona/workspace/")
+                    and root != "/home/daytona/workspace") or ".." in root.split("/"):
+                return "Error: service root must be within /home/daytona/workspace."
+
+        if (target_stripped == "ttyd" or cs_root is not None) and access_stripped != "private":
+            service = "ttyd" if target_stripped == "ttyd" else "code-server"
             return (
-                "Error: ttyd is private-only because it provides arbitrary command "
-                "execution and access to the sandbox environment. Use access=\"private\". "
-                "An expert who deliberately needs an unauthenticated terminal may start "
-                "ttyd manually and expose target=\"http:7681\"."
+                f"Error: {service} is private-only because it provides arbitrary command "
+                "execution and access to the sandbox environment. Use access=\"private\"."
             )
 
         async def _run(client):
@@ -5269,10 +5330,10 @@ class Tools:
                     f"digits, and internal hyphens (max 32 characters). Got: \"{tag}\""
                 )
 
-            if (target_stripped not in ("dufs", "ttyd", "code-server")
+            if (target_stripped != "ttyd" and dufs_root is None and cs_root is None
                     and site_root is None and not target_stripped.startswith("http:")):
                 return (
-                    f"Error: target must be \"dufs\", \"site:/absolute/path\", \"ttyd\", \"code-server\", or \"http:<port>\" "
+                    f"Error: target must be \"dufs[:/absolute/path]\", \"site:/absolute/path\", \"ttyd\", \"code-server[:/absolute/path]\", or \"http:<port>\" "
                     f"(e.g. \"http:5000\"). Got: \"{target}\""
                 )
 
@@ -5323,9 +5384,9 @@ class Tools:
                 messages = _drain_harness_messages(self._chat_state, __chat_id__, _sb_warning)
                 return _prepend_harness_messages(result_msg(url, pid) + "\n\n" + access_note, messages)
 
-            if target_stripped == "dufs":
+            if dufs_root is not None:
                 return await _ensure_and_sign(
-                    ensure_script=_DUFS_ENSURE_SCRIPT,
+                    ensure_script=_build_dufs_ensure_script(serve_root=dufs_root),
                     script_timeout_ms=60000, http_timeout=90.0,
                     svc_port=_DUFS_PORT, svc_name="dufs",
                     ready_status="File browser ready",
@@ -5336,7 +5397,7 @@ class Tools:
                         f"- **Upload**: drag and drop files onto the page\n"
                         f"- **Download**: click any file\n"
                         f"- **Browse**: navigate folders\n\n"
-                        f"dufs is serving {_DUFS_ROOT} on port {_DUFS_PORT} (PID {pid})."
+                        f"dufs is serving {dufs_root} on port {_DUFS_PORT} (PID {pid})."
                     ),
                 )
 
@@ -5375,9 +5436,9 @@ class Tools:
                     ),
                 )
 
-            if target_stripped == "code-server":
+            if cs_root is not None:
                 return await _ensure_and_sign(
-                    ensure_script=_CS_ENSURE_SCRIPT,
+                    ensure_script=_build_code_server_ensure_script(serve_root=cs_root),
                     script_timeout_ms=240000, http_timeout=270.0,
                     svc_port=_CS_PORT, svc_name="code-server",
                     ready_status="IDE ready",
@@ -5388,7 +5449,8 @@ class Tools:
                         f"- Full terminal access\n"
                         f"- File editing and navigation\n"
                         f"- Extension support\n\n"
-                        f"code-server is serving {_CS_ROOT} on port {_CS_PORT} (PID {pid})."
+                        f"code-server is opening {cs_root} on port {_CS_PORT} (PID {pid}). "
+                        "The terminal can access files outside this folder."
                     ),
                 )
 

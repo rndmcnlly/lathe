@@ -94,8 +94,8 @@ rejected with a clear error if you try to set them.
 > Without a preview wrapper, every HTTP URL returned by `expose()` is a bearer
 > credential: anyone who sees or copies it can access the service until it
 > expires or stops working. A raw URL exposed in chat, a screen share, or a
-> recording can disclose a ttyd shell, terminal-capable code-server session, or a writable
-> file browser. After several months of personal and institutional use, this has
+> recording can disclose an intentionally public custom terminal service or a writable
+> file browser. Managed ttyd and code-server now require private access. After several months of personal and institutional use, this has
 > been Lathe's most significant recurring security sharp edge.
 
 Every `expose()` call requires the agent to choose `access="public"` or
@@ -113,8 +113,14 @@ when the wrapper supports it, browser authentication. Wrapping applies to
 arbitrary HTTP services, managed static sites, dufs, ttyd, and code-server before
 a URL reaches the model or user. `site:/absolute/path` starts a managed static
 server without requiring the model to choose a port or background process;
-multiple paths can remain live at once. The named `ttyd` target provides a
-lightweight browser shell and is private-only. Lathe does not provide SSH access.
+multiple paths can remain live at once. `dufs:/absolute/path` and
+`code-server:/absolute/path` select a directory (bare names use the workspace).
+Named directory roots must exist within `/home/daytona/workspace`, including
+after symlink resolution. Dufs and code-server each use one fixed port, so a
+running instance with another root must stop before switching roots. Both
+`ttyd` and `code-server` are private-only. The code-server folder is an initial
+working folder, not confinement: its terminal can access the full sandbox.
+Lathe does not provide SSH access.
 
 #### What a wrapper does
 

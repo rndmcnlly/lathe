@@ -1205,7 +1205,7 @@ def preview(tools, sandbox, http):
     return SimpleNamespace(invoke=invoke, upstream=upstream, protected=protected, secret=secret, good=good)
 
 
-@pytest.mark.parametrize("target", ["http:5000", "dufs", "site:/Workspace/My Site", "ttyd", "code-server"])
+@pytest.mark.parametrize("target", ["http:5000", "dufs", "dufs:/home/daytona/workspace/Files", "site:/home/daytona/workspace/My Site", "ttyd", "code-server", "code-server:/home/daytona/workspace/Project"])
 async def test_preview_uses_trusted_identity_and_hides_credentials(preview, target):
     result, calls, events = await preview.invoke(target=target)
     assert preview.protected in result and "Owner-authenticated" in result
@@ -1223,6 +1223,15 @@ async def test_ttyd_is_private_only_before_io(tools, monkeypatch):
     monkeypatch.setattr(lathe, "_tool_context", context)
     result = await tools.expose("ttyd", "public", __user__=USER)
     assert result.startswith("Error: ttyd is private-only")
+    context.assert_not_called()
+
+
+@pytest.mark.parametrize("target", ["code-server", "code-server:/home/daytona/workspace/project"])
+async def test_code_server_is_private_only_before_io(tools, monkeypatch, target):
+    context = AsyncMock(side_effect=AssertionError("public IDE reached I/O"))
+    monkeypatch.setattr(lathe, "_tool_context", context)
+    result = await tools.expose(target, "public", __user__=USER)
+    assert result.startswith("Error: code-server is private-only")
     context.assert_not_called()
 
 
@@ -1283,6 +1292,8 @@ def test_managed_archive_install_is_release_consistent_verified_and_atomic(
         installed = install_root / "code-server/bin/code-server"
         port = 8080
 
+    script = script.replace("/home/daytona/workspace", str(tmp_path))
+
     if fault == "stale":
         if service == "dufs":
             installed.write_text("incomplete")
@@ -1334,7 +1345,11 @@ def test_managed_archive_install_is_release_consistent_verified_and_atomic(
         """))
     fake_curl.chmod(0o755)
     fake_ss = fake_bin / "ss"
-    fake_ss.write_text(f"#!/bin/sh\nprintf '%s\\n' 'LISTEN 0 128 0.0.0.0:{port} users:((\"{service}\",pid=123,fd=3))'\n")
+    fake_ss.write_text(
+        f"#!/bin/sh\n"
+        f"test -f {shlex.quote(str(install_root / (service + '.root')))} || exit 0\n"
+        f"printf '%s\\n' 'LISTEN 0 128 0.0.0.0:{port} users:((\"{service}\",pid=123,fd=3))'\n"
+    )
     fake_ss.chmod(0o755)
 
     env = {**os.environ, "PATH": f"{fake_bin}:{os.environ['PATH']}"}
@@ -1391,6 +1406,52 @@ async def test_site_fast_path_preserves_path_and_manages_only_its_server(preview
     assert "hash collision" in script
     registration = next(r for r in calls if r.url.host == "wrapper.test")
     assert json.loads(registration.content)["access"] == "private"
+
+
+@pytest.mark.parametrize("target,root,command", [
+    ("dufs", "/home/daytona/workspace/Files", "dufs"),
+    ("code-server", "/home/daytona/workspace/Project", "code-server"),
+])
+async def test_managed_root_is_passed_to_service_and_reported(preview, target, root, command):
+    result, calls, _ = await preview.invoke(target=f"{target}:{root}")
+    assert root in result
+    script = json.loads(next(r for r in calls if r.url.host == "proxy.test").content)["command"]
+    assert f"'{root}'" in script
+    assert "already serving a different root" in script
+    assert "os.path.realpath" in script
+    assert f"{command}.root" in script
+
+
+@pytest.mark.parametrize("target", ["site", "dufs", "code-server"])
+@pytest.mark.parametrize("root", ["/home/daytona", "/home/daytona/workspace/../volume", "/home/daytona/workspace-other"])
+async def test_root_outside_workspace_refused_before_io(tools, monkeypatch, target, root):
+    context = AsyncMock(side_effect=AssertionError("outside root reached I/O"))
+    monkeypatch.setattr(lathe, "_tool_context", context)
+    result = await tools.expose(f"{target}:{root}", "private", __user__=USER)
+    assert result.startswith("Error: service root must be within")
+    context.assert_not_called()
+
+
+@pytest.mark.parametrize("target", ["site", "dufs", "code-server"])
+def test_named_service_rejects_symlink_escape_before_launch(tmp_path, target):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (workspace / "escape").symlink_to(outside, target_is_directory=True)
+    root = str(workspace / "escape")
+    install = tmp_path / "install"
+    if target == "site":
+        script = lathe._build_site_ensure_script(root, 30123)
+    elif target == "dufs":
+        script = lathe._build_dufs_ensure_script(str(install), root)
+    else:
+        script = lathe._build_code_server_ensure_script(str(install), root)
+    script = script.replace("/home/daytona/workspace", str(workspace))
+    result = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=5)
+    assert result.returncode != 0
+    assert "Service root must be an existing directory" in result.stderr
+    assert not install.exists()
 
 
 def test_site_ports_are_stable_and_allow_parallel_sites():
