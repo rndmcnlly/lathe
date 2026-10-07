@@ -1,6 +1,6 @@
 {
   "id": "lathe-shared-workspace",
-  "version": 3,
+  "version": 4,
   "steps": [
     {
       "id": "auth.owui",
@@ -113,7 +113,7 @@
     {
       "id": "editor.open",
       "do": "editor.open-via-explorer",
-      "fallback": ["editor.open-via-quick-open", "editor.open-via-terminal"],
+      "fallback": ["editor.open-via-quick-open"],
       "required": true,
       "intent": "Present the same relay artifact in VS Code",
       "screenshot": "shared-file-in-editor",
@@ -123,11 +123,15 @@
     {
       "id": "editor.edit",
       "do": "editor.replace-line",
-      "fallback": ["editor.replace-line-via-terminal"],
       "required": true,
       "intent": "Edit the shared artifact from the browser editor",
       "screenshot": "relay-edited",
-      "with": { "line": 2, "text": "You: A shared state of mind." },
+      "with": {
+        "path": "{{checkout}}/RELAY.md",
+        "line": 2,
+        "text": "You: A shared state of mind.",
+        "before": "Lathe: What do you call a chat agent and an editor sharing one sandbox?\nYou:\n"
+      },
       "failureDomain": "ui_drift"
     },
     {

@@ -11,6 +11,7 @@ import { strFromU8, strToU8, unzipSync, zipSync } from "fflate";
 
 import { normalizedToolEvents, matchesToolExpectation } from "./evidence.mjs";
 import { runScenario } from "./interpreter.mjs";
+import { replaceEditorLine } from "./editor.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const OUT_DIR = resolve(__dirname, "out");
@@ -78,7 +79,6 @@ const TARGETS = {
   "owui.send": ["#send-message-button"],
   "owui.integration-menu": ["#integration-menu-button", "#tools-menu-button"],
   "editor.workbench": [".monaco-workbench"],
-  "editor.terminal": [".terminal-wrapper", ".xterm"],
 };
 
 const started = Date.now();
@@ -410,20 +410,6 @@ async function openPreview(state) {
   state.previewReady = true;
 }
 
-async function ensureTerminal(page) {
-  const terminal = page.locator(target("editor.terminal")).first();
-  if (!await terminal.isVisible().catch(() => false)) {
-    await page.keyboard.press("Escape");
-    await page.keyboard.press("Control+`");
-    await terminal.waitFor({ state: "visible", timeout: 5000 });
-  }
-  const input = page.locator("textarea.xterm-helper-textarea,.xterm textarea").last();
-  await input.waitFor({ state: "attached", timeout: 3000 });
-  await input.click({ force: true });
-  await page.waitForTimeout(250);
-  return input;
-}
-
 function redact(value) {
   if (typeof value === "string") {
     return value
@@ -506,7 +492,6 @@ const state = {
   chatUrl: null,
   toolBaseline: 0,
   previewReady: false,
-  editorRoute: null,
   finalChat: null,
   releaseScreenshots: [],
   onEvent: async (event, report) => {
@@ -642,7 +627,6 @@ const adapter = {
     await file.waitFor({ state: "visible", timeout: 5000 });
     await file.dblclick();
     await state.page.waitForTimeout(750);
-    state.editorRoute = "explorer";
     return { observations: [`editor.open-path=${path}`, "editor.route=explorer"] };
   },
 
@@ -655,55 +639,10 @@ const adapter = {
     await quickInput.press("Enter");
     await state.page.getByText("RELAY.md", { exact: true }).last().waitFor({ state: "visible", timeout: 10000 });
     await state.page.waitForTimeout(750);
-    state.editorRoute = "quick-open";
     return { observations: [`editor.open-path=${path}`, "editor.route=quick-open"] };
   },
 
-  "editor.open-via-terminal": async ({ path }) => {
-    await openPreview(state);
-    const input = await ensureTerminal(state.page);
-    await input.pressSequentially(`sed -n '1,2p' ${path}`, { delay: 15 });
-    await input.press("Enter");
-    await state.page.waitForTimeout(1200);
-    state.editorRoute = "terminal";
-    return { observations: [`editor.open-path=${path}`, "editor.route=terminal"] };
-  },
-
-  "editor.replace-line": async ({ line, text }) => {
-    if (state.editorRoute === "terminal") {
-      throw new Error("The terminal presentation route requires the terminal edit fallback");
-    }
-    const editorInput = state.page.locator(".monaco-editor textarea,textarea.inputarea").last();
-    await editorInput.waitFor({ state: "attached", timeout: 2500 });
-    await editorInput.click({ force: true });
-    await state.page.keyboard.press("Control+G");
-    await state.page.keyboard.type(String(line));
-    await state.page.keyboard.press("Enter");
-    await state.page.keyboard.press("Home");
-    // Select the logical line, including its newline, not just a wrapped row.
-    // The command palette also avoids OS/browser conflicts with Ctrl/Cmd+L.
-    await state.page.keyboard.press("F1");
-    const commandInput = state.page.locator(".quick-input-widget input").first();
-    await commandInput.waitFor({ state: "visible", timeout: 2500 });
-    await commandInput.fill(">Expand Line Selection");
-    await commandInput.press("Enter");
-    await state.page.waitForTimeout(250);
-    await state.page.keyboard.type(text + "\n", { delay: 55 });
-    await state.page.keyboard.press("Control+S");
-    await state.page.waitForTimeout(1200);
-    return { observations: [`editor.replaced-line=${line}`] };
-  },
-
-  "editor.replace-line-via-terminal": async ({ line, text }) => {
-    const input = await ensureTerminal(state.page);
-    const path = `${state.variables.checkout}/RELAY.md`;
-    const code = `from pathlib import Path; p=Path(${JSON.stringify(path)}); xs=p.read_text().splitlines(); xs[${line - 1}]=${JSON.stringify(text)}; p.write_text('\\n'.join(xs)+'\\n')`;
-    const encoded = Buffer.from(code).toString("base64");
-    await input.pressSequentially(`python3 -c "$(printf %s ${encoded} | base64 -d)"`, { delay: 8 });
-    await input.press("Enter");
-    await state.page.waitForTimeout(1000);
-    return { observations: [`editor.replaced-line=${line}`, "editor.route=terminal"] };
-  },
+  "editor.replace-line": async (params) => replaceEditorLine(state.page, params),
 
   "chat.return": async () => {
     await state.page.goto(state.chatUrl);

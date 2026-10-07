@@ -35,6 +35,11 @@ The first recorded question asks Lathe for its installed version. The capture
 requires a matching `lathe(manpage="version")` result and saves a version frame,
 so the video identifies the deployed toolkit rather than the checkout version.
 
+The relay edit targets the file editor by URI, selects text with cursor movement,
+and verifies the rendered document before saving. The later Lathe read proves
+persistence independently. Editor failures reject the take as `ui_drift`;
+terminal editing cannot substitute for the demonstrated editor interaction.
+
 ## Weekly monitor
 
 GitHub Actions runs the production scenario every Wednesday at 14:17 UTC. Scheduled runs retain evidence and report health, but never publish the canonical demo. A required contract failure fails the workflow and identifies its category and first failing step in the job summary.
