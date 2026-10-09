@@ -99,7 +99,7 @@ rejected with a clear error if you try to set them.
 > been Lathe's most significant recurring security sharp edge.
 
 Every `expose()` call requires the agent to choose `access="public"` or
-`access="private"`. Public requests try the configured wrapper first, then fall
+`access="private"`. Public requests without upstream headers try the configured wrapper first, then fall
 back to Daytona's direct signed bearer URL if wrapping is unavailable, refused,
 or malformed. Private requests require successful owner-authenticated wrapper
 registration and never downgrade to public. The model-facing contract tells
@@ -153,7 +153,7 @@ institutional support, or routine screen sharing are part of the workflow.
 
 The wrapper receives the upstream URL and ownership from OWUI's injected
 `__user__` context. The model can select an exposure target, port, desired
-access level, and optional untrusted display tag, but it cannot supply the owner
+access level, optional application headers, and untrusted display tag, but it cannot supply the owner
 identity or substitute an arbitrary upstream URL. For private access, the generic identity invariant is email-based:
 the wrapper authenticates the browser through OAuth/OIDC and matches the
 provider-verified email claim against the owner email supplied at registration.
@@ -192,11 +192,39 @@ Lathe verifies a distinct HTTPS destination and a future timezone-qualified
 expiry. It rejects responses that
 reflect the upstream hostname or installation credential in the returned URL.
 It never follows registration redirects or exposes raw response/error text.
-For public requests, any wrapper failure falls back to the
+For public requests without upstream headers, any wrapper failure falls back to the
 direct signed URL. For private requests, missing configuration or identity,
 registration failure, and malformed responses all fail closed.
 The wrapper remains trusted to implement its claims; valid JSON alone cannot
 prove that it enforces browser ownership.
+
+Optional `upstream_headers` supplies fixed application headers, independently of
+public/private access:
+
+```python
+expose(target="http:8765", access="public", upstream_headers={"Authorization": "Bearer app-token"})
+```
+
+Lathe sends the dictionary in registration JSON only when nonempty. Success must
+then include `"upstream_headers_applied": true`; missing acknowledgement fails
+closed, including for public access. Direct Daytona URLs cannot provide header
+injection, so these calls never fall back or silently omit headers. Existing
+headerless behavior is unchanged. The model can supply values directly, without
+an additional approval dialog; ownership still governs only private access.
+
+The proxy replaces configured browser headers case-insensitively on HTTP and
+WebSocket requests. `Authorization` (including Basic) is supported. Limits and
+reserved names are specified in the [sidecar contract](preview-wrapper/README.md#upstream-headers).
+Values are not echoed in Lathe results, but remain in OWUI tool arguments and
+are entrusted to the application, which may reflect them. Public visitors can
+exercise the injected credential. Neither Lathe nor these headers establishes
+visitor identity or prevents alternate routes into the application. An app that
+trusts a proxy assertion must separately qualify trusted peers and direct bypass.
+
+The reference sidecar requires a separate encryption secret for header-bearing
+registrations. Independent wrappers, including BayLeaf's, must implement the
+same validation, forwarding, acknowledgement, and containment contract using
+their own storage and deployment mechanisms. See [Lathe #98](https://github.com/rndmcnlly/lathe/issues/98).
 
 #### Lifetime and browser behavior
 

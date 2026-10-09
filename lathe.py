@@ -5,7 +5,7 @@ author_url: https://adamsmith.as
 description: Coding agent tools (lathe, bash, read, write, edit, glob, grep, view, interpret, delegate, onboard, expose, destroy) backed by per-user sandbox VMs with transparent lifecycle management.
 required_open_webui_version: 0.11.0
 requirements: httpx, httpx-ws, pydantic-ai-slim[openai]~=2.5, cachetools
-version: 0.30.7
+version: 0.31.0
 licence: MIT
 """
 
@@ -365,14 +365,52 @@ def _extract_pid(output: str) -> str:
     return m.group(1) if m else "?"
 
 
+_UPSTREAM_HEADER_BLOCKED = frozenset({
+    "host", "cookie", "origin", "referer", "forwarded", "x-real-ip", "true-client-ip",
+    "connection", "upgrade", "keep-alive", "te", "trailer", "transfer-encoding",
+    "content-length", "expect", "http2-settings", "proxy-authorization", "proxy-authenticate",
+})
+_UPSTREAM_HEADER_PREFIXES = ("x-forwarded-", "sec-", "cf-", "daytona-", "x-daytona-", "x-lathe-")
+
+
+def _validate_upstream_headers(headers: dict[str, str]) -> str | None:
+    """Bound application headers without disclosing names or credential values.
+
+    Keep this wire contract aligned with preview-wrapper/src/index.js. Access
+    policy is independent: these are model-controlled app configuration, not
+    identity claims vouched for by Lathe.
+    """
+    if len(headers) > 16:
+        return "Error: upstream_headers permits at most 16 headers."
+    seen = set()
+    total = 0
+    for name, value in headers.items():
+        lower = name.lower()
+        if (not re.fullmatch(r"[!#$%&'*+.^_`|~0-9A-Za-z-]{1,64}", name)
+                or lower in _UPSTREAM_HEADER_BLOCKED
+                or lower.startswith(_UPSTREAM_HEADER_PREFIXES)):
+            return "Error: upstream_headers contains an invalid or reserved header name."
+        if lower in seen:
+            return "Error: upstream_headers contains duplicate names (case-insensitive)."
+        seen.add(lower)
+        if len(value) > 4096 or any(ord(c) < 32 or ord(c) > 126 for c in value):
+            return "Error: upstream_headers values must be printable ASCII, at most 4096 bytes each."
+        total += len(name) + len(value)
+    if total > 8192:
+        return "Error: upstream_headers names and values exceed the 8192-byte total limit."
+    return None
+
+
 async def _http_preview(valves, sandbox_id: str, port: int, user: dict,
                          access: str, tag: str,
-                         client: httpx.AsyncClient) -> tuple[str, str]:
+                         client: httpx.AsyncClient, *,
+                         upstream_headers: dict[str, str] = {}) -> tuple[str, str]:
     """Obtain a signed URL and enforce the caller-selected disclosure level.
 
-    Public requests fail open to the direct signed bearer URL when wrapping is
-    unavailable or refused. Private requests fail closed unless the trusted
-    wrapper successfully registers an owner-authenticated URL. Wrapper failures
+    Headerless public requests fail open to the direct signed bearer URL when
+    wrapping is unavailable or refused. Private requests fail closed unless the trusted
+    wrapper successfully registers an owner-authenticated URL. Header-bearing
+    requests always require acknowledged injection, with no direct fallback. Wrapper failures
     stay inside this credential boundary so raw response bodies never reach the model.
     """
     endpoint = valves.preview_wrapper_url.strip()
@@ -380,9 +418,9 @@ async def _http_preview(valves, sandbox_id: str, port: int, user: dict,
     wrapper_configured = bool(endpoint or credential)
     lifetime = f"{valves.preview_expiry_seconds / 3600:g} hour(s)"
 
-    # Private requests should fail before minting an upstream bearer URL when
+    # Private or header-bearing requests fail before minting a bearer URL when
     # the wrapper configuration or trusted caller identity is unusable.
-    if access == "private":
+    if access == "private" or upstream_headers:
         endpoint_parts = urllib.parse.urlsplit(endpoint)
         if (not endpoint or not credential or endpoint_parts.scheme != "https"
                 or not endpoint_parts.hostname or endpoint_parts.username
@@ -391,8 +429,8 @@ async def _http_preview(valves, sandbox_id: str, port: int, user: dict,
                 or not isinstance(user.get("id"), str) or not user["id"]
                 or not isinstance(user.get("email"), str) or not user["email"]):
             raise RuntimeError(
-                "Private HTTP preview unavailable. The wrapping service is not configured correctly; "
-                "no public URL was returned."
+                "HTTP preview unavailable. This request requires a correctly configured "
+                "wrapping service and trusted caller identity; no direct URL was returned."
             )
 
     try:
@@ -443,6 +481,8 @@ async def _http_preview(valves, sandbox_id: str, port: int, user: dict,
         }
         if tag:
             registration["tag"] = tag
+        if upstream_headers:
+            registration["upstream_headers"] = upstream_headers
         response = await client.post(
             endpoint,
             headers={"Authorization": f"Bearer {credential}"},
@@ -452,6 +492,8 @@ async def _http_preview(valves, sandbox_id: str, port: int, user: dict,
         )
         response.raise_for_status()
         result = response.json()
+        if upstream_headers and result.get("upstream_headers_applied") is not True:
+            raise ValueError()
         url = result["url"]
         parsed = urllib.parse.urlsplit(url)
         expiry = datetime.fromisoformat(result["expires_at"].replace("Z", "+00:00"))
@@ -463,11 +505,12 @@ async def _http_preview(valves, sandbox_id: str, port: int, user: dict,
                 or expiry.tzinfo is None or expiry <= datetime.now(timezone.utc)):
             raise ValueError()
     except Exception:
-        if access == "public":
+        if access == "public" and not upstream_headers:
             return direct_public("wrapping was unavailable or refused")
         raise RuntimeError(
-            "Private HTTP preview unavailable. Protected preview registration failed; "
-            "no public URL was returned. Ask the administrator to check the wrapping service."
+            "HTTP preview unavailable. Required wrapper registration failed or requested "
+            "header injection was not acknowledged; no direct URL was returned. "
+            "Ask the administrator to check the wrapping service."
         ) from None
 
     if access == "public":
@@ -1458,12 +1501,32 @@ def _type_name(annotation) -> str:
         args = typing.get_args(annotation)
         member = _type_name(args[0]) if args else "Any"
         return f"list[{member}]"
+    if origin is dict:
+        args = typing.get_args(annotation)
+        return f"dict[{', '.join(_type_name(arg) for arg in args)}]" if args else "dict"
     return getattr(annotation, "__name__", str(annotation))
 
 
 def _check_param_type(name: str, value, expected_type) -> str | None:
     """Recursively validate one value using exact runtime type semantics."""
     origin = typing.get_origin(expected_type)
+    if origin is dict:
+        if type(value) is not dict:
+            return (
+                f"Error: parameter '{name}' expected type {_type_name(expected_type)}, "
+                f"got {type(value).__name__}"
+            )
+        args = typing.get_args(expected_type)
+        if args:
+            for index, (key, member) in enumerate(value.items()):
+                for location, item, annotation in (
+                    (f"{name}.key[{index}]", key, args[0]),
+                    (f"{name}.value[{index}]", member, args[1]),
+                ):
+                    error = _check_param_type(location, item, annotation)
+                    if error:
+                        return error
+        return None
     if origin is list:
         if type(value) is not list:
             return (
@@ -3692,7 +3755,7 @@ class Tools:
             description="Daytona toolbox proxy URL",
         )
         preview_wrapper_url: str = Field(
-            "", description="Optional HTTPS registration endpoint for public or owner-authenticated HTTP previews. Public requests fall back to the direct signed URL; private requests fail closed.",
+            "", description="Optional HTTPS registration endpoint for public or owner-authenticated HTTP previews. Headerless public requests fall back to the direct signed URL; private or header-bearing requests fail closed.",
         )
         preview_wrapper_key: str = Field(
             "", description="Installation bearer credential for the preview wrapper (admin only).",
@@ -4033,6 +4096,29 @@ class Tools:
 
             {preview_access_note}
 
+            ## Upstream application headers
+
+            expose(..., upstream_headers={"Authorization": "Bearer app-token"})
+            configures fixed headers on this registration's HTTP requests and
+            WebSocket handshakes. Public/private access is independent: public
+            visitors also use the injected credential. Headers do not prove
+            visitor identity. The application decides what they mean.
+
+            Configured names replace browser-supplied values case-insensitively.
+            Unconfigured names remain ordinary browser headers; no application
+            assertion namespace is reserved. Authorization (including Basic) is
+            supported. Routing, framing, transport, browser security, and provider
+            headers are forbidden. Limits: 16 headers, 64-byte names, printable
+            ASCII values up to 4096 bytes, 8192 bytes total for names and values.
+
+            Nonempty headers require a compatible wrapper and acknowledgement:
+            no direct fallback or silent omission. Values are sent to the wrapper
+            and application, not echoed in tool results. Model-supplied values
+            remain in the chat's tool arguments. Apps may reflect them in replies.
+            If the app trusts an assertion, separately verify its trusted-peer
+            rules and direct/upstream bypass routes. Exposure does not secure
+            alternate paths into the sandbox application.
+
             ## Manual configurations
 
             Named targets intentionally cover common configurations. For a custom
@@ -4306,7 +4392,7 @@ class Tools:
 
             Named targets install, start, and recover their services. For
             http:<port>, start the service yourself before calling expose().
-            Public requests fall back to the direct signed bearer URL if wrapping
+            Headerless public requests fall back to the direct signed bearer URL if wrapping
             is unavailable or refused. Private requests never downgrade to public.
             The sandbox auto-stops on idle, which kills background processes —
             call the same named target again to recover. See
@@ -4454,7 +4540,7 @@ class Tools:
             content = content.replace("{destroy_volume_note}", destroy_volume_note)
             preview_note = (
                 "HTTP expose requires an explicit public/private access choice. Public requests try the wrapper, "
-                "then fall back to a direct signed bearer URL if wrapping is unavailable or refused. "
+                "then fall back to a direct signed bearer URL if wrapping is unavailable or refused (unless upstream_headers are requested). "
                 "Private requests require successful owner-authenticated wrapper registration and never downgrade to public. "
                 "Choose private unless the user specifically requested public/world access."
                 if self.valves.preview_wrapper_url or self.valves.preview_wrapper_key else
@@ -5275,6 +5361,7 @@ class Tools:
         target: str,
         access: str,
         tag: str = "",
+        upstream_headers: dict[str, str] = {},
         __user__: dict = {},
         __chat_id__: str = "",
         __event_emitter__=None,
@@ -5285,13 +5372,19 @@ class Tools:
         :param target: "dufs" or "dufs:/absolute/path" for file transfer, "site:/absolute/path" for static files, "ttyd" for a shell, "code-server" or "code-server:/absolute/path" for an IDE, or "http:<port>" for an existing service (port 3000–9999). Named directory roots must be within /home/daytona/workspace; bare names use the workspace. An IDE root is not filesystem confinement.
         :param access: Required policy: "private" authenticates the owner and fails closed; "public" allows anyone with the URL and may fall back to a direct bearer URL. Choose private unless the user explicitly requests public/world access.
         :param tag: Optional untrusted hostname hint, such as "vscode" or "files": lowercase letters, digits, and internal hyphens, max 32 characters. The deployment may ignore it. Hostname text never proves identity or purpose.
+        :param upstream_headers: Optional fixed application headers for HTTP and WebSocket forwarding, independent of public/private access. Replaces browser values case-insensitively; supports Authorization. Requires a compatible wrapper, with no direct fallback. Max 16 headers, 64-byte names, printable ASCII values up to 4096 bytes, 8192 bytes total. Routing/transport headers are forbidden. Values remain in tool arguments; see lathe(manpage="services") for trust boundaries.
         """
         type_err = _check_tool_params(
-            {"target": target, "access": access, "tag": tag},
+            {"target": target, "access": access, "tag": tag,
+             "upstream_headers": upstream_headers},
             type(self).expose,
         )
         if type_err:
             return type_err
+
+        header_error = _validate_upstream_headers(upstream_headers)
+        if header_error:
+            return header_error
 
         target_value = target.strip()
         target_stripped = target_value.lower()
@@ -5392,7 +5485,7 @@ class Tools:
                 await _emit(__event_emitter__, "Generating URL...")
                 url, access_note = await _http_preview(
                     self.valves, sandbox_id, svc_port, __user__, access_stripped,
-                    tag_stripped, client,
+                    tag_stripped, client, upstream_headers=upstream_headers,
                 )
 
                 await _emit(__event_emitter__, ready_status, done=True)

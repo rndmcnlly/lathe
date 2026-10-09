@@ -148,7 +148,7 @@ def module(request, monkeypatch):
 def test_tools_interface(module):
     methods = dict(inspect.getmembers(module.Tools(), inspect.ismethod))
     assert {n for n in methods if not n.startswith("_")} == set(EXPECTED_SCHEMA)
-    types = {str: "string", int: "integer", bool: "boolean", list: "array"}
+    types = {str: "string", int: "integer", bool: "boolean", list: "array", dict: "object"}
     for name, expected in EXPECTED_SCHEMA.items():
         method = methods[name]
         hints = typing.get_type_hints(method)
@@ -222,6 +222,9 @@ def test_delegate_interface(module):
     ("expose", {"target": 7, "access": "private"}, "target", "str", "int"),
     ("expose", {"target": "dufs", "access": 7}, "access", "str", "int"),
     ("expose", {"target": "dufs", "access": "private", "tag": 7}, "tag", "str", "int"),
+    ("expose", {"target": "dufs", "access": "public", "upstream_headers": []}, "upstream_headers", "dict[str, str]", "list"),
+    ("expose", {"target": "dufs", "access": "public", "upstream_headers": {7: "x"}}, "upstream_headers.key[0]", "str", "int"),
+    ("expose", {"target": "dufs", "access": "public", "upstream_headers": {"Authorization": 7}}, "upstream_headers.value[0]", "str", "int"),
 ])
 async def test_bad_types_rejected_before_io(
     module, monkeypatch, name, kwargs, location, expected, actual,
@@ -1175,7 +1178,7 @@ def preview(tools, sandbox, http):
     good = {"url": protected, "expires_at": "2099-01-01T00:00:00Z"}
 
     async def invoke(payload=None, status=200, target="http:5000", user=USER,
-                     access="private", tag="", setup_failure=False):
+                     access="private", tag="", setup_failure=False, upstream_headers=None):
         calls, events = [], []
         async def emit(event):
             events.append(event)
@@ -1200,7 +1203,8 @@ def preview(tools, sandbox, http):
                 return httpx.Response(200, json={"exitCode": 1, "result": "checksum mismatch"})
             return httpx.Response(200, json={"exitCode": 0, "result": "READY PID=123"})
         http(handler)
-        result = await tools.expose(target, access, tag, __user__=user, __event_emitter__=emit)
+        result = await tools.expose(target, access, tag, upstream_headers=upstream_headers or {},
+                                    __user__=user, __event_emitter__=emit)
         return result, calls, json.dumps(events)
     return SimpleNamespace(invoke=invoke, upstream=upstream, protected=protected, secret=secret, good=good)
 
@@ -1515,6 +1519,86 @@ async def test_public_preview_accepts_public_wrapper_result(preview):
     assert len([r for r in calls if r.url.host == "wrapper.test"]) == 1
     request = next(r for r in calls if r.url.host == "wrapper.test")
     assert json.loads(request.content)["access"] == "public"
+
+
+@pytest.mark.parametrize("access", ["public", "private"])
+@pytest.mark.parametrize("target", ["http:5000", "dufs", "site:/home/daytona/workspace/site"])
+async def test_preview_headers_are_registration_scoped_and_not_echoed(preview, access, target):
+    headers = {"Authorization": "Basic YXBwOnNlY3JldA==", "X-App-Mode": "demo"}
+    result, calls, events = await preview.invoke(
+        {**preview.good, "upstream_headers_applied": True}, access=access,
+        target=target, upstream_headers=headers)
+    assert preview.protected in result
+    assert all(value not in result + events for value in headers.values())
+    registration = json.loads(next(r.content for r in calls if r.url.host == "wrapper.test"))
+    assert registration["upstream_headers"] == headers
+    assert registration["access"] == access
+    assert registration["owner"] == {"subject": USER["id"], "email": USER["email"]}
+    # A later headerless call must not inherit the previous exposure's values.
+    _, calls, _ = await preview.invoke(access=access)
+    assert "upstream_headers" not in json.loads(next(r.content for r in calls if r.url.host == "wrapper.test"))
+
+
+@pytest.mark.parametrize("headers", [
+    {"X" * 64: "x" * 4096, "X-Empty": ""},
+    {f"X-{i}": "value" for i in range(16)},
+    {"X-A": "x" * 4096, "X-B": "x" * 4090},
+])
+async def test_upstream_header_bounds_are_inclusive(preview, headers):
+    result, calls, _ = await preview.invoke(
+        {**preview.good, "upstream_headers_applied": True}, access="public", upstream_headers=headers)
+    assert preview.protected in result
+    request = next(r for r in calls if r.url.host == "wrapper.test")
+    assert json.loads(request.content)["upstream_headers"] == headers
+
+
+@pytest.mark.parametrize("access", ["public", "private"])
+@pytest.mark.parametrize("failure", ["missing", "false", "string", "integer", "timeout", "malformed", "refused"])
+async def test_header_requests_cannot_silently_downgrade(preview, access, failure):
+    payload = dict(preview.good)
+    if failure in ("false", "string", "integer"):
+        payload["upstream_headers_applied"] = {"false": False, "string": "true", "integer": 1}[failure]
+    elif failure in ("timeout", "malformed"):
+        payload = failure
+    elif failure == "refused":
+        payload = {"error": "Bearer secret-app-credential"}
+    result, calls, events = await preview.invoke(
+        payload, 409 if failure == "refused" else 200, access=access,
+        upstream_headers={"Authorization": "Bearer secret-app-credential"})
+    assert result.startswith("Error:")
+    assert all(value not in result + events for value in (
+        preview.upstream, preview.protected, preview.secret, "secret-app-credential"))
+    assert len([r for r in calls if r.url.host == "wrapper.test"]) == 1
+
+
+@pytest.mark.parametrize("access", ["public", "private"])
+async def test_header_requests_require_wrapper_before_signing(preview, tools, access):
+    tools.valves.preview_wrapper_key = ""
+    result, calls, events = await preview.invoke(
+        access=access, upstream_headers={"Authorization": "secret-app-credential"})
+    assert result.startswith("Error:") and not calls
+    assert "secret-app-credential" not in result + events
+
+
+@pytest.mark.parametrize("headers", [
+    {"Host": "credential-canary"}, {"cOoKiE": "credential-canary"},
+    {"Origin": "credential-canary"}, {"X-Forwarded-Owner": "credential-canary"},
+    {"Connection": "credential-canary"}, {"Content-Length": "12"},
+    {"Sec-WebSocket-Protocol": "credential-canary"}, {"X-Daytona-Token": "credential-canary"},
+    {"Bad Name": "credential-canary"}, {"": "credential-canary"}, {"X" * 65: "value"},
+    {"X-App": "credential-canary\r\nHost: attacker"}, {"X-App": "\x00"},
+    {"X-App": "\t"}, {"X-App": "é"}, {"X-App": "\x7f"},
+    {"X-App": "x" * 4097}, {f"X-{i}": "value" for i in range(17)},
+    {"X-A": "x" * 4096, "X-B": "x" * 4096},
+    {"Authorization": "credential-canary", "authorization": "other"},
+])
+async def test_invalid_upstream_headers_rejected_before_io(module, monkeypatch, headers):
+    context = AsyncMock(side_effect=AssertionError("invalid header input reached I/O"))
+    monkeypatch.setattr(module, "_tool_context", context)
+    result = await module.Tools().expose("http:5000", "public", upstream_headers=headers)
+    assert result.startswith("Error: upstream_headers")
+    assert "credential-canary" not in result
+    context.assert_not_called()
 
 
 @pytest.mark.parametrize("failure,status", [

@@ -109,6 +109,79 @@ policy or rejects the registration. Generic explicit-label registrations remain
 public-only and cannot use the reserved `lathe-` prefix. Previous request,
 response, and stored-record shapes are not accepted.
 
+### Upstream headers
+
+Both Lathe and generic trusted producers may add an optional `upstream_headers`
+dictionary. It configures fixed application headers on one registration, for
+**either public or private access**. The model may propose the values directly;
+owner authentication remains solely the private-access gate. The wrapper does
+not interpret assertion names, map identities, infer roles, or create accounts.
+
+```json
+{"owner":{"subject":"owui-user-id","email":"owner@example.org"},
+ "upstream_url":"https://signed-upstream.example/","access":"public",
+ "upstream_headers":{"Authorization":"Basic YXBwOnNlY3JldA==","X-App-Mode":"demo"}}
+```
+
+Limits: at most 16 string/string entries; HTTP-token names of 1–64 ASCII bytes;
+printable ASCII values (including empty strings) of at most 4096 bytes each;
+8192 total bytes across names and values. Case-insensitive duplicate names are
+rejected. Invalid inputs return a generic 400 without echoing names or values.
+
+Forbidden names (case-insensitive): `Host`, `Cookie`, `Origin`, `Referer`,
+`Forwarded`, `X-Real-IP`, `True-Client-IP`, `Connection`, `Upgrade`, `Keep-Alive`,
+`TE`, `Trailer`, `Transfer-Encoding`, `Content-Length`, `Expect`, `HTTP2-Settings`,
+`Proxy-Authorization`, and `Proxy-Authenticate`. Forbidden prefixes:
+`X-Forwarded-`, `Sec-`, `CF-`, `Daytona-`, `X-Daytona-`, and `X-Lathe-`.
+`Authorization` (including Basic) is supported as an application credential,
+separate from registration, OIDC, browser-session, and Daytona credentials.
+
+Configured headers replace browser-supplied values case-insensitively, after any
+private-access check, on HTTP requests and WebSocket handshakes. Client
+`Connection` nominations cannot turn injected headers into hop-by-hop fields.
+Unconfigured application headers retain their existing behavior: no assertion
+namespace is reserved. Existing origin information is not replaced; applications
+remain responsible for cross-origin/CSRF policy. Public visitors can exercise
+the configured credential without signing in.
+
+For nonempty headers, success adds `"upstream_headers_applied": true` to the
+ordinary registration reply. No header names or values are returned. Lathe
+requires this exact acknowledgement and refuses direct-URL fallback if injection
+was requested. Omitted or empty headers keep the original reply and behavior.
+
+#### Storage and rotation
+
+Header-bearing registrations require `REGISTRATION_ENCRYPTION_KEY`: a base64
+encoded, random 32-byte secret. The complete registration, including destination,
+headers, owner, access, and absolute expiry, is encrypted using AES-256-GCM with a
+fresh 96-bit nonce and the exact hostname as authenticated additional data. KV
+stores a version-3 envelope (`iv`, `payload`), with the existing expiry TTL and
+ordinary producer/access/owner metadata, but no destination or header values in
+metadata. Existing headerless version-2 records remain compatible. Plaintext
+records containing nonempty headers are rejected. Missing/invalid encryption
+configuration refuses new header-bearing registrations with a sanitized 503.
+
+KV expiry and DELETE revocation remain authoritative. Absolute expiry is also
+checked on read. Generic re-registration replaces the complete record, including
+headers: omission removes old injections. Lathe registrations use fresh random
+hostnames, so a new exposure does not revoke previous live exposures. Revocation
+does not terminate already-established WebSockets.
+
+The encryption secret is separate from `REGISTER_TOKEN`: rotating the latter
+preserves encrypted leases. Replacing the encryption secret makes old encrypted
+records unreadable (404), until re-registered; there is no old-key fallback or
+automatic migration. KV ciphertext may remain until TTL/deletion. Encryption
+does not hide data from the running Worker, administrators holding its key, or
+the upstream application, and is not a zero-access claim. Values supplied by a
+model already exist in OWUI tool arguments; applications may echo them in bodies
+or response headers. This proxy does not sanitize successful application bodies.
+
+An app treating a header as an authentication assertion must independently
+verify trusted peer addresses and prevent spoofing via direct or alternate
+upstream routes. The wrapper is not a private network tunnel and cannot prove
+that network boundary. Protocol reference: [Lathe #98](https://github.com/rndmcnlly/lathe/issues/98),
+related independent BayLeaf implementation: [BayLeaf #86](https://github.com/bayleaf-ucsc/bayleaf/issues/86).
+
 ### Hostname templates
 
 `HOSTNAME_TEMPLATE` may contain literal text and these variables:
@@ -164,8 +237,17 @@ Worker, KV namespace, route, secret, and DNS records.
    ```bash
    wrangler secret put REGISTER_TOKEN
    wrangler secret put OIDC_CLIENT_SECRET
-   wrangler deploy
+    wrangler deploy
+    ```
+
+   To enable upstream headers, also generate and install a separate secret:
+
+   ```bash
+   openssl rand -base64 32 | wrangler secret put REGISTRATION_ENCRYPTION_KEY
    ```
+
+   Deploying source does not create this secret. Headerless previews do not
+   require it. Treat encryption-key rotation as invalidation of encrypted leases.
 
 5. In Cloudflare DNS, create proxied `A` records for `@` and `*`, both pointing
    to reserved TEST-NET address `192.0.2.1`. Worker routes own the requests; no

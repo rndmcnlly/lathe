@@ -15,6 +15,12 @@ const AUTH_CALLBACK_PATH = "/_lathe/auth/callback";
 const SESSION_COOKIE = "__Host-lathe_session";
 const STATE_PREFIX = "_lathe:state:";
 const SESSION_PREFIX = "_lathe:session:";
+const UPSTREAM_HEADER_BLOCKED = new Set([
+  "host", "cookie", "origin", "referer", "forwarded", "x-real-ip", "true-client-ip",
+  "connection", "upgrade", "keep-alive", "te", "trailer", "transfer-encoding",
+  "content-length", "expect", "http2-settings", "proxy-authorization", "proxy-authenticate",
+]);
+const UPSTREAM_HEADER_PREFIXES = ["x-forwarded-", "sec-", "cf-", "daytona-", "x-daytona-", "x-lathe-"];
 
 let oidcConfigurationPromise;
 
@@ -70,7 +76,7 @@ export default {
         }
       }
 
-      return proxy(request, url, registration.target, host, env.ZONE);
+      return proxy(request, url, registration.target, host, env.ZONE, registration.upstream_headers);
     }
 
     return page("off territory", "<p>This host is outside the zone.</p>", 421, env.ZONE);
@@ -124,6 +130,14 @@ async function handleRegister(request, env) {
   if (!latheRegistration && access !== undefined && access !== "public") {
     return json({ error: "generic registrations support only public access" }, 409);
   }
+
+  let upstreamHeaders;
+  try {
+    upstreamHeaders = validateUpstreamHeaders(body.upstream_headers === undefined ? {} : body.upstream_headers);
+  } catch {
+    return json({ error: "upstream_headers must be a bounded dictionary of permitted application headers" }, 400);
+  }
+  const hasUpstreamHeaders = Object.keys(upstreamHeaders).length > 0;
 
   const tag = body.tag === undefined ? "" : body.tag;
   if (latheRegistration && (typeof tag !== "string" || (tag && !TAG_RE.test(tag)))) {
@@ -196,8 +210,17 @@ async function handleRegister(request, env) {
     owner,
     registered_at: new Date(nowS * 1000).toISOString(),
     expires_at: expiresS,
+    ...(hasUpstreamHeaders ? { upstream_headers: upstreamHeaders } : {}),
   };
-  await env.SUBDOMAINS.put(host, JSON.stringify(registration), {
+  let stored = registration;
+  if (hasUpstreamHeaders) {
+    try {
+      stored = await encryptRegistration(registration, host, env);
+    } catch {
+      return json({ error: "encrypted registration storage is unavailable" }, 503);
+    }
+  }
+  await env.SUBDOMAINS.put(host, JSON.stringify(stored), {
     expirationTtl: ttl,
     metadata: {
       producer: latheRegistration ? "lathe" : "generic",
@@ -210,6 +233,7 @@ async function handleRegister(request, env) {
     url: `https://${host}/`,
     host,
     expires_at: new Date(expiresS * 1000).toISOString(),
+    ...(hasUpstreamHeaders ? { upstream_headers_applied: true } : {}),
   });
 }
 
@@ -228,15 +252,80 @@ async function getRegistration(env, host) {
   const stored = await env.SUBDOMAINS.get(host);
   if (!stored) return null;
   try {
-    const registration = JSON.parse(stored);
+    const envelope = JSON.parse(stored);
+    const encrypted = envelope?.version === 3;
+    const registration = encrypted ? await decryptRegistration(envelope, host, env) : envelope;
     if (registration?.version === 2 && typeof registration.target === "string"
-        && ["public", "private"].includes(registration.access)) {
+        && ["public", "private"].includes(registration.access)
+        && Number.isInteger(registration.expires_at) && registrationRemaining(registration) > 0) {
+      // Never accept configured credentials in a plaintext legacy record.
+      const headers = validateUpstreamHeaders(registration.upstream_headers ?? {});
+      if (!encrypted && Object.keys(headers).length) return null;
+      registration.upstream_headers = headers;
       return registration;
     }
   } catch {
     return null;
   }
   return null;
+}
+
+function validateUpstreamHeaders(value) {
+  // Wire contract mirrored in lathe.py; errors never contain input values.
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("invalid headers");
+  const entries = Object.entries(value);
+  if (entries.length > 16) throw new Error("too many headers");
+  const result = Object.create(null);
+  let total = 0;
+  for (const [name, headerValue] of entries) {
+    const lower = name.toLowerCase();
+    if (!/^[!#$%&'*+.^_`|~0-9A-Za-z-]{1,64}$/.test(name)
+        || UPSTREAM_HEADER_BLOCKED.has(lower)
+        || UPSTREAM_HEADER_PREFIXES.some((prefix) => lower.startsWith(prefix))
+        || Object.hasOwn(result, lower)
+        || typeof headerValue !== "string" || headerValue.length > 4096
+        || /[^\x20-\x7e]/.test(headerValue)) {
+      throw new Error("invalid headers");
+    }
+    total += name.length + headerValue.length;
+    result[lower] = headerValue;
+  }
+  if (total > 8192) throw new Error("headers too large");
+  return result;
+}
+
+async function registrationKey(env) {
+  // Separate from the control-plane token, so token rotation preserves leases.
+  const encoded = env.REGISTRATION_ENCRYPTION_KEY;
+  if (typeof encoded !== "string" || !/^[A-Za-z0-9+/]{43}=$/.test(encoded)) {
+    throw new Error("invalid storage key");
+  }
+  const bytes = Uint8Array.from(atob(encoded), (c) => c.charCodeAt(0));
+  if (bytes.length !== 32) throw new Error("invalid storage key");
+  return crypto.subtle.importKey("raw", bytes, "AES-GCM", false, ["encrypt", "decrypt"]);
+}
+
+async function encryptRegistration(registration, host, env) {
+  const key = await registrationKey(env);
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const payload = await crypto.subtle.encrypt({
+    name: "AES-GCM", iv, additionalData: new TextEncoder().encode(host),
+  }, key, new TextEncoder().encode(JSON.stringify(registration)));
+  return { version: 3, iv: base64Url(iv), payload: base64Url(new Uint8Array(payload)) };
+}
+
+async function decryptRegistration(envelope, host, env) {
+  const key = await registrationKey(env);
+  const payload = await crypto.subtle.decrypt({
+    name: "AES-GCM", iv: decodeBase64Url(envelope.iv),
+    additionalData: new TextEncoder().encode(host),
+  }, key, decodeBase64Url(envelope.payload));
+  return JSON.parse(new TextDecoder().decode(payload));
+}
+
+function decodeBase64Url(value) {
+  if (typeof value !== "string" || !/^[A-Za-z0-9_-]+$/.test(value)) throw new Error("invalid ciphertext");
+  return Uint8Array.from(atob(value.replace(/-/g, "+").replace(/_/g, "/")), (c) => c.charCodeAt(0));
 }
 
 function oidcConfigured(env) {
@@ -474,7 +563,7 @@ function base64Url(bytes) {
   return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 }
 
-async function proxy(request, url, target, publicHost, zone) {
+async function proxy(request, url, target, publicHost, zone, upstreamHeaders = {}) {
   let upstream;
   try {
     upstream = new URL(target);
@@ -491,12 +580,33 @@ async function proxy(request, url, target, publicHost, zone) {
   if (cookies) headers.set("cookie", cookies);
   else headers.delete("cookie");
 
-  const resp = await fetch(upstream, {
-    method: request.method,
-    headers,
-    body: ["GET", "HEAD"].includes(request.method) ? undefined : request.body,
-    redirect: "manual",
-  });
+  // Connection-nominated fields must not let a browser mark injected headers
+  // hop-by-hop. Preserve only the WebSocket upgrade control, then inject last.
+  if (Object.keys(upstreamHeaders).length) {
+    const websocket = headers.get("upgrade")?.toLowerCase() === "websocket";
+    for (const name of (headers.get("connection") ?? "").split(",")) {
+      const token = name.trim().toLowerCase();
+      if (token && /^[!#$%&'*+.^_`|~0-9a-z-]+$/.test(token)
+          && !(websocket && (token === "upgrade" || token.startsWith("sec-websocket-")))) {
+        headers.delete(token);
+      }
+    }
+    if (websocket) headers.set("connection", "Upgrade");
+    else headers.delete("connection");
+    for (const [name, value] of Object.entries(upstreamHeaders)) headers.set(name, value);
+  }
+
+  let resp;
+  try {
+    resp = await fetch(upstream, {
+      method: request.method,
+      headers,
+      body: ["GET", "HEAD"].includes(request.method) ? undefined : request.body,
+      redirect: "manual",
+    });
+  } catch {
+    return page("upstream unavailable", "<p>The application could not be reached.</p>", 502, zone);
+  }
 
   // Reconstructing the response would discard Cloudflare's WebSocket handle.
   if (resp.status === 101) return resp;

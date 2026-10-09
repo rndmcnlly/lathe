@@ -3,3 +3,6 @@
 REGISTER_TOKEN=change-me-long-random
 # wrangler secret put OIDC_CLIENT_SECRET
 OIDC_CLIENT_SECRET=change-me-oidc-client-secret
+# Optional upstream-header storage key: generate with openssl rand -base64 32.
+# wrangler secret put REGISTRATION_ENCRYPTION_KEY
+# REGISTRATION_ENCRYPTION_KEY=<base64-encoded-32-random-bytes>
