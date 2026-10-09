@@ -1,6 +1,6 @@
 # Agent Instructions — lathe
 
-Single-file Open WebUI toolkit (`lathe.py`) with a three-tier test suite. Read `lathe.py` **in full** before making changes — do not delegate exploration to a subagent that returns a summary. You need the actual code in context.
+Single-file Open WebUI toolkit (`lathe.py`) with a three-tier test suite.
 
 ## Documentation routing
 
