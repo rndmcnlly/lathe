@@ -5,7 +5,7 @@ author_url: https://adamsmith.as
 description: Coding agent tools (lathe, bash, read, write, edit, glob, grep, view, interpret, delegate, onboard, expose, destroy) backed by per-user sandbox VMs with transparent lifecycle management.
 required_open_webui_version: 0.11.0
 requirements: httpx, httpx-ws, pydantic-ai-slim[openai]~=2.5, cachetools
-version: 0.31.0
+version: 0.31.1
 licence: MIT
 """
 
@@ -2641,6 +2641,12 @@ def _build_onboard_script(project_path: str) -> str:
 
         # ── Collect and merge skills ─────────────────────────────────
 
+        sections.append(
+            "# Skill Locations\\n\\n"
+            "Scanning global skills via " + os.path.join(GLOBAL, "skills", "<skill-name>", "SKILL.md") + "\\n"
+            "Scanning project skills via " + os.path.join(PROJECT, ".agents", "skills", "<skill-name>", "SKILL.md")
+        )
+
         def collect_skills(base):
             skills_dir = os.path.join(base, "skills")
             if not os.path.isdir(skills_dir):
@@ -2714,6 +2720,11 @@ _SNAPSHOT_SCRIPT = (
     "import subprocess, os\n"
     + textwrap.dedent("""\
     sections = []
+
+    sections.append(
+        "Skills: " + os.path.expanduser("~/.agents/skills/<skill-name>/SKILL.md")
+        + " (scan with onboard(path), also checks <path>/.agents/skills/<skill-name>/SKILL.md)."
+    )
 
     # ── Directory listing (flat, one level) ──────────────────────
     for label, path in [("Workspace", "/home/daytona/workspace"),
