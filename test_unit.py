@@ -666,7 +666,8 @@ def test_output_tail_is_bounded_and_recoverable(text):
         assert output == text
 
 
-def test_onboard_merges_global_and_project_context(tmp_path):
+@pytest.mark.parametrize("build_script", [lathe._build_onboard_script, lathe._build_snapshot_script])
+def test_onboarding_merges_global_and_project_skills(tmp_path, build_script):
     home = tmp_path / "home"
     project = tmp_path / "it's a project"
     for base, instruction, description in [
@@ -678,16 +679,27 @@ def test_onboard_merges_global_and_project_context(tmp_path):
         skill = (base if base == home / ".agents" else base / ".agents") / "skills" / "shared"
         skill.mkdir(parents=True)
         (skill / "SKILL.md").write_text(f"---\nname: shared\ndescription: {description}\n---\nPRIVATE BODY")
-    result = run_script(lathe._build_onboard_script(str(project)), env={**os.environ, "HOME": str(home)})
-    assert "global instructions" in result and "project instructions" in result
+    unique = home / ".agents" / "skills" / "global-only"
+    unique.mkdir()
+    (unique / "SKILL.md").write_text("---\nname: global-only\ndescription: unique global skill\n---\nPRIVATE BODY")
+    result = run_script(build_script(str(project)), env={**os.environ, "HOME": str(home)})
+    if build_script is lathe._build_onboard_script:
+        assert "global instructions" in result and "project instructions" in result
+        assert str(project / "AGENTS.md") in result
+    else:
+        assert "global instructions" not in result and "project instructions" not in result
     assert "- **shared**: project skill" in result
     assert "- **shared**: global skill" not in result
+    assert "- **global-only**: unique global skill" in result
+    assert f"`{unique / 'SKILL.md'}`" in result
+    assert f"`{project / '.agents' / 'skills' / 'shared' / 'SKILL.md'}`" in result
+    assert f"`{home / '.agents' / 'skills' / 'shared' / 'SKILL.md'}`" not in result
     assert "PRIVATE BODY" not in result
-    assert str(project / "AGENTS.md") in result
 
 
 @pytest.mark.parametrize("existing", [False, True])
-def test_onboard_announces_skill_locations_even_without_skills(tmp_path, existing):
+@pytest.mark.parametrize("build_script", [lathe._build_onboard_script, lathe._build_snapshot_script])
+def test_onboarding_announces_skill_locations_even_without_skills(tmp_path, existing, build_script):
     home = tmp_path / "home"
     project = tmp_path / "project"
     global_skills = home / ".agents" / "skills"
@@ -695,20 +707,17 @@ def test_onboard_announces_skill_locations_even_without_skills(tmp_path, existin
     if existing:
         global_skills.mkdir(parents=True)
         project_skills.mkdir(parents=True)
-    result = run_script(lathe._build_onboard_script(str(project)), env={**os.environ, "HOME": str(home)})
+    result = run_script(build_script(str(project)), env={**os.environ, "HOME": str(home)})
     assert f"Scanning global skills via {global_skills}/<skill-name>/SKILL.md" in result
     assert f"Scanning project skills via {project_skills}/<skill-name>/SKILL.md" in result
     assert "<skill-name>/SKILL.md" in result
 
 
-def test_auto_init_announces_skill_location_without_claiming_to_scan(tmp_path):
+def test_auto_init_scans_default_workspace_skills(tmp_path):
     home = tmp_path / "home"
     result = run_script(lathe._SNAPSHOT_SCRIPT, env={**os.environ, "HOME": str(home)})
-    assert f"Skills: {home / '.agents' / 'skills'}/<skill-name>/SKILL.md" in result
-    assert "<skill-name>/SKILL.md" in result
-    assert "onboard(path)" in result
-    assert "<path>/.agents/skills" in result
-    assert "scan with onboard(path)" in result
+    assert f"Scanning global skills via {home / '.agents' / 'skills'}/<skill-name>/SKILL.md" in result
+    assert "Scanning project skills via /home/daytona/workspace/.agents/skills/<skill-name>/SKILL.md" in result
 
 
 @pytest.mark.parametrize("volume,wrapped", [(False, False), (True, False), (True, True)])

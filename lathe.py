@@ -5,7 +5,7 @@ author_url: https://adamsmith.as
 description: Coding agent tools (lathe, bash, read, write, edit, glob, grep, view, interpret, delegate, onboard, expose, destroy) backed by per-user sandbox VMs with transparent lifecycle management.
 required_open_webui_version: 0.11.0
 requirements: httpx, httpx-ws, pydantic-ai-slim[openai]~=2.5, cachetools
-version: 0.31.1
+version: 0.31.2
 licence: MIT
 """
 
@@ -2585,6 +2585,62 @@ async def _core_interpret(valves, sandbox_id: str, client: httpx.AsyncClient,
     return result
 
 
+_SKILL_CATALOG_SCRIPT = textwrap.dedent("""\
+    # Shared discovery for explicit onboarding and the first-call snapshot.
+    sections.append(
+        "# Skill Locations\\n\\n"
+        "Scanning global skills via " + os.path.join(GLOBAL, "skills", "<skill-name>", "SKILL.md") + "\\n"
+        "Scanning project skills via " + os.path.join(PROJECT, ".agents", "skills", "<skill-name>", "SKILL.md")
+    )
+
+    def collect_skills(base):
+        skills_dir = os.path.join(base, "skills")
+        if not os.path.isdir(skills_dir):
+            return
+        for skill_md in sorted(glob.glob(os.path.join(skills_dir, "*/SKILL.md"))):
+            dir_name = os.path.basename(os.path.dirname(skill_md))
+            name = dir_name
+            desc = ""
+            try:
+                with open(skill_md) as f:
+                    lines = f.readlines()
+            except OSError:
+                continue
+            # Parse YAML frontmatter (minimal, no deps)
+            if lines and lines[0].strip() == "---":
+                for line in lines[1:]:
+                    if line.strip() == "---":
+                        break
+                    if line.startswith("name:"):
+                        name = line[len("name:"):].strip()
+                    elif line.startswith("description:"):
+                        desc = line[len("description:"):].strip()
+            yield name, desc, skill_md
+
+    # Global first, then project overrides on collision
+    skills = {}   # name -> (desc, path)
+    order = []    # first-seen order
+    for base in (GLOBAL, os.path.join(PROJECT, ".agents")):
+        for name, desc, path in collect_skills(base):
+            if name not in skills:
+                order.append(name)
+            skills[name] = (desc, path)
+
+    if order:
+        lines = [
+            "# Available Skills",
+            "",
+            "Load a skill's full instructions with read(path) when the task matches its description.",
+            "",
+        ]
+        for name in order:
+            desc, path = skills[name]
+            lines.append(f"- **{name}**: {desc}")
+            lines.append("  `" + path + "`")
+        sections.append("\\n".join(lines))
+""")
+
+
 def _build_onboard_script(project_path: str) -> str:
     """Build a Python script that collects agent context from a sandbox.
 
@@ -2639,63 +2695,9 @@ def _build_onboard_script(project_path: str) -> str:
         if project_md:
             sections.append(project_md)
 
-        # ── Collect and merge skills ─────────────────────────────────
-
-        sections.append(
-            "# Skill Locations\\n\\n"
-            "Scanning global skills via " + os.path.join(GLOBAL, "skills", "<skill-name>", "SKILL.md") + "\\n"
-            "Scanning project skills via " + os.path.join(PROJECT, ".agents", "skills", "<skill-name>", "SKILL.md")
-        )
-
-        def collect_skills(base):
-            skills_dir = os.path.join(base, "skills")
-            if not os.path.isdir(skills_dir):
-                return
-            for skill_md in sorted(glob.glob(os.path.join(skills_dir, "*/SKILL.md"))):
-                dir_name = os.path.basename(os.path.dirname(skill_md))
-                name = dir_name
-                desc = ""
-                try:
-                    with open(skill_md) as f:
-                        lines = f.readlines()
-                except OSError:
-                    continue
-                # Parse YAML frontmatter (minimal, no deps)
-                if lines and lines[0].strip() == "---":
-                    for line in lines[1:]:
-                        if line.strip() == "---":
-                            break
-                        if line.startswith("name:"):
-                            name = line[len("name:"):].strip()
-                        elif line.startswith("description:"):
-                            desc = line[len("description:"):].strip()
-                yield name, desc, skill_md
-
-        # Global first, then project overrides on collision
-        skills = {}   # name -> (desc, path)
-        order  = []   # first-seen order
-        for name, desc, path in collect_skills(GLOBAL):
-            if name not in skills:
-                order.append(name)
-            skills[name] = (desc, path)
-        for name, desc, path in collect_skills(os.path.join(PROJECT, ".agents")):
-            if name not in skills:
-                order.append(name)
-            skills[name] = (desc, path)
-
-        if order:
-            lines = [
-                "# Available Skills",
-                "",
-                "Load a skill's full instructions with read(path) when the task matches its description.",
-                "",
-            ]
-            for name in order:
-                desc, path = skills[name]
-                lines.append(f"- **{name}**: {desc}")
-                lines.append("  `" + path + "`")
-            sections.append("\\n".join(lines))
-
+    """)
+        + _SKILL_CATALOG_SCRIPT
+        + textwrap.dedent("""\
         # ── Output ───────────────────────────────────────────────────
 
         print("\\n\\n---\\n\\n".join(sections))
@@ -2711,23 +2713,23 @@ def _build_onboard_script(project_path: str) -> str:
 # a dedicated tool call.  Subsequent calls in the same chat skip the
 # snapshot (tracked by chat_id in an LRU cache on the Tools instance).
 #
-# The snapshot is deliberately lighter than onboard(): no AGENTS.md, no
-# skills catalog, no deep directory scan.  Just enough to eliminate the
+# The snapshot is deliberately lighter than onboard(): no AGENTS.md or
+# full skill bodies, no deep directory scan. Just enough to eliminate the
 # 2-5 exploratory turns models typically spend probing "what's here?" and
 # "what's installed?".
 
-_SNAPSHOT_SCRIPT = (
-    "import subprocess, os\n"
-    + textwrap.dedent("""\
+def _build_snapshot_script(project_path: str) -> str:
+    """Build first-call orientation with the same skill catalog as onboard()."""
+    return (
+        "import subprocess, os, glob\n\nPROJECT = " + repr(project_path)
+        + "\n" + textwrap.dedent("""\
+    GLOBAL = os.path.expanduser("~/.agents")
     sections = []
-
-    sections.append(
-        "Skills: " + os.path.expanduser("~/.agents/skills/<skill-name>/SKILL.md")
-        + " (scan with onboard(path), also checks <path>/.agents/skills/<skill-name>/SKILL.md)."
-    )
-
+    """)
+        + _SKILL_CATALOG_SCRIPT
+        + textwrap.dedent("""\
     # ── Directory listing (flat, one level) ──────────────────────
-    for label, path in [("Workspace", "/home/daytona/workspace"),
+    for label, path in [("Workspace", PROJECT),
                         ("Volume", "/home/daytona/volume")]:
         if os.path.isdir(path):
             entries = sorted(os.listdir(path))
@@ -2758,7 +2760,10 @@ _SNAPSHOT_SCRIPT = (
 
     print("\\n\\n".join(sections))
     """)
-)
+    )
+
+
+_SNAPSHOT_SCRIPT = _build_snapshot_script("/home/daytona/workspace")
 
 
 async def _chat_auto_init(
