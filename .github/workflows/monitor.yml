@@ -2,6 +2,11 @@ name: Isolated live monitor
 
 on:
   workflow_dispatch:
+    inputs:
+      model:
+        description: OpenRouter model for isolated qualification of the selected trusted ref
+        type: string
+        default: openrouter/pareto-code
   schedule:
     - cron: '17 9 * * 1'
   push:
@@ -29,6 +34,8 @@ jobs:
     if: github.repository == 'rndmcnlly/lathe' && github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    env:
+      LATHE_MONITOR_MODEL: ${{ inputs.model || 'openrouter/pareto-code' }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:

@@ -6,6 +6,7 @@ Needs Docker, OpenSSL, Node/npm, and the monitor's two provider environment keys
 Port 443 must be free. No cloud deployment or production OWUI configuration.
 """
 
+import argparse
 import asyncio
 import base64
 import hashlib
@@ -33,6 +34,7 @@ NETWORK = "lathe-local-demo"
 WORKER = "lathe-local-worker"
 TLS = "lathe-local-tls"
 ISSUER = f"http://{monitor.CONTAINER}:9100/demo-idp"
+DEMO_MODEL = "z-ai/glm-5.3-flash"
 
 
 def demo_identity_app(client_secret, *, clock=time.monotonic):
@@ -69,7 +71,9 @@ def demo_identity_app(client_secret, *, clock=time.monotonic):
                 '<button>Sign in as demo user</button></form>')
         code = secrets.token_urlsafe(32)
         codes[code] = (dict(query), clock() + 60)
-        raise web.HTTPFound(query["redirect_uri"] + "?" + urlencode({"code": code, "state": query["state"]}))
+        # Reconstruct from validated components, never redirect to a raw input URL.
+        redirect = f"https://{callback.hostname}/_lathe/auth/callback"
+        raise web.HTTPFound(redirect + "?" + urlencode({"code": code, "state": query["state"]}))
 
     async def token(request):
         form = await request.post()
@@ -121,22 +125,26 @@ async def serve():
     try:
         token = await monitor.bootstrap("http://127.0.0.1:8080", relay.key)
         os.environ.update(OWUI_URL="http://127.0.0.1:8080", OWUI_TOKEN=token,
-                          OWUI_MODEL=monitor.MODEL, LATHE_TEST_TOOL_ID="lathe_test")
+                          OWUI_MODEL=monitor.workspace_model(), LATHE_TEST_TOOL_ID="lathe_test")
         import test_deployment as suite
         suite.TRACE = trace
         await suite.deploy_staging_tool()
         # Private pipe to the parent, never written to an artifact or console.
         print(json.dumps({"ready": True, "token": token}), flush=True)
         await asyncio.to_thread(sys.stdin.readline)
+        relay.verify_evidence()
     finally:
-        if suite:
-            await suite.delete_staging_tool()
-        await runner.cleanup()
-        await identity.cleanup()
-        (directory / "demo-routing.json").write_text(json.dumps({
-            "serving_models": sorted(trace.models), "requests": relay.requests,
-            "evidence_errors": relay.evidence_errors,
-        }, indent=2))
+        try:
+            if suite:
+                await suite.delete_staging_tool()
+        finally:
+            await runner.cleanup()
+            await identity.cleanup()
+            (directory / "demo-routing.json").write_text(json.dumps({
+                "requested_model": relay.model,
+                "serving_models": sorted(trace.models), "requests": relay.requests,
+                "evidence_errors": relay.evidence_errors,
+            }, indent=2))
 
 
 def prepare_infrastructure(path):
@@ -160,6 +168,7 @@ def prepare_infrastructure(path):
     (path / ".dev.vars").write_text(f"REGISTER_TOKEN={token}\n"
         f"OIDC_ISSUER={ISSUER}\nOIDC_CLIENT_ID=lathe-demo\nOIDC_CLIENT_SECRET={identity_secret}\n"
         f"REGISTRATION_ENCRYPTION_KEY={encryption_key}\n")
+    (path / ".dev.vars").chmod(0o600)
     (path / "nginx.conf").write_text(f"""events {{}}
 http {{
   resolver 127.0.0.11 valid=5s;
@@ -222,30 +231,102 @@ def capture_environment(token, port):
     env = {k: v for k, v in os.environ.items()
            if not k.startswith(("DEMO_", "OWUI_")) and k not in server_keys}
     env.update(DEMO_LOCAL_TOKEN=token, DEMO_OWUI_URL=f"http://127.0.0.1:{port}",
-               DEMO_MODEL=monitor.MODEL, DEMO_PROXY_DOMAINS=ZONE)
+               DEMO_MODEL=monitor.workspace_model(), DEMO_PROXY_DOMAINS=ZONE)
     # This opt-in affects prewarm only, never authentication or preview policy.
     if os.environ.get("DEMO_SKIP_PREWARM") == "1":
         env["DEMO_SKIP_PREWARM"] = "1"
     return env
 
 
+def cleanup_demo(directory):
+    """Repeatable teardown of this demo's exact-label sandboxes and local stack."""
+    manifest = directory / "environment.json"
+    if not manifest.exists():
+        return False  # No resources can have been created before this manifest.
+    if not json.loads(manifest.read_text())["deployment_label"].startswith("lathe-ci-demo-"):
+        raise RuntimeError("Refusing to clean a non-demo manifest")
+    errors = []
+    try:
+        if monitor.cleanup(directory):
+            errors.append("OWUI/Daytona cleanup failed")
+    except Exception as exc:
+        errors.append(monitor.sanitize(str(exc)))
+    for name in (TLS, WORKER):
+        try:
+            logs = monitor.docker("logs", name, check=False)
+            (directory / f"{name}.log").write_text(monitor.sanitize(logs.stdout + logs.stderr))
+            result = monitor.docker("rm", "-f", "-v", name, check=False)
+            if result.returncode and "No such container" not in result.stderr:
+                errors.append(monitor.sanitize(result.stderr or f"Could not remove {name}"))
+        except Exception as exc:
+            errors.append(monitor.sanitize(str(exc)))
+    try:
+        result = monitor.docker("network", "rm", NETWORK, check=False)
+        if result.returncode and not ("network" in result.stderr and "not found" in result.stderr):
+            errors.append(monitor.sanitize(result.stderr or "Could not remove demo network"))
+    except Exception as exc:
+        errors.append(monitor.sanitize(str(exc)))
+    (directory / "demo-cleanup.json").write_text(json.dumps({"success": not errors, "errors": errors}, indent=2))
+    return bool(errors)
+
+
+def qualify(directory):
+    """Gate release assets on capture, routing evidence, checkout, and teardown."""
+    qualification = ROOT / "demo-video/out/qualification.json"
+    qualification.unlink(missing_ok=True)
+    environment = json.loads((directory / "environment.json").read_text())
+    routing = json.loads((directory / "demo-routing.json").read_text())
+    cleanup = json.loads((directory / "demo-cleanup.json").read_text())
+    capture = json.loads((ROOT / "demo-video/out/capture-report.json").read_text())
+    if (capture["status"] != "accepted" or not cleanup["success"]
+            or routing["requested_model"] != environment["requested_model"]
+            or not routing["serving_models"] or not routing["requests"]
+            or routing["evidence_errors"]):
+        raise RuntimeError("Demo qualification failed: capture, routing, or cleanup evidence")
+    result = {"accepted": True, "git_sha": environment["git_sha"],
+              "requested_model": routing["requested_model"], "serving_models": routing["serving_models"],
+              "deployment_label": environment["deployment_label"]}
+    qualification.write_text(json.dumps(result, indent=2))
+
+
 def main():
-    if "--inside" in sys.argv:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--inside", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--cleanup", action="store_true", help="Repeat teardown using --artifacts manifest")
+    parser.add_argument("--artifacts", type=Path, help="Evidence directory (required for --cleanup)")
+    args = parser.parse_args()
+    os.environ.setdefault("LATHE_MONITOR_MODEL", DEMO_MODEL)
+    if args.inside:
         asyncio.run(serve())
         return
     for key in ("DAYTONA_API_KEY", "OPENROUTER_API_KEY"):
         if not os.environ.get(key):
             raise RuntimeError(f"Export {key} before running")
+    if args.cleanup:
+        if not args.artifacts:
+            parser.error("--cleanup requires --artifacts")
+        if cleanup_demo(args.artifacts.resolve()):
+            raise RuntimeError("Demo cleanup failed")
+        return
     for name in (monitor.CONTAINER, WORKER, TLS):
-        if monitor.docker("inspect", name, check=False).returncode == 0:
+        result = monitor.docker("inspect", name, check=False)
+        if result.returncode == 0:
             raise RuntimeError(f"Finish or clean up the existing {name} first")
-    if monitor.docker("network", "inspect", NETWORK, check=False).returncode == 0:
+        if "No such" not in result.stderr:
+            raise RuntimeError(monitor.sanitize(f"Cannot establish demo isolation: {result.stderr}"))
+    result = monitor.docker("network", "inspect", NETWORK, check=False)
+    if result.returncode == 0:
         raise RuntimeError(f"Network {NETWORK} already exists")
+    if "not found" not in result.stderr and "No such" not in result.stderr:
+        raise RuntimeError(monitor.sanitize(f"Cannot establish demo isolation: {result.stderr}"))
     def interrupted(signum, frame):
         raise KeyboardInterrupt(f"signal {signum}")
     signal.signal(signal.SIGTERM, interrupted)
-    directory = ROOT / "monitor-artifacts" / ("demo-" + secrets.token_hex(6))
+    directory = args.artifacts.resolve() if args.artifacts else ROOT / "monitor-artifacts" / ("demo-" + secrets.token_hex(6))
+    if (directory / "environment.json").exists():
+        raise RuntimeError("Use a fresh artifact directory to avoid mixing run evidence")
     directory.mkdir(parents=True)
+    (ROOT / "demo-video/out/qualification.json").unlink(missing_ok=True)
     os.environ["LATHE_TEST_DEPLOYMENT_LABEL"] = "lathe-ci-demo-" + secrets.token_hex(12)
     (directory / "environment.json").write_text(json.dumps({
         "deployment_label": os.environ["LATHE_TEST_DEPLOYMENT_LABEL"]}))
@@ -262,7 +343,7 @@ def main():
                 "--env", f"LATHE_PREVIEW_WRAPPER_URL=https://{ZONE}/register",
                 "--env", "LATHE_DEMO_IDP_SECRET",
                 "--env", "LATHE_PREVIEW_WRAPPER_KEY"))
-            process = subprocess.Popen(["docker", "exec", "-i", monitor.CONTAINER,
+            process = subprocess.Popen(["docker", "exec", "--user", f"{os.getuid()}:{os.getgid()}", "-i", monitor.CONTAINER,
                 "python", "/monitor/demo_local.py", "--inside"],
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
             selector = selectors.DefaultSelector()
@@ -282,23 +363,22 @@ def main():
             subprocess.run(["npm", "run", "capture"], cwd=ROOT / "demo-video", env=env,
                            check=True, timeout=1200)
         finally:
+            inner_failed = False
             if process:
                 try:
                     stdout, stderr = process.communicate("done\n", timeout=45)
                     (directory / "demo-host.log").write_text(monitor.sanitize(stdout + stderr))
+                    inner_failed = process.returncode != 0
                 except subprocess.TimeoutExpired:
                     process.kill()
                     process.communicate()
-            failed = monitor.cleanup(directory)
-            for name in (TLS, WORKER):
-                logs = monitor.docker("logs", name, check=False)
-                (directory / f"{name}.log").write_text(monitor.sanitize(logs.stdout + logs.stderr))
-                if monitor.docker("inspect", name, check=False).returncode == 0:
-                    failed |= monitor.docker("rm", "-f", "-v", name, check=False).returncode != 0
-            if monitor.docker("network", "inspect", NETWORK, check=False).returncode == 0:
-                failed |= monitor.docker("network", "rm", NETWORK, check=False).returncode != 0
+                    inner_failed = True
+            failed = cleanup_demo(directory)
             if failed:
                 raise RuntimeError(f"Cleanup failed; inspect {directory}")
+            if inner_failed:
+                raise RuntimeError(f"Demo relay or staging teardown failed; inspect {directory}")
+    qualify(directory)
     print(f"Video: {ROOT / 'demo-video/out/demo.webm'}")
 
 

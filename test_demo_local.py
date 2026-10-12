@@ -3,6 +3,7 @@
 import base64
 import hashlib
 import json
+import subprocess
 from urllib.parse import parse_qs, urlsplit
 
 from aiohttp import ClientSession
@@ -10,6 +11,70 @@ from aiohttp.test_utils import TestServer
 import pytest
 
 import demo_local as demo
+
+
+@pytest.mark.parametrize("fault", [None, "daemon", "removal", "network", "sandbox"])
+def test_demo_cleanup_attempts_every_resource_and_fails_closed(tmp_path, monkeypatch, fault):
+    (tmp_path / "environment.json").write_text(json.dumps({"deployment_label": "lathe-ci-demo-fixture"}))
+    seen = []
+    def docker(*args, **kwargs):
+        seen.append(args)
+        if fault == "daemon":
+            return subprocess.CompletedProcess(args, 1, "", "Cannot connect to Docker daemon")
+        if fault == "removal" and args[0] == "rm":
+            return subprocess.CompletedProcess(args, 1, "", "permission denied")
+        if fault == "network" and args[:2] == ("network", "rm"):
+            return subprocess.CompletedProcess(args, 1, "", "network has active endpoints")
+        # Explicitly missing resources are expected on repeated cleanup.
+        message = "network demo not found" if args[0] == "network" else "No such container: demo"
+        return subprocess.CompletedProcess(args, 1, "", message)
+    monkeypatch.setattr(demo.monitor, "docker", docker)
+    monkeypatch.setattr(demo.monitor, "cleanup", lambda directory: fault == "sandbox")
+    assert demo.cleanup_demo(tmp_path) == bool(fault)
+    assert ("rm", "-f", "-v", demo.TLS) in seen
+    assert ("rm", "-f", "-v", demo.WORKER) in seen
+    assert ("network", "rm", demo.NETWORK) in seen
+    assert json.loads((tmp_path / "demo-cleanup.json").read_text())["success"] == (not fault)
+
+
+@pytest.mark.parametrize("fault", [None, "capture", "cleanup", "model", "models", "requests", "evidence"])
+def test_publication_qualification_requires_independent_evidence(tmp_path, monkeypatch, fault):
+    monkeypatch.setattr(demo, "ROOT", tmp_path)
+    out = tmp_path / "demo-video/out"
+    out.mkdir(parents=True)
+    environment = {"deployment_label": "lathe-ci-demo-fixture", "git_sha": "fixture-sha",
+                   "requested_model": "z-ai/glm-5.3-flash"}
+    routing = {"requested_model": "z-ai/glm-5.3-flash", "serving_models": ["z-ai/glm-5.3-flash"],
+               "requests": 3, "evidence_errors": []}
+    capture = {"status": "accepted"}
+    cleanup = {"success": True}
+    if fault == "capture":
+        capture["status"] = "rejected"
+    if fault == "cleanup":
+        cleanup["success"] = False
+    if fault == "model":
+        routing["requested_model"] = "openrouter/pareto-code"
+    if fault == "models":
+        routing["serving_models"] = []
+    if fault == "requests":
+        routing["requests"] = 0
+    if fault == "evidence":
+        routing["evidence_errors"] = ["routing contract"]
+    for name, value in [("environment.json", environment), ("demo-routing.json", routing), ("demo-cleanup.json", cleanup)]:
+        (tmp_path / name).write_text(json.dumps(value))
+    (out / "capture-report.json").write_text(json.dumps(capture))
+    (out / "qualification.json").write_text('{"accepted": true}')  # stale prior success
+    if fault:
+        with pytest.raises(RuntimeError, match="qualification failed"):
+            demo.qualify(tmp_path)
+        assert not (out / "qualification.json").exists()
+    else:
+        demo.qualify(tmp_path)
+        result = json.loads((out / "qualification.json").read_text())
+        assert result["accepted"] is True
+        assert result["git_sha"] == "fixture-sha"
+        assert result["requested_model"] == "z-ai/glm-5.3-flash"
+        assert result["serving_models"] == ["z-ai/glm-5.3-flash"]
 
 
 def test_capture_environment_does_not_inherit_hosted_targets_or_server_keys(monkeypatch):
@@ -20,7 +85,7 @@ def test_capture_environment_does_not_inherit_hosted_targets_or_server_keys(monk
     env = demo.capture_environment("disposable-token", "12345")
     assert env["DEMO_OWUI_URL"] == "http://127.0.0.1:12345"
     assert env["DEMO_LOCAL_TOKEN"] == "disposable-token"
-    assert env["DEMO_MODEL"] == demo.monitor.MODEL
+    assert env["DEMO_MODEL"] == demo.monitor.workspace_model()
     assert env["DEMO_PROXY_DOMAINS"] == demo.ZONE
     assert env["DEMO_SKIP_PREWARM"] == "1"
     assert "production-secret" not in env.values()
@@ -94,6 +159,7 @@ def test_infrastructure_uses_real_worker_private_auth_and_loopback_tls(tmp_path,
     assert (tmp_path / "worker.mjs").read_bytes() == (demo.ROOT / "preview-wrapper/src/index.js").read_bytes()
     variables = dict(line.split("=", 1) for line in (tmp_path / ".dev.vars").read_text().splitlines())
     assert variables["REGISTER_TOKEN"] == registration
+    assert (tmp_path / ".dev.vars").stat().st_mode & 0o777 == 0o600
     assert variables["OIDC_ISSUER"] == demo.ISSUER
     assert variables["OIDC_CLIENT_SECRET"] == demo.os.environ["LATHE_DEMO_IDP_SECRET"]
     assert len(base64.b64decode(variables["REGISTRATION_ENCRYPTION_KEY"])) == 32

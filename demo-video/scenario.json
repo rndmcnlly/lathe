@@ -105,7 +105,7 @@
       "screenshot": "private-editor-ready",
       "with": {
         "tools": ["expose"],
-        "argumentContains": "code-server",
+        "managedTarget": "code-server",
         "argumentsEqual": { "access": "private" },
         "outputContains": "Copying the URL does not grant access."
       },

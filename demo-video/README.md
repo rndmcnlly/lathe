@@ -52,10 +52,11 @@ HTTP-port substitute. The local identity fixture is explicitly synthetic, while
 the real Worker performs PKCE exchange, owner-email authorization, and host-only
 session creation. It does not qualify Pocket ID or real passkey authentication.
 
-The legacy hosted `render-demo.yml` schedule and publisher have been removed.
-The isolated live monitor remains weekly, but does not record this video.
-Automated video capture/publication awaits qualification of the disposable
-Docker/Wrangler/TLS stack on Linux runners, always-run cleanup, and a release
-gate accepting only qualified evidence from the tested ref. Existing release
-assets are not refreshed by this change. Do not restore hosted production
-credentials as a shortcut.
+`render-demo.yml` runs this disposable stack every Wednesday at 14:17 UTC and
+on manual dispatch, using `z-ai/glm-5.3-flash` and existing repository provider
+secrets under the `lathe-demo` environment. Scheduled and branch runs check and
+retain evidence only. Manual dispatch with `publish=true` on the default branch
+can refresh the existing `demo-video-latest` release after exact-checkout,
+accepted-capture, requested/served-model, and cleanup gates. Publication defaults
+off. The regular weekly isolated monitor remains separate and does not record
+this video. No hosted personal OWUI or cloud Worker is used.

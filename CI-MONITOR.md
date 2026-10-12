@@ -19,8 +19,10 @@ Repository Actions secrets:
 - `DAYTONA_API_KEY`
 - `OPENROUTER_API_KEY`
 
-These are intentionally repository-level, so a future disposable demo-video
-workflow can use the same credentials. Neither key belongs in workflow source,
+These are intentionally repository-level, so the disposable demo-video
+workflow can use the same credentials. The isolated demo uses these existing
+keys under the `lathe-demo` GitHub environment (same-name environment overrides
+are optional). Neither key belongs in workflow source,
 artifacts, or a branch-specific configuration file.
 
 For a local run, export those two variables and start Docker, then run:
@@ -55,6 +57,30 @@ rejects a missing or changed routing policy, and records the concrete serving
 model from actual streaming and non-streaming responses. It does not emulate
 inference or tool execution. If a future OWUI release drops custom parameters,
 the monitor fails visibly rather than silently testing another tier.
+
+### Explicit model selection
+
+The regular monitor still defaults to Pareto Medium. To qualify a checkout with
+the demo's direct model, export `LATHE_MONITOR_MODEL=z-ai/glm-5.3-flash` before
+running `monitor_e2e.py`. Both bootstrap and the real-provider relay use that
+selection, including delegate calls. Direct models get **no Pareto plugin**.
+The relay rejects mismatched model/plugin requests instead of rewriting them.
+Data collection remains denied. `environment.json`, per-request trace entries,
+and summaries distinguish requested and actually served models; a direct model
+may legitimately serve under its own requested ID, unlike the Pareto alias.
+
+The monitor workflow also accepts a `model` manual-dispatch input. With this
+workflow and helper revision present on a trusted target branch:
+
+```sh
+gh workflow run monitor.yml --repo rndmcnlly/lathe --ref TRUSTED_BRANCH \
+  -f model=z-ai/glm-5.3-flash
+```
+
+The selected ref is checked out and its exact Git SHA and Lathe source hash are
+recorded. For another PR checkout, apply this helper/workflow revision there
+first if it predates model selection. Never run untrusted PR code with secrets.
+Existing repository secrets permit GitHub runs, not local credential recovery.
 
 ## Checks and budgets
 
@@ -155,6 +181,11 @@ over the private Docker network and trusts a temporary certificate bundle.
 The capture browser accepts that temporary certificate only in its disposable
 browser contexts; nothing is installed in the laptop's trust store.
 
+The demo explicitly defaults to `z-ai/glm-5.3-flash`, overridable with
+`LATHE_MONITOR_MODEL`. It uses the same no-plugin direct-model relay policy as
+isolated deployment qualification. The Docker-exec process runs with host UID/GID
+so routing and teardown evidence remain host-writable on Linux runners.
+
 The same scenario always asks for a **private managed code-server** editor and
 requires private `expose` arguments plus the owner-only access result before
 opening it. No public HTTP-port workaround is permitted. A disposable identity
@@ -178,6 +209,28 @@ Output is `demo-video/out/demo.webm`, with screenshots and a qualification repor
 Infrastructure evidence goes into a unique `monitor-artifacts/demo-*` directory.
 Normal completion and exceptions clean up containers, local KV state, temporary
 TLS material, the Docker network, and the uniquely labelled Daytona sandbox.
+Use `--artifacts PATH` for a known fresh evidence directory, and
+`demo_local.py --cleanup --artifacts PATH` for repeated last-resort teardown.
+Cleanup attempts removal directly and ignores only explicit missing-resource
+responses, not Docker daemon or inspection failures. `qualification.json` is
+written only after the browser take, model-serving evidence, inner staging
+teardown, and outer cleanup all succeed. It identifies the tested Git SHA.
+
+Local live runs shared with other review sessions must hold the review lock for
+the full subprocess lifetime. After explicitly supplying both provider keys,
+run this from the checkout being qualified:
+
+```sh
+LATHE_MONITOR_MODEL=z-ai/glm-5.3-flash uv run --locked python - <<'PY'
+import fcntl, subprocess
+with open('/private/var/folders/qj/gyqbn5y57956rrqd_g6yfqwr0000gn/T/opencode/lathe-review-live.lock', 'a') as lock:
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    subprocess.run(['uv', 'run', '--locked', 'python', 'monitor_e2e.py'], check=True)
+PY
+```
+
+Use `demo_local.py` instead of `monitor_e2e.py` for a video take. Do not load
+production OWUI settings or obtain a general OpenRouter key as a shortcut.
 
 ## Reusing the host for branch demo videos
 
@@ -189,10 +242,26 @@ and upload video artifacts labeled with the tested ref and commit. Keep its
 unique Daytona label, disabled volumes, and expiry policy. Its browser and
 capture code must never fall back to a configured daily-use OWUI URL.
 
-`demo_local.py` exercises this lifecycle with the existing browser capture.
-The legacy hosted demo-video workflow (including its schedule and publisher)
-has been removed rather than retain an execution path that bypasses the
-disposable stack. Remaining migration scope: qualify this stack on Linux Actions
-runners, install Docker/TLS/browser prerequisites, add interruption-safe cleanup
-and evidence upload, and restore publication gated on accepted capture evidence.
-The isolated monitor workflow is unchanged; it is not a video qualification.
+`render-demo.yml` now runs this same disposable lifecycle every Wednesday at
+14:17 UTC and on manual dispatch, with the chosen GLM model. No hosted OWUI or
+cloud Worker credentials are used. Jobs run under `lathe-demo`: configure any
+desired trusted-ref restrictions or approvals without blocking scheduled runs.
+Provider secrets remain `OPENROUTER_API_KEY` and `DAYTONA_API_KEY`, already
+present at repository level. No `DEMO_OWUI_URL`, `DEMO_PASSKEY`, or cloud token
+is required. Runs serialize without cancellation and always repeat cleanup and
+upload sanitized infrastructure/capture evidence.
+
+Manual dispatch defaults to capture/check only. `publish=true` enables
+publication **only on the default branch**, after accepted capture, routing,
+cleanup, and exact-SHA gates. It retains the existing `demo-video-latest`
+release, `demo.webm`, and screenshot filenames. Scheduled or branch runs never
+refresh public assets. To qualify this branch without publication:
+
+```sh
+gh workflow run render-demo.yml --repo rndmcnlly/lathe \
+  --ref review/demo-alignment -f publish=false
+```
+
+Linux live qualification is still required; offline tests do not qualify
+Docker/Wrangler/TLS/editor behavior. Pocket ID/passkeys remain outside the
+synthetic identity fixture's qualification boundary.

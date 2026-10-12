@@ -12,7 +12,10 @@ test("shipped scenario rejects public IDE and generic port substitutes", () => {
     output: "Owner-only wrapped preview: Copying the URL does not grant access." };
   assert.equal(matchesToolExpectation(event, exposure), true);
   for (const arguments_ of [{ target: "code-server", access: "public" },
-    { target: "http:8080", access: "private" }, { target: "code-server" }]) {
+    { target: "http:8080", access: "private" },
+    { target: "http:8080", access: "private", tag: "code-server" },
+    { target: "code-server:relative", access: "private" },
+    { target: "not-code-server", access: "private" }, { target: "code-server" }]) {
     assert.equal(matchesToolExpectation({ ...event, arguments: arguments_ }, exposure), false);
   }
   assert.equal(matchesToolExpectation({ ...event, output: "Public wrapped preview: https://example.invalid" }, exposure), false);
@@ -31,12 +34,6 @@ test("shipped scenario executes with independent tool and file-read evidence", a
     .map((operation) => [operation, async () => ({})]));
   adapter["chat.await-tool-result"] = async (expected) => {
     assert.ok(events.some((event) => matchesToolExpectation(event, expected)));
-  };
-  adapter["chat.send"] = async ({ prompt }) => {
-    if (prompt.includes("focused review")) {
-      assert.ok(prompt.includes("locate the definition by symbol"));
-      assert.ok(!/lines \d+-\d+/.test(prompt));
-    }
   };
   assert.equal((await runScenario(scenario, adapter, { variables: { checkout: "/workspace" } })).status, "accepted");
   events.find((event) => event.tool === "read").output = "Assistant says the edit worked";

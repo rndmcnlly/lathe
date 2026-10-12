@@ -3,6 +3,9 @@ export function matchesToolExpectation(event, expected) {
   return expected.tools.includes(event.tool)
     && Object.entries(expected.argumentsEqual || {}).every(([key, value]) =>
       event.arguments?.[key] === value)
+    && (!expected.managedTarget || event.arguments?.target === expected.managedTarget
+      || (typeof event.arguments?.target === "string"
+        && event.arguments.target.startsWith(`${expected.managedTarget}:/`)))
     && contains(event.arguments, expected.argumentContains)
     && contains(event.output, expected.outputContains)
     && (!expected.outputLineEquals || event.output.split(/\r?\n/).some((line) =>
