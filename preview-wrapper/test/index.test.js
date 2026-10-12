@@ -468,10 +468,16 @@ test("absolute expiry, ciphertext tampering, and plaintext header records cannot
 test("encrypted registrations enforce absolute expiry even before KV eviction", async (t) => {
   const env = environment();
   const registration = await register(env, "public", "", { upstream_headers: appHeaders });
+  const encrypted = await env.SUBDOMAINS.get(registration.host);
+  // Model a stale edge value: keep ciphertext readable past its original TTL.
+  await env.SUBDOMAINS.put(registration.host, encrypted);
   const future = Date.now() + 3601 * 1000;
   t.mock.method(Date, "now", () => future);
-  globalThis.fetch = async () => { throw new Error("expired registration reached network"); };
+  assert.equal(await env.SUBDOMAINS.get(registration.host), encrypted);
+  let forwarded = 0;
+  globalThis.fetch = async () => { forwarded++; return new Response("unexpected upstream"); };
   assert.equal((await worker.fetch(new Request(registration.url), env)).status, 404);
+  assert.equal(forwarded, 0, "expired decrypted registration must not reach upstream");
 });
 
 test("upstream transport failures cannot disclose target or credentials", async () => {
