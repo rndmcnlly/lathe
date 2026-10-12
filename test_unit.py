@@ -1377,8 +1377,9 @@ async def test_ttyd_setup_failure_stops_before_preview(preview):
 
 @pytest.mark.parametrize("service", ["dufs", "code-server"])
 @pytest.mark.parametrize("fault", [None, "stale", "release", "digest"])
+@pytest.mark.parametrize("existing_listener", [False, True])
 def test_managed_archive_install_is_release_consistent_verified_and_atomic(
-    tmp_path, service, fault,
+    tmp_path, service, fault, existing_listener,
 ):
     install_root = tmp_path / "lathe"
     install_root.mkdir()
@@ -1460,6 +1461,18 @@ def test_managed_archive_install_is_release_consistent_verified_and_atomic(
         esac
         """))
     fake_curl.chmod(0o755)
+    # The fake listener's PID must have a coherent command identity. Never read
+    # the host's unrelated /proc/123, which may be missing or a different process.
+    proc_root = fixtures / "proc"
+    process = proc_root / "123"
+    process.mkdir(parents=True)
+    options = "\0--allow-upload\0--allow-delete\0--allow-search\0--allow-archive\0--allow-hash" if service == "dufs" else ""
+    process.joinpath("cmdline").write_bytes(f"{installed}\0{tmp_path}{options}\0".encode())
+    script = script.replace("/proc/", str(proc_root) + "/")
+    if existing_listener:
+        # Force the reuse path deterministically, instead of relying on which
+        # concurrent installer reaches the listener check first.
+        (install_root / (service + ".root")).write_text(str(tmp_path))
     fake_ss = fake_bin / "ss"
     fake_ss.write_text(
         f"#!/bin/sh\n"
@@ -1502,6 +1515,39 @@ def test_managed_archive_install_is_release_consistent_verified_and_atomic(
         assert not installed.exists()
         assert not any(path.name.startswith(".install.") for path in install_root.iterdir())
         assert len(calls) == (1 if fault == "release" else 2)
+
+
+@pytest.mark.parametrize("identity,error", [
+    ("matching", None), ("wrong-binary", "occupied by another process"),
+    ("wrong-root", "serving a different root"),
+])
+def test_code_server_fake_listener_preserves_identity_guards(tmp_path, identity, error):
+    root = tmp_path / "lathe"
+    project = tmp_path / "project"
+    project.mkdir()
+    binary = root / "code-server/bin/code-server"
+    binary.parent.mkdir(parents=True)
+    binary.write_text("#!/bin/sh\nexit 0\n")
+    binary.chmod(0o755)
+    (root / "code-server.root").write_text(str(project))
+    proc = tmp_path / "proc"
+    (proc / "123").mkdir(parents=True)
+    command = str(binary) if identity != "wrong-binary" else "/unrelated-service"
+    serve_root = str(project) if identity != "wrong-root" else "/wrong-project"
+    (proc / "123/cmdline").write_bytes(f"{command}\0{serve_root}\0".encode())
+    fake = tmp_path / "fake-bin"
+    fake.mkdir()
+    ss = fake / "ss"
+    ss.write_text('#!/bin/sh\necho \'LISTEN 0 128 0.0.0.0:8080 users:(("code-server",pid=123,fd=3))\'\n')
+    ss.chmod(0o755)
+    script = lathe._build_code_server_ensure_script(str(root), str(project))
+    script = script.replace("/home/daytona/workspace", str(tmp_path)).replace("/proc/", str(proc) + "/")
+    result = subprocess.run(["bash", "-c", script], capture_output=True, text=True,
+                            env={**os.environ, "PATH": f"{fake}:{os.environ['PATH']}"}, timeout=10)
+    if error:
+        assert result.returncode != 0 and error in result.stderr
+    else:
+        assert result.returncode == 0 and "READY PID=123" in result.stdout
 
 
 def test_dufs_launch_keeps_file_operations_without_outside_symlinks(tmp_path):
