@@ -237,6 +237,18 @@ async def main():
         require("background-finished" in output, output)
 
     async def bounded_command_retention():
+        import re
+        output = await tools.bash("python3 -c 'print(\"x\" * 1000000)'", **ctx)
+        require(len(output.encode()) < 53 * 1024, "bash preview exceeded byte budget")
+        match = re.search(r"Full output \([^)]+\): ([^\s\]]+)", output)
+        require(match is not None, output[-2000:])
+        full_log = match[1]
+        await tools.bash("echo unrelated-chat", **{**ctx, "__chat_id__": "retention-other"})
+        output = await tools.read(full_log, **ctx)
+        require("Text preview truncated" in output and len(output.encode()) < 53 * 1024, output[-2000:])
+        output = await tools.bash(f"wc -c < {full_log}; cat {full_log.rsplit('/', 1)[0]}/exit", **ctx)
+        require("1000001" in output, output)
+
         output = await tools.bash(
             "nohup python3 -m http.server 8766 >/tmp/lathe-retention-http.log 2>&1 &",
             **ctx,
@@ -282,8 +294,10 @@ async def main():
             response.raise_for_status()
             sidecars = json.loads(response.json()["result"].strip())
             require(len(sessions) == 1, f"expected one service session, got {len(sessions)}")
-            require(len(sidecars) == 1 and next(iter(sidecars.values())) == ["keep"], sidecars)
-            print(f"  measured after 21 completed commands: {len(sessions)} retained session, {len(sidecars)} minimal sidecar")
+            require(len(sidecars) >= 21, sidecars)
+            require(all("log" in names and "exit" in names for names in sidecars.values()), sidecars)
+            require(sum("keep" in names for names in sidecars.values()) == 1, sidecars)
+            print(f"  measured: {len(sessions)} service session, {len(sidecars)} retained results")
 
             response = await client.post(
                 _toolbox(tools.valves, sandbox_id, "/process/execute"),
@@ -312,6 +326,20 @@ async def main():
                 if session.get("sessionId", "").startswith("lathe-cmd-")
             ]
             require(not sessions, f"exited service session was not reaped: {sessions}")
+            expire_script = (
+                "import os,time; root='/dev/shm/lathe/cmd'; "
+                "[(os.utime(root+'/'+d+'/exit', (time.time()-86401, time.time()-86401))) "
+                "for d in os.listdir(root) if os.path.isfile(root+'/'+d+'/exit')]"
+            )
+            response = await client.post(
+                _toolbox(tools.valves, sandbox_id, "/process/execute"),
+                headers=_headers(tools.valves),
+                json={"command": f"python3 -c {json.dumps(expire_script)}", "timeout": 5000}, timeout=15,
+            )
+            response.raise_for_status()
+        await tools.bash("echo expire-old-results", **ctx)
+        output = await tools.read(full_log, **ctx)
+        require(output.startswith("Error:") and "File not found" in output, output)
 
     async def expose_contract():
         import re

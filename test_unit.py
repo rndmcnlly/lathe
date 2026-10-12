@@ -19,6 +19,7 @@ import subprocess
 import sys
 import tarfile
 import textwrap
+import time
 from types import ModuleType, SimpleNamespace
 import typing
 from unittest.mock import AsyncMock
@@ -343,6 +344,9 @@ class GuardedFile:
     def read(self, size=-1):
         if size < 0: raise AssertionError("unbounded read")
         return self.file.read(size)
+    def readline(self, size=-1):
+        if size < 0: raise AssertionError("unbounded readline")
+        return self.file.readline(size)
 def guarded_open(*args, **kwargs): return GuardedFile(_real_open(*args, **kwargs))
 builtins.open = guarded_open
 print(read_file({str(path)!r}, 50_000, 50_003))
@@ -590,28 +594,28 @@ async def test_completed_bash_retention_is_bounded(tools, monkeypatch, tmp_path,
 
     async with httpx.AsyncClient(transport=transport(handler)) as client:
         await lathe._reap_bash_commands(tools.valves, "sb", client)
-        assert {p.name for p in ordinary.iterdir()} == {"reap"}
-        assert not old_spill.exists()
+        assert {p.name for p in ordinary.iterdir()} == {"exit", "log", "reap"}
+        assert old_spill.exists()
         assert leased.exists()
-        assert {p.name for p in retained.iterdir()} == {"keep"}
+        assert {p.name for p in retained.iterdir()} == {"keep", "log", "exit"}
         assert "lathe-cmd-retained" not in deleted_sessions
         assert "lathe-cmd-old-spill" in deleted_sessions
 
         await lathe._reap_bash_commands(tools.valves, "sb", client)
-        assert not ordinary.exists()
+        assert (ordinary / "log").read_text() == "command output\n"
         assert delete_attempts["lathe-cmd-ordinary"] == 2
 
         current = sidecar("current")
         await lathe._reap_bash_commands(
             tools.valves, "sb", client, preserve_log_for="current",
         )
-        assert {p.name for p in current.iterdir()} == {"log", "spill", "reap"}
+        assert {p.name for p in current.iterdir()} == {"log", "exit", "reap"}
         assert "plaintext" not in "".join(p.read_text() for p in current.iterdir())
 
         await lathe._reap_bash_commands(
             tools.valves, "sb", client, release_lease_for="leased",
         )
-        assert not leased.exists()
+        assert (leased / "exit").read_text() == "0\n"
 
         # A reused PID with a different process start time is not retained.
         retained_proc.joinpath("stat").write_text(
@@ -620,10 +624,16 @@ async def test_completed_bash_retention_is_bounded(tools, monkeypatch, tmp_path,
             )
         )
         await lathe._reap_bash_commands(tools.valves, "sb", client)
-        assert not retained.exists()
+        assert "lathe-cmd-retained" in deleted_sessions
+        assert (retained / "log").read_text() == "command output\n"
 
         await lathe._reap_bash_commands(tools.valves, "sb", client)
-        assert not current.exists()
+        assert (current / "log").read_text() == "command output\n"
+        expired = time.time() - 24 * 60 * 60 - 1
+        for directory in (current, ordinary, retained, old_spill, leased):
+            os.utime(directory / "exit", (expired, expired))
+        await lathe._reap_bash_commands(tools.valves, "sb", client)
+        assert not list(command_root.iterdir())
 
 
 async def test_bash_launch_failure_discards_session_and_wrapper(tools, sandbox, http):
@@ -649,6 +659,86 @@ async def test_bash_launch_failure_discards_session_and_wrapper(tools, sandbox, 
     assert any(method == "DELETE" and path == "/sb/files/" for method, path in requests)
     assert any(method == "DELETE" and "/process/session/lathe-cmd-" in path
                for method, path in requests)
+
+
+async def test_bash_large_log_survives_unrelated_chat(tools, sandbox, http, monkeypatch, tmp_path, clock):
+    monkeypatch.setattr(lathe, "_EPHEMERAL_ROOT", str(tmp_path / "lathe"))
+    for chat in ("a", "b"):
+        tools._chat_state[chat] = {"init": True, "pending": []}
+    deleted = []
+    exits = {}
+
+    def handler(request):
+        if request.method == "POST" and request.url.path == "/sb/files/upload":
+            path = Path(request.url.params["path"])
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(request.content.split(b"\r\n\r\n", 1)[1].rsplit(b"\r\n--", 1)[0])
+            return httpx.Response(200)
+        if request.method == "POST" and request.url.path == "/sb/process/session":
+            return httpx.Response(201)
+        if request.method == "POST" and request.url.path.endswith("/exec"):
+            command = json.loads(request.content)["command"]
+            process = subprocess.run(command, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=10)
+            exits[request.url.path.removesuffix("/exec")] = process.returncode
+            return httpx.Response(200, json={"cmdId": "cmd"})
+        if request.method == "POST" and request.url.path == "/sb/process/execute":
+            script = shlex.split(json.loads(request.content)["command"])[2]
+            return httpx.Response(200, json={"exitCode": 0, "result": run_script(script)})
+        if request.method == "GET" and "/process/session/" in request.url.path:
+            assert not request.url.path.endswith("/logs"), "unbounded log download"
+            return httpx.Response(200, json={"commands": [{"id": "cmd", "exitCode": exits[request.url.path]}]})
+        assert request.method == "DELETE" and "/process/session/" in request.url.path
+        deleted.append(request.url.path)
+        return httpx.Response(204)
+
+    http(handler)
+    output = await tools.bash("python3 -c 'print(\"x\" * 1000000)'", workdir=str(tmp_path),
+                              __user__=USER, __chat_id__="a")
+    assert "Bounded tail preview" in output and len(output.encode()) < 53 * 1024
+    log = next((tmp_path / "lathe" / "cmd").glob("*/log"))
+    await tools.bash("echo unrelated", workdir=str(tmp_path), __user__=USER, __chat_id__="b")
+    preview = await tools.read(str(log), __user__=USER, __chat_id__="a")
+    assert "Text preview truncated" in preview and len(preview.encode()) < 53 * 1024
+    assert log.stat().st_size == 1000001
+    assert (log.parent / "exit").read_text().strip() == "0"
+    assert deleted, "sessions should be cleaned independently of result files"
+    emissions = []
+    async def emit(event):
+        emissions.append(event)
+    failure = await tools.bash("echo failed; false", workdir=str(tmp_path), __user__=USER,
+                               __chat_id__="a", __event_emitter__=emit)
+    assert failure.startswith("Error: Exit code: 1") and "failed" in failure
+    assert not any(e["data"]["description"] == "Command complete" for e in emissions)
+
+
+@pytest.mark.parametrize("start,stop", [(1, 0), (-1, 0), (1, -1)])
+def test_read_oversized_line_has_explicit_byte_preview(tmp_path, start, stop):
+    path = tmp_path / "huge.txt"
+    path.write_text("é" * 500000 + "\nlast\n")
+    result = run_script(lathe._READ_SCRIPT + f"\nprint(read_file({str(path)!r}, {start}, {stop}))")
+    assert len(result.encode()) < 53 * 1024
+    if start == -1:
+        assert "2: last" in result
+    else:
+        assert "Text preview truncated" in result and str(path) in result
+
+
+async def test_failed_write_does_not_emit_success(tools, sandbox, http, tmp_path):
+    tools._chat_state["chat"] = {"init": True, "pending": []}
+    parent_file = tmp_path / "not-a-directory"
+    parent_file.write_text("occupied")
+    emissions = []
+    def handler(request):
+        assert request.url.path == "/sb/process/execute"
+        script = shlex.split(json.loads(request.content)["command"])[2]
+        return httpx.Response(200, json={"exitCode": 0, "result": run_script(script)})
+    http(handler)
+    async def emit(event):
+        emissions.append(event)
+    result = await tools.write(str(parent_file / "file"), "data", __user__=USER,
+                               __chat_id__="chat", __event_emitter__=emit)
+    assert result.startswith("Error:")
+    assert not any(e["data"]["description"] == "Write complete" for e in emissions)
 
 
 @pytest.mark.parametrize("text", ["", "short\ntext", "x\n" * 3000, ("é" * 100 + "\n") * 600])
@@ -785,6 +875,9 @@ async def test_background_bash_poll_delivers_once(tools, sandbox, http, clock):
     def handler(request):
         requests.append(request.url.path)
         if (request.method, request.url.path) == ("POST", "/sb/process/execute"):
+            script = shlex.split(json.loads(request.content)["command"])[2]
+            if "f.seek" in script:
+                return httpx.Response(200, json={"exitCode": 0, "result": json.dumps({"text": "final output", "size": 12})})
             return httpx.Response(200, json={"exitCode": 0, "result": "caller output"})
         assert request.method == "GET"
         if request.url.path == "/sb/process/session/session":
@@ -1799,8 +1892,69 @@ async def test_one_step_delegate_answers_from_context_without_tools(
     assert [client.close_calls for client in clients[:3]] == [1, 1, 1]
 
 
-@pytest.mark.parametrize("background,fail", [(False, False), (True, False), (True, True)])
-async def test_real_delegate_execution_and_completion(tools, sandbox, http, monkeypatch, tmp_path, background, fail):
+@pytest.mark.parametrize("sizes", [(1000000,), (30000, 30000)])
+async def test_delegate_rejects_oversized_reference_before_inference(tools, sandbox, http, sizes):
+    tools._chat_state["chat"] = {"init": True, "pending": []}
+    chunks_received = 0
+    class ReferenceStream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            nonlocal chunks_received
+            for _ in range(125):
+                chunks_received += 1
+                yield b"x" * 8192
+    def handler(request):
+        assert request.method == "GET" and request.url.path == "/sb/files/download"
+        size = sizes[int(request.url.params["path"].rsplit("/", 1)[1])]
+        if size == 1000000:
+            return httpx.Response(200, stream=ReferenceStream())
+        return httpx.Response(200, content=b"x" * size)
+    http(handler)
+    async def app(scope, receive, send):
+        pytest.fail("oversized reference reached inference")
+    result = await tools.delegate("Analyze references", context_files=[f"/reference/{i}" for i in range(len(sizes))],
+        max_steps=1, __user__=USER, __chat_id__="chat", __model__={"id": "model"},
+        __request__=delegate_request(app))
+    assert result.startswith("Error:") and "byte text limit" in result
+    if sizes == (1000000,):
+        assert chunks_received <= 7, "reference must be rejected before full acquisition"
+
+
+async def test_interpret_bounds_oversized_and_many_frames(tools, sandbox, http, monkeypatch):
+    import contextlib
+    import httpx_ws
+    tools._chat_state["chat"] = {"init": True, "pending": []}
+    monkeypatch.setattr(lathe, "_ensure_interpreter_context", AsyncMock(return_value=("ctx", False)))
+    frames = iter([{"type": "stdout", "text": "é" * 500000}] +
+                  [{"type": "stderr", "text": "discarded"}] * 1000)
+    received = 0
+    class WS:
+        async def send_json(self, message):
+            assert message["code"] == "print('large')"
+        async def receive_json(self):
+            nonlocal received
+            try:
+                frame = next(frames)
+            except StopIteration:
+                raise httpx_ws.WebSocketDisconnect(1000)
+            received += 1
+            return frame
+    @contextlib.asynccontextmanager
+    async def connect(*args, **kwargs):
+        assert kwargs["queue_size"] == 1
+        yield WS()
+    monkeypatch.setattr(httpx_ws, "aconnect_ws", connect)
+    http(lambda request: pytest.fail("unexpected HTTP"))
+    result = await tools.interpret("print('large')", __user__=USER, __chat_id__="chat")
+    assert received == 1001, "must drain execution even after preview fills"
+    assert len(result.encode()) < 53 * 1024
+    assert "Text preview truncated" in result and "discarded" in result
+
+
+@pytest.mark.parametrize("background,fail,persist_failure", [
+    (False, False, False), (True, False, False), (True, True, False),
+    (False, False, True), (True, False, True),
+])
+async def test_real_delegate_execution_and_completion(tools, sandbox, http, monkeypatch, tmp_path, background, fail, persist_failure):
     """Real Agent, tool cores and files; observe completion as the caller does."""
     release = asyncio.Event()
     if not background:
@@ -1818,6 +1972,9 @@ async def test_real_delegate_execution_and_completion(tools, sandbox, http, monk
         assert request.headers["authorization"] == "Bearer test-key"
         command = shlex.split(json.loads(request.content)["command"])
         assert command[:2] == ["python3", "-c"]
+        if persist_failure and "/result'" in command[2]:
+            # Execute the real shipped write path against a filesystem failure.
+            next((root / "delegate").iterdir()).joinpath("result").mkdir(exist_ok=True)
         return httpx.Response(200, json={"exitCode": 0, "result": run_script(command[2])})
     clients = http(execute)
 
@@ -1871,7 +2028,7 @@ async def test_real_delegate_execution_and_completion(tools, sandbox, http, monk
         sidecars = directories[0]
         assert (sidecars / "task").read_text() == task_description
         emission_count = len(emissions)
-        notice = "Background delegation failed" if fail else "Background delegation completed"
+        notice = "Background delegation failed" if fail or persist_failure else "Background delegation completed"
         if background:
             descriptor = re.search(r"^DELEGATE=(.+)$", result, re.MULTILINE)
             assert descriptor and sidecars.name == descriptor[1], result
@@ -1879,7 +2036,11 @@ async def test_real_delegate_execution_and_completion(tools, sandbox, http, monk
             assert [client.close_calls for client in delegate_clients] == [1, 0, 0]
             assert notice not in await read_in("chat")
         else:
-            assert "verified result" in result and "1 tool call(s)" in result
+            if persist_failure:
+                assert "Delegation failed" in result and "Cannot write" in result
+                assert not any(e["data"]["description"].startswith("Delegation complete") for e in emissions)
+            else:
+                assert "verified result" in result and "1 tool call(s)" in result
         release.set()
         async with asyncio.timeout(5):
             if background:
@@ -1893,9 +2054,9 @@ async def test_real_delegate_execution_and_completion(tools, sandbox, http, monk
             assert len(emissions) == emission_count, "delegate emitted to a closed foreground stream"
         assert notice not in await read_in("chat")
         assert notice not in await read_in("other")
-        if fail:
-            assert "synthetic model failure" in (sidecars / "error").read_text()
-            assert not (sidecars / "result").exists()
+        if fail or persist_failure:
+            assert ("Cannot write" if persist_failure else "synthetic model failure") in (sidecars / "error").read_text()
+            assert not (sidecars / "result").is_file()
         else:
             assert (sidecars / "result").read_text() == "verified result"
             assert json.loads((sidecars / "usage").read_text())["tool_calls"] == 1

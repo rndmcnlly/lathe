@@ -152,7 +152,11 @@ async def _tool_context(emitter, fn):
         return f"Error: {e}"
     except httpx.HTTPStatusError as e:
         await _emit(emitter, f"API error: HTTP {e.response.status_code}", done=True)
-        return f"API error: HTTP {e.response.status_code} — {e.response.text[:500]}"
+        try:
+            detail = e.response.text[:500]
+        except httpx.ResponseNotRead:
+            detail = "(streamed error body not buffered)"
+        return f"API error: HTTP {e.response.status_code}: {detail}"
     except Exception as e:
         await _emit(emitter, f"Error: {e}", done=True)
         return f"Error: {e}"
@@ -214,12 +218,14 @@ def _format_bg_bash_notice(cmd_id: str, exit_code: int | None,
         f"[Background job completed: CMD-{cmd_id}]",
         f"Exit code: {ec_str} (took {elapsed}s)",
     ]
-    tail = tail.strip()
+    tail = tail.encode("utf-8")[-2048:].decode("utf-8", errors="ignore").strip()
     if tail:
         lines.append("Last lines of output:")
         lines.extend(f"  {tl}" for tl in tail.splitlines()[-5:])
     else:
         lines.append("(no output)")
+    lines.append(f"Full output: {_bash_sidecar_dir(cmd_id)}/log; exit: {_bash_sidecar_dir(cmd_id)}/exit")
+    lines.append("Retained for 24 hours after completion (sandbox stop/restart clears it).")
     return "\n".join(lines)
 
 
@@ -227,6 +233,7 @@ def _format_bg_delegate_notice(delegate_id: str, elapsed: int,
                                step_count: int, tool_calls: int,
                                result_preview: str, error: str | None) -> str:
     if error:
+        error = error.encode("utf-8")[:2048].decode("utf-8", errors="ignore")
         lines = [
             f"[Background delegation failed: DELEGATE-{delegate_id}]",
             f"Failed after {elapsed}s: {error}",
@@ -236,12 +243,13 @@ def _format_bg_delegate_notice(delegate_id: str, elapsed: int,
             f"[Background delegation completed: DELEGATE-{delegate_id}]",
             f"{step_count} step(s), {tool_calls} tool call(s) (took {elapsed}s)",
         ]
-        preview = result_preview.strip()
+        preview = result_preview.encode("utf-8")[-2048:].decode("utf-8", errors="ignore").strip()
         if preview:
             lines.append("Result preview:")
             lines.extend(f"  {pl}" for pl in preview.splitlines()[-10:])
         else:
             lines.append("(no result text)")
+    lines.append(f"Result/evidence files: {_delegate_sidecar_dir(delegate_id)}/{{result,error,usage,log}} (failed writes may be unavailable).")
     return "\n".join(lines)
 
 
@@ -569,6 +577,9 @@ def _truncate_tail(text: str) -> tuple[str, bool, dict]:
         line_bytes = len(line.encode("utf-8")) + (1 if kept else 0)  # +1 for \n joiner
         if kept_bytes + line_bytes > _MAX_BYTES:
             truncated_by = "bytes"
+            room = _MAX_BYTES - kept_bytes - (1 if kept else 0)
+            if room > 0:
+                kept.append(line.encode("utf-8")[-room:].decode("utf-8", errors="ignore"))
             break
         kept.append(line)
         kept_bytes += line_bytes
@@ -1259,61 +1270,55 @@ def read_file(path, start, stop):
     if not os.path.exists(path):
         return f"Error: File not found: {path}"
 
-    # Negative endpoints need the final line count before their indices can be
-    # resolved. Preserve their existing behavior; positive ranges retain only
-    # the requested (capped) lines while streaming the file.
-    if start < 0 or stop < 0:
-        try:
-            with open(path, "r", errors="replace") as f:
-                content = f.read()
-        except OSError as e:
-            return f"Error: Cannot read {path}: {e}"
-
-        lines = content.split("\n")
-        if lines and lines[-1] == "":
-            lines = lines[:-1]
-        total_lines = len(lines)
-
+    # Count in fixed-size chunks, including files consisting of one huge line.
+    # A second bounded scan preserves negative indexing without loading the file.
+    cap = 50 * 1024
+    try:
+        with open(path, "rb") as f:
+            total_lines = 0
+            last = b""
+            while True:
+                chunk = f.read(8192)
+                if not chunk:
+                    break
+                total_lines += chunk.count(b"\n")
+                last = chunk[-1:]
+            total_lines += int(bool(last) and last != b"\n")
         start_idx = max(0, total_lines + start) if start < 0 else max(0, start - 1)
-        if stop < 0:
-            end_idx = max(0, total_lines + stop)
-        elif stop > 0:
-            end_idx = stop - 1
-        else:
-            end_idx = total_lines
-        start_idx = max(0, min(start_idx, total_lines))
-        end_idx = max(start_idx, min(end_idx, total_lines))
-        end_idx = min(end_idx, start_idx + 2000)
-        selected = lines[start_idx:end_idx]
-    else:
-        start_idx = max(0, start - 1) if start else 0
-        requested_end = stop - 1 if stop else None
-        selected = []
-        total_lines = 0
-        try:
-            with open(path, "r", errors="replace") as f:
-                for line_idx, line in enumerate(f):
-                    total_lines = line_idx + 1
-                    if (line_idx >= start_idx
-                            and (requested_end is None or line_idx < requested_end)
-                            and len(selected) < 2000):
-                        selected.append(line[:-1] if line.endswith("\n") else line)
-        except OSError as e:
-            return f"Error: Cannot read {path}: {e}"
+        end_idx = total_lines + stop if stop < 0 else (stop - 1 if stop else total_lines)
         start_idx = min(start_idx, total_lines)
-        if requested_end is None:
-            end_idx = min(total_lines, start_idx + 2000)
-        else:
-            end_idx = max(start_idx, min(requested_end, total_lines, start_idx + 2000))
-
-    numbered = "\n".join(
-        f"{start_idx + i + 1}: {line}"
-        for i, line in enumerate(selected)
-    )
+        end_idx = max(start_idx, min(end_idx, total_lines, start_idx + 2000))
+        selected = bytearray()
+        line_idx = 0
+        clipped = False
+        with open(path, "rb") as f:
+            while line_idx < end_idx:
+                chunk = f.readline(8192)
+                if not chunk:
+                    break
+                if line_idx >= start_idx:
+                    room = cap - len(selected)
+                    selected.extend(chunk[:room])
+                    if len(chunk) > room:
+                        clipped = True
+                        break
+                if chunk.endswith(b"\n"):
+                    line_idx += 1
+        lines = selected.decode("utf-8", errors="replace").split("\n")
+        if lines and lines[-1] == "":
+            lines.pop()
+        numbered = "\n".join(f"{start_idx + i + 1}: {line}" for i, line in enumerate(lines))
+        # Line prefixes also count toward the preview budget.
+        raw = numbered.encode("utf-8")
+        clipped = clipped or len(raw) > cap
+        numbered = raw[:cap].decode("utf-8", errors="ignore")
+    except OSError as e:
+        return f"Error: Cannot read {path}: {e}"
     header = f"File: {path} ({total_lines} lines total)"
     if start_idx > 0 or end_idx < total_lines:
         header += f", showing lines {start_idx + 1}-{end_idx}"
-    return f"{header}\n{numbered}"
+    notice = f"\n[Text preview truncated at 50 KiB. Full file: {path}; use bash byte ranges or expose() for full access.]" if clipped else ""
+    return f"{header}\n{numbered}{notice}"
 '''
 
 
@@ -1433,22 +1438,39 @@ async def _upload_file(valves, sandbox_id: str, client: httpx.AsyncClient,
     resp.raise_for_status()
 
 
+class _ToolFailure(RuntimeError):
+    """An operation failed, rather than returning successful text containing an error."""
+
+
+def _checked_result(result: str) -> str:
+    # Legacy sandbox scripts have a reserved error prefix. Normalize it once at
+    # the internal boundary; user-facing wrappers and delegate tools render prose.
+    if result.startswith("Error:"):
+        raise _ToolFailure(result.removeprefix("Error:").strip())
+    return result
+
+
 async def _download_file(valves, sandbox_id: str, client: httpx.AsyncClient,
-                         path: str) -> str:
+                         path: str, *, max_bytes: int = _MAX_BYTES) -> str:
     """Download a file from the sandbox. Returns file content as text.
 
     Returns None if the file does not exist (404). Raises on other errors.
     """
-    resp = await client.get(
+    async with client.stream("GET",
         _toolbox(valves, sandbox_id, "/files/download"),
         params={"path": path},
         headers=_headers(valves),
         timeout=60.0,
-    )
-    if resp.status_code == 404:
-        return None
-    resp.raise_for_status()
-    return resp.text
+    ) as resp:
+        if resp.status_code == 404:
+            return None
+        resp.raise_for_status()
+        content = bytearray()
+        async for chunk in resp.aiter_bytes(chunk_size=8192):
+            if len(content) + len(chunk) > max_bytes:
+                raise _ToolFailure(f"File exceeds {max_bytes} byte text limit: {path}. Use read() for an explicit preview or prepare a smaller reference file.")
+            content.extend(chunk)
+        return content.decode("utf-8", errors="replace")
 
 
 async def _run_sandbox_script(valves, sandbox_id: str, client: httpx.AsyncClient,
@@ -1458,8 +1480,8 @@ async def _run_sandbox_script(valves, sandbox_id: str, client: httpx.AsyncClient
     """Execute a Python script on the sandbox and return its stdout.
 
     For short scripts, passes the script inline via ``python3 -c``.
-    Returns the script's stdout on success. On non-zero exit, returns
-    an error string prefixed with *error_prefix*.
+    Returns the script's stdout on success. Non-zero exit and the reserved
+    script error prefix raise _ToolFailure, rendered only at user boundaries.
     """
     resp = await client.post(
         _toolbox(valves, sandbox_id, "/process/execute"),
@@ -1475,8 +1497,8 @@ async def _run_sandbox_script(valves, sandbox_id: str, client: httpx.AsyncClient
     result = data.get("result", "")
     exit_code = data.get("exitCode", -1)
     if exit_code != 0:
-        return f"Error: {error_prefix} (exit {exit_code}).\n{result[:500]}"
-    return result
+        raise _ToolFailure(f"{error_prefix} (exit {exit_code}).\n{result[:500]}")
+    return _checked_result(result)
 
 
 # ── shared tool cores ───────────────────────────────────────────────
@@ -1690,9 +1712,9 @@ def _standard_tool(core_fn, *, emit_start: str, emit_done: str,
                     extra_core_kwargs(self, sandbox_id, __chat_id__)
                 )
 
-            result = await core_fn(
+            result = _checked_result(await core_fn(
                 self.valves, sandbox_id, client, **call_kwargs,
-            )
+            ))
 
             await _emit(__event_emitter__, emit_done, done=True)
             messages = _drain_harness_messages(
@@ -1724,7 +1746,9 @@ def _standard_tool(core_fn, *, emit_start: str, emit_done: str,
 
 async def _core_read(valves, sandbox_id: str, client: httpx.AsyncClient, *,
                      path: str, start: int = 1, stop: int = 0) -> str:
-    """Read a file from the sandbox. Returns numbered lines.
+    """Read a file from the sandbox. Returns numbered lines, capped at 2000 lines
+    and 50 KiB of text. A clipped preview is explicitly labeled; the original
+    file remains available via bash byte ranges or expose().
     Supports Python-style negative indexing: start=-10 reads from
     10 lines before the end, stop=-3 stops 3 lines before the end.
     All positive values are 1-indexed. stop is exclusive (half-open).
@@ -1996,19 +2020,19 @@ def _build_bash_script(command: str, user_pairs: list[tuple[str, str]],
 
 
 _BASH_COMPLETION_LEASE_SECONDS = 960
+_BASH_RESULT_RETENTION_SECONDS = 24 * 60 * 60
 
 
 def _build_bash_reap_script(preserve_log_for: str | None = None,
                             release_lease_for: str | None = None,
                             proc_root: str = "/proc") -> str:
-    """Build the sandbox-side completed-command scrubber."""
+    """Release completed processes independently of the 24-hour result lease."""
     return textwrap.dedent(f"""\
         import os
         import time
 
         root = {_EPHEMERAL_ROOT + '/cmd'!r}
         proc_root = {proc_root!r}
-        preserve = {preserve_log_for!r}
         release = {release_lease_for!r}
         if os.path.isdir(root):
             for command_id in os.listdir(root):
@@ -2047,19 +2071,11 @@ def _build_bash_reap_script(preserve_log_for: str | None = None,
                             break
                     except (OSError, ValueError, IndexError):
                         pass
-                for name in ("sh", "pid", "exit"):
+                for name in ("sh", "pid"):
                     try:
                         os.unlink(os.path.join(command_dir, name))
                     except OSError:
                         pass
-                if command_id == preserve and os.path.isfile(os.path.join(command_dir, "log")):
-                    open(os.path.join(command_dir, "spill"), "a").close()
-                else:
-                    for name in ("log", "spill"):
-                        try:
-                            os.unlink(os.path.join(command_dir, name))
-                        except OSError:
-                            pass
                 if live:
                     print("retain " + command_id)
                 else:
@@ -2069,13 +2085,22 @@ def _build_bash_reap_script(preserve_log_for: str | None = None,
                         pass
                     open(os.path.join(command_dir, "reap"), "a").close()
                     print("delete " + command_id)
+                    try:
+                        evidence = os.path.join(command_dir, "exit")
+                        if not os.path.exists(evidence):
+                            evidence = os.path.join(command_dir, "reap")
+                        completed = os.path.getmtime(evidence)
+                        if time.time() - completed >= {_BASH_RESULT_RETENTION_SECONDS}:
+                            print("expire " + command_id)
+                    except OSError:
+                        pass
         """)
 
 
 async def _reap_bash_commands(valves, sandbox_id: str, client: httpx.AsyncClient,
                               preserve_log_for: str | None = None,
                               release_lease_for: str | None = None) -> None:
-    """Scrub completed sidecars and delete sessions with no live background jobs."""
+    """Delete completed sessions; expire result files only after their lease."""
     try:
         result = await _run_sandbox_script(
             valves, sandbox_id, client,
@@ -2087,17 +2112,17 @@ async def _reap_bash_commands(valves, sandbox_id: str, client: httpx.AsyncClient
             return
         for line in result.splitlines():
             action, _, command_id = line.partition(" ")
-            if action != "delete" or not command_id:
+            if action not in ("delete", "expire") or not command_id:
                 continue
-            response = await client.delete(
-                _toolbox(valves, sandbox_id, f"/process/session/lathe-cmd-{command_id}"),
-                headers=_headers(valves), timeout=30.0,
-            )
-            if response.status_code not in (204, 404):
-                logger.warning("bash cleanup: session %s returned HTTP %s",
-                               command_id, response.status_code)
-                continue
-            if command_id != preserve_log_for:
+            if action == "delete":
+                response = await client.delete(
+                    _toolbox(valves, sandbox_id, f"/process/session/lathe-cmd-{command_id}"),
+                    headers=_headers(valves), timeout=30.0,
+                )
+                if response.status_code not in (204, 404):
+                    logger.warning("bash cleanup: session %s returned HTTP %s",
+                                   command_id, response.status_code)
+            else:
                 response = await client.delete(
                     _toolbox(valves, sandbox_id, "/files/"),
                     params={"path": _bash_sidecar_dir(command_id), "recursive": "true"},
@@ -2177,6 +2202,31 @@ def _format_bash_result(output: str, exit_code: int | None,
     return output
 
 
+async def _bash_log_preview(valves, sandbox_id, client, log_path, *, allow_missing=False):
+    """Acquire only a bounded tail over HTTP, leaving the full log on disk."""
+    script = textwrap.dedent(f"""\
+        import json, os
+        path = {log_path!r}
+        if {allow_missing!r} and not os.path.exists(path):
+            print(json.dumps({{'text': '', 'size': 0}}))
+            raise SystemExit(0)
+        with open(path, 'rb') as f:
+            size = os.fstat(f.fileno()).st_size
+            f.seek(max(0, size - {_MAX_BYTES}))
+            data = f.read({_MAX_BYTES})
+        print(json.dumps({{'text': data.decode('utf-8', errors='replace'), 'size': size}}))
+        """)
+    data = json.loads(await _run_sandbox_script(
+        valves, sandbox_id, client, script, error_prefix=f"bash log preview failed; full log: {log_path}",
+    ))
+    # Replacement decoding can expand invalid UTF-8, so bound the decoded text too.
+    text = data["text"].encode("utf-8")[-_MAX_BYTES:].decode("utf-8", errors="ignore")
+    output, truncated, meta = _truncate_tail(text)
+    if data["size"] > _MAX_BYTES:
+        output += f"\n[Bounded tail preview, may begin mid-line. Full output ({_human_size(data['size'])}): {log_path}]"
+    return output, truncated, meta
+
+
 async def _core_bash(valves, sandbox_id: str, client: httpx.AsyncClient, *,
                      command: str, workdir: str = "/home/daytona/workspace",
                      user_pairs: list[tuple[str, str]],
@@ -2186,7 +2236,9 @@ async def _core_bash(valves, sandbox_id: str, client: httpx.AsyncClient, *,
     """Execute a bash command in the sandbox. Non-interactive only.
     Commands that finish within the foreground window return output directly.
     Long-running commands auto-background and return a descriptor with log
-    file paths for monitoring.
+    file paths for monitoring. Text previews are capped at 50 KiB. Full logs and
+    exit status remain readable for 24 hours after completion, until a later
+    bash call reaps expired evidence. Sandbox stop/restart clears these files.
 
     When creating git commits, add an Assisted-by: Lathe trailer to the
     commit message to acknowledge AI assistance.
@@ -2297,14 +2349,9 @@ async def _core_bash(valves, sandbox_id: str, client: httpx.AsyncClient, *,
             last_status_at = now
 
     # ── Fetch logs ──────────────────────────────────────────────
-    logs_resp = await client.get(
-        _toolbox(valves, sandbox_id, f"/process/session/{session_id}/command/{session_cmd_id}/logs"),
-        headers=_headers(valves),
-        timeout=30.0,
+    output, was_truncated, meta = await _bash_log_preview(
+        valves, sandbox_id, client, log_path, allow_missing=not finished,
     )
-    result = logs_resp.text if logs_resp.status_code == 200 else ""
-
-    output, was_truncated, meta = _truncate_tail(result)
 
     if not finished:
         elapsed = int(time.time() - (deadline - fg_timeout))
@@ -2323,11 +2370,14 @@ async def _core_bash(valves, sandbox_id: str, client: httpx.AsyncClient, *,
         output, exit_code, was_truncated, meta,
         spill_path=spill_path,
     )
+    formatted += f"\n[Result files retained for 24 hours after completion: {log_path}, {exit_path}. Sandbox stop/restart clears them.]"
     await _reap_bash_commands(
         valves, sandbox_id, client,
         preserve_log_for=cmd_id if was_truncated else None,
         release_lease_for=cmd_id,
     )
+    if exit_code != 0:
+        raise _ToolFailure(formatted)
     return formatted
 
 
@@ -2384,16 +2434,12 @@ async def _poll_bg_bash(valves, sandbox_id: str, session_id: str,
             elapsed = int(time.time() - start_time)
             tail = ""
             try:
-                log_resp = await poll_client.get(
-                    _toolbox(valves, sandbox_id,
-                             f"/process/session/{session_id}/command/{session_cmd_id}/logs"),
-                    headers=_headers(valves),
-                    timeout=30.0,
+                tail, _, _ = await _bash_log_preview(
+                    valves, sandbox_id, poll_client, f"{_bash_sidecar_dir(cmd_id)}/log",
                 )
-                if log_resp.status_code == 200:
-                    tail = log_resp.text
             except Exception as e:
                 logger.debug("bg-poll: failed to fetch log tail: %s", e)
+                tail = "(Preview unavailable; use the full log path below.)"
 
             notice = _format_bg_bash_notice(cmd_id, exit_code, elapsed, tail)
             await _reap_bash_commands(
@@ -2521,6 +2567,8 @@ async def _core_interpret(valves, sandbox_id: str, client: httpx.AsyncClient,
     Use this for iterative data exploration, incremental computation, or
     any workflow where you need state to persist between executions.
     For one-shot shell commands or non-Python work, prefer bash() instead.
+    Stream output is a 50 KiB preview; excess output is discarded explicitly.
+    Write large results to a sandbox file for full access via read() or expose().
 
     :param code: Python code to execute. Top-level await is not supported.
     :param timeout: Max execution time in seconds (default: 120). Use 0 for no limit.
@@ -2541,11 +2589,15 @@ async def _core_interpret(valves, sandbox_id: str, client: httpx.AsyncClient,
     stderr_parts: list[str] = []
     errors: list[dict] = []
     timed_out = False
+    preview_bytes = 0
+    preview_clipped = False
+    execution_failed = False
 
     try:
         async with aconnect_ws(
             ws_url, client,
             keepalive_ping_interval_seconds=20,
+            queue_size=1,
             headers=_headers(valves),
         ) as ws:
             # Send the execute request.
@@ -2565,15 +2617,28 @@ async def _core_interpret(valves, sandbox_id: str, client: httpx.AsyncClient,
                     break
 
                 msg_type = msg.get("type", "")
-                if msg_type == "stdout":
-                    stdout_parts.append(msg.get("text", ""))
-                elif msg_type == "stderr":
-                    stderr_parts.append(msg.get("text", ""))
-                elif msg_type == "error":
-                    errors.append(msg)
+                if msg_type not in ("stdout", "stderr", "error"):
+                    continue
+                if msg_type == "error":
+                    execution_failed = True
+                    text = msg.get("traceback") or f"{msg.get('name', 'Error')}: {msg.get('value', '')}"
+                else:
+                    text = msg.get("text", "")
+                raw = text.encode("utf-8")
+                room = _MAX_BYTES - preview_bytes
+                clipped = raw[:room].decode("utf-8", errors="ignore")
+                preview_bytes += len(clipped.encode("utf-8"))
+                preview_clipped = preview_clipped or len(raw) > room
+                if clipped:
+                    if msg_type == "stdout":
+                        stdout_parts.append(clipped)
+                    elif msg_type == "stderr":
+                        stderr_parts.append(clipped)
+                    else:
+                        errors.append({"traceback": clipped})
 
     except Exception as e:
-        return f"Error connecting to interpreter: {e}"
+        raise _ToolFailure(f"Error connecting to interpreter: {e}") from e
 
     stdout = "".join(stdout_parts)
     stderr = "".join(stderr_parts)
@@ -2581,6 +2646,10 @@ async def _core_interpret(valves, sandbox_id: str, client: httpx.AsyncClient,
     result = _format_interpret_result(stdout, stderr, errors, lost_state)
     if timed_out:
         result = f"[Execution timed out after {timeout}s]\n\n{result}"
+    if preview_clipped:
+        result += "\n[Text preview truncated at 50 KiB; excess stream output was discarded. For full output, write to a sandbox file in your Python code and use read() or expose().]"
+    if timed_out or execution_failed:
+        raise _ToolFailure(result)
 
     return result
 
@@ -3098,6 +3167,8 @@ def _build_delegate_tool(core_fn, *, infra_args: tuple,
         "_infra_args": infra_args,
         "_extra_kwargs": extra_infra_kwargs or {},
         "_defaults": defaults,
+        "_checked_result": _checked_result,
+        "_ToolFailure": _ToolFailure,
     }
     # Import type names so annotations resolve in the exec'd function
     for p in tool_params:
@@ -3107,7 +3178,10 @@ def _build_delegate_tool(core_fn, *, infra_args: tuple,
 
     code = (
         f"async def {fn_name}({sig_str}) -> str:\n"
-        f"    return await _core_fn(*_infra_args, **_extra_kwargs, {kwargs_str})\n"
+        f"    try:\n"
+        f"        return _checked_result(await _core_fn(*_infra_args, **_extra_kwargs, {kwargs_str}))\n"
+        f"    except _ToolFailure as exc:\n"
+        f"        return f'Error: {{exc}}'\n"
     )
     exec(code, ns)
     fn = ns[fn_name]
@@ -3966,14 +4040,14 @@ class Tools:
             sandbox was restarted (in which case the PID is stale). To
             distinguish the two, check whether the PID is still alive.
             While a command runs, its sidecar remains available for monitoring.
-            Once Lathe observes completion, it removes the wrapper, PID, exit status,
-            and log, then deletes the Daytona session unless a live shell-backgrounded
-            job still depends on it. A short lease prevents another OWUI worker from
-            racing the background completion poller. A retained service session is
-            reduced to only a PID marker and is
-            reaped by a later bash() call after the job exits. A truncated foreground
-            command's full log remains readable until the next bash() call. Sandbox
-            stop or restart clears all sidecars and sessions.
+            Completion releases the Daytona session unless a live shell-backgrounded
+            job still depends on it. Cleanup removes the wrapper and PID, but keeps
+            the full log and exit status for 24 hours after completion. Unrelated
+            bash calls, including calls from other chats, do not shorten this lease.
+            A later bash call removes expired evidence once no retained job is live.
+            Previews are bounded to 50 KiB, and may begin mid-line. Use read() for
+            numbered previews, bash byte ranges, or expose() for full file access.
+            Sandbox stop or restart clears all sidecars and sessions.
 
             ## Recipes
 
@@ -4284,6 +4358,9 @@ class Tools:
             sub-agent's prompt. The files are fetched once at delegation
             time and appear as a "Reference Files" section — the sub-agent
             sees their full contents without spending steps reading them.
+            References have an aggregate 50 KiB budget including headings.
+            Oversized files fail before inference; they are never silently clipped.
+            Prepare smaller references, or have the sub-agent use read() previews.
 
             This is the recommended way to pass project context. If you
             discovered relevant files via onboard() or glob(), name them
@@ -4847,7 +4924,8 @@ class Tools:
                 on_background=_on_bg,
             )
 
-            await _emit(__event_emitter__, "Command complete", done=True)
+            status = "Command running in background" if "[Backgrounded after" in result else "Command complete"
+            await _emit(__event_emitter__, status, done=True)
             messages = _drain_harness_messages(self._chat_state, __chat_id__, _sb_warning)
             return _prepend_harness_messages(result, messages)
 
@@ -4935,7 +5013,7 @@ class Tools:
             )
 
             await _emit(__event_emitter__, f"Loading image {path}...")
-            result = await _core_view(self.valves, sandbox_id, client, path=path)
+            result = _checked_result(await _core_view(self.valves, sandbox_id, client, path=path))
 
             await _emit(__event_emitter__, "Image loaded", done=True)
             # The result must stay byte-identical to the core output: OWUI
@@ -4972,7 +5050,7 @@ class Tools:
         Long-running delegations auto-background and return a descriptor with log/result
         file paths for monitoring, exactly like bash() does for long commands.
         :param task: What the sub-agent should accomplish. Be specific — it cannot ask clarifying questions. Include any context (error messages, prior findings, instructions) directly in the task description.
-        :param context_files: Absolute sandbox file paths to inject into the sub-agent's prompt (e.g. AGENTS.md, SKILL.md, config files). Fetched at delegation time — the sub-agent sees their contents without spending steps reading them.
+        :param context_files: Absolute sandbox file paths to inject into the sub-agent's prompt. Maximum aggregate 50 KiB including headings; oversized references fail before inference, never silently truncate. Prepare smaller reference files or let the sub-agent use read() for explicit previews.
         :param max_steps: Maximum inference calls the sub-agent may make (default: 10, max: 30). With max_steps=1, it receives the task and context_files but no tools, so it must answer directly from that supplied context. Use at least 2 for tasks requiring sandbox access or changes.
         :param foreground_seconds: Seconds to wait before auto-backgrounding (default: 30, max: 300). Set 0 for immediate background (fire-and-forget). Omit or set -1 to use the default.
         """
@@ -5025,20 +5103,21 @@ class Tools:
                     err = _require_abs_path(fpath, "context_files entry")
                     if err:
                         return err
+                remaining = _MAX_BYTES
                 for fpath in context_files:
-                    resp = await client.get(
-                        _toolbox(self.valves, sandbox_id, "/files/download"),
-                        params={"path": fpath},
-                        headers=_headers(self.valves),
-                        timeout=60.0,
+                    content = await _download_file(
+                        self.valves, sandbox_id, client, fpath, max_bytes=remaining,
                     )
-                    if resp.status_code == 404:
+                    if content is None:
                         return (
                             f"Error: context_files entry not found on sandbox: {fpath}\n"
                             f"Verify the path exists before delegating."
                         )
-                    resp.raise_for_status()
-                    file_sections.append(f"### {fpath}\n\n{resp.text}")
+                    section = f"### {fpath}\n\n{content}"
+                    remaining -= len(section.encode("utf-8"))
+                    if remaining < 0:
+                        raise _ToolFailure("context_files exceed the aggregate 50 KiB limit including headings. Prepare smaller reference files; nothing was silently truncated.")
+                    file_sections.append(section)
 
             # ASGI transport — in-process call to OWUI's FastAPI app.
             # Uses /api/chat/completions which handles all model types:
@@ -5105,14 +5184,14 @@ class Tools:
                 usage_path = f"{delegate_dir}/usage"
                 task_path = f"{delegate_dir}/task"
 
-                await _core_write(
+                _checked_result(await _core_write(
                     self.valves, sandbox_id, client,
                     path=task_path, content=task,
-                )
-                await _core_write(
+                ))
+                _checked_result(await _core_write(
                     self.valves, sandbox_id, client,
                     path=log_path, content="",
-                )
+                ))
                 await _emit(__event_emitter__, "Sub-agent starting...")
             except BaseException:
                 await agent_clients.aclose()
@@ -5134,15 +5213,13 @@ class Tools:
             async def _append_log(line: str):
                 """Append a timestamped line to the in-memory log and sandbox file."""
                 ts = time.strftime("%H:%M:%S")
-                entry = f"[{ts}] {line}"
+                hint = line.encode("utf-8")[:1024].decode("utf-8", errors="ignore")
+                entry = f"[{ts}] {hint}"
                 log_lines.append(entry)
-                try:
-                    await _core_write(
-                        self.valves, sandbox_id, bg_client,
-                        path=log_path, content="\n".join(log_lines) + "\n",
-                    )
-                except Exception as e:
-                    logger.debug("delegate: sidecar log write failed: %s", e)
+                _checked_result(await _core_write(
+                    self.valves, sandbox_id, bg_client,
+                    path=log_path, content="\n".join(log_lines) + "\n",
+                ))
 
             # ── The actual sub-agent execution coroutine ─────────────
             # This is separated so it can either run inline (foreground)
@@ -5226,20 +5303,20 @@ class Tools:
                         result_output = agent_run.result.output if agent_run.result else "(no output)"
 
                     # ── Write sidecar result files ────────────────────
-                    await _core_write(
+                    _checked_result(await _core_write(
                         self.valves, sandbox_id, bg_client,
                         path=result_path, content=result_output,
-                    )
+                    ))
                     usage_data = {
                         "steps": step_count,
                         "tool_calls": usage.tool_calls,
                         "input_tokens": usage.input_tokens,
                         "output_tokens": usage.output_tokens,
                     }
-                    await _core_write(
+                    _checked_result(await _core_write(
                         self.valves, sandbox_id, bg_client,
                         path=usage_path, content=json.dumps(usage_data),
-                    )
+                    ))
                     await _append_log(
                         f"Completed: {step_count} steps, {usage.tool_calls} tool calls"
                     )
@@ -5275,12 +5352,13 @@ class Tools:
                         "step_count": step_count,
                     })
                     try:
-                        await _core_write(
+                        _checked_result(await _core_write(
                             self.valves, sandbox_id, bg_client,
                             path=error_path, content=error_msg,
-                        )
+                        ))
                         await _append_log(f"Error: {error_msg}")
                     except Exception as e2:
+                        agent_result["error"] += f"; failure evidence could not be persisted: {e2}"
                         logger.debug("delegate: sidecar error write failed: %s", e2)
 
                 finally:
@@ -5325,7 +5403,9 @@ class Tools:
                 await bg_task
 
                 if agent_result.get("ok"):
-                    result_output = agent_result["output"]
+                    result_output, clipped, _ = _truncate_tail(agent_result["output"])
+                    if clipped:
+                        result_output += f"\n[Bounded text preview; full delegate result: {result_path}]"
                     usage = agent_result["usage"]
                     step_count = agent_result["step_count"]
                     parts = [f"{step_count} step(s)", f"{usage.tool_calls} tool call(s)"]
