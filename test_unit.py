@@ -850,7 +850,7 @@ async def test_startup_readiness_retries_and_creates_workspace(
 ):
     tools.valves.persistent_volume = False
     observations = iter([initial, "started"])
-    workspace = tmp_path / "workspace"
+    workspace = tmp_path / "workspace with spaces"
     attempts = []
 
     def handler(request):
@@ -885,8 +885,9 @@ async def test_startup_readiness_retries_and_creates_workspace(
             return httpx.Response(200, json={"exitCode": 1, "result": "mkdir failed"})
         # Execute the shipped readiness command, with only its absolute root
         # redirected to a real temporary directory.
-        result = subprocess.run(command.replace("/home/daytona/workspace", str(workspace)),
-                                shell=True, capture_output=True, text=True)
+        argv = shlex.split(command)
+        argv[2] = argv[2].replace("/home/daytona/workspace", shlex.quote(str(workspace)))
+        result = subprocess.run(argv, capture_output=True, text=True)
         return httpx.Response(200, json={"exitCode": result.returncode, "result": result.stdout})
 
     async with httpx.AsyncClient(transport=transport(handler)) as client:
