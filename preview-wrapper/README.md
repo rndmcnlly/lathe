@@ -257,8 +257,12 @@ Worker, KV namespace, route, secret, and DNS records.
    `https://WRAPPER_DOMAIN/register` and `preview_wrapper_key` as the same
    registration secret.
 
-KV's `expirationTtl` performs actual expiry. The daily cron is a cleanup canary
-and logs live/deleted record counts. No per-preview DNS record is created.
+KV's `expirationTtl` performs actual expiry. Auth state and sessions also carry
+absolute expiry: KV requires at least 60 seconds of storage TTL, even when the
+preview lease has less time remaining. Longer storage never extends authorization.
+State/session records from older code without absolute expiry fail closed and
+require a fresh sign-in. The daily cron is a cleanup canary and logs live/deleted
+record counts. No per-preview DNS record is created.
 
 ## Proxy Behavior
 
@@ -268,7 +272,8 @@ and logs live/deleted record counts. No per-preview DNS record is created.
 - Removes `__Host-lathe_session` before proxying request cookies upstream and
   discards upstream attempts to set it.
 - Rewrites same-origin absolute redirects to the public wrapper hostname.
-- Passes WebSocket upgrade responses through without reconstruction.
+- Preserves the runtime WebSocket handle while applying the same cookie filtering
+  to upgrade responses as ordinary HTTP.
 
 The upstream target must be reachable from Cloudflare's edge. Do not treat the
 wrapper as a private network tunnel.
@@ -276,10 +281,38 @@ wrapper as a private network tunnel.
 ## Development
 
 ```bash
+npm ci
 npm run check
+npm test
 wrangler dev
 wrangler tail
 ```
 
 Use `.dev.vars.example` for local development. `.dev.vars`, `wrangler.toml`,
 and Wrangler state are gitignored.
+
+Tests require Node 22 or newer. PR CI runs both wrapper and demo-video Node
+suites. `npm test` includes `test/runtime.test.js`; `npm run test:runtime` selects
+only that qualification. It takes about a minute because it observes real KV
+expiry rather than replacing the clock.
+
+The runtime suite executes the shipped Worker in workerd via pinned Miniflare,
+with real local KV bindings and loopback HTTP/OIDC/WebSocket servers. The local
+identity provider deterministically issues codes, validates PKCE and callback
+binding, and supplies owner/wrong-owner/unverified claims. No fetch mocks,
+production credentials, real user login, cloud deployment, or browser download
+are involved. It checks private gating, host-bound state/session rejection,
+request/response cookie isolation (including 101 headers), injected application
+credentials, real upgrade handles with text/binary frame echo, redirects, KV's
+minimum TTL, sub-minute remaining leases, stale-record absolute expiry, and
+actual storage eviction.
+
+This is not qualification of Cloudflare DNS/TLS/routes, Pocket ID configuration,
+OWUI identity injection, or browser cookie enforcement. Cookie attributes are
+checked on HTTP responses and cross-host session replay is attempted explicitly,
+not through a browser cookie jar. Local KV does not model multi-edge eventual
+consistency or make read/delete an atomic one-time-state primitive. The fast
+unit suite uses mocked fetch and a TTL-aware in-memory KV; it does not claim to
+prove Worker upgrades or edge propagation. Miniflare is currently pinned to its
+5.x alpha (and its workerd build) to avoid the known vulnerable dependencies in
+the available 4.x release; the lockfile makes this qualification reproducible.

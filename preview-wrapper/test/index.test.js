@@ -16,21 +16,31 @@ class MemoryKV {
   }
 
   async get(key) {
+    const expiration = this.options.get(key)?.expiration;
+    if (expiration && expiration <= Math.floor(Date.now() / 1000)) {
+      await this.delete(key);
+    }
     return this.values.get(key) ?? null;
   }
 
   async put(key, value, options) {
+    if (options?.expirationTtl !== undefined && options.expirationTtl < 60) {
+      throw new Error("KV expirationTtl must be at least 60 seconds");
+    }
     this.values.set(key, value);
-    this.options.set(key, options);
+    this.options.set(key, { ...options,
+      ...(options?.expirationTtl ? { expiration: Math.floor(Date.now() / 1000) + options.expirationTtl } : {}),
+    });
   }
 
   async delete(key) {
     this.values.delete(key);
+    this.options.delete(key);
   }
 
   async list() {
     return {
-      keys: [...this.values.keys()].map((name) => ({ name })),
+      keys: [...this.values.keys()].map((name) => ({ name, expiration: this.options.get(name)?.expiration })),
       list_complete: true,
     };
   }
@@ -274,7 +284,7 @@ const appHeaders = { Authorization: "Basic YXBwOnNlY3JldA==", "X-App-Assertion":
 
 for (const access of ["public", "private"]) {
   for (const websocket of [false, true]) {
-    test(`${access} configured headers replace browser values on ${websocket ? "WS" : "HTTP"}`, async () => {
+    test(`${access} configured headers replace browser values on ${websocket ? "upgrade requests (mock HTTP response)" : "HTTP"}`, async () => {
       const env = environment();
       const registration = await register(env, access, "", { upstream_headers: appHeaders });
       assert.equal(registration.upstream_headers_applied, true);
@@ -289,10 +299,9 @@ for (const access of ["public", "private"]) {
       assert.equal(env.SUBDOMAINS.options.get(host).expirationTtl, 3600);
       if (access === "private") {
         await env.SUBDOMAINS.put("_lathe:session:owner", JSON.stringify({
-          host, owner_email: "owner@example.org",
+          host, owner_email: "owner@example.org", expires_at: Math.floor(Date.now() / 1000) + 3600,
         }));
       }
-      const upgraded = { status: 101, webSocket: { canary: true } };
       let forwarded = 0;
       globalThis.fetch = async (input, init) => {
         forwarded++;
@@ -305,7 +314,7 @@ for (const access of ["public", "private"]) {
         assert.equal(headers.get("cookie"), "app=cookie");
         assert.equal(headers.get("connection"), websocket ? "Upgrade" : null);
         if (websocket) assert.equal(headers.get("sec-websocket-protocol"), "app-protocol");
-        return websocket ? upgraded : new Response("application content");
+        return new Response("application content");
       };
       const response = await worker.fetch(new Request(`${registration.url}app`, {
         headers: {
@@ -317,8 +326,7 @@ for (const access of ["public", "private"]) {
         },
       }), env);
       assert.equal(forwarded, 1);
-      if (websocket) assert.equal(response, upgraded);
-      else assert.equal(await response.text(), "application content");
+      assert.equal(await response.text(), "application content");
     });
   }
 }
@@ -327,7 +335,7 @@ test("private injected credentials never reach upstream for anonymous or wrong-o
   const env = environment();
   const registration = await register(env, "private", "", { upstream_headers: appHeaders });
   await env.SUBDOMAINS.put("_lathe:session:attacker", JSON.stringify({
-    host: registration.host, owner_email: "attacker@example.org",
+    host: registration.host, owner_email: "attacker@example.org", expires_at: Math.floor(Date.now() / 1000) + 3600,
   }));
   globalThis.fetch = async (input) => {
     assert.equal(input.toString(), "https://auth.test/.well-known/openid-configuration");

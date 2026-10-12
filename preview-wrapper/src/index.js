@@ -366,12 +366,15 @@ async function beginAuthentication(url, registration, host, env) {
     const verifier = randomToken(48);
     const challenge = await sha256Base64Url(verifier);
     const redirectUri = `https://${host}${AUTH_CALLBACK_PATH}`;
+    const stateExpires = Math.min(Math.floor(Date.now() / 1000) + AUTH_STATE_TTL, registration.expires_at);
+    // KV has a 60-second minimum TTL; absolute expiry remains the auth boundary.
     await env.SUBDOMAINS.put(STATE_PREFIX + state, JSON.stringify({
       host,
       return_to: url.pathname + url.search,
       verifier,
       redirect_uri: redirectUri,
-    }), { expirationTtl: Math.min(AUTH_STATE_TTL, remaining) });
+      expires_at: stateExpires,
+    }), { expirationTtl: Math.max(MIN_TTL, Math.min(AUTH_STATE_TTL, remaining)) });
 
     const authorization = new URL(configuration.authorization_endpoint);
     authorization.searchParams.set("client_id", env.OIDC_CLIENT_ID);
@@ -408,7 +411,8 @@ async function handleAuthCallback(request, url, registration, host, env) {
     return page("sign-in failed", "<p>The sign-in state was invalid.</p>", 401, env.ZONE);
   }
   if (authState.host !== host || authState.redirect_uri !== `https://${host}${AUTH_CALLBACK_PATH}`
-      || typeof authState.verifier !== "string" || !safeReturnPath(authState.return_to)) {
+      || typeof authState.verifier !== "string" || !safeReturnPath(authState.return_to)
+      || !Number.isInteger(authState.expires_at) || registrationRemaining(authState) <= 0) {
     return page("sign-in failed", "<p>The sign-in state did not match this preview.</p>", 401, env.ZONE);
   }
 
@@ -455,7 +459,8 @@ async function handleAuthCallback(request, url, registration, host, env) {
       host,
       owner_email: ownerEmail,
       subject: claims.sub,
-    }), { expirationTtl: remaining });
+      expires_at: registration.expires_at,
+    }), { expirationTtl: Math.max(MIN_TTL, remaining) });
 
     return new Response(null, {
       status: 302,
@@ -478,6 +483,7 @@ async function hasAuthorizedSession(request, registration, host, env) {
   try {
     const session = JSON.parse(stored);
     return session.host === host
+      && Number.isInteger(session.expires_at) && registrationRemaining(session) > 0
       && normalizeEmail(session.owner_email) === normalizeEmail(registration.owner?.email);
   } catch {
     return false;
@@ -608,9 +614,6 @@ async function proxy(request, url, target, publicHost, zone, upstreamHeaders = {
     return page("upstream unavailable", "<p>The application could not be reached.</p>", 502, zone);
   }
 
-  // Reconstructing the response would discard Cloudflare's WebSocket handle.
-  if (resp.status === 101) return resp;
-
   const out = new Headers();
   for (const [name, value] of resp.headers.entries()) {
     if (name.toLowerCase() === "set-cookie") continue;
@@ -631,7 +634,12 @@ async function proxy(request, url, target, publicHost, zone, upstreamHeaders = {
   const location = out.get("location");
   if (location) out.set("location", unwrapLocation(location, upstream, publicHost));
 
-  return new Response(resp.body, { status: resp.status, headers: out });
+  // workerd supports reconstructing 101 responses when the handle is explicit.
+  // Upgrade cookies cross the same authentication boundary as ordinary HTTP.
+  return new Response(resp.body, {
+    status: resp.status, headers: out,
+    ...(resp.status === 101 ? { webSocket: resp.webSocket } : {}),
+  });
 }
 
 function unwrapLocation(location, upstream, publicHost) {
@@ -640,6 +648,7 @@ function unwrapLocation(location, upstream, publicHost) {
     if (parsed.origin === upstream.origin) {
       parsed.protocol = "https:";
       parsed.host = publicHost;
+      parsed.port = "";
       return parsed.toString();
     }
     return location;
