@@ -609,7 +609,7 @@ async def test_completed_bash_retention_is_bounded(tools, monkeypatch, tmp_path,
         await lathe._reap_bash_commands(
             tools.valves, "sb", client, preserve_log_for="current",
         )
-        assert {p.name for p in current.iterdir()} == {"log", "exit", "reap"}
+        assert {p.name for p in current.iterdir()} == {"log", "exit", "reap", "session_done"}
         assert "plaintext" not in "".join(p.read_text() for p in current.iterdir())
 
         await lathe._reap_bash_commands(
@@ -629,6 +629,7 @@ async def test_completed_bash_retention_is_bounded(tools, monkeypatch, tmp_path,
 
         await lathe._reap_bash_commands(tools.valves, "sb", client)
         assert (current / "log").read_text() == "command output\n"
+        assert delete_attempts["lathe-cmd-current"] == 1, "retained evidence must not repeat session cleanup"
         expired = time.time() - 24 * 60 * 60 - 1
         for directory in (current, ordinary, retained, old_spill, leased):
             os.utime(directory / "exit", (expired, expired))
@@ -709,6 +710,10 @@ async def test_bash_large_log_survives_unrelated_chat(tools, sandbox, http, monk
                                __chat_id__="a", __event_emitter__=emit)
     assert failure.startswith("Error: Exit code: 1") and "failed" in failure
     assert not any(e["data"]["description"] == "Command complete" for e in emissions)
+    async with lathe.httpx.AsyncClient() as client:
+        delegate_bash = lathe._build_delegate_tools(tools.valves, "sb", client, [])[0]
+        literal = await delegate_bash.function(command="printf 'Error: expected output'", workdir=str(tmp_path))
+        assert literal.startswith("Error: expected output") and "Result files retained" in literal
 
 
 @pytest.mark.parametrize("start,stop", [(1, 0), (-1, 0), (1, -1)])
@@ -1919,13 +1924,15 @@ async def test_delegate_rejects_oversized_reference_before_inference(tools, sand
         assert chunks_received <= 7, "reference must be rejected before full acquisition"
 
 
-async def test_interpret_bounds_oversized_and_many_frames(tools, sandbox, http, monkeypatch):
+@pytest.mark.parametrize("oversized", [False, True])
+async def test_interpret_bounds_oversized_and_many_frames(tools, sandbox, http, monkeypatch, oversized):
     import contextlib
     import httpx_ws
     tools._chat_state["chat"] = {"init": True, "pending": []}
     monkeypatch.setattr(lathe, "_ensure_interpreter_context", AsyncMock(return_value=("ctx", False)))
-    frames = iter([{"type": "stdout", "text": "é" * 500000}] +
-                  [{"type": "stderr", "text": "discarded"}] * 1000)
+    frames = iter(([{"type": "stdout", "text": "é" * 500000}] +
+                   [{"type": "stderr", "text": "discarded"}] * 1000) if oversized else
+                  [{"type": "stdout", "text": "Error: expected output"}])
     received = 0
     class WS:
         async def send_json(self, message):
@@ -1945,9 +1952,12 @@ async def test_interpret_bounds_oversized_and_many_frames(tools, sandbox, http, 
     monkeypatch.setattr(httpx_ws, "aconnect_ws", connect)
     http(lambda request: pytest.fail("unexpected HTTP"))
     result = await tools.interpret("print('large')", __user__=USER, __chat_id__="chat")
-    assert received == 1001, "must drain execution even after preview fills"
+    assert received == (1001 if oversized else 1), "must drain execution even after preview fills"
     assert len(result.encode()) < 53 * 1024
-    assert "Text preview truncated" in result and "discarded" in result
+    if oversized:
+        assert "Text preview truncated" in result and "discarded" in result
+    else:
+        assert result == "Error: expected output", "literal stdout is not the internal error protocol"
 
 
 @pytest.mark.parametrize("background,fail,persist_failure", [

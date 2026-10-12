@@ -1712,9 +1712,13 @@ def _standard_tool(core_fn, *, emit_start: str, emit_done: str,
                     extra_core_kwargs(self, sandbox_id, __chat_id__)
                 )
 
-            result = _checked_result(await core_fn(
+            result = await core_fn(
                 self.valves, sandbox_id, client, **call_kwargs,
-            ))
+            )
+            # Interpreter output is arbitrary user stdout, not error-protocol
+            # text. Its failures already raise _ToolFailure.
+            if core_fn is not _core_interpret:
+                result = _checked_result(result)
 
             await _emit(__event_emitter__, emit_done, done=True)
             messages = _drain_harness_messages(
@@ -2084,7 +2088,8 @@ def _build_bash_reap_script(preserve_log_for: str | None = None,
                     except OSError:
                         pass
                     open(os.path.join(command_dir, "reap"), "a").close()
-                    print("delete " + command_id)
+                    if not os.path.isfile(os.path.join(command_dir, "session_done")):
+                        print("delete " + command_id)
                     try:
                         evidence = os.path.join(command_dir, "exit")
                         if not os.path.exists(evidence):
@@ -2110,6 +2115,7 @@ async def _reap_bash_commands(valves, sandbox_id: str, client: httpx.AsyncClient
         if result.startswith("Error:"):
             logger.warning("%s", result)
             return
+        cleaned = []
         for line in result.splitlines():
             action, _, command_id = line.partition(" ")
             if action not in ("delete", "expire") or not command_id:
@@ -2122,6 +2128,8 @@ async def _reap_bash_commands(valves, sandbox_id: str, client: httpx.AsyncClient
                 if response.status_code not in (204, 404):
                     logger.warning("bash cleanup: session %s returned HTTP %s",
                                    command_id, response.status_code)
+                else:
+                    cleaned.append(command_id)
             else:
                 response = await client.delete(
                     _toolbox(valves, sandbox_id, "/files/"),
@@ -2131,6 +2139,15 @@ async def _reap_bash_commands(valves, sandbox_id: str, client: httpx.AsyncClient
                 if response.status_code not in (204, 404):
                     logger.warning("bash cleanup: sidecar %s returned HTTP %s",
                                    command_id, response.status_code)
+        if cleaned:
+            # A successful session release is recorded separately from evidence
+            # expiry, avoiding repeated HTTP deletes for every retained result.
+            script = f"import os\nroot={_EPHEMERAL_ROOT + '/cmd'!r}\n"
+            script += f"for command_id in {cleaned!r}:\n"
+            script += "    path = os.path.join(root, command_id, 'session_done')\n"
+            script += "    if os.path.isdir(os.path.dirname(path)):\n        open(path, 'a').close()\n"
+            await _run_sandbox_script(valves, sandbox_id, client, script,
+                                      error_prefix="bash session cleanup marker failed")
     except Exception as exc:
         logger.warning("bash cleanup failed: %s", exc)
 
@@ -2224,6 +2241,9 @@ async def _bash_log_preview(valves, sandbox_id, client, log_path, *, allow_missi
     output, truncated, meta = _truncate_tail(text)
     if data["size"] > _MAX_BYTES:
         output += f"\n[Bounded tail preview, may begin mid-line. Full output ({_human_size(data['size'])}): {log_path}]"
+        # The fetched tail does not know the full file's line count. Its byte
+        # notice is authoritative; do not relabel tail-relative lines as global.
+        return output, False, {}
     return output, truncated, meta
 
 
@@ -2576,7 +2596,7 @@ async def _core_interpret(valves, sandbox_id: str, client: httpx.AsyncClient,
     from httpx_ws import aconnect_ws, WebSocketDisconnect
 
     if not code.strip():
-        return "Error: empty code. Provide Python code to execute."
+        raise _ToolFailure("empty code. Provide Python code to execute.")
 
     context_id, lost_state = await _ensure_interpreter_context(
         valves, sandbox_id, client, chat_state, chat_id,
@@ -3167,7 +3187,9 @@ def _build_delegate_tool(core_fn, *, infra_args: tuple,
         "_infra_args": infra_args,
         "_extra_kwargs": extra_infra_kwargs or {},
         "_defaults": defaults,
-        "_checked_result": _checked_result,
+        # Execution output may legitimately start with "Error:". Those cores
+        # raise on failure; legacy structured tool replies reserve the prefix.
+        "_checked_result": (lambda result: result) if core_fn in (_core_bash, _core_interpret) else _checked_result,
         "_ToolFailure": _ToolFailure,
     }
     # Import type names so annotations resolve in the exec'd function
