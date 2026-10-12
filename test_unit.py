@@ -739,7 +739,11 @@ async def test_bash_launch_failure_discards_session_and_wrapper(tools, sandbox, 
                for method, path in requests)
 
 
-async def test_bash_large_log_survives_unrelated_chat(tools, sandbox, http, monkeypatch, tmp_path, clock):
+@pytest.mark.parametrize("command,log_size", [
+    ("python3 -c 'print(\"x\" * 1000000)'", 1000001),
+    ("python3 -c 'import sys; sys.stdout.buffer.write(bytes([255]) * 20000)'", 20000),
+])
+async def test_bash_large_log_survives_unrelated_chat(tools, sandbox, http, monkeypatch, tmp_path, clock, command, log_size):
     monkeypatch.setattr(lathe, "_EPHEMERAL_ROOT", str(tmp_path / "lathe"))
     for chat in ("a", "b"):
         tools._chat_state[chat] = {"init": True, "pending": []}
@@ -770,14 +774,15 @@ async def test_bash_large_log_survives_unrelated_chat(tools, sandbox, http, monk
         return httpx.Response(204)
 
     http(handler)
-    output = await tools.bash("python3 -c 'print(\"x\" * 1000000)'", workdir=str(tmp_path),
+    output = await tools.bash(command, workdir=str(tmp_path),
                               __user__=USER, __chat_id__="a")
     assert "Bounded tail preview" in output and len(output.encode()) < 53 * 1024
     log = next((tmp_path / "lathe" / "cmd").glob("*/log"))
+    assert str(log) in output, "clipped previews must identify recoverable full output"
     await tools.bash("echo unrelated", workdir=str(tmp_path), __user__=USER, __chat_id__="b")
     preview = await tools.read(str(log), __user__=USER, __chat_id__="a")
     assert "Text preview truncated" in preview and len(preview.encode()) < 53 * 1024
-    assert log.stat().st_size == 1000001
+    assert log.stat().st_size == log_size
     assert (log.parent / "exit").read_text().strip() == "0"
     assert deleted, "sessions should be cleaned independently of result files"
     emissions = []

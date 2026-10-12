@@ -1891,9 +1891,10 @@ async def _bash_log_preview(valves, sandbox_id, client, log_path, *, allow_missi
         valves, sandbox_id, client, script, error_prefix=f"bash log preview failed; full log: {log_path}",
     ))
     # Replacement decoding can expand invalid UTF-8, so bound the decoded text too.
-    text = data["text"].encode("utf-8")[-_MAX_BYTES:].decode("utf-8", errors="ignore")
+    decoded_bytes = data["text"].encode("utf-8")
+    text = decoded_bytes[-_MAX_BYTES:].decode("utf-8", errors="ignore")
     output, truncated, meta = _truncate_tail(text)
-    if data["size"] > _MAX_BYTES:
+    if data["size"] > _MAX_BYTES or len(decoded_bytes) > _MAX_BYTES:
         output += f"\n[Bounded tail preview, may begin mid-line. Full output ({_human_size(data['size'])}): {log_path}]"
         # The fetched tail does not know the full file's line count. Its byte
         # notice is authoritative; do not relabel tail-relative lines as global.
