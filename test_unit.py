@@ -818,6 +818,129 @@ async def test_background_bash_poll_deadline(tools, http, clock, monkeypatch):
     assert tools._chat_state["chat"]["pending"] == []
 
 
+async def test_started_tool_request_budget(tools, http):
+    tools._chat_state["chat"] = {"init": True, "pending": []}
+    calls = []
+
+    def handler(request):
+        calls.append((request.method, request.url.path))
+        if request.url.path == "/sandbox":
+            return httpx.Response(200, json=[{
+                "id": "sb", "state": "started", "labels": {"test": USER["email"]},
+            }])
+        if request.url.path == "/sandbox/sb":
+            return httpx.Response(200, json={"id": "sb", "state": "started"})
+        assert (request.method, request.url.path) == ("POST", "/sb/process/execute")
+        command = json.loads(request.content)["command"]
+        result = "" if command == "bash -c 'mkdir -p /home/daytona/workspace'" else "file contents"
+        return httpx.Response(200, json={"exitCode": 0, "result": result})
+
+    http(handler)
+    for _ in range(2):
+        before = len(calls)
+        assert await tools.read("/file", __user__=USER, __chat_id__="chat") == "file contents"
+        assert len(calls) - before == 4
+        assert calls[before:before + 2] == [("GET", "/sandbox"), ("GET", "/sandbox/sb")]
+
+
+@pytest.mark.parametrize("initial", ["created", "conflicted", "stopped", "starting", "error"])
+@pytest.mark.parametrize("failure", ["http", "timeout", "mkdir"])
+async def test_startup_readiness_retries_and_creates_workspace(
+    tools, transport, clock, tmp_path, initial, failure,
+):
+    tools.valves.persistent_volume = False
+    observations = iter([initial, "started"])
+    workspace = tmp_path / "workspace"
+    attempts = []
+
+    def handler(request):
+        if request.url.path == "/sandbox" and request.method == "GET":
+            return httpx.Response(200, json=[] if initial in ("created", "conflicted") else [{
+                "id": "sb", "state": "started", "labels": {"test": USER["email"]},
+            }])
+        if request.url.path == "/sandbox" and request.method == "POST":
+            if initial == "conflicted":
+                return httpx.Response(409)
+            return httpx.Response(200, json={"id": "sb", "state": "started"})
+        if request.url.path == "/sandbox/test/owner@example.test":
+            return httpx.Response(200, json={
+                "id": "sb", "state": "started", "name": "test/owner@example.test",
+                "labels": {"test": USER["email"]},
+            })
+        if request.url.path == "/sandbox/sb" and request.method == "GET":
+            return httpx.Response(200, json={
+                "id": "sb", "state": next(observations), "recoverable": True,
+            })
+        if request.url.path in ("/sandbox/sb/start", "/sandbox/sb/recover"):
+            assert request.method == "POST"
+            return httpx.Response(200, json={})
+        assert (request.method, request.url.path) == ("POST", "/sb/process/execute")
+        command = json.loads(request.content)["command"]
+        attempts.append(command)
+        if len(attempts) == 1:
+            if failure == "timeout":
+                raise httpx.ReadTimeout("toolbox starting", request=request)
+            if failure == "http":
+                return httpx.Response(503)
+            return httpx.Response(200, json={"exitCode": 1, "result": "mkdir failed"})
+        # Execute the shipped readiness command, with only its absolute root
+        # redirected to a real temporary directory.
+        result = subprocess.run(command.replace("/home/daytona/workspace", str(workspace)),
+                                shell=True, capture_output=True, text=True)
+        return httpx.Response(200, json={"exitCode": result.returncode, "result": result.stdout})
+
+    async with httpx.AsyncClient(transport=transport(handler)) as client:
+        sandbox_id, _ = await lathe._ensure_sandbox(tools.valves, USER["email"], client)
+    assert sandbox_id == "sb" and workspace.is_dir()
+    assert len(attempts) == 2 and clock() >= 1
+
+
+@pytest.mark.parametrize("failure", ["http", "timeout", "mkdir"])
+async def test_started_workspace_failure_never_runs_tool(tools, http, clock, failure):
+    tools._chat_state["chat"] = {"init": True, "pending": []}
+    calls = []
+
+    def handler(request):
+        calls.append((request.method, request.url.path))
+        if request.url.path == "/sandbox":
+            return httpx.Response(200, json=[{
+                "id": "sb", "labels": {"test": USER["email"]},
+            }])
+        if request.url.path == "/sandbox/sb":
+            return httpx.Response(200, json={"id": "sb", "state": "started"})
+        assert (request.method, request.url.path) == ("POST", "/sb/process/execute")
+        assert json.loads(request.content)["command"] == "bash -c 'mkdir -p /home/daytona/workspace'"
+        if failure == "timeout":
+            raise httpx.ReadTimeout("sandbox stopped after lookup", request=request)
+        if failure == "http":
+            return httpx.Response(503)
+        return httpx.Response(200, json={"exitCode": 1, "result": "workspace path is a file"})
+
+    http(handler)
+    result = await tools.read("/file", __user__=USER, __chat_id__="chat")
+    assert "workspace could not be prepared" in result and "Retry this tool call" in result
+    assert len(calls) == 3 and clock() == 0
+
+
+async def test_startup_workspace_failure_is_bounded(tools, transport, clock):
+    tools.valves.persistent_volume = False
+    attempts = []
+
+    def handler(request):
+        if (request.method, request.url.path) == ("GET", "/sandbox"):
+            return httpx.Response(200, json=[])
+        if (request.method, request.url.path) == ("POST", "/sandbox"):
+            return httpx.Response(200, json={"id": "sb", "state": "started"})
+        assert (request.method, request.url.path) == ("POST", "/sb/process/execute")
+        attempts.append(request)
+        return httpx.Response(200, json={"exitCode": 1, "result": "mkdir failed"})
+
+    async with httpx.AsyncClient(transport=transport(handler)) as client:
+        with pytest.raises(RuntimeError, match="could not prepare the workspace"):
+            await lathe._ensure_sandbox(tools.valves, USER["email"], client)
+    assert len(attempts) == 30 and clock() == 30
+
+
 @pytest.mark.parametrize("state,status", [
     ("deleted", 200), ("destroyed", 200), ("started", 404),
 ])
@@ -886,6 +1009,7 @@ async def test_concurrent_first_calls_converge_by_unique_name(tools, transport):
     ]
     assert label_lookups == 2 and create_calls == 2
     assert calls.count(("GET", "/sandbox/test/owner@example.test")) == 1
+    assert calls.count(("POST", "/winner/process/execute")) == 2
 
 
 async def test_create_conflict_without_authoritative_winner_is_retryable(tools, transport):
@@ -969,6 +1093,7 @@ async def test_lifecycle_ready_and_restartable_states(
     assert sandbox_id == "sb"
     assert (expected_warning is None and warning is None) or expected_warning in warning
     assert calls.count(("POST", "/sandbox/sb/start")) == start_calls
+    assert calls.count(("POST", "/sb/process/execute")) == 1
     assert (clock() > 0) == bool(start_calls)
 
 
