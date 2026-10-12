@@ -9,9 +9,10 @@ import { fileURLToPath } from "node:url";
 import { chromium } from "playwright";
 import { strFromU8, strToU8, unzipSync, zipSync } from "fflate";
 
-import { normalizedToolEvents, matchesToolExpectation } from "./evidence.mjs";
+import { normalizedToolEvents, matchesToolExpectation, managedTargetRoot } from "./evidence.mjs";
 import { runScenario } from "./interpreter.mjs";
 import { replaceEditorLine } from "./editor.mjs";
+import { openOwuiChat } from "./owui.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const OUT_DIR = resolve(__dirname, "out");
@@ -92,9 +93,6 @@ async function suppressIncidentalUi(page) {
     style.id = "_capture_style";
     style.textContent = "[data-tooltip]:before,[data-tooltip]:after,.tooltip,[role=tooltip],#model-selector-model-button{display:none!important;visibility:hidden!important}";
     document.head.appendChild(style);
-    for (const button of document.querySelectorAll("button")) {
-      if (button.textContent.trim() === "Okay, Let's Go!") button.click();
-    }
   });
 }
 
@@ -476,12 +474,11 @@ try {
 }
 const state = {
   browser,
-  variables: { checkout: "/home/daytona/workspace/lathe-demo" },
+  variables: {},
   loginContext: null,
   context: null,
   page: null,
   token: null,
-  cookies: [],
   chatUrl: null,
   toolBaseline: 0,
   previewReady: false,
@@ -525,13 +522,12 @@ const adapter = {
     }
     state.loginPage = await state.loginContext.newPage();
     if (LOCAL_TOKEN) {
-      await state.loginPage.goto(CHAT_URL);
-      await state.loginPage.locator(target("owui.chat-input")).waitFor({ state: "visible", timeout: 30000 });
       state.token = LOCAL_TOKEN;
     } else {
       state.token = await ensureOwuiAuth(state.loginPage);
     }
-    state.cookies = await state.loginContext.cookies();
+    // Acknowledge release notes before recording, even when prewarm is skipped.
+    await openOwuiChat(state.loginPage, CHAT_URL);
     return { observations: ["auth.state=owui-authenticated"] };
   },
 
@@ -540,13 +536,10 @@ const adapter = {
       return { result: "skipped", observations: ["sandbox.prewarm=skipped-local"] };
     }
     const page = state.loginPage;
-    await page.goto(CHAT_URL);
-    await page.waitForLoadState("networkidle").catch(() => {});
-    await page.keyboard.press("Escape");
+    await openOwuiChat(page, CHAT_URL);
     await suppressIncidentalUi(page);
-    await page.locator(target("owui.chat-input")).waitFor({ state: "visible", timeout: 15000 });
     await enableLathe(page);
-    await typeMessage(page, "Run exactly: mkdir -p /home/daytona/workspace/.vscode && printf '%s\\n' '{\"chat.disableAIFeatures\":true,\"workbench.secondarySideBar.defaultVisibility\":\"hidden\"}' > /home/daytona/workspace/.vscode/settings.json && rm -rf /home/daytona/workspace/lathe-demo && echo warm");
+    await typeMessage(page, "Run exactly: mkdir -p \"$HOME/.local/share/code-server/User\" && printf '%s\\n' '{\"chat.disableAIFeatures\":true,\"workbench.secondarySideBar.defaultVisibility\":\"hidden\"}' > \"$HOME/.local/share/code-server/User/settings.json\" && echo warm");
     await sendMessage(page);
     await waitForResponse(page, 120000);
     const chatId = chatIdFromUrl(page.url());
@@ -557,13 +550,14 @@ const adapter = {
   },
 
   "capture.start": async () => {
+    // Keep acknowledged release notes and other origin state outside the take.
+    const storageState = await state.loginContext.storageState();
     await state.loginContext.close();
     state.loginContext = null;
     state.context = await browser.newContext({
       viewport: VIEWPORT,
       ignoreHTTPSErrors: Boolean(LOCAL_TOKEN),
-      storageState: LOCAL_TOKEN ? { cookies: [], origins: [{ origin: OWUI_URL,
-        localStorage: [{ name: "token", value: LOCAL_TOKEN }] }] } : undefined,
+      storageState,
       recordVideo: { dir: VIDEO_TMP, size: VIEWPORT },
     });
     await state.context.tracing.start({ screenshots: true, snapshots: true, sources: false });
@@ -571,21 +565,13 @@ const adapter = {
       await state.context.credentials.create(PASSKEY.rpId, PASSKEY);
       await state.context.credentials.install();
     }
-    await state.context.addCookies(state.cookies);
     state.page = await state.context.newPage();
-    if (!LOCAL_TOKEN) {
-      await state.page.goto(`${OWUI_URL}/auth`);
-      await state.page.evaluate((token) => localStorage.setItem("token", token), state.token);
-    }
     return { observations: ["capture.state=recording"] };
   },
 
   "chat.open": async () => {
-    await state.page.goto(CHAT_URL);
-    await state.page.waitForLoadState("networkidle").catch(() => {});
-    await state.page.keyboard.press("Escape");
+    await openOwuiChat(state.page, CHAT_URL);
     await suppressIncidentalUi(state.page);
-    await state.page.locator(target("owui.chat-input")).waitFor({ state: "visible", timeout: 15000 });
     await state.page.waitForTimeout(1200);
     return { observations: ["chat.state=fresh"] };
   },
@@ -606,16 +592,16 @@ const adapter = {
 
   "chat.await-tool-result": async (expected) => {
     const event = await awaitToolResult(state, expected);
+    if (expected.bindCheckout) {
+      state.variables.checkout = managedTargetRoot(event, expected.managedTarget);
+    }
     return { observations: [`chat.tool=${event.tool}`, "chat.tool.status=completed"] };
   },
 
   "editor.open-via-explorer": async ({ path }) => {
     await openPreview(state);
     await state.page.keyboard.press("Control+Shift+E");
-    const folder = state.page.getByText("lathe-demo", { exact: true }).last();
-    await folder.waitFor({ state: "visible", timeout: 10000 });
-    await folder.click();
-    await state.page.keyboard.press("ArrowRight");
+    // VS Code opens the exposed checkout as its root; no assumed clone folder.
     const file = state.page.getByText("RELAY.md", { exact: true }).last();
     await file.waitFor({ state: "visible", timeout: 5000 });
     await file.dblclick();
@@ -638,8 +624,7 @@ const adapter = {
   "editor.replace-line": async (params) => replaceEditorLine(state.page, params),
 
   "chat.return": async () => {
-    await state.page.goto(state.chatUrl);
-    await state.page.waitForLoadState("networkidle").catch(() => {});
+    await openOwuiChat(state.page, state.chatUrl);
     await suppressIncidentalUi(state.page);
     await scrollChatToBottom(state.page);
     await enableLathe(state.page);

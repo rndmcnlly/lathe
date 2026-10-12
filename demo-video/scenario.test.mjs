@@ -15,7 +15,7 @@ test("shipped scenario rejects public IDE and generic port substitutes", () => {
     { target: "http:8080", access: "private" },
     { target: "http:8080", access: "private", tag: "code-server" },
     { target: "code-server:relative", access: "private" },
-    { target: "not-code-server", access: "private" }, { target: "code-server" }]) {
+    { target: "not-code-server", access: "private" }, { target: "code-server", access: "private" }]) {
     assert.equal(matchesToolExpectation({ ...event, arguments: arguments_ }, exposure), false);
   }
   assert.equal(matchesToolExpectation({ ...event, output: "Public wrapped preview: https://example.invalid" }, exposure), false);
@@ -24,8 +24,9 @@ test("shipped scenario rejects public IDE and generic port substitutes", () => {
 test("shipped scenario executes with independent tool and file-read evidence", async () => {
   const events = [
     { tool: "lathe", arguments: { manpage: "version" }, output: "Lathe toolkit version: fixture" },
+    { tool: "bash", arguments: { command: "git clone https://github.com/rndmcnlly/lathe" }, output: "Cloned" },
     { tool: "write", arguments: { path: "/workspace/RELAY.md" }, output: "Saved" },
-    { tool: "expose", arguments: { target: "code-server", access: "private" }, output: "Copying the URL does not grant access." },
+    { tool: "expose", arguments: { target: "code-server:/workspace", access: "private" }, output: "Copying the URL does not grant access." },
     { tool: "read", arguments: { path: "/workspace/RELAY.md" }, output: "2: You: A shared state of mind." },
     { tool: "delegate", arguments: {}, output: "Backgrounded" },
     { tool: "bash", arguments: { command: "ss -ltn | grep 8080" }, output: "Stopped" },

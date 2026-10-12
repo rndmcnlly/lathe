@@ -2,9 +2,10 @@
 
 The demo is a live synthetic monitor of Open WebUI, Lathe, Daytona, the preview wrapper, and the configured model. `scenario.json` owns the narrative, prompts, required outcomes, and bounded presentation fallbacks. `interpreter.mjs` validates and executes that data through the finite operation set implemented by `capture.mjs`.
 
-Run the offline interpreter tests with:
+Run the offline tests (including a local browser UI fixture) with:
 
 ```sh
+npx playwright install --only-shell chromium
 npm test
 ```
 
@@ -29,6 +30,13 @@ a redacted `sanitized-chat.json`. Scenario-marked main-sequence frames go in
 and are never captured as release screenshots. A failed or rejected take remains
 diagnostic evidence but cannot replace the `demo-video-latest` video or screenshots.
 
+Chat navigation waits for the visible composer, not `networkidle`: OWUI's
+realtime traffic can keep the network busy indefinitely. Release notes are
+acknowledged before recording, with browser storage carried into the take.
+The disposable demo disables prompt suggestions, follow-up generation, and the
+built-in code interpreter. Model and toolkit display names omit staging labels;
+hidden staging IDs still protect cleanup isolation.
+
 The recorded activation beat deliberately animates a tutorial cursor through
 `Integrations → Tools → Lathe`, with recognition and confirmation pauses. Keep
 that choreography when changing selectors: activation is instructional content,
@@ -37,11 +45,19 @@ not incidental browser mechanics.
 The first recorded question asks Lathe for its installed version. The capture
 requires a matching `lathe(manpage="version")` result and saves a version frame,
 so the video identifies the deployed toolkit rather than the checkout version.
+Conversational prompts keep test instructions out of the visible dialogue.
+The overview precedes the relay-writing turn, and the editor's rooted expose
+call supplies the actual checkout path rather than a hardcoded clone destination.
+Cold IDE setup gets a six-minute turn budget, covering Lathe's four-minute
+installation window and the model's reply.
 
 The relay edit targets the file editor by URI, selects text with cursor movement,
-and verifies the rendered document before saving. The later Lathe read proves
+and verifies the rendered document before saving with the platform's shortcut.
+It waits for the editor's dirty indicator to clear before leaving. The later Lathe read proves
 persistence independently. Editor failures reject the take as `ui_drift`;
 terminal editing cannot substitute for the demonstrated editor interaction.
+Prewarm sets code-server user preferences, not settings in a parent folder:
+all VS Code AI features are disabled and the secondary Chat sidebar starts hidden.
 
 ## Capture policy and automation
 

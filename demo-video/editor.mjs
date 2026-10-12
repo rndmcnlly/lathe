@@ -34,7 +34,9 @@ export async function replaceEditorLine(page, { path, line, text, before }, time
   await input.pressSequentially(text, { delay: 55 });
   lines[line - 1] = text;
   await verify(lines.join("\n"));
-  await input.press("Control+S");
+  await input.press("ControlOrMeta+S");
+  // Saving is asynchronous. Do not navigate away with an unsaved editor buffer.
+  await page.locator(".part.editor .tab.dirty").waitFor({ state: "hidden", timeout: timeoutMs });
   // The subsequent Lathe read independently checks that this reached disk.
   return { observations: [`editor.replaced-line=${line}`, "editor.content=verified"] };
 }

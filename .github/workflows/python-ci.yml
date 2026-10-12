@@ -30,11 +30,14 @@ jobs:
       - name: Check wrapper and run unit + workerd qualification
         working-directory: preview-wrapper
         run: npm run check && npm test
-      - name: Install demo test tooling (no browser download)
+      - name: Install demo test tooling
         working-directory: demo-video
         env:
           PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: '1'
         run: npm ci
+      - name: Install headless browser for demo UI regression
+        working-directory: demo-video
+        run: npx playwright install --with-deps --only-shell chromium
       - name: Run demo Node tests
         working-directory: demo-video
         run: npm test

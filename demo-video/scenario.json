@@ -1,6 +1,6 @@
 {
   "id": "lathe-shared-workspace",
-  "version": 5,
+  "version": 7,
   "steps": [
     {
       "id": "auth.owui",
@@ -45,7 +45,7 @@
       "required": true,
       "intent": "Ask which installed Lathe version this demo uses",
       "with": {
-        "prompt": "Before we begin, call lathe(manpage=\"version\") and tell me which version of Lathe we're using.",
+        "prompt": "Which version of Lathe are we using?",
         "timeoutMs": 60000
       },
       "failureDomain": "model_behavior"
@@ -64,13 +64,36 @@
       "failureDomain": "lathe_behavior"
     },
     {
+      "id": "workspace.clone",
+      "do": "chat.send",
+      "required": true,
+      "intent": "Clone Lathe and introduce it in three readable bullets",
+      "screenshot": "lathe-overview",
+      "with": {
+        "prompt": "Clone https://github.com/rndmcnlly/lathe. Give me three short bullets: what Lathe lets you do, where the work runs, and what persists between conversations.",
+        "timeoutMs": 180000
+      },
+      "failureDomain": "model_behavior"
+    },
+    {
+      "id": "workspace.prove-cloned",
+      "do": "chat.await-tool-result",
+      "required": true,
+      "intent": "Verify cloning through tool evidence",
+      "with": {
+        "tools": ["bash"],
+        "argumentContains": "github.com/rndmcnlly/lathe"
+      },
+      "failureDomain": "model_behavior"
+    },
+    {
       "id": "workspace.create",
       "do": "chat.send",
       "required": true,
-      "intent": "Clone Lathe and create the relay artifact",
+      "intent": "Write the relay while viewers read the overview",
       "with": {
-        "prompt": "Clone https://github.com/rndmcnlly/lathe into {{checkout}}, replacing any previous checkout there. Create RELAY.md in that checkout containing exactly this two-line text:\n\n```text\nLathe: What do you call a chat agent and an editor sharing one sandbox?\nYou:\n```\n\nAfter saving the file, explain here in chat (not in the file) in three short bullets: what Lathe lets a model do, where the work runs, and what persists between conversations.",
-        "timeoutMs": 180000
+        "prompt": "Create RELAY.md in the lathe folder with these two lines:\n\nLathe: What do you call a chat agent and an editor sharing one sandbox?\nYou:",
+        "timeoutMs": 90000
       },
       "failureDomain": "model_behavior"
     },
@@ -92,8 +115,8 @@
       "required": true,
       "intent": "Ask Lathe to expose a private browser editor",
       "with": {
-        "prompt": "Give me a private browser-based VS Code editor for {{checkout}} using Lathe's managed code-server target, not a manually started service or generic HTTP port. Share it as a markdown link with a short label instead of exposing the raw URL, then summarize the access and expiry information reported by the tool.",
-        "timeoutMs": 180000
+        "prompt": "Expose private VS Code in the lathe folder. Tell me the access and expiry details.",
+        "timeoutMs": 360000
       },
       "failureDomain": "model_behavior"
     },
@@ -106,6 +129,7 @@
       "with": {
         "tools": ["expose"],
         "managedTarget": "code-server",
+        "bindCheckout": true,
         "argumentsEqual": { "access": "private" },
         "outputContains": "Copying the URL does not grant access."
       },
@@ -148,7 +172,7 @@
       "required": true,
       "intent": "Have Lathe observe the editor's filesystem edit",
       "with": {
-        "prompt": "Read {{checkout}}/RELAY.md and briefly report the text after 'You:'.",
+        "prompt": "Read RELAY.md. What did I write after 'You:'?",
         "timeoutMs": 60000
       },
       "failureDomain": "model_behavior"
@@ -173,7 +197,7 @@
       "required": true,
       "intent": "Start a bounded architecture review in the background",
       "with": {
-        "prompt": "Start a focused review of the _standard_tool function in {{checkout}}/lathe.py using delegate with max_steps=5 and foreground_seconds=0. Ask the sub-agent to locate the definition by symbol, read its implementation, and report one strength and one tradeoff in the wrapper design, citing function names. Return control immediately.",
+        "prompt": "Delegate a quick review of _standard_tool in lathe.py: one strength and one tradeoff. Run it in the background so we can keep working.",
         "timeoutMs": 60000
       },
       "failureDomain": "model_behavior"
@@ -196,7 +220,7 @@
       "required": true,
       "intent": "Show that the main agent remains useful while delegated work runs",
       "with": {
-        "prompt": "While the sub-agent works, use bash yourself, not delegate, to stop code-server and verify that port 8080 is no longer listening. Then check the background sub-agent's status once, without polling or waiting more than five seconds. Summarize any available review result in no more than four bullets.",
+        "prompt": "While the review runs, stop code-server and check that port 8080 is closed. Then check on the review and summarize what’s ready.",
         "timeoutMs": 90000
       },
       "failureDomain": "model_behavior"

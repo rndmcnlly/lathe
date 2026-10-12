@@ -4,6 +4,7 @@ import base64
 import hashlib
 import json
 import subprocess
+import sys
 from urllib.parse import parse_qs, urlsplit
 
 from aiohttp import ClientSession
@@ -11,6 +12,31 @@ from aiohttp.test_utils import TestServer
 import pytest
 
 import demo_local as demo
+
+
+@pytest.mark.parametrize("missing", ["No such object: fixture", "error: no such object: fixture", "Cannot connect to Docker daemon"])
+def test_demo_preflight_accepts_missing_resources_but_not_daemon_failure(tmp_path, monkeypatch, missing):
+    monkeypatch.setattr(sys, "argv", ["demo_local.py", "--artifacts", str(tmp_path / "evidence")])
+    monkeypatch.setattr(demo, "ROOT", tmp_path)
+    monkeypatch.setenv("DAYTONA_API_KEY", "fixture")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "fixture")
+    monkeypatch.setattr(demo.signal, "signal", lambda *args: None)
+    seen = []
+
+    def docker(*args, **kwargs):
+        seen.append(args)
+        return subprocess.CompletedProcess(args, 1, "", missing)
+
+    def infrastructure(path):
+        raise RuntimeError("preflight passed")
+
+    monkeypatch.setattr(demo.monitor, "docker", docker)
+    monkeypatch.setattr(demo, "prepare_infrastructure", infrastructure)
+    monkeypatch.setattr(demo, "cleanup_demo", lambda directory: False)
+    error = "Cannot establish demo isolation" if "daemon" in missing else "preflight passed"
+    with pytest.raises(RuntimeError, match=error):
+        demo.main()
+    assert len(seen) == (1 if "daemon" in missing else 4)
 
 
 @pytest.mark.parametrize("fault", [None, "daemon", "removal", "network", "sandbox"])

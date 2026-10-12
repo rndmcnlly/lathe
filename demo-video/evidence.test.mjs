@@ -1,7 +1,17 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { normalizedToolEvents, matchesToolExpectation } from "./evidence.mjs";
+import { normalizedToolEvents, matchesToolExpectation, managedTargetRoot } from "./evidence.mjs";
+
+test("checkout paths come from rooted IDE exposure, not an assumed clone destination", () => {
+  for (const root of ["/home/daytona/workspace/lathe", "/home/daytona/workspace/projects/lathe"] ) {
+    const event = { tool: "expose", arguments: { target: `code-server:${root}`, access: "private" }, output: "Ready" };
+    assert.equal(managedTargetRoot(event, "code-server"), root);
+    assert.equal(matchesToolExpectation(event, { tools: ["expose"], managedTarget: "code-server", bindCheckout: true }), true);
+  }
+  assert.equal(managedTargetRoot({ arguments: { target: "code-server" } }, "code-server"), null);
+  assert.equal(managedTargetRoot({ arguments: { target: "http:8080" } }, "code-server"), null);
+});
 
 test("read-back rejects trailing text left by a wrapped-row edit", () => {
   const expected = { tools: ["read", "bash"], argumentContains: "RELAY.md",

@@ -167,7 +167,7 @@ class RecordingRelay:
                 return response
 
 
-async def bootstrap(base, key):
+async def bootstrap(base, key, *, display_name=None):
     """Create the first admin and a native-tool workspace model on fresh OWUI.
 
     Kept separate so a future demo-video runner can reuse the disposable host
@@ -208,7 +208,7 @@ async def bootstrap(base, key):
         response.raise_for_status()
         response = await client.post("/api/v1/models/create", json={
             "id": workspace_model(), "base_model_id": model,
-            "name": "CI Pareto Medium" if model == ROUTER else f"CI {model}",
+            "name": display_name or ("CI Pareto Medium" if model == ROUTER else f"CI {model}"),
             "params": {"function_calling": "native", "max_tokens": 4096,
                        "custom_params": custom_params},
             "meta": {"capabilities": {"vision": True, "builtin_tools": False}},

@@ -124,12 +124,12 @@ async def serve():
     await web.TCPSite(identity, "0.0.0.0", 9100).start()
     suite = None
     try:
-        token = await monitor.bootstrap("http://127.0.0.1:8080", relay.key)
+        token = await monitor.bootstrap("http://127.0.0.1:8080", relay.key, display_name=relay.model)
         os.environ.update(OWUI_URL="http://127.0.0.1:8080", OWUI_TOKEN=token,
                           OWUI_MODEL=monitor.workspace_model(), LATHE_TEST_TOOL_ID="lathe_test")
         import test_deployment as suite
         suite.TRACE = trace
-        await suite.deploy_staging_tool()
+        await suite.deploy_staging_tool(display_name="Lathe")
         # Private pipe to the parent, never written to an artifact or console.
         print(json.dumps({"ready": True, "token": token}), flush=True)
         await asyncio.to_thread(sys.stdin.readline)
@@ -265,7 +265,7 @@ def cleanup_demo(directory):
                 with (directory / f"{name}.log").open("a") as out:
                     out.write(monitor.sanitize(logs.stdout + logs.stderr))
             result = monitor.docker("rm", "-f", "-v", name, check=False)
-            if result.returncode and "No such container" not in result.stderr:
+            if result.returncode and "no such container" not in result.stderr.lower():
                 errors.append(monitor.sanitize(result.stderr or f"Could not remove {name}"))
         except Exception as exc:
             errors.append(monitor.sanitize(str(exc)))
@@ -322,12 +322,12 @@ def main():
         result = monitor.docker("inspect", name, check=False)
         if result.returncode == 0:
             raise RuntimeError(f"Finish or clean up the existing {name} first")
-        if "No such" not in result.stderr:
+        if "no such" not in result.stderr.lower():
             raise RuntimeError(monitor.sanitize(f"Cannot establish demo isolation: {result.stderr}"))
     result = monitor.docker("network", "inspect", NETWORK, check=False)
     if result.returncode == 0:
         raise RuntimeError(f"Network {NETWORK} already exists")
-    if "not found" not in result.stderr and "No such" not in result.stderr:
+    if "not found" not in result.stderr.lower() and "no such" not in result.stderr.lower():
         raise RuntimeError(monitor.sanitize(f"Cannot establish demo isolation: {result.stderr}"))
     def interrupted(signum, frame):
         raise KeyboardInterrupt(f"signal {signum}")
@@ -348,6 +348,9 @@ def main():
             os.environ["LATHE_PREVIEW_WRAPPER_KEY"] = registration_key
             monitor.launch(directory, docker_args=(
                 "--network", NETWORK,
+                "--env", "DEFAULT_PROMPT_SUGGESTIONS=[]",
+                "--env", "ENABLE_CODE_INTERPRETER=false",
+                "--env", "ENABLE_FOLLOW_UP_GENERATION=false",
                 "--mount", f"type=bind,src={path},dst=/local-demo,readonly",
                 "--env", "SSL_CERT_FILE=/local-demo/ca-bundle.pem",
                 "--env", f"LATHE_PREVIEW_WRAPPER_URL=https://{ZONE}/register",

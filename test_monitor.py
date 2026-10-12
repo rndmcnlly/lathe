@@ -103,7 +103,8 @@ async def test_direct_relay_rejects_pareto_plugin_before_provider(tmp_path, monk
 
 
 @pytest.mark.parametrize("selected", [None, "z-ai/glm-5.3-flash"])
-async def test_bootstrap_configures_selected_model_without_router_plugin_leak(monkeypatch, selected):
+@pytest.mark.parametrize("display_name", [None, "z-ai/glm-5.3-flash"])
+async def test_bootstrap_configures_selected_model_without_router_plugin_leak(monkeypatch, selected, display_name):
     if selected:
         monkeypatch.setenv("LATHE_MONITOR_MODEL", selected)
     model = selected or "openrouter/pareto-code"
@@ -123,6 +124,7 @@ async def test_bootstrap_configures_selected_model_without_router_plugin_leak(mo
             config = json.loads(request.content)
             assert config["id"] == alias
             assert config["base_model_id"] == model
+            assert config["name"] == (display_name or (f"CI {model}" if selected else "CI Pareto Medium"))
             assert config["params"]["function_calling"] == "native"
             policy = config["params"]["custom_params"]
             assert policy["provider"] == {"data_collection": "deny"}
@@ -139,7 +141,7 @@ async def test_bootstrap_configures_selected_model_without_router_plugin_leak(mo
     client_type = httpx.AsyncClient
     monkeypatch.setattr(monitor.httpx, "AsyncClient", lambda **kwargs:
         client_type(transport=httpx.MockTransport(owui), **kwargs))
-    assert await monitor.bootstrap("http://127.0.0.1:8080", "fixture-key") == "disposable"
+    assert await monitor.bootstrap("http://127.0.0.1:8080", "fixture-key", display_name=display_name) == "disposable"
     assert len(created) == 1
 
 
@@ -204,7 +206,8 @@ async def test_cleanup_owns_only_exact_run_and_follows_pages(suite, monkeypatch)
                         ("DELETE", "/api/sandbox/owned"), ("GET", "/api/sandbox/owned")]
 
 
-async def test_staging_deployment_disables_volumes_and_sets_expiry(suite, monkeypatch):
+@pytest.mark.parametrize("display_name", ["Lathe Test", "Lathe"])
+async def test_staging_deployment_disables_volumes_and_sets_expiry(suite, monkeypatch, display_name):
     seen = []
     def owui(request):
         if request.method == "GET":
@@ -216,8 +219,10 @@ async def test_staging_deployment_disables_volumes_and_sets_expiry(suite, monkey
     suite.OWUI_BASE = "http://127.0.0.1:8080"
     monkeypatch.setattr(suite.httpx, "AsyncClient",
                         lambda **kw: client_type(transport=httpx.MockTransport(owui), **kw))
-    await suite.deploy_staging_tool()
+    await suite.deploy_staging_tool(display_name=display_name)
     assert seen[0]["content"] == Path("lathe.py").read_text()
+    assert seen[0]["id"] == "lathe_test"
+    assert seen[0]["name"] == display_name
     valves = seen[1]
     assert valves["deployment_label"] == "lathe-ci-this-run"
     assert valves["persistent_volume"] is False

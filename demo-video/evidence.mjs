@@ -1,3 +1,9 @@
+export function managedTargetRoot(event, target) {
+  const value = event.arguments?.target;
+  return typeof value === "string" && value.startsWith(`${target}:/`)
+    ? value.slice(target.length + 1) : null;
+}
+
 export function matchesToolExpectation(event, expected) {
   const contains = (value, text) => !text || JSON.stringify(value).toLowerCase().includes(text.toLowerCase());
   return expected.tools.includes(event.tool)
@@ -6,6 +12,7 @@ export function matchesToolExpectation(event, expected) {
     && (!expected.managedTarget || event.arguments?.target === expected.managedTarget
       || (typeof event.arguments?.target === "string"
         && event.arguments.target.startsWith(`${expected.managedTarget}:/`)))
+    && (!expected.bindCheckout || Boolean(managedTargetRoot(event, expected.managedTarget)))
     && contains(event.arguments, expected.argumentContains)
     && contains(event.output, expected.outputContains)
     && (!expected.outputLineEquals || event.output.split(/\r?\n/).some((line) =>

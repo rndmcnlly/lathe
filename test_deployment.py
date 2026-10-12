@@ -103,11 +103,11 @@ class Results:
             return False
 
 
-async def deploy_staging_tool():
+async def deploy_staging_tool(*, display_name="Lathe Test"):
     source = staged_source()
     payload = {
         "id": TOOL_ID,
-        "name": "Lathe Test",
+        "name": display_name,
         "content": source,
         "meta": {"description": "Ephemeral deployment-test copy of Lathe"},
     }

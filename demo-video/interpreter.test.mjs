@@ -11,8 +11,7 @@ test("recorded conversation establishes the deployed Lathe version before worksp
   const proof = steps.findIndex((step) => step.id === "version.prove-installed");
   assert.ok(request > steps.findIndex((step) => step.id === "lathe.enable"));
   assert.equal(proof, request + 1);
-  assert.ok(proof < steps.findIndex((step) => step.id === "workspace.create"));
-  assert.match(steps[request].with.prompt, /lathe\(manpage="version"\)/);
+  assert.ok(proof < steps.findIndex((step) => step.id === "workspace.clone"));
   assert.equal(steps[proof].required, true);
   assert.equal(steps[proof].screenshot, "lathe-version");
   assert.deepEqual(steps[proof].with, {
