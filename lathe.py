@@ -163,7 +163,7 @@ def _prepend_harness_messages(result: str, messages: list[str]) -> str:
 
     Harness messages are things the infrastructure decides to push to the
     agent alongside the tool's own output: sandbox lifecycle warnings,
-    auto-init snapshots, and (future) background job completion notices.
+    auto-init snapshots, and background job completion notices.
     Each message is separated by a blank line for readability.
     """
     if not messages:
@@ -174,11 +174,7 @@ def _prepend_harness_messages(result: str, messages: list[str]) -> str:
 
 def _drain_harness_messages(chat_state: LRUCache, chat_id: str | None,
                             warning: str | None) -> list[str]:
-    """Collect pending harness messages and the sandbox lifecycle warning.
-
-    Runs after every tool call, making it a natural hook for future
-    trace accumulation (#54).
-    """
+    """Collect pending harness messages and the sandbox lifecycle warning."""
     messages: list[str] = []
     if warning:
         messages.append(warning)
@@ -1846,11 +1842,11 @@ async def _core_grep(valves, sandbox_id: str, client: httpx.AsyncClient, *,
 # a user image message (convert_output_to_messages with
 # flatten_tool_images=True, the open-webui#27126-equivalent fix).
 #
-# Two hard requirements fall out of that convention:
+# Three hard requirements fall out of that convention:
 #   1. The result must START with the data URI.  Any prepended text (e.g.
 #      harness messages) breaks OWUI's startswith() detection, and the
 #      base64 lands in the model's text context instead.  The Tools
-#      wrapper uses defer_harness_messages=True for this reason.
+#      wrapper leaves harness messages queued for a later text result.
 #   2. On OWUI < 0.11.0 the current turn works but replayed history is
 #      NOT flattened — strict providers reject the conversation on later
 #      turns.  Only deploy with view() on OWUI >= 0.11.0.
@@ -2853,9 +2849,6 @@ async def _ensure_chat_init(
     if chat_id in chat_state and chat_state[chat_id].get("init"):
         return
     # First tool call in this chat: create state and run snapshot.
-    # Future: a "trace" key here (list of dicts) could accumulate a
-    # structured record of every tool call (tool name, key args, outcome)
-    # for flush to the persistent volume at handoff() time.  See #54.
     chat_state[chat_id] = {"init": True, "pending": []}
     await _chat_auto_init(
         valves, sandbox_id, client, chat_state, chat_id, user, emitter,
@@ -2963,15 +2956,6 @@ def _build_delegate_system_prompt(max_steps: int, *, has_volume: bool = True) ->
 # instructions and writes the handoff document as streamed reply text.
 # No tool calls, no sandbox I/O — the agent already has everything it
 # needs in context.
-#
-# Future (#54): handoff() could flush an in-memory trace (accumulated
-# via _drain_harness_messages / the _run closures) to a JSONL file on
-# the persistent volume, then reference it in _HANDOFF_INSTRUCTIONS so
-# the receiving agent can selectively grep it.  This would require
-# handoff() to acquire a client and sandbox_id (currently it bypasses
-# _tool_context entirely).  Deferred: the prose-only handoff is
-# adequate today, and the trace format should be co-designed with the
-# micro-compaction filter (#51) so both use a shared line schema.
 
 _HANDOFF_INSTRUCTIONS = textwrap.dedent("""\
     You just called handoff(). Your job now is to write a handoff
@@ -3020,11 +3004,9 @@ _HANDOFF_INSTRUCTIONS = textwrap.dedent("""\
 
     - Do NOT make any tool calls. Write the handoff as your reply
       text, then stop.
-    - Do NOT continue working on the task after writing the handoff.
-      The conversation is over. If the user replies asking you to
-      continue, tell them to delete the message that triggered the
-      handoff and continue from there instead — otherwise the handoff
-      text bloats the context with duplicated information.
+    - End this response after the handoff. If the user later asks to
+      continue here, follow their request; a handoff does not close the
+      conversation or override later user instructions.
     - The handoff body should be dense and factual. The next agent
       will read it cold — assume no prior context.
     - Reference sandbox file paths rather than inlining code. The
@@ -3847,44 +3829,18 @@ class Tools:
 
     def __init__(self):
         self.valves = self.Valves()
-        # Chat-scoped harness message queue.  Keyed by chat_id, value is a
-        # list[str] of messages waiting to be prepended to the next tool
-        # result.  The auto-init snapshot deposits the first message;
-        # future producers (e.g. background job completion notifications)
-        # can push here too, and the next tool call drains the queue.
-        #
-        # LRU(1024) bounds memory.  Eviction of an old chat_id just means
-        # its pending messages are lost (acceptable: the chat is likely
-        # dead) and the next tool call in that chat re-runs auto-init
-        # (idempotent, ~150 tokens).
+        # Chat-scoped auto-init and background notices, drained into text results.
+        # LRU eviction drops pending messages; a later call re-runs auto-init.
         self._chat_state: LRUCache = LRUCache(maxsize=1024)
 
     # ── agent-facing manual ──────────────────────────────────────────
     #
-    # The manpage system is the model's primary orientation surface.
-    # Design principles:
-    #   - Tool docstrings stay minimal; details are deferred here so
-    #     context budget is spent only when the model actually needs help.
-    #   - The tool catalog is introspected dynamically so it can never
-    #     drift from the actual method list.
-    #   - Manpage content is currently static strings, but the
-    #     architecture is designed to evolve:
-    #
-    # TODO(future): Valve-driven behavioral policy injection.
-    #   Valves already control mechanism (timeouts, sandbox language,
-    #   auto-stop). The next step is for Valve values to also inject
-    #   *policy guidance* into manpage content. Mechanism is fixed at
-    #   class scan time; policy is runtime-configurable through the manual.
-    #
-    # TODO(future): Information architecture expansion.
-    #   Add per-tool deep dives (manpage="bash"), workflow recipes
-    #   (manpage="expose-recipes"), and troubleshooting guides. Existing
-    #   tool docstrings can then be further scrunched by adding
-    #   breadcrumbs like 'see lathe(manpage="bash") for details'.
+    # Keep initial orientation short; defer recipes to task-specific pages.
+    # The tool catalog is introspected from the public methods.
 
     # Manpage strings are interpolated via plain str.replace() in the
     # lathe() method, NOT str.format().  Known placeholders today:
-    # {tool_catalog}, {volume_note}, {destroy_volume_note}.  Unknown
+    # {tool_catalog}, {volume_note}, {destroy_volume_note}, {preview_access_note}. Unknown
     # placeholders pass through unchanged (no KeyError), and literal
     # braces in shell/JSON/regex snippets (${VAR}, {pid,log,exit},
     # {"key":"value"}, {n,m}) are always safe.  If you add a new dynamic
@@ -3907,17 +3863,17 @@ class Tools:
 
             ## When curl fails: egress workarounds
 
-            If a request fails because the sandbox cannot reach a host
-            (connection timeout, connection refused on a host you know is
-            up), the host is not on the egress allowlist. There is no clean
-            way for the agent to independently bypass this — the
-            workarounds involve the user.
+            Timeouts or connection failures on a known-live host may indicate
+            egress filtering, but are not proof: check the URL and service too.
+            For a blocked host, the workarounds below involve the user.
 
             **Common — user downloads and uploads via dufs:**
             Ask the user to download the file on their own machine, then
             upload it to the sandbox through the dufs file browser. Call
-            expose(target="dufs", access="public") to get the URL. This handles any file
-            type and any host, subject to the deployment's upload limits.
+            expose(target="dufs", access="private") to get the URL. Choose public
+            only if the user explicitly requests public/world access; missing
+            private wrapping is not permission to downgrade. This handles any
+            file type and host, subject to the deployment's upload limits.
 
             **Rare — custom browser-side fetch service:**
             For repeated fetch needs (e.g. crawling an API the sandbox
@@ -4072,7 +4028,7 @@ class Tools:
         "services": textwrap.dedent("""\
             # Lathe — Service Details
 
-            Use the expose() tool description or the overview's target table for
+            Use the expose() tool description for
             normal one-step operation. This page is for implementation details,
             recovery, and configurations outside the named fast paths.
 
@@ -4165,11 +4121,9 @@ class Tools:
             write, edit, glob, grep. It does NOT have: lathe, onboard,
             expose, destroy, or delegate (no recursion).
 
-            The sub-agent makes up to max_steps inference calls (default 10,
-            max 30), executing tools as needed. It knows its step budget
-            upfront and receives a wrap-up nudge when close to the limit, so
-            it can prioritize producing a useful summary over starting new
-            work.
+            max_steps caps inference calls (default 10, max 30), including
+            the final response. Reserve time for a summary; a wrap-up nudge
+            near the limit does not guarantee completion.
 
             A one-step delegation is context-only: the sub-agent receives the task
             and any context_files, but no tools. Use max_steps=1 for single-shot
@@ -4200,82 +4154,20 @@ class Tools:
             finishes. Absence of both means it's still running.
             Sidecars remain available until the sandbox stops or restarts.
 
-            ### Monitoring recipes
+            Read the returned result/error paths to collect completion, log
+            for progress, and usage for cost. Tell the user background work
+            is running; poll only when asked or when completion is expected.
 
-            **Check if done:**
-            ```
-            test -f $DELEGATE/result && echo DONE || test -f $DELEGATE/error && echo FAILED || echo RUNNING
-            ```
+            ## Scope and parallel work
 
-            **Read the result:**
-            ```
-            cat $DELEGATE/result
-            ```
+            Delegate bounded investigation, changes, or batch work, not a
+            single tool operation or work requiring user interaction/expose.
+            Include the goal, constraints, errors, and completion criteria
+            in task: the sub-agent cannot ask clarifying questions.
 
-            **Peek at progress:**
-            ```
-            cat $DELEGATE/log
-            ```
-
-            **Read usage stats:**
-            ```
-            cat $DELEGATE/usage
-            ```
-
-            ## Agent teams and swarms
-
-            Background delegation is the primitive for running agent teams:
-
-            1. Fire off multiple delegates with foreground_seconds=0 (or a
-               short window):
-               ```
-               delegate(task="Refactor module A...", foreground_seconds=0)
-               delegate(task="Fix tests in module B...", foreground_seconds=0)
-               delegate(task="Write docs for module C...", foreground_seconds=0)
-               ```
-            2. Each returns a DELEGATE id immediately.
-            3. Check completion by reading result files.
-            4. Delegates can coordinate through the shared filesystem —
-               writing task specs, partial results, or completion sentinels
-               for each other to read.
-
-            No special swarm API is needed. The pattern falls out naturally
-            from background delegation + shared sandbox filesystem.
-
-            ## When to use delegate
-
-            - **Exploration**: "Find all test files and determine the testing
-              framework and coverage structure."
-            - **Refactoring**: "Rename all occurrences of getFoo to get_foo
-              across the Python codebase, updating tests."
-            - **Debugging**: "The build fails with error X. Investigate,
-              identify the root cause, and fix it."
-            - **Research**: "Read the configuration files and summarize the
-              project's dependency tree."
-            - **Batch operations**: "Add type hints to all functions in
-              src/utils/ that are missing them."
-            - **Parallel work** (background): Fan out multiple independent
-              tasks, then collect results.
-
-            ## When NOT to use delegate
-
-            - Single-step operations (just call the tool directly).
-            - Tasks requiring user interaction (URLs, uploads, questions).
-            - Tasks requiring expose() or destroy().
-
-            ## Writing good task descriptions
-
-            The sub-agent cannot ask clarifying questions. Be specific
-            and include all relevant context (error messages, prior
-            findings, instructions) directly in the task string:
-
-            Bad:  "Fix the tests"
-            Good: "Run pytest in /home/daytona/workspace. For each failure,
-                   read the failing test and the source it tests, identify
-                   the bug, and fix it. Re-run pytest to confirm."
-
-            Bad:  task="Fix the build", context="Error: module X not found"
-            Good: task="Fix the build. The error is: module X not found"
+            For independent tasks, use foreground_seconds=0 and collect each
+            result. All delegates share the filesystem: assign disjoint edit
+            scopes or coordinate explicitly to avoid overwriting each other.
 
             ## The context_files parameter
 
@@ -4285,39 +4177,24 @@ class Tools:
             time and appear as a "Reference Files" section — the sub-agent
             sees their full contents without spending steps reading them.
 
-            This is the recommended way to pass project context. If you
-            discovered relevant files via onboard() or glob(), name them
-            here rather than pasting their contents into the task string.
+            Pass relevant AGENTS.md/SKILL.md paths discovered via onboard()
+            rather than duplicating their contents in task.
 
             All paths must be absolute. Delegation fails immediately if
             any path does not exist on the sandbox.
 
             ## Step budget and handoff behavior
 
-            The sub-agent's system prompt tells it how many steps it has
-            and instructs it to reserve time for a handoff summary.
-            Additionally, when 2 steps remain, Lathe injects a hard nudge
-            telling the sub-agent to stop making tool calls and write a
-            structured handoff: what was accomplished, what remains
-            unresolved, and absolute paths to critical sandbox files
-            needed to continue the work.
-
-            This means: even if the sub-agent misjudges its pacing, it
-            gets a hard nudge before the limit cuts it off. The "(no output)"
-            failure mode (sub-agent exhausts budget mid-investigation) should
-            be much less common. And when a sub-agent does run out of
-            steps, its output is actionable — you can immediately
-            delegate a follow-up with the named files as context_files.
-
-            If you find "(no output)" still happening, increase max_steps
-            or simplify the task.
+            With 2 steps remaining, Lathe nudges for a handoff: accomplished,
+            unresolved, and critical absolute file paths. A delegate can still
+            exhaust its budget without useful output. Simplify the task or
+            increase max_steps; use reported files as follow-up context_files.
 
             ## Cost model
 
             Each step is a full inference call billed to the same provider.
-            A 10-step delegation costs ~10x a single tool call in tokens.
-            The usage summary in the tool result shows exact token counts.
-            Use max_steps to cap cost for bounded tasks.
+            Token cost varies with context and output; max_steps caps calls,
+            not tokens or dollars. Inspect the returned usage summary.
             """),
         "handoff": textwrap.dedent("""\
             # Lathe — Handoff
@@ -4342,7 +4219,7 @@ class Tools:
             2. The tool returns formatting instructions.
             3. You write the handoff document as reply text, following
                those instructions exactly.
-            4. You stop. No more tool calls after the handoff.
+            4. End that response. Later user requests can continue here.
 
             The handoff has a short preamble in the user's language
             telling them what to do, a horizontal rule, then the
@@ -4367,137 +4244,50 @@ class Tools:
         "overview": textwrap.dedent("""\
             # Lathe Toolkit — Overview
 
-            Lathe is a coding-agent toolkit running inside Open WebUI. It gives
-            you a persistent Linux sandbox backed by a Daytona VM with a
-            cross-conversation filesystem. The sandbox is created transparently
-            on first tool use and survives across conversations for the same user.
-
-            - Documentation: https://lathe.tools
-            - Source: https://github.com/rndmcnlly/lathe
-
-            Read this page fully before your first tool call. It covers the
-            sandbox model, available workflows, and common mistakes.
-
-            ## Sandbox model
-
-            - One sandbox per user, identified by email. The sandbox starts,
-              stops, and recovers automatically — you never manage lifecycle.
-            - The default working directory is /home/daytona/workspace.
+            Work in a per-user Linux sandbox, shared across conversations.
+            Tools create/start/recover it automatically. Default working directory:
+            /home/daytona/workspace. Use absolute sandbox paths for file tools.
             {volume_note}\
-            - The sandbox auto-stops after a configurable idle timeout and
-              auto-archives after a further interval. Any tool call transparently
-              restarts it. The filesystem (including installed packages and user
-              files) survives both stop and archive — only running processes are
-              lost.
+            Files survive stop/archive; running processes and interpreter state do
+            not. Idle stop defaults to 15 minutes. Previews do not keep it awake.
 
-            ## Tool catalog
+            ## Start with project context
+
+            The first sandbox tool call attempts a workspace snapshot and skill
+            catalog, not AGENTS.md contents. Use onboard(path) for the project's listing, AGENTS.md,
+            and skill catalog (also searches ~/.agents/). Read a relevant SKILL.md
+            before using its workflow. Do not repeat onboarding just for a listing
+            already supplied. Use "" for the default workspace.
+
+            ## Operating safeguards
+
+            - Shell commands are non-interactive; use -y flags as needed.
+              Parallelize with separate bash calls, not shell-level & + wait.
+            - bash and delegate auto-background after their foreground window.
+              Use the returned sidecar paths to inspect progress/results. Bash
+              truncation retains the full log until the next bash call: inspect
+              needed sections first.
+            - {preview_access_note}
+            - Named expose targets manage service startup/recovery; http:<port>
+              requires an already-running service. ttyd/code-server are private-only.
+            - destroy is irreversible and requires user confirmation.{destroy_volume_note}
+
+            ## Read details only when needed
+
+            Call lathe(manpage="...") with:
+            - "interpret": persistent Python state and limitations (vs. one-shot bash).
+            - "delegate": bounded autonomous work, context files, background results, costs.
+            - "background": shell-job sidecars and peek/poll/kill recipes.
+            - "services": browser file transfer, sites, terminals, IDEs, headers, recovery.
+            - "egress": network allowlist and user-assisted workarounds for blocked hosts.
+            - "handoff": user-approved context transfer to a new conversation.
+            - "version": installed toolkit version.
+
+            ## Available tools
 
             {tool_catalog}
 
-            ## Key workflows
-
-            **Choosing browser access:**
-
-            | User need | expose target | Access constraint |
-            |---|---|---|
-            | Upload, download, or browse files | dufs[:/absolute/path] | public or private |
-            | Serve an existing static directory | site:/absolute/path | public or private |
-            | Lightweight interactive shell | ttyd | private only |
-            | Full editor, terminal, and extensions | code-server[:/absolute/path] | private only |
-            | Already-running custom web service | http:<port> | public or private |
-
-            Named targets install, start, and recover their services. For
-            http:<port>, start the service yourself before calling expose().
-            Headerless public requests fall back to the direct signed bearer URL if wrapping
-            is unavailable or refused. Private requests never downgrade to public.
-            The sandbox auto-stops on idle, which kills background processes —
-            call the same named target again to recover. See
-            lathe(manpage="services") only for custom configuration or diagnosis.
-
-            **Project context:**
-            Call onboard() at the start of a conversation to get a directory
-            listing and load any AGENTS.md or skills. Works even without agent
-            files (you still get the listing). Pass "" or the workspace path to
-            onboard the default directory. Searches both the project directory
-            and ~/.agents/ for global agent instructions and skills.
-
-            **Delegating multi-step work:**
-            Use delegate(task="...") to hand off autonomous multi-step tasks
-            to a sub-agent. The sub-agent has bash/read/write/edit/glob/grep
-            and runs against the same sandbox. Good for: exploration, refactoring,
-            debugging, test fixing, research. Use context_files= to inject
-            AGENTS.md, skills, or other reference files into the sub-agent's
-            prompt without re-reading them. The sub-agent cannot interact with
-            the user or expose URLs — it just works and returns a summary.
-            Like bash(), delegate() auto-backgrounds if the sub-agent takes longer
-            than foreground_seconds (default 30), returning a descriptor with
-            sidecar file paths. Use foreground_seconds=0 to fire-and-forget
-            multiple delegates in parallel (agent teams / swarms).
-            See lathe(manpage="delegate") for details.
-
-            **Persistent Python REPL:**
-            Use interpret(code="...") for iterative Python work where state
-            needs to persist across calls: data analysis, incremental
-            computation, prototyping. Variables, imports, and definitions
-            survive within the conversation. For one-shot commands or
-            non-Python work, prefer bash(). The interpreter context is
-            per-conversation and is lost on sandbox restart.
-            See lathe(manpage="interpret") for details.
-
-            **Network requests:**
-            Use bash("curl ...") or bash("wget ...") for HTTP requests. The
-            sandbox can reach a broad allowlist of hosts directly (package
-            registries, git hosts, CDNs, AI APIs, etc.), and bash gives you
-            streaming, piping, and natural access to env-var credentials.
-            If a request fails due to egress filtering, see
-            lathe(manpage="egress") for workarounds.
-
-            **Handing off to a new conversation:**
-            When context gets long or the user asks, call handoff() to write
-            a structured handoff document. The user pastes it into a new
-            conversation as their opening message, and the next agent picks
-            up where you left off. The sandbox persists, so all files survive.
-            See lathe(manpage="handoff") for details.
-
-            ## Gotchas
-
-            - Commands are non-interactive. No stdin prompts or curses UIs. Use
-              -y or equivalent flags. For an interactive terminal, expose ttyd;
-              use code-server when the user also needs a browser IDE.
-            - bash() auto-backgrounds commands that exceed ~30 seconds. When this
-              happens, it returns a background descriptor with CMD and PID paths.
-              Use foreground_seconds= to extend the wait (e.g. foreground_seconds=120
-              for known-slow commands or when waiting for a backgrounded command to
-              finish). The command keeps running even after backgrounding.
-              See lathe(manpage="background") for peek/poll/kill recipes.
-            - Do NOT use shell-level & + wait to parallelize work inside a single
-              bash() call. Each bash() call already gets its own independent session,
-              so the right way to parallelize is to make multiple bash() tool calls
-              simultaneously at the agent level. Shell-level & + wait adds no
-              benefit and risks tripping the foreground timeout on the wait builtin,
-              producing an alarming background descriptor even when the real work
-              is already done.
-            - bash() output is truncated to the last 2000 lines / 50 KB. If
-              truncated, the full output is available in the log file at
-              /dev/shm/lathe/cmd/<id>/log until the next bash() call — use read()
-              to inspect specific sections before running another command.
-            - edit() requires an exact string match (including whitespace). If
-              the match is ambiguous, provide more surrounding context or use
-              replace_all=true.
-            - delegate() auto-backgrounds after ~30 seconds (configurable via
-              foreground_seconds). Backgrounded delegates write to
-              /dev/shm/lathe/delegate/<id>/{log,result,error,usage}. Use foreground_seconds=0
-              to fire-and-forget for parallel agent teams.
-            - {preview_access_note}
-            - The sandbox stops on idle (~15 min default), killing servers.
-              A preview registration does not keep it awake or restart a service.
-            - destroy() prompts for user confirmation via a dialog before proceeding. Irreversible.{destroy_volume_note}
-            - **Network egress may be restricted.** Depending on the admin's
-              Daytona tier, the sandbox may only reach a curated allowlist of
-              hosts (package registries, git hosts, CDNs, AI APIs, etc.).
-              Requests to non-allowlisted hosts silently fail or time out.
-              If curl fails on a host you know is up, see
-              lathe(manpage="egress") for workarounds.
+            Users: https://lathe.tools · Source: https://github.com/rndmcnlly/lathe
             """),
     }
 
@@ -4521,8 +4311,8 @@ class Tools:
         __event_emitter__=None,
     ) -> str:
         """
-        Manual for the lathe toolkit. Call lathe(manpage="overview") before your first tool use in a new conversation to learn the sandbox model, available workflows, and gotchas. Costs one tool call, saves many.
-        :param manpage: Which manual page to return. Use "overview" for big-picture orientation, "version" for the installed version.
+        Read operational orientation or a task-specific manual page.
+        :param manpage: "overview" for safeguards and page index; "interpret", "delegate", "background", "services", "egress", "handoff" for details; "version" for installed version.
         """
         type_err = _check_tool_params({"manpage": manpage}, type(self).lathe)
         if type_err:
@@ -4587,7 +4377,7 @@ class Tools:
         __event_emitter__=None,
     ) -> str:
         """
-        Prepare a handoff document for continuing this work in a new conversation. Call this when the user asks to compact, hand off, or save context for a fresh chat. After calling, write the handoff as your reply — do not make any more tool calls.
+        Get formatting instructions for a user-approved handoff to a fresh chat. Write it as reply text, then end this response; later user requests may continue here.
         """
         await _emit(__event_emitter__, "Handoff", done=True)
         return _HANDOFF_INSTRUCTIONS
@@ -4724,11 +4514,10 @@ class Tools:
         __event_emitter__=None,
     ) -> str:
         """
-        Load project context (directory listing, AGENTS.md, skill catalog) at the start of a conversation.
-        Always returns a directory listing of the target path. Additionally
-        searches the project directory and ~/.agents/ for agent instructions and skills.
-        Use read() on a skill's SKILL.md path to load its full instructions later.
-        :param path: Absolute path to the project root (e.g. /home/daytona/workspace/myproject).
+        Load project listing, AGENTS.md, and skill catalog; also searches ~/.agents/.
+        Read relevant SKILL.md files for full instructions. Skip repeat onboarding
+        when the supplied context already covers this project.
+        :param path: Absolute project root; "" selects /home/daytona/workspace.
         """
         type_err = _check_tool_params({"path": path}, type(self).onboard)
         if type_err:
@@ -4965,16 +4754,13 @@ class Tools:
         __event_emitter__=None,
     ) -> str:
         """
-        Delegate a multi-step task to an autonomous sub-agent with sandbox access.
-        The sub-agent runs the same model, has bash/read/write/edit/glob/grep tools,
-        and returns a summary when done. Use for exploration, refactoring, debugging,
-        or any multi-step work that doesn't need user interaction.
-        Long-running delegations auto-background and return a descriptor with log/result
-        file paths for monitoring, exactly like bash() does for long commands.
-        :param task: What the sub-agent should accomplish. Be specific — it cannot ask clarifying questions. Include any context (error messages, prior findings, instructions) directly in the task description.
-        :param context_files: Absolute sandbox file paths to inject into the sub-agent's prompt (e.g. AGENTS.md, SKILL.md, config files). Fetched at delegation time — the sub-agent sees their contents without spending steps reading them.
-        :param max_steps: Maximum inference calls the sub-agent may make (default: 10, max: 30). With max_steps=1, it receives the task and context_files but no tools, so it must answer directly from that supplied context. Use at least 2 for tasks requiring sandbox access or changes.
-        :param foreground_seconds: Seconds to wait before auto-backgrounding (default: 30, max: 300). Set 0 for immediate background (fire-and-forget). Omit or set -1 to use the default.
+        Run bounded autonomous work with the same model and shared sandbox.
+        Has bash/read/write/edit/glob/grep, not user interaction or expose.
+        Returns a summary or background sidecar paths; see lathe(manpage="delegate").
+        :param task: Specific goal, constraints, and findings; the sub-agent cannot ask questions.
+        :param context_files: Absolute sandbox files injected once as reference context; missing files fail delegation.
+        :param max_steps: Inference-call budget, 1–30 (default 10). At 1, no tools: supplied-context analysis only. Use >=2 for sandbox work.
+        :param foreground_seconds: Wait before auto-backgrounding, 0–300 seconds; 0 backgrounds immediately, -1 uses default 30.
         """
         type_err = _check_tool_params(
             {"task": task, "context_files": context_files, "max_steps": max_steps,
