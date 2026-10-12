@@ -424,18 +424,53 @@ def test_wildcard_free_directories_are_recursive_and_files_remain_exact(tmp_path
 
 
 @pytest.mark.parametrize("kind,total", [("GLOB", 13), ("GREP", 22)])
-@pytest.mark.parametrize("budget", [4, 8, 100])
-def test_search_budget_conserves_matches(tree, kind, total, budget):
+@pytest.mark.parametrize("budget", [1, 4, 8, 100])
+def test_search_budget_keeps_concrete_evidence(tree, kind, total, budget):
     args = (str(tree), "**/*", budget) if kind == "GLOB" else (str(tree), "needle", "**/*", budget)
     result = script_call(kind, kind.lower() + "_hierarchy", *args)
     header, *body = result.splitlines()
     assert int(header.split()[0]) == total
-    assert len(body) <= budget
-    counts = [re.search(r"(?:\(|and )(\d+) (?:more )?matches", line) for line in body]
-    assert sum(int(m[1]) if m else 1 for m in counts) == total
-    if budget == 100:
-        assert all(line.startswith(str(tree)) for line in body)
-        assert len(body) == total
+    assert len(body) == min(total, budget)
+    for line in body:
+        if kind == "GLOB":
+            assert Path(line).is_file()
+        else:
+            path, number, text = line.rsplit(":", 2)
+            assert Path(path).read_text().splitlines()[int(number) - 1] == text.strip()
+            assert "needle" in text
+    if total > budget:
+        assert f"showing {budget}, {total - budget} omitted" in header
+    else:
+        assert "omitted" not in header
+
+
+@pytest.mark.parametrize("kind", ["GLOB", "GREP"])
+@pytest.mark.parametrize("count", [0, 1, 99, 100, 101, 2000])
+def test_search_thresholds_do_not_collapse_to_counts(tmp_path, kind, count):
+    root = tmp_path.resolve()
+    for i in range(count):
+        path = root / f"group-{i % 5}" / f"hit-{i}.txt"
+        path.parent.mkdir(exist_ok=True)
+        path.write_text(f"miss\nneedle {i}\n")
+    # Overlapping includes must neither duplicate evidence nor inflate totals.
+    scope = "**/*.txt,group-0/*.txt"
+    args = (str(root), scope, 100) if kind == "GLOB" else (
+        str(root), "needle", scope, 100)
+    header, *body = script_call(kind, kind.lower() + "_hierarchy", *args).splitlines()
+    assert int(header.split()[0]) == count
+    assert len(body) == min(count, 100)
+    assert len(set(body)) == len(body)
+    for line in body:
+        if kind == "GLOB":
+            assert Path(line).is_file()
+        else:
+            path, number, text = line.rsplit(":", 2)
+            assert number == "2"
+            assert text.strip() == Path(path).read_text().splitlines()[1]
+    if count > 100:
+        assert f"showing 100, {count - 100} omitted" in header
+    else:
+        assert "omitted" not in header
 
 
 def test_grep_invalid_regex_and_no_hits(tree):
@@ -463,12 +498,54 @@ def test_grep_skips_binary_and_bounds_large_file_matches(tmp_path):
 
     dense = script_call("GREP", "grep_hierarchy", str(tmp_path), "needle", "**/*", 5)
     assert dense.splitlines()[0].startswith("50000 matches across 1 files")
-    assert len(dense.splitlines()[1:]) <= 5
+    assert dense.splitlines()[1:] == [f"{large}:{i}: needle" for i in range(1, 6)]
+    assert "showing 5, 49995 omitted" in dense.splitlines()[0]
+    assert "1 binary or unreadable files skipped" in dense.splitlines()[0]
     assert str(binary) not in dense
 
     late = script_call("GREP", "grep_hierarchy", str(tmp_path), "late marker", "**/*", 5)
     assert f"{large}:50001: late marker" in late
     assert str(binary) not in late
+
+
+def test_grep_clips_concrete_long_hits(tmp_path):
+    path = tmp_path / "wide.txt"
+    path.write_text("needle" + "x" * 100_000 + "\n")
+    result = script_call("GREP", "grep_hierarchy", str(tmp_path), "needle", "**/*", 1)
+    assert result.splitlines()[1:] == [f"{path}:1: " + "needle" + "x" * 194 + "..."]
+
+
+def test_empty_grep_reports_readable_scope(tree):
+    result = script_call("GREP", "grep_hierarchy", str(tree), "absent", "**/*.py", 1)
+    assert "0 matches across 0 files" in result
+    assert "searched 12 readable files" in result
+    assert "**/*.py" in result and str(tree) in result
+
+
+def test_grep_discards_hits_from_failed_file_reads(tmp_path):
+    path = tmp_path / "partial.txt"
+    path.write_text("needle\nneedle\n")
+    source = lathe._GREP_SCRIPT + f'''
+import builtins
+_real_open = builtins.open
+class InterruptedFile:
+    def __init__(self, file): self.file = file
+    def __enter__(self): return self
+    def __exit__(self, *args): return self.file.__exit__(*args)
+    def __iter__(self):
+        yield next(iter(self.file))
+        raise OSError("injected read interruption")
+def interrupted_open(path, mode="r", **kwargs):
+    file = _real_open(path, mode, **kwargs)
+    return file if mode == "rb" else InterruptedFile(file)
+builtins.open = interrupted_open
+print(grep_hierarchy({str(tmp_path)!r}, "needle", "**/*.txt", 1))
+'''
+    result = run_script(source)
+    assert result.startswith("0 matches across 0 files")
+    assert "searched 0 readable files" in result
+    assert "1 binary or unreadable files skipped" in result
+    assert len(result.splitlines()) == 1
 
 
 @pytest.mark.parametrize("name,kwargs", [
@@ -1414,8 +1491,9 @@ async def test_ttyd_setup_failure_stops_before_preview(preview):
 
 @pytest.mark.parametrize("service", ["dufs", "code-server"])
 @pytest.mark.parametrize("fault", [None, "stale", "release", "digest"])
+@pytest.mark.parametrize("existing_listener", [False, True])
 def test_managed_archive_install_is_release_consistent_verified_and_atomic(
-    tmp_path, service, fault,
+    tmp_path, service, fault, existing_listener,
 ):
     install_root = tmp_path / "lathe"
     install_root.mkdir()
@@ -1497,6 +1575,18 @@ def test_managed_archive_install_is_release_consistent_verified_and_atomic(
         esac
         """))
     fake_curl.chmod(0o755)
+    # The fake listener's PID must have a coherent command identity. Never read
+    # the host's unrelated /proc/123, which may be missing or a different process.
+    proc_root = fixtures / "proc"
+    process = proc_root / "123"
+    process.mkdir(parents=True)
+    options = "\0--allow-upload\0--allow-delete\0--allow-search\0--allow-archive\0--allow-hash" if service == "dufs" else ""
+    process.joinpath("cmdline").write_bytes(f"{installed}\0{tmp_path}{options}\0".encode())
+    script = script.replace("/proc/", str(proc_root) + "/")
+    if existing_listener:
+        # Force the reuse path deterministically, instead of relying on which
+        # concurrent installer reaches the listener check first.
+        (install_root / (service + ".root")).write_text(str(tmp_path))
     fake_ss = fake_bin / "ss"
     fake_ss.write_text(
         f"#!/bin/sh\n"
@@ -1539,6 +1629,39 @@ def test_managed_archive_install_is_release_consistent_verified_and_atomic(
         assert not installed.exists()
         assert not any(path.name.startswith(".install.") for path in install_root.iterdir())
         assert len(calls) == (1 if fault == "release" else 2)
+
+
+@pytest.mark.parametrize("identity,error", [
+    ("matching", None), ("wrong-binary", "occupied by another process"),
+    ("wrong-root", "serving a different root"),
+])
+def test_code_server_fake_listener_preserves_identity_guards(tmp_path, identity, error):
+    root = tmp_path / "lathe"
+    project = tmp_path / "project"
+    project.mkdir()
+    binary = root / "code-server/bin/code-server"
+    binary.parent.mkdir(parents=True)
+    binary.write_text("#!/bin/sh\nexit 0\n")
+    binary.chmod(0o755)
+    (root / "code-server.root").write_text(str(project))
+    proc = tmp_path / "proc"
+    (proc / "123").mkdir(parents=True)
+    command = str(binary) if identity != "wrong-binary" else "/unrelated-service"
+    serve_root = str(project) if identity != "wrong-root" else "/wrong-project"
+    (proc / "123/cmdline").write_bytes(f"{command}\0{serve_root}\0".encode())
+    fake = tmp_path / "fake-bin"
+    fake.mkdir()
+    ss = fake / "ss"
+    ss.write_text('#!/bin/sh\necho \'LISTEN 0 128 0.0.0.0:8080 users:(("code-server",pid=123,fd=3))\'\n')
+    ss.chmod(0o755)
+    script = lathe._build_code_server_ensure_script(str(root), str(project))
+    script = script.replace("/home/daytona/workspace", str(tmp_path)).replace("/proc/", str(proc) + "/")
+    result = subprocess.run(["bash", "-c", script], capture_output=True, text=True,
+                            env={**os.environ, "PATH": f"{fake}:{os.environ['PATH']}"}, timeout=10)
+    if error:
+        assert result.returncode != 0 and error in result.stderr
+    else:
+        assert result.returncode == 0 and "READY PID=123" in result.stdout
 
 
 def test_dufs_launch_keeps_file_operations_without_outside_symlinks(tmp_path):
