@@ -136,12 +136,17 @@ async def test_identity_code_exchange_and_verified_user(fault):
 
 @pytest.mark.parametrize("callback", ["https://evil.invalid/_lathe/auth/callback",
     f"http://private.{demo.ZONE}/_lathe/auth/callback",
-    f"https://private.{demo.ZONE}/wrong", f"https://private.{demo.ZONE}/_lathe/auth/callback?evil=1"])
+    f"https://private.{demo.ZONE}/wrong", f"https://private.{demo.ZONE}/_lathe/auth/callback?evil=1",
+    f"https://evil.invalid\\.{demo.ZONE}/_lathe/auth/callback",
+    f"https://evil.invalid%2f.{demo.ZONE}/_lathe/auth/callback",
+    f"https://private.{demo.ZONE}:443/_lathe/auth/callback",
+    f"https://user@private.{demo.ZONE}/_lathe/auth/callback"])
 async def test_identity_rejects_unbound_callbacks(callback):
     async with TestServer(demo.demo_identity_app("secret")) as server, ClientSession() as client:
         response = await client.post(server.make_url("/demo-idp/authorize"), params={
             "client_id": "lathe-demo", "response_type": "code", "state": "state",
-            "redirect_uri": callback, "code_challenge": "challenge", "code_challenge_method": "S256"})
+            "redirect_uri": callback, "code_challenge": "challenge", "code_challenge_method": "S256"},
+            allow_redirects=False)
         assert response.status == 400
 
 

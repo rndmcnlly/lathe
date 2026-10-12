@@ -14,6 +14,7 @@ import html
 import json
 import os
 from pathlib import Path
+import re
 import secrets
 import selectors
 import signal
@@ -60,7 +61,7 @@ def demo_identity_app(client_secret, *, clock=time.monotonic):
                 or query.get("code_challenge_method") != "S256"
                 or not query.get("code_challenge") or not query.get("state")
                 or callback.scheme != "https" or callback.netloc != callback.hostname
-                or not callback.hostname.endswith("." + ZONE)
+                or not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\." + re.escape(ZONE), callback.hostname or "")
                 or callback.path != "/_lathe/auth/callback" or callback.query or callback.fragment):
             raise web.HTTPBadRequest()
         if request.method == "GET":
