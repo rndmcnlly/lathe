@@ -136,7 +136,7 @@ headers, or raw logs are uploaded. `environment.json` intentionally preserves
 non-secret image identifiers. Startup failures may occur before a suite summary
 exists; use the host error and OWUI log in that case.
 
-## Local public-preview demo video
+## Local private-editor demo video
 
 With the same two provider keys exported and Docker running:
 
@@ -155,16 +155,25 @@ over the private Docker network and trusts a temporary certificate bundle.
 The capture browser accepts that temporary certificate only in its disposable
 browser contexts; nothing is installed in the laptop's trust store.
 
-The local variant explicitly asks for **public** previews and requires the
-tool's `Public wrapped preview` result before opening the editor. It demonstrates
-the real registration, proxy, and WebSocket paths without an OIDC provider.
+The same scenario always asks for a **private managed code-server** editor and
+requires private `expose` arguments plus the owner-only access result before
+opening it. No public HTTP-port workaround is permitted. A disposable identity
+fixture runs inside OWUI on port 9100, reachable only over the Docker network
+and the loopback TLS listener's `/demo-idp/` route. Its sign-in button explicitly
+identifies the fixed synthetic user `monitor@lathe.invalid`. This is not Pocket
+ID, real user authentication, or a full OIDC implementation. The actual Worker
+uses its unchanged discovery, authorization-code + S256 PKCE, userinfo,
+verified-email matching, and host-scoped session path. Single-use codes expire
+after 60 seconds; the fixture checks the client secret and redirect binding.
+Backchannel discovery/token/userinfo use HTTP inside the disposable Docker
+network; browser authorization and callbacks use the temporary HTTPS listener.
 Provider inference and Daytona remain hosted. The browser-facing wrapper is
 local; the signed upstream Daytona URL remains a remote bearer capability held
 by the wrapper.
 
 `DEMO_LOCAL_TOKEN` is handed directly from bootstrap to the browser process;
 capture accepts this mode only with a loopback OWUI URL and skips `.env`.
-The default release scenario and its passkey authentication remain separate.
+The token changes OWUI login only, never the narrative or preview policy.
 Output is `demo-video/out/demo.webm`, with screenshots and a qualification report.
 Infrastructure evidence goes into a unique `monitor-artifacts/demo-*` directory.
 Normal completion and exceptions clean up containers, local KV state, temporary
@@ -180,5 +189,10 @@ and upload video artifacts labeled with the tested ref and commit. Keep its
 unique Daytona label, disabled volumes, and expiry policy. Its browser and
 capture code must never fall back to a configured daily-use OWUI URL.
 
-`demo_local.py` now exercises this lifecycle with the existing browser capture.
-The GitHub demo-video workflow has not yet been migrated to launch this stack.
+`demo_local.py` exercises this lifecycle with the existing browser capture.
+The legacy hosted demo-video workflow (including its schedule and publisher)
+has been removed rather than retain an execution path that bypasses the
+disposable stack. Remaining migration scope: qualify this stack on Linux Actions
+runners, install Docker/TLS/browser prerequisites, add interruption-safe cleanup
+and evidence upload, and restore publication gated on accepted capture evidence.
+The isolated monitor workflow is unchanged; it is not a video qualification.

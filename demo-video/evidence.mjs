@@ -1,6 +1,8 @@
 export function matchesToolExpectation(event, expected) {
   const contains = (value, text) => !text || JSON.stringify(value).toLowerCase().includes(text.toLowerCase());
   return expected.tools.includes(event.tool)
+    && Object.entries(expected.argumentsEqual || {}).every(([key, value]) =>
+      event.arguments?.[key] === value)
     && contains(event.arguments, expected.argumentContains)
     && contains(event.output, expected.outputContains)
     && (!expected.outputLineEquals || event.output.split(/\r?\n/).some((line) =>

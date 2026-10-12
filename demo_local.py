@@ -7,6 +7,9 @@ Port 443 must be free. No cloud deployment or production OWUI configuration.
 """
 
 import asyncio
+import base64
+import hashlib
+import html
 import json
 import os
 from pathlib import Path
@@ -17,6 +20,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from urllib.parse import urlencode, urlsplit
 
 import certifi
 import httpx
@@ -28,6 +32,75 @@ ZONE = "lathe-preview.test"
 NETWORK = "lathe-local-demo"
 WORKER = "lathe-local-worker"
 TLS = "lathe-local-tls"
+ISSUER = f"http://{monitor.CONTAINER}:9100/demo-idp"
+
+
+def demo_identity_app(client_secret, *, clock=time.monotonic):
+    """Fixed synthetic identity, not real user authentication or a full OIDC IdP.
+
+    Implements the Worker's discovery/code+PKCE/userinfo protocol. Only local
+    Docker peers and the loopback TLS listener can reach this disposable fixture.
+    It never accepts user-supplied identity and never bypasses Worker sessions.
+    """
+    from aiohttp import web
+    codes, tokens = {}, {}
+
+    async def discovery(request):
+        return web.json_response({"issuer": ISSUER,
+            "authorization_endpoint": f"https://{ZONE}/demo-idp/authorize",
+            "token_endpoint": ISSUER + "/token", "userinfo_endpoint": ISSUER + "/userinfo"})
+
+    async def authorize(request):
+        query = request.query
+        callback = urlsplit(query.get("redirect_uri", ""))
+        if (query.get("client_id") != "lathe-demo"
+                or query.get("response_type") != "code"
+                or query.get("code_challenge_method") != "S256"
+                or not query.get("code_challenge") or not query.get("state")
+                or callback.scheme != "https" or callback.netloc != callback.hostname
+                or not callback.hostname.endswith("." + ZONE)
+                or callback.path != "/_lathe/auth/callback" or callback.query or callback.fragment):
+            raise web.HTTPBadRequest()
+        if request.method == "GET":
+            return web.Response(content_type="text/html", text=
+                '<h1>Disposable demo identity provider</h1>'
+                '<p>Fixed synthetic identity: monitor@lathe.invalid. Not Pocket ID or passkey authentication.</p>'
+                f'<form method="post" action="?{html.escape(urlencode(dict(query)), quote=True)}">'
+                '<button>Sign in as demo user</button></form>')
+        code = secrets.token_urlsafe(32)
+        codes[code] = (dict(query), clock() + 60)
+        raise web.HTTPFound(query["redirect_uri"] + "?" + urlencode({"code": code, "state": query["state"]}))
+
+    async def token(request):
+        form = await request.post()
+        if (form.get("client_id") != "lathe-demo"
+                or not secrets.compare_digest(form.get("client_secret", ""), client_secret)
+                or form.get("grant_type") != "authorization_code"):
+            raise web.HTTPUnauthorized()
+        stored = codes.pop(form.get("code", ""), None)
+        challenge = base64.urlsafe_b64encode(hashlib.sha256(
+            form.get("code_verifier", "").encode()).digest()).decode().rstrip("=")
+        if (not stored or stored[1] <= clock()
+                or stored[0]["redirect_uri"] != form.get("redirect_uri")
+                or stored[0]["code_challenge"] != challenge):
+            raise web.HTTPBadRequest()
+        access = secrets.token_urlsafe(32)
+        tokens[access] = clock() + 60
+        return web.json_response({"access_token": access, "token_type": "Bearer", "expires_in": 60})
+
+    async def userinfo(request):
+        access = request.headers.get("Authorization", "").removeprefix("Bearer ")
+        if tokens.get(access, 0) <= clock():
+            raise web.HTTPUnauthorized()
+        return web.json_response({"sub": "demo-monitor", "email": "monitor@lathe.invalid", "email_verified": True})
+
+    app = web.Application()
+    app.router.add_get("/demo-idp/.well-known/openid-configuration", discovery)
+    app.router.add_get("/demo-idp/authorize", authorize)
+    app.router.add_post("/demo-idp/authorize", authorize)
+    app.router.add_post("/demo-idp/token", token)
+    app.router.add_get("/demo-idp/userinfo", userinfo)
+    return app
 
 
 async def serve():
@@ -41,6 +114,9 @@ async def serve():
     runner = web.AppRunner(app, access_log=None)
     await runner.setup()
     await web.TCPSite(runner, "127.0.0.1", 9099).start()
+    identity = web.AppRunner(demo_identity_app(os.environ["LATHE_DEMO_IDP_SECRET"]), access_log=None)
+    await identity.setup()
+    await web.TCPSite(identity, "0.0.0.0", 9100).start()
     suite = None
     try:
         token = await monitor.bootstrap("http://127.0.0.1:8080", relay.key)
@@ -56,6 +132,7 @@ async def serve():
         if suite:
             await suite.delete_staging_tool()
         await runner.cleanup()
+        await identity.cleanup()
         (directory / "demo-routing.json").write_text(json.dumps({
             "serving_models": sorted(trace.models), "requests": relay.requests,
             "evidence_errors": relay.evidence_errors,
@@ -76,9 +153,16 @@ def prepare_infrastructure(path):
         "kv_namespaces": [{"binding": "SUBDOMAINS", "id": "local-demo"}],
         "vars": {"ZONE": ZONE, "HOSTNAME_TEMPLATE": "lathe-{access}"},
     }))
-    (path / ".dev.vars").write_text(f"REGISTER_TOKEN={token}\n")
+    identity_secret = secrets.token_urlsafe(32)
+    encryption_key = base64.b64encode(secrets.token_bytes(32)).decode()
+    monitor.SECRETS.extend([identity_secret, encryption_key])
+    os.environ["LATHE_DEMO_IDP_SECRET"] = identity_secret
+    (path / ".dev.vars").write_text(f"REGISTER_TOKEN={token}\n"
+        f"OIDC_ISSUER={ISSUER}\nOIDC_CLIENT_ID=lathe-demo\nOIDC_CLIENT_SECRET={identity_secret}\n"
+        f"REGISTRATION_ENCRYPTION_KEY={encryption_key}\n")
     (path / "nginx.conf").write_text(f"""events {{}}
 http {{
+  resolver 127.0.0.11 valid=5s;
   map $http_upgrade $connection_upgrade {{ default upgrade; '' close; }}
   server {{
     listen 443 ssl;
@@ -86,6 +170,11 @@ http {{
     ssl_certificate /local-demo/cert.pem;
     ssl_certificate_key /local-demo/key.pem;
     client_max_body_size 32m;
+    location /demo-idp/ {{
+      # OWUI is launched after this listener. Resolve its Docker name on demand.
+      set $identity_upstream http://{monitor.CONTAINER}:9100;
+      proxy_pass $identity_upstream$request_uri;
+    }}
     location / {{
       proxy_pass http://{WORKER}:8787;
       # Wrangler rewrites same-host redirects to its HTTP development listener.
@@ -126,6 +215,20 @@ http {{
     raise RuntimeError("Local Wrangler/TLS did not become healthy")
 
 
+def capture_environment(token, port):
+    """Keep stale hosted settings and server credentials out of the browser."""
+    server_keys = {"DAYTONA_API_KEY", "OPENROUTER_API_KEY",
+                   "LATHE_PREVIEW_WRAPPER_KEY", "LATHE_DEMO_IDP_SECRET"}
+    env = {k: v for k, v in os.environ.items()
+           if not k.startswith(("DEMO_", "OWUI_")) and k not in server_keys}
+    env.update(DEMO_LOCAL_TOKEN=token, DEMO_OWUI_URL=f"http://127.0.0.1:{port}",
+               DEMO_MODEL=monitor.MODEL, DEMO_PROXY_DOMAINS=ZONE)
+    # This opt-in affects prewarm only, never authentication or preview policy.
+    if os.environ.get("DEMO_SKIP_PREWARM") == "1":
+        env["DEMO_SKIP_PREWARM"] = "1"
+    return env
+
+
 def main():
     if "--inside" in sys.argv:
         asyncio.run(serve())
@@ -157,6 +260,7 @@ def main():
                 "--mount", f"type=bind,src={path},dst=/local-demo,readonly",
                 "--env", "SSL_CERT_FILE=/local-demo/ca-bundle.pem",
                 "--env", f"LATHE_PREVIEW_WRAPPER_URL=https://{ZONE}/register",
+                "--env", "LATHE_DEMO_IDP_SECRET",
                 "--env", "LATHE_PREVIEW_WRAPPER_KEY"))
             process = subprocess.Popen(["docker", "exec", "-i", monitor.CONTAINER,
                 "python", "/monitor/demo_local.py", "--inside"],
@@ -173,9 +277,7 @@ def main():
             token = ready["token"]
             monitor.SECRETS.append(token)
             port = monitor.docker("port", monitor.CONTAINER, "8080/tcp").stdout.strip().split(":")[-1]
-            env = {k: v for k, v in os.environ.items() if not k.startswith(("DEMO_", "OWUI_"))}
-            env.update(DEMO_LOCAL_TOKEN=token, DEMO_OWUI_URL=f"http://127.0.0.1:{port}",
-                       DEMO_MODEL=monitor.MODEL, DEMO_PROXY_DOMAINS=ZONE)
+            env = capture_environment(token, port)
             print(f"Recording local demo at http://127.0.0.1:{port}", flush=True)
             subprocess.run(["npm", "run", "capture"], cwd=ROOT / "demo-video", env=env,
                            check=True, timeout=1200)
@@ -191,8 +293,10 @@ def main():
             for name in (TLS, WORKER):
                 logs = monitor.docker("logs", name, check=False)
                 (directory / f"{name}.log").write_text(monitor.sanitize(logs.stdout + logs.stderr))
-                monitor.docker("rm", "-f", "-v", name, check=False)
-            monitor.docker("network", "rm", NETWORK, check=False)
+                if monitor.docker("inspect", name, check=False).returncode == 0:
+                    failed |= monitor.docker("rm", "-f", "-v", name, check=False).returncode != 0
+            if monitor.docker("network", "inspect", NETWORK, check=False).returncode == 0:
+                failed |= monitor.docker("network", "rm", NETWORK, check=False).returncode != 0
             if failed:
                 raise RuntimeError(f"Cleanup failed; inspect {directory}")
     print(f"Video: {ROOT / 'demo-video/out/demo.webm'}")
