@@ -422,18 +422,53 @@ def test_wildcard_free_directories_are_recursive_and_files_remain_exact(tmp_path
 
 
 @pytest.mark.parametrize("kind,total", [("GLOB", 13), ("GREP", 22)])
-@pytest.mark.parametrize("budget", [4, 8, 100])
-def test_search_budget_conserves_matches(tree, kind, total, budget):
+@pytest.mark.parametrize("budget", [1, 4, 8, 100])
+def test_search_budget_keeps_concrete_evidence(tree, kind, total, budget):
     args = (str(tree), "**/*", budget) if kind == "GLOB" else (str(tree), "needle", "**/*", budget)
     result = script_call(kind, kind.lower() + "_hierarchy", *args)
     header, *body = result.splitlines()
     assert int(header.split()[0]) == total
-    assert len(body) <= budget
-    counts = [re.search(r"(?:\(|and )(\d+) (?:more )?matches", line) for line in body]
-    assert sum(int(m[1]) if m else 1 for m in counts) == total
-    if budget == 100:
-        assert all(line.startswith(str(tree)) for line in body)
-        assert len(body) == total
+    assert len(body) == min(total, budget)
+    for line in body:
+        if kind == "GLOB":
+            assert Path(line).is_file()
+        else:
+            path, number, text = line.rsplit(":", 2)
+            assert Path(path).read_text().splitlines()[int(number) - 1] == text.strip()
+            assert "needle" in text
+    if total > budget:
+        assert f"showing {budget}, {total - budget} omitted" in header
+    else:
+        assert "omitted" not in header
+
+
+@pytest.mark.parametrize("kind", ["GLOB", "GREP"])
+@pytest.mark.parametrize("count", [0, 1, 99, 100, 101, 2000])
+def test_search_thresholds_do_not_collapse_to_counts(tmp_path, kind, count):
+    root = tmp_path.resolve()
+    for i in range(count):
+        path = root / f"group-{i % 5}" / f"hit-{i}.txt"
+        path.parent.mkdir(exist_ok=True)
+        path.write_text(f"miss\nneedle {i}\n")
+    # Overlapping includes must neither duplicate evidence nor inflate totals.
+    scope = "**/*.txt,group-0/*.txt"
+    args = (str(root), scope, 100) if kind == "GLOB" else (
+        str(root), "needle", scope, 100)
+    header, *body = script_call(kind, kind.lower() + "_hierarchy", *args).splitlines()
+    assert int(header.split()[0]) == count
+    assert len(body) == min(count, 100)
+    assert len(set(body)) == len(body)
+    for line in body:
+        if kind == "GLOB":
+            assert Path(line).is_file()
+        else:
+            path, number, text = line.rsplit(":", 2)
+            assert number == "2"
+            assert text.strip() == Path(path).read_text().splitlines()[1]
+    if count > 100:
+        assert f"showing 100, {count - 100} omitted" in header
+    else:
+        assert "omitted" not in header
 
 
 def test_grep_invalid_regex_and_no_hits(tree):
@@ -461,12 +496,21 @@ def test_grep_skips_binary_and_bounds_large_file_matches(tmp_path):
 
     dense = script_call("GREP", "grep_hierarchy", str(tmp_path), "needle", "**/*", 5)
     assert dense.splitlines()[0].startswith("50000 matches across 1 files")
-    assert len(dense.splitlines()[1:]) <= 5
+    assert dense.splitlines()[1:] == [f"{large}:{i}: needle" for i in range(1, 6)]
+    assert "showing 5, 49995 omitted" in dense.splitlines()[0]
+    assert "1 binary or unreadable files skipped" in dense.splitlines()[0]
     assert str(binary) not in dense
 
     late = script_call("GREP", "grep_hierarchy", str(tmp_path), "late marker", "**/*", 5)
     assert f"{large}:50001: late marker" in late
     assert str(binary) not in late
+
+
+def test_grep_clips_concrete_long_hits(tmp_path):
+    path = tmp_path / "wide.txt"
+    path.write_text("needle" + "x" * 100_000 + "\n")
+    result = script_call("GREP", "grep_hierarchy", str(tmp_path), "needle", "**/*", 1)
+    assert result.splitlines()[1:] == [f"{path}:1: " + "needle" + "x" * 194 + "..."]
 
 
 @pytest.mark.parametrize("name,kwargs", [
