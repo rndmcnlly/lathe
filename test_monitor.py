@@ -12,6 +12,13 @@ from aiohttp.test_utils import TestServer
 import monitor_e2e as monitor
 
 
+@pytest.fixture(autouse=True)
+def default_monitor_selection(monkeypatch):
+    # Tests must protect both the unchanged default and explicit overrides,
+    # regardless of the model chosen for the enclosing live workflow.
+    monkeypatch.delenv("LATHE_MONITOR_MODEL", raising=False)
+
+
 @pytest.mark.parametrize("credential", [
     "dtn_fake-token", "sk-or-v1-fake-token", "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ4In0.signature",
     "Bearer unknown-secret", "https://new-preview-host.example/path?unknown-signature=secret",
@@ -37,14 +44,19 @@ def test_registered_secrets_and_failure_evidence(tmp_path, monkeypatch):
     assert "generated-password" not in trace.path.read_text()
 
 
+@pytest.mark.parametrize("selected", [monitor.ROUTER, "z-ai/glm-5.3-flash"])
 @pytest.mark.parametrize("streaming", [True, False])
-async def test_relay_forwards_real_body_and_records_concrete_model(tmp_path, monkeypatch, streaming):
+async def test_relay_forwards_real_body_and_records_concrete_model(tmp_path, monkeypatch, streaming, selected):
     # Exercise the HTTP handler itself. An independent upstream boundary checks
     # exact forwarding, including plugins and the delegate's non-streaming path.
-    payload = {"model": monitor.ROUTER, "plugins": monitor.PLUGINS,
+    monkeypatch.setenv("LATHE_MONITOR_MODEL", selected)
+    payload = {"model": selected,
                "messages": [{"role": "user", "content": "hello"}], "stream": streaming}
+    if selected == monitor.ROUTER:
+        payload["plugins"] = monitor.PLUGINS
     encoded = json.dumps(payload).encode()
-    reply = {"id": "gen-test", "model": "provider/concrete", "usage": {"total_tokens": 42}}
+    serving = "provider/concrete" if selected == monitor.ROUTER else selected
+    reply = {"id": "gen-test", "model": serving, "usage": {"total_tokens": 42}}
     content = (("data: " + json.dumps(reply) + "\n\ndata: [DONE]\n\n").encode()
                if streaming else json.dumps(reply).encode())
 
@@ -67,8 +79,68 @@ async def test_relay_forwards_real_body_and_records_concrete_model(tmp_path, mon
                                headers={"Authorization": "Bearer test-key"}) as response:
             assert response.status == 200
             assert await response.read() == content
-    assert trace.models == {"provider/concrete"}
+    assert trace.models == {serving}
     assert not relay.evidence_errors
+    relay.verify_evidence()
+    rows = [json.loads(line) for line in trace.path.read_text().splitlines()]
+    assert rows[0]["kind"] == "inference_request"
+    assert rows[0]["model"] == selected
+    assert any(row["kind"] == "inference" and row["model"] == serving for row in rows)
+
+
+async def test_direct_relay_rejects_pareto_plugin_before_provider(tmp_path, monkeypatch):
+    monkeypatch.setenv("LATHE_MONITOR_MODEL", "z-ai/glm-5.3-flash")
+    monkeypatch.setattr(monitor.httpx, "AsyncClient", lambda **kwargs: pytest.fail("Wrong plugin reached provider"))
+    relay = monitor.RecordingRelay(monitor.Trace(tmp_path), "test-key")
+    app = web.Application()
+    app.router.add_post("/v1/chat/completions", relay.handle)
+    async with TestServer(app) as server, ClientSession() as client:
+        response = await client.post(server.make_url("/v1/chat/completions"),
+            json={"model": "z-ai/glm-5.3-flash", "plugins": monitor.PLUGINS},
+            headers={"Authorization": "Bearer test-key"})
+        assert response.status == 400
+    assert relay.evidence_errors
+
+
+@pytest.mark.parametrize("selected", [None, "z-ai/glm-5.3-flash"])
+async def test_bootstrap_configures_selected_model_without_router_plugin_leak(monkeypatch, selected):
+    if selected:
+        monkeypatch.setenv("LATHE_MONITOR_MODEL", selected)
+    model = selected or "openrouter/pareto-code"
+    alias = "lathe-ci-direct" if selected else "lathe-ci-pareto"
+    created = []
+    def owui(request):
+        if request.url.path == "/health":
+            return httpx.Response(200)
+        if request.url.path == "/api/v1/auths/signup":
+            return httpx.Response(200, json={"role": "admin", "token": "disposable"})
+        assert request.headers["Authorization"] == "Bearer disposable"
+        if request.url.path == "/openai/config/update":
+            config = json.loads(request.content)
+            assert config["OPENAI_API_CONFIGS"]["0"]["model_ids"] == [model]
+            assert config["OPENAI_API_BASE_URLS"] == ["http://127.0.0.1:9099/v1"]
+        elif request.url.path == "/api/v1/models/create":
+            config = json.loads(request.content)
+            assert config["id"] == alias
+            assert config["base_model_id"] == model
+            assert config["params"]["function_calling"] == "native"
+            policy = config["params"]["custom_params"]
+            assert policy["provider"] == {"data_collection": "deny"}
+            if selected:
+                assert "plugins" not in policy
+            else:
+                assert policy["plugins"] == [{"id": "pareto-router", "min_coding_score": 0.5}]
+            created.append(config)
+        elif request.url.path == "/api/models":
+            return httpx.Response(200, json={"data": [{"id": alias}]})
+        else:
+            pytest.fail(f"Unexpected request {request.url.path}")
+        return httpx.Response(200, json={})
+    client_type = httpx.AsyncClient
+    monkeypatch.setattr(monitor.httpx, "AsyncClient", lambda **kwargs:
+        client_type(transport=httpx.MockTransport(owui), **kwargs))
+    assert await monitor.bootstrap("http://127.0.0.1:8080", "fixture-key") == "disposable"
+    assert len(created) == 1
 
 
 @pytest.mark.parametrize("change", ["plugins", "model", "auth"])
@@ -202,9 +274,12 @@ def test_single_dispatch_allows_only_optional_first_use_overview(suite, expected
             suite.require_single_dispatch(invalid, expected)
 
 
-def test_launcher_tracks_moving_slim_and_exposes_only_loopback(tmp_path, monkeypatch):
+@pytest.mark.parametrize("selected", [None, "z-ai/glm-5.3-flash"])
+def test_launcher_tracks_moving_slim_and_exposes_only_loopback(tmp_path, monkeypatch, selected):
     import subprocess
     commands = []
+    if selected:
+        monkeypatch.setenv("LATHE_MONITOR_MODEL", selected)
     monkeypatch.setenv("LATHE_TEST_DEPLOYMENT_LABEL", "lathe-ci-run-2")
     monkeypatch.setattr(monitor.httpx, "get", lambda *a, **kw: pytest.fail(
         "moving :slim launch must not resolve a versioned GitHub release"))
@@ -224,6 +299,9 @@ def test_launcher_tracks_moving_slim_and_exposes_only_loopback(tmp_path, monkeyp
     assert "owui_release" not in metadata
     assert run[run.index("--publish") + 1] == "127.0.0.1:0:8080"
     assert "LATHE_TEST_DEPLOYMENT_LABEL" in run
+    assert f"LATHE_MONITOR_MODEL={selected or 'openrouter/pareto-code'}" in run
+    assert metadata["requested_model"] == (selected or "openrouter/pareto-code")
+    assert metadata["plugins"] == ([] if selected else monitor.PLUGINS)
     assert not any("chat.adamsmith.as" in arg for arg in run)
     assert not any("type=volume" in arg for arg in run)
 

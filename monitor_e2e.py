@@ -29,6 +29,22 @@ PLUGINS = [{"id": "pareto-router", "min_coding_score": 0.5}]
 SECRETS = []
 
 
+def requested_model():
+    """Explicit OpenRouter selection; no override preserves the monitor default."""
+    value = os.environ.get("LATHE_MONITOR_MODEL", ROUTER)
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.:-]+", value):
+        raise ValueError("LATHE_MONITOR_MODEL must be an OpenRouter provider/model ID")
+    return value
+
+
+def model_plugins(model):
+    return PLUGINS if model == ROUTER else []
+
+
+def workspace_model():
+    return MODEL if requested_model() == ROUTER else "lathe-ci-direct"
+
+
 def sanitize(text):
     """Redact before persistence, including bearer URLs with unfamiliar formats."""
     for value in [*SECRETS, *(os.environ.get(k, "") for k in
@@ -69,9 +85,9 @@ class Trace:
 class RecordingRelay:
     """Loopback-only forwarder, with no synthetic model responses or body edits.
 
-    A workspace model supplies plugins to parent AND delegate requests. Reject
-    missing policy at the actual upstream boundary instead of silently falling
-    back to the account's (possibly different) router tier.
+    The workspace selects the model and any router plugin for parent AND
+    delegate requests. Reject changed policy at the actual upstream boundary
+    rather than silently inheriting an account tier or a Pareto-only plugin.
     """
 
     def __init__(self, trace, key):
@@ -79,13 +95,23 @@ class RecordingRelay:
         self.key = key
         self.requests = 0
         self.evidence_errors = []
+        self.model = requested_model()
+        self.plugins = model_plugins(self.model)
+
+    def verify_evidence(self):
+        # A direct provider may legitimately return the requested model ID.
+        # Pareto is a router alias and must resolve to a concrete serving model.
+        if (self.evidence_errors or not self.trace.models
+                or workspace_model() in self.trace.models
+                or (self.model == ROUTER and ROUTER in self.trace.models)):
+            raise RuntimeError("Concrete OpenRouter serving-model evidence is missing")
 
     async def handle(self, request):
         from aiohttp import web
 
         body = await request.read()
         payload = json.loads(body)
-        if (payload.get("model") != ROUTER or payload.get("plugins") != PLUGINS
+        if (payload.get("model") != self.model or payload.get("plugins", []) != self.plugins
                 or request.headers.get("Authorization") != f"Bearer {self.key}"):
             self.trace("fatal", error="Inference request lost router policy or authentication")
             self.evidence_errors.append("routing contract")
@@ -93,7 +119,7 @@ class RecordingRelay:
         self.requests += 1
         number = self.requests
         self.trace("inference_request", request=number, model=payload["model"],
-                   plugins=payload["plugins"], stream=payload.get("stream", False))
+                   plugins=payload.get("plugins", []), stream=payload.get("stream", False))
         async with httpx.AsyncClient(timeout=180) as client:
             async with client.stream("POST", "https://openrouter.ai/api/v1/chat/completions",
                 content=body, headers={"Authorization": f"Bearer {self.key}",
@@ -148,6 +174,10 @@ async def bootstrap(base, key):
     and the same repository secrets rather than targeting a daily-use server.
     """
     password = secrets.token_urlsafe(32)
+    model = requested_model()
+    custom_params = {"provider": {"data_collection": "deny"}}
+    if model_plugins(model):
+        custom_params["plugins"] = model_plugins(model)
     SECRETS.append(password)
     async with httpx.AsyncClient(base_url=base, timeout=30) as client:
         for _ in range(180):
@@ -173,20 +203,20 @@ async def bootstrap(base, key):
             "ENABLE_OPENAI_API": True,
             "OPENAI_API_BASE_URLS": ["http://127.0.0.1:9099/v1"],
             "OPENAI_API_KEYS": [key],
-            "OPENAI_API_CONFIGS": {"0": {"enable": True, "model_ids": [ROUTER]}},
+            "OPENAI_API_CONFIGS": {"0": {"enable": True, "model_ids": [model]}},
         })
         response.raise_for_status()
         response = await client.post("/api/v1/models/create", json={
-            "id": MODEL, "base_model_id": ROUTER, "name": "CI Pareto Medium",
+            "id": workspace_model(), "base_model_id": model,
+            "name": "CI Pareto Medium" if model == ROUTER else f"CI {model}",
             "params": {"function_calling": "native", "max_tokens": 4096,
-                       "custom_params": {"plugins": PLUGINS,
-                                         "provider": {"data_collection": "deny"}}},
+                       "custom_params": custom_params},
             "meta": {"capabilities": {"vision": True, "builtin_tools": False}},
         })
         response.raise_for_status()
         response = await client.get("/api/models")
         response.raise_for_status()
-        if MODEL not in {m["id"] for m in response.json()["data"]}:
+        if workspace_model() not in {m["id"] for m in response.json()["data"]}:
             raise RuntimeError("Disposable workspace model is missing")
     return token
 
@@ -205,14 +235,12 @@ async def inside(directory):
     try:
         base = "http://127.0.0.1:8080"
         token = await bootstrap(base, relay.key)
-        os.environ.update(OWUI_URL=base, OWUI_TOKEN=token, OWUI_MODEL=MODEL,
+        os.environ.update(OWUI_URL=base, OWUI_TOKEN=token, OWUI_MODEL=workspace_model(),
                           LATHE_ISOLATED_CI="1", LATHE_TEST_TOOL_ID="lathe_test")
         import test_deployment as suite
         suite.TRACE = trace
         result = await suite.main()
-        if relay.evidence_errors or not trace.models or ROUTER in trace.models or MODEL in trace.models:
-            result = 1
-            raise RuntimeError("Concrete OpenRouter serving-model evidence is missing")
+        relay.verify_evidence()
     except Exception as exc:
         result = 1
         trace("fatal", error=f"{type(exc).__name__}: {exc}")
@@ -220,6 +248,7 @@ async def inside(directory):
     finally:
         await runner.cleanup()
         summary = {"exit_code": result, "first_failing_scenario": trace.first_failure,
+                   "requested_model": relay.model,
                    "serving_models": sorted(trace.models), "inference_requests": relay.requests}
         (directory / "summary.json").write_text(sanitize(json.dumps(summary, indent=2)) + "\n")
     return result
@@ -277,14 +306,16 @@ def launch(directory, *, docker_args=()):
                 "image_id": info["Id"], "architecture": info["Architecture"],
                 "lathe_sha256": hashlib.sha256((ROOT / "lathe.py").read_bytes()).hexdigest(),
                 "git_sha": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip(),
-                "router": ROUTER, "plugins": PLUGINS,
+                "router": requested_model(), "requested_model": requested_model(),
+                "plugins": model_plugins(requested_model()),
                 "deployment_label": os.environ["LATHE_TEST_DEPLOYMENT_LABEL"]}
     (directory / "environment.json").write_text(json.dumps(metadata, indent=2) + "\n")
     docker("run", "--detach", "--name", CONTAINER,
            "--publish", "127.0.0.1:0:8080", "--mount", f"type=bind,src={ROOT},dst=/monitor,readonly",
            "--mount", f"type=bind,src={directory},dst=/artifacts",
            "--env", "OPENROUTER_API_KEY", "--env", "DAYTONA_API_KEY",
-           "--env", "LATHE_TEST_DEPLOYMENT_LABEL",
+            "--env", "LATHE_TEST_DEPLOYMENT_LABEL",
+            "--env", f"LATHE_MONITOR_MODEL={requested_model()}",
            "--env", "LATHE_ISOLATED_CI=1", "--env", "ENABLE_OLLAMA_API=false",
            "--env", "ENABLE_SIGNUP=true", "--env", "WEBUI_AUTH=true",
            "--env", "SCARF_NO_ANALYTICS=true", "--env", "DO_NOT_TRACK=true",

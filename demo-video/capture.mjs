@@ -41,13 +41,6 @@ if (LOCAL_TOKEN) {
   if (local.protocol !== "http:" || local.hostname !== "127.0.0.1") {
     throw new Error("Disposable-token capture requires a loopback Open WebUI URL");
   }
-  SCENARIO.id = "lathe-local-public-workspace";
-  const editor = SCENARIO.steps.find((step) => step.id === "editor.request");
-  editor.intent = "Ask Lathe for a public, locally wrapped browser editor";
-  editor.with.prompt = "Give me a public browser-based VS Code editor for this repo. I explicitly want public access. Share it as a markdown link with a short label, then summarize the access and expiry information reported by the tool.";
-  const evidence = SCENARIO.steps.find((step) => step.id === "editor.prove-exposed");
-  evidence.screenshot = "public-wrapped-editor-ready";
-  evidence.with.outputContains = "Public wrapped preview";
 }
 if (!OWUI_URL || !MODEL || (!LOCAL_TOKEN && (!PASSKEY?.rpId || !PASSKEY?.id || !PASSKEY?.privateKey))) {
   const message = "Set DEMO_OWUI_URL, DEMO_PASSKEY, and DEMO_MODEL";

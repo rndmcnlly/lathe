@@ -4,115 +4,133 @@ on:
   schedule:
     - cron: '17 14 * * 3'
   workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish a qualified default-branch capture to demo-video-latest
+        type: boolean
+        default: false
 
 permissions:
   contents: read
 
+# Fixed local identities are owned by one run. Never cancel teardown.
 concurrency:
-  group: demo-video-${{ github.ref }}
-  cancel-in-progress: true
+  group: lathe-demo-video
+  cancel-in-progress: false
 
 jobs:
   capture:
-    # This legacy workflow still targets a configured hosted OWUI. Branch demos
-    # use demo_local.py until this workflow is migrated to the disposable stack.
-    if: github.ref_name == github.event.repository.default_branch
+    if: github.repository == 'rndmcnlly/lathe' && github.event_name != 'pull_request'
+    environment: lathe-demo
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 45
+    env:
+      LATHE_MONITOR_MODEL: z-ai/glm-5.3-flash
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           persist-credentials: false
-
+      - uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff # v6
+        with:
+          enable-cache: true
       - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
         with:
           node-version: 22
-
-      - name: Install npm deps
-        working-directory: demo-video
-        run: npm ci
-
-      - name: Test scenario interpreter
-        working-directory: demo-video
-        run: npm test
-
-      - name: Install Playwright Chromium
-        working-directory: demo-video
-        run: npx playwright install --with-deps chromium
-
-      - name: Run capture
+      - name: Install capture prerequisites
+        run: |
+          npm ci --prefix demo-video
+          cd demo-video
+          npx playwright install --with-deps chromium
+      - name: Offline contracts
+        run: |
+          uv run --locked pytest
+          npm test --prefix demo-video
+      - name: Disposable OWUI, private Worker, and live model capture
         id: capture
         continue-on-error: true
-        working-directory: demo-video
+        timeout-minutes: 35
         env:
-          DEMO_OWUI_URL: ${{ secrets.DEMO_OWUI_URL }}
-          DEMO_PASSKEY: ${{ secrets.DEMO_PASSKEY }}
-          DEMO_MODEL: ${{ secrets.DEMO_MODEL }}
-          DEMO_PROXY_DOMAINS: ${{ secrets.DEMO_PROXY_DOMAINS }}
-        run: npm run capture
-
+          # Existing repository keys, or same-name overrides in lathe-demo.
+          DAYTONA_API_KEY: ${{ secrets.DAYTONA_API_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        run: uv run --locked python demo_local.py --artifacts monitor-artifacts/demo-ci
+      - name: Last-resort isolated teardown
+        if: always()
+        env:
+          DAYTONA_API_KEY: ${{ secrets.DAYTONA_API_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        run: uv run --locked python demo_local.py --cleanup --artifacts monitor-artifacts/demo-ci
       - name: Upload capture evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: demo-video-${{ github.sha }}
+          name: demo-video-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: demo-video/out/
           if-no-files-found: warn
           retention-days: 30
-
+      - name: Upload sanitized infrastructure evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: demo-infrastructure-${{ github.run_id }}-${{ github.run_attempt }}
+          path: monitor-artifacts/demo-ci/
+          if-no-files-found: warn
+          retention-days: 14
       - name: Write capture summary
         if: always()
         env:
           CAPTURE_OUTCOME: ${{ steps.capture.outcome }}
         run: |
-          if test -f demo-video/out/capture-report.json; then
-            STATUS=$(jq -r '.status // "unknown"' demo-video/out/capture-report.json)
-            DOMAIN=$(jq -r '.failure_domain // "none"' demo-video/out/capture-report.json)
-            STEP=$(jq -r '.failed_step // "none"' demo-video/out/capture-report.json)
-          else
-            STATUS=missing-report
-            DOMAIN=infrastructure
-            STEP=bootstrap
-          fi
-          {
-            echo '## Demo synthetic monitor'
-            echo
-            echo "- Capture command: $CAPTURE_OUTCOME"
-            echo "- Qualification: $STATUS"
-            echo "- Failure domain: $DOMAIN"
-            echo "- First failing step: $STEP"
-          } >> "$GITHUB_STEP_SUMMARY"
-
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          report = Path('demo-video/out/capture-report.json')
+          data = json.loads(report.read_text()) if report.exists() else {}
+          qualification = Path('demo-video/out/qualification.json')
+          qualified = json.loads(qualification.read_text()) if qualification.exists() else {}
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as out:
+              out.write('## Isolated demo capture\n\n')
+              out.write(f"- Capture command: {os.environ['CAPTURE_OUTCOME']}\n")
+              out.write(f"- Qualification: {qualified.get('accepted', False)}\n")
+              out.write(f"- Requested model: {qualified.get('requested_model', os.environ['LATHE_MONITOR_MODEL'])}\n")
+              out.write(f"- Serving models: {qualified.get('serving_models', [])}\n")
+              out.write(f"- Failure domain: {data.get('failure_domain', 'infrastructure')}\n")
+              out.write(f"- First failing step: {data.get('failed_step', 'none')}\n")
+          PY
       - name: Enforce qualification
-        if: always() && steps.capture.outcome != 'success'
-        run: exit 1
+        if: always()
+        env:
+          CAPTURE_OUTCOME: ${{ steps.capture.outcome }}
+        run: |
+          test "$CAPTURE_OUTCOME" = success
+          test "$(jq -r '.accepted' demo-video/out/qualification.json)" = true
+          test "$(jq -r '.git_sha' demo-video/out/qualification.json)" = "$GITHUB_SHA"
 
   publish:
     needs: capture
-    if: github.event_name != 'schedule' && github.ref_name == github.event.repository.default_branch
+    if: github.event_name == 'workflow_dispatch' && inputs.publish && github.ref_name == github.event.repository.default_branch
+    environment: lathe-demo
     runs-on: ubuntu-latest
-    concurrency:
-      group: demo-video-publication
-      cancel-in-progress: false
     permissions:
-      actions: write
       contents: write
     steps:
-      - name: Download rendered artifact
+      - name: Download qualified capture
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          name: demo-video-${{ github.sha }}
+          name: demo-video-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: release
-
-      - name: Publish latest release asset
+      - name: Publish existing release destination
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
-          if ! gh release view demo-video-latest >/dev/null 2>&1; then
-            gh release create demo-video-latest --title "Demo Video (latest)" --notes "Auto-captured Playwright demo session." --latest=false
-          fi
           test "$(jq -r '.status' release/capture-report.json)" = accepted
+          test "$(jq -r '.accepted' release/qualification.json)" = true
+          test "$(jq -r '.git_sha' release/qualification.json)" = "$GITHUB_SHA"
+          test "$(jq -r '.requested_model' release/qualification.json)" = z-ai/glm-5.3-flash
+          if ! gh release view demo-video-latest >/dev/null 2>&1; then
+            gh release create demo-video-latest --title "Demo Video (latest)" --notes "Isolated Playwright demo with disposable OWUI and private Worker." --latest=false
+          fi
           gh release upload demo-video-latest release/demo.webm --clobber
           for screenshot in release/screenshots/*.png; do
             test -e "$screenshot" || continue

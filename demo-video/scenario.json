@@ -1,6 +1,6 @@
 {
   "id": "lathe-shared-workspace",
-  "version": 4,
+  "version": 5,
   "steps": [
     {
       "id": "auth.owui",
@@ -92,7 +92,7 @@
       "required": true,
       "intent": "Ask Lathe to expose a private browser editor",
       "with": {
-        "prompt": "Give me a private browser-based VS Code editor for this repo. Share it as a markdown link with a short label instead of exposing the raw URL, then summarize the access and expiry information reported by the tool.",
+        "prompt": "Give me a private browser-based VS Code editor for {{checkout}} using Lathe's managed code-server target, not a manually started service or generic HTTP port. Share it as a markdown link with a short label instead of exposing the raw URL, then summarize the access and expiry information reported by the tool.",
         "timeoutMs": 180000
       },
       "failureDomain": "model_behavior"
@@ -105,8 +105,9 @@
       "screenshot": "private-editor-ready",
       "with": {
         "tools": ["expose"],
-        "argumentContains": "code-server",
-        "outputContains": "https://"
+        "managedTarget": "code-server",
+        "argumentsEqual": { "access": "private" },
+        "outputContains": "Copying the URL does not grant access."
       },
       "failureDomain": "lathe_behavior"
     },
@@ -172,7 +173,7 @@
       "required": true,
       "intent": "Start a bounded architecture review in the background",
       "with": {
-        "prompt": "Start a focused review of lines 1320-1470 in {{checkout}}/lathe.py using delegate with max_steps=5 and foreground_seconds=0. Ask for one strength and one tradeoff in the _standard_tool wrapper design, citing function names. Return control immediately.",
+        "prompt": "Start a focused review of the _standard_tool function in {{checkout}}/lathe.py using delegate with max_steps=5 and foreground_seconds=0. Ask the sub-agent to locate the definition by symbol, read its implementation, and report one strength and one tradeoff in the wrapper design, citing function names. Return control immediately.",
         "timeoutMs": 60000
       },
       "failureDomain": "model_behavior"
