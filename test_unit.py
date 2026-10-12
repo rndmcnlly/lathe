@@ -7,6 +7,7 @@ its files and state. Live Daytona and OWUI checks remain explicit scripts.
 import __future__
 import asyncio
 import base64
+from contextlib import asynccontextmanager
 import hashlib
 import inspect
 import json
@@ -177,7 +178,8 @@ def test_delegate_interface(module):
     for with_chat in (False, True):
         tools = module._build_delegate_tools(
             t.valves, "sb", None, [],
-            chat_state=t._chat_state if with_chat else None, chat_id="chat")
+            chat_state=t._chat_state if with_chat else None, chat_id="chat",
+            interpreter_state=t._interpreter_state if with_chat else None)
         expected_names = {"bash", "read", "write", "edit", "glob", "grep"}
         if with_chat:
             expected_names.add("interpret")
@@ -1021,7 +1023,7 @@ async def test_chat_init_and_notice_delivery(tools, transport):
 async def test_interpreter_context_recovery(tools, transport, prior, live, expected, lost):
     tools._chat_state["a"] = {"init": True, "pending": []}
     if prior:
-        tools._chat_state["a"]["interpreter_context_id"] = prior
+        tools._interpreter_state["a"] = {"id": prior, "sandbox_id": "sb", "lock": asyncio.Lock()}
     calls = []
     def handler(request):
         calls.append(request.method)
@@ -1029,9 +1031,121 @@ async def test_interpreter_context_recovery(tools, transport, prior, live, expec
         assert request.method in {"GET", "POST"}
         return httpx.Response(200, json={"contexts": live} if request.method == "GET" else {"id": "new"})
     async with httpx.AsyncClient(transport=transport(handler)) as client:
-        assert await lathe._ensure_interpreter_context(tools.valves, "sb", client, tools._chat_state, "a") == (expected, lost)
-    assert tools._chat_state["a"]["interpreter_context_id"] == expected
+        assert await lathe._ensure_interpreter_context(tools.valves, "sb", client, tools._interpreter_state, "a") == (expected, lost)
+    assert tools._interpreter_state["a"]["id"] == expected
     assert calls.count("POST") == (expected == "new")
+
+
+@pytest.mark.parametrize("failure", [503, 404, "transport", "missing-list", "bad-entry"])
+async def test_interpreter_probe_failure_preserves_identity(tools, transport, failure):
+    tools._interpreter_state["a"] = {"id": "healthy", "sandbox_id": "sb", "lock": asyncio.Lock()}
+    failed = True
+    def handler(request):
+        assert request.method == "GET"  # Never create on an ambiguous probe.
+        if not failed:
+            return httpx.Response(200, json={"contexts": [{"id": "healthy"}]})
+        if failure == "transport":
+            raise httpx.ConnectError("temporarily unavailable", request=request)
+        if isinstance(failure, int):
+            return httpx.Response(failure)
+        return httpx.Response(200, json={} if failure == "missing-list" else {"contexts": [{}]})
+    async with httpx.AsyncClient(transport=transport(handler)) as client:
+        with pytest.raises((httpx.HTTPError, RuntimeError)):
+            await lathe._ensure_interpreter_context(tools.valves, "sb", client, tools._interpreter_state, "a")
+        assert tools._interpreter_state["a"]["id"] == "healthy"
+        failed = False
+        assert await lathe._ensure_interpreter_context(tools.valves, "sb", client, tools._interpreter_state, "a") == ("healthy", False)
+
+
+async def test_interpreter_concurrent_creation_and_notice_reconstruction(tools, transport):
+    entered, release = asyncio.Event(), asyncio.Event()
+    posts = []
+    async def handler(request):
+        if request.method == "POST":
+            posts.append(request)
+            entered.set()
+            await release.wait()
+            return httpx.Response(200, json={"id": "shared"})
+        assert request.method == "GET"
+        return httpx.Response(200, json={"contexts": [{"id": "shared"}]})
+    async with httpx.AsyncClient(transport=transport(handler)) as client:
+        async def resolve():
+            return await lathe._ensure_interpreter_context(tools.valves, "sb", client, tools._interpreter_state, "a")
+        first = asyncio.create_task(resolve())
+        await entered.wait()
+        second = asyncio.create_task(resolve())
+        await asyncio.sleep(0)
+        release.set()
+        assert await asyncio.gather(first, second) == [("shared", False)] * 2
+        tools._chat_state["a"] = {"init": True, "pending": []}
+        for index in range(tools._chat_state.maxsize):
+            tools._chat_state[str(index)] = {"init": True, "pending": []}
+        assert "a" not in tools._chat_state
+        tools._chat_state["a"] = {"init": True, "pending": []}
+        assert await resolve() == ("shared", False)
+    assert len(posts) == 1
+
+
+async def test_interpreter_sandbox_replacement_and_failed_creation(tools, transport):
+    tools._interpreter_state["a"] = {"id": "old", "sandbox_id": "old-sb", "lock": asyncio.Lock()}
+    fail = True
+    def handler(request):
+        assert (request.method, request.url.path) == ("POST", "/new-sb/process/interpreter/context")
+        return httpx.Response(503) if fail else httpx.Response(200, json={"id": "new"})
+    async with httpx.AsyncClient(transport=transport(handler)) as client:
+        with pytest.raises(httpx.HTTPStatusError):
+            await lathe._ensure_interpreter_context(tools.valves, "new-sb", client, tools._interpreter_state, "a")
+        assert tools._interpreter_state["a"]["id"] == "old"
+        fail = False
+        assert await lathe._ensure_interpreter_context(tools.valves, "new-sb", client, tools._interpreter_state, "a") == ("new", True)
+
+
+async def test_interpreter_parent_delegate_share_identity(tools, sandbox, http, monkeypatch):
+    import httpx_ws
+    executions = []
+    posts = []
+    def handler(request):
+        assert request.url.path == "/sb/process/interpreter/context"
+        if request.method == "POST":
+            posts.append(request)
+            return httpx.Response(200, json={"id": "shared"})
+        assert request.method == "GET"
+        return httpx.Response(200, json={"contexts": [{"id": "shared"}]})
+    http(handler)
+    class Socket:
+        async def send_json(self, message):
+            executions.append(message)
+        async def receive_json(self):
+            raise httpx_ws.WebSocketDisconnect(1000)
+    @asynccontextmanager
+    async def connect(*args, **kwargs):
+        yield Socket()
+    monkeypatch.setattr(httpx_ws, "aconnect_ws", connect)
+    assert await tools.interpret("x = 1", __chat_id__="a", __user__=USER) == "(no output)"
+    tools._chat_state.clear()  # Delegate availability does not depend on notices.
+    async with lathe.httpx.AsyncClient() as client:
+        delegates = lathe._build_delegate_tools(
+            tools.valves, "sb", client, [], chat_state=tools._chat_state,
+            chat_id="a", interpreter_state=tools._interpreter_state)
+        interpret = next(tool for tool in delegates if tool.name == "interpret")
+        assert await interpret.function(code="x += 1") == "(no output)"
+    assert [call["contextId"] for call in executions] == ["shared", "shared"]
+    assert len(posts) == 1
+
+
+async def test_interpreter_conversations_are_isolated_and_require_identity(tools, transport):
+    created = []
+    def handler(request):
+        assert request.method == "POST"
+        context_id = f"context-{len(created)}"
+        created.append(context_id)
+        return httpx.Response(200, json={"id": context_id})
+    async with httpx.AsyncClient(transport=transport(handler)) as client:
+        with pytest.raises(ValueError, match="conversation ID"):
+            await lathe._ensure_interpreter_context(tools.valves, "sb", client, tools._interpreter_state, "")
+        for chat_id, expected in [("a", "context-0"), ("b", "context-1")]:
+            assert await lathe._ensure_interpreter_context(tools.valves, "sb", client, tools._interpreter_state, chat_id) == (expected, False)
+    assert created == ["context-0", "context-1"]
 
 
 async def test_background_bash_poll_delivers_once(tools, sandbox, http, clock):
