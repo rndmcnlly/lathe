@@ -152,7 +152,11 @@ async def _tool_context(emitter, fn):
         return f"Error: {e}"
     except httpx.HTTPStatusError as e:
         await _emit(emitter, f"API error: HTTP {e.response.status_code}", done=True)
-        return f"API error: HTTP {e.response.status_code} — {e.response.text[:500]}"
+        try:
+            detail = e.response.text[:500]
+        except httpx.ResponseNotRead:
+            detail = "(streamed error body not buffered)"
+        return f"API error: HTTP {e.response.status_code}: {detail}"
     except Exception as e:
         await _emit(emitter, f"Error: {e}", done=True)
         return f"Error: {e}"
@@ -163,7 +167,7 @@ def _prepend_harness_messages(result: str, messages: list[str]) -> str:
 
     Harness messages are things the infrastructure decides to push to the
     agent alongside the tool's own output: sandbox lifecycle warnings,
-    auto-init snapshots, and (future) background job completion notices.
+    auto-init snapshots, and background job completion notices.
     Each message is separated by a blank line for readability.
     """
     if not messages:
@@ -174,11 +178,7 @@ def _prepend_harness_messages(result: str, messages: list[str]) -> str:
 
 def _drain_harness_messages(chat_state: LRUCache, chat_id: str | None,
                             warning: str | None) -> list[str]:
-    """Collect pending harness messages and the sandbox lifecycle warning.
-
-    Runs after every tool call, making it a natural hook for future
-    trace accumulation (#54).
-    """
+    """Collect pending harness messages and the sandbox lifecycle warning."""
     messages: list[str] = []
     if warning:
         messages.append(warning)
@@ -214,12 +214,14 @@ def _format_bg_bash_notice(cmd_id: str, exit_code: int | None,
         f"[Background job completed: CMD-{cmd_id}]",
         f"Exit code: {ec_str} (took {elapsed}s)",
     ]
-    tail = tail.strip()
+    tail = tail.encode("utf-8")[-2048:].decode("utf-8", errors="ignore").strip()
     if tail:
         lines.append("Last lines of output:")
         lines.extend(f"  {tl}" for tl in tail.splitlines()[-5:])
     else:
         lines.append("(no output)")
+    lines.append(f"Full output: {_bash_sidecar_dir(cmd_id)}/log; exit: {_bash_sidecar_dir(cmd_id)}/exit")
+    lines.append("Retained for 24 hours after completion (sandbox stop/restart clears it).")
     return "\n".join(lines)
 
 
@@ -227,6 +229,7 @@ def _format_bg_delegate_notice(delegate_id: str, elapsed: int,
                                step_count: int, tool_calls: int,
                                result_preview: str, error: str | None) -> str:
     if error:
+        error = error.encode("utf-8")[:2048].decode("utf-8", errors="ignore")
         lines = [
             f"[Background delegation failed: DELEGATE-{delegate_id}]",
             f"Failed after {elapsed}s: {error}",
@@ -236,12 +239,13 @@ def _format_bg_delegate_notice(delegate_id: str, elapsed: int,
             f"[Background delegation completed: DELEGATE-{delegate_id}]",
             f"{step_count} step(s), {tool_calls} tool call(s) (took {elapsed}s)",
         ]
-        preview = result_preview.strip()
+        preview = result_preview.encode("utf-8")[-2048:].decode("utf-8", errors="ignore").strip()
         if preview:
             lines.append("Result preview:")
             lines.extend(f"  {pl}" for pl in preview.splitlines()[-10:])
         else:
             lines.append("(no result text)")
+    lines.append(f"Result/evidence files: {_delegate_sidecar_dir(delegate_id)}/{{result,error,usage,log}} (failed writes may be unavailable).")
     return "\n".join(lines)
 
 
@@ -569,6 +573,9 @@ def _truncate_tail(text: str) -> tuple[str, bool, dict]:
         line_bytes = len(line.encode("utf-8")) + (1 if kept else 0)  # +1 for \n joiner
         if kept_bytes + line_bytes > _MAX_BYTES:
             truncated_by = "bytes"
+            room = _MAX_BYTES - kept_bytes - (1 if kept else 0)
+            if room > 0:
+                kept.append(line.encode("utf-8")[-room:].decode("utf-8", errors="ignore"))
             break
         kept.append(line)
         kept_bytes += line_bytes
@@ -724,18 +731,6 @@ def _prepare_globs(base, globs):
     return prepared
 
 
-def _is_excluded(filepath, negative_globs):
-    for root, pattern in negative_globs:
-        try:
-            rel = os.path.relpath(filepath, root)
-        except ValueError:
-            continue
-        if rel != os.pardir and not rel.startswith(os.pardir + os.sep):
-            if _glob_matches(rel, pattern):
-                return True
-    return False
-
-
 def _matches_any(filepath, globs):
     for root, pattern in globs:
         rel = os.path.relpath(filepath, root)
@@ -773,11 +768,15 @@ def _iter_matching_files(base, positive, negative):
             max_depth = max(max_depth, root_depth + len(parts))
         for filepath in _iter_tree_files(root, max_depth):
             if (_matches_any(filepath, positive_globs)
-                    and not _is_excluded(filepath, negative_globs)):
+                    and not _matches_any(filepath, negative_globs)):
                 yield filepath
 '''
 
-# ── hierarchical glob (runs on sandbox) ──────────────────────────────
+# ── bounded search results (runs on sandbox) ─────────────────────────
+# Scan the complete scope for exact counts, retaining only max_lines hits.
+# The header carries omissions, leaving even a one-line budget useful.
+# Traversal order is filesystem-dependent; sorting only the retained sample
+# must not be mistaken for a globally sorted prefix or representative sample.
 
 _GLOB_MAX_LINES = 100
 
@@ -798,173 +797,22 @@ def glob_hierarchy(base_dir, pattern, max_lines):
 
     matches = []
     match_count = 0
-    common_path = None
     for filepath in _iter_matching_files(base, positive, negative):
         match_count += 1
-        common_path = filepath if common_path is None else os.path.commonpath((common_path, filepath))
         if len(matches) < max_lines:
             matches.append(filepath)
 
     if match_count == 0:
         return f"0 matches for {pattern!r} in {base}"
 
-    # Detailed paths cannot fit in the output budget, so retaining a full trie
-    # would only consume memory for information the caller cannot receive.
-    if match_count > max_lines:
-        effective_base = common_path
-        if not os.path.isdir(effective_base):
-            effective_base = os.path.dirname(effective_base)
-        header = (
-            f"{match_count} matches for {pattern!r} in {effective_base} "
-            f"(budget: {max_lines} lines, some directories collapsed)"
-        )
-        return header + f"\n{effective_base}/ ({match_count} matches)"
-
-    matches.sort()
-
-    # ── Compute effective base for trie rendering ────────────────
-    # When all results are under the workspace, effective_base == base.
-    # When results span other directories, effective_base is their
-    # longest common directory prefix, so the trie stays coherent.
-    if all(m.startswith(str(base) + os.sep) for m in matches):
-        effective_base = str(base)
-    else:
-        effective_base = os.path.commonpath(matches)
-        # commonpath may return a file prefix — ensure it's a directory
-        if not os.path.isdir(effective_base):
-            effective_base = os.path.dirname(effective_base)
-
-    # ── Build trie ───────────────────────────────────────────────
-    root = {"children": {}, "files": [], "count": 0, "path": effective_base}
-
-    for filepath in matches:
-        rel = os.path.relpath(filepath, effective_base)
-        parts = rel.split(os.sep)
-        node = root
-        node["count"] += 1
-        for part in parts[:-1]:
-            if part not in node["children"]:
-                node["children"][part] = {
-                    "children": {},
-                    "files": [],
-                    "count": 0,
-                    "path": os.path.join(node["path"], part),
-                }
-            node = node["children"][part]
-            node["count"] += 1
-        node["files"].append(filepath)
-
-    # ── Budget-driven expansion ──────────────────────────────────
-    expanded = {id(root)}
-    partial_limit = {}
-
-    def _ordered_children(node):
-        items = []
-        for name in sorted(node["children"],
-                           key=lambda n: node["children"][n]["count"],
-                           reverse=True):
-            items.append(("dir", node["children"][name]))
-        for f in sorted(node["files"]):
-            items.append(("file", f))
-        return items
-
-    def _count_lines(node):
-        if id(node) not in expanded:
-            return 1
-        limit = partial_limit.get(id(node))
-        if limit is not None:
-            items = _ordered_children(node)
-            if limit < len(items):
-                total = 1  # the "... and N more" line
-                for kind, item in items[:limit]:
-                    total += 1 if kind == "file" else _count_lines(item)
-                return total
-        total = len(node["files"])
-        for child in node["children"].values():
-            total += _count_lines(child)
-        return total
-
-    def _collapsible(node):
-        if id(node) not in expanded:
-            yield (node["count"], node)
-            return
-        for child in node["children"].values():
-            yield from _collapsible(child)
-
-    current_lines = _count_lines(root)
-
-    while current_lines < max_lines:
-        candidates = list(_collapsible(root))
-        if not candidates:
-            break
-
-        candidates.sort(key=lambda x: x[0], reverse=True)
-        best_count, best_node = candidates[0]
-        n_children = len(best_node["files"]) + len(best_node["children"])
-
-        if n_children <= 1:
-            expanded.add(id(best_node))
-            current_lines = _count_lines(root)
-            continue
-
-        net_cost = n_children - 1
-        if current_lines + net_cost <= max_lines:
-            expanded.add(id(best_node))
-            current_lines = _count_lines(root)
-            continue
-
-        # Partial expansion
-        budget_for_children = max_lines - current_lines
-        if budget_for_children < 2:
-            break
-        expanded.add(id(best_node))
-        partial_limit[id(best_node)] = budget_for_children
-        current_lines = _count_lines(root)
-        break
-
-    # ── Render ───────────────────────────────────────────────────
-    output = []
-
-    def render(node):
-        if id(node) not in expanded:
-            output.append(f"{node['path']}/ ({node['count']} matches)")
-            return
-
-        items = _ordered_children(node)
-        limit = partial_limit.get(id(node))
-
-        if limit is not None and limit < len(items):
-            shown = items[:limit]
-            hidden_count = sum(
-                1 if k == "file" else item["count"]
-                for k, item in items[limit:]
-            )
-            for kind, item in shown:
-                if kind == "file":
-                    output.append(item)
-                else:
-                    render(item)
-            output.append(
-                f"{node['path']}/ ... and {hidden_count} more matches"
-            )
-        else:
-            for f in sorted(node["files"]):
-                output.append(f)
-            for name in sorted(node["children"]):
-                render(node["children"][name])
-
-    render(root)
-
-    header = f"{len(matches)} matches for {pattern!r} in {effective_base}"
-    has_collapsed = bool(list(_collapsible(root))) or bool(partial_limit)
-    if has_collapsed:
-        header += f" (budget: {max_lines} lines, some directories collapsed)"
-
-    return header + "\n" + "\n".join(output)
+    header = f"{match_count} matches for {pattern!r} (base: {base})"
+    if match_count > len(matches):
+        header += f"; showing {len(matches)}, {match_count - len(matches)} omitted (traversal-order sample)"
+    return header + "\n" + "\n".join(sorted(matches))
 '''
 
 
-# ── hierarchical grep (runs on sandbox) ──────────────────────────────
+# ── grep (runs on sandbox) ───────────────────────────────────────────
 
 _GREP_MAX_LINES = 100
 
@@ -992,246 +840,52 @@ def grep_hierarchy(base_dir, regex, files_pattern, max_lines):
     if not positive:
         return f"Error: files pattern must include at least one positive glob (got {files_pattern!r})"
 
-    # ── Scan files for matches ───────────────────────────────────
-    file_matches = {}
+    # Retain a single bounded list, not max_lines hits for every file.
+    hits = []
     files_scanned = 0
     matched_files = 0
-    matched_common_path = None
-    fully_collapsed = False
     total_matches = 0
+    skipped_files = 0
 
     for filepath in _iter_matching_files(base, positive, negative):
         files_scanned += 1
+        previous_counts = total_matches, matched_files, len(hits)
         try:
             with open(filepath, "rb") as raw:
                 header = raw.read(8192)
             if b"\0" in header:
+                skipped_files += 1
                 continue
             with open(filepath, "r", errors="replace") as f:
-                hits = []
-                hit_count = 0
+                file_matched = False
                 for i, line in enumerate(f, 1):
                     if pat.search(line):
-                        hit_count += 1
+                        total_matches += 1
+                        if not file_matched:
+                            matched_files += 1
+                            file_matched = True
                         if len(hits) < max_lines:
                             text = line.rstrip("\n\r")
                             if len(text) > _MAX_LINE_WIDTH:
                                 text = text[:_MAX_LINE_WIDTH] + "..."
-                            hits.append((i, text))
-            if hit_count:
-                matched_files += 1
-                matched_common_path = (
-                    filepath if matched_common_path is None
-                    else os.path.commonpath((matched_common_path, filepath))
-                )
-                total_matches += hit_count
-                if not fully_collapsed and len(file_matches) < max_lines:
-                    file_matches[filepath] = {"hits": hits, "count": hit_count}
-                else:
-                    # Once matching files exceed the output budget, no detailed
-                    # trie can be rendered. Keep exact aggregates only.
-                    fully_collapsed = True
-                    file_matches.clear()
+                            hits.append((filepath, i, text))
         except (OSError, UnicodeDecodeError):
+            total_matches, matched_files, previous_hits = previous_counts
+            del hits[previous_hits:]
+            skipped_files += 1
             continue
 
     if files_scanned == 0:
         return f"0 files match {files_pattern!r} in {base}"
 
-    if matched_files == 0:
-        return f"0 matches for {regex!r} in {files_scanned} files"
-
-    if fully_collapsed:
-        effective_base = matched_common_path
-        if not os.path.isdir(effective_base):
-            effective_base = os.path.dirname(effective_base)
-        header = (
-            f"{total_matches} matches across {matched_files} files for {regex!r} "
-            f"(budget: {max_lines} lines, some entries collapsed)"
-        )
-        files_label = "file" if matched_files == 1 else "files"
-        return header + f"\n{effective_base}/ ({total_matches} matches in {matched_files} {files_label})"
-
-    # ── Compute effective base for trie rendering ────────────────
-    matched_paths = list(file_matches.keys())
-    if all(m.startswith(str(base) + os.sep) for m in matched_paths):
-        effective_base = str(base)
-    else:
-        effective_base = os.path.commonpath(matched_paths)
-        if not os.path.isdir(effective_base):
-            effective_base = os.path.dirname(effective_base)
-
-    # ── Build trie of files with matches ─────────────────────────
-    root = {
-        "children": {}, "files": {}, "path": effective_base,
-        "n_files": 0, "n_matches": 0,
-    }
-
-    for filepath, match_data in sorted(file_matches.items()):
-        hit_count = match_data["count"]
-        rel = os.path.relpath(filepath, effective_base)
-        parts = rel.split(os.sep)
-        node = root
-        node["n_files"] += 1
-        node["n_matches"] += hit_count
-
-        for part in parts[:-1]:
-            if part not in node["children"]:
-                node["children"][part] = {
-                    "children": {}, "files": {}, "n_files": 0, "n_matches": 0,
-                    "path": os.path.join(node["path"], part),
-                }
-            node = node["children"][part]
-            node["n_files"] += 1
-            node["n_matches"] += hit_count
-
-        node["files"][filepath] = match_data
-
-    # ── Two-level budget-driven expansion ────────────────────────
-    dir_expanded = {id(root)}
-    file_expanded = set()
-    file_partial = {}
-
-    def _count_lines(node):
-        if id(node) not in dir_expanded:
-            return 1
-        total = 0
-        for fp, match_data in node["files"].items():
-            hit_count = match_data["count"]
-            if fp in file_expanded:
-                limit = file_partial.get(fp)
-                if limit is not None and limit < hit_count:
-                    total += limit + 1
-                else:
-                    total += hit_count
-            else:
-                total += 1
-        for child in node["children"].values():
-            total += _count_lines(child)
-        return total
-
-    def _dir_candidates(node):
-        if id(node) not in dir_expanded:
-            yield (node["n_matches"], "dir", node)
-            return
-        for child in node["children"].values():
-            yield from _dir_candidates(child)
-
-    def _file_candidates(node):
-        if id(node) not in dir_expanded:
-            return
-        for fp, match_data in node["files"].items():
-            if fp not in file_expanded:
-                yield (match_data["count"], "file", fp, match_data)
-        for child in node["children"].values():
-            yield from _file_candidates(child)
-
-    current_lines = _count_lines(root)
-
-    while current_lines < max_lines:
-        dir_cands = list(_dir_candidates(root))
-        file_cands = list(_file_candidates(root))
-
-        if not dir_cands and not file_cands:
-            break
-
-        best_dir = max(dir_cands, key=lambda x: x[0]) if dir_cands else None
-        best_file = max(file_cands, key=lambda x: x[0]) if file_cands else None
-
-        best_type = None
-        if best_dir and best_file:
-            best_type = "dir" if best_dir[0] >= best_file[0] else "file"
-        elif best_dir:
-            best_type = "dir"
-        else:
-            best_type = "file"
-
-        if best_type == "dir":
-            _, _, node = best_dir
-            n_items = len(node["files"]) + len(node["children"])
-
-            if n_items <= 1:
-                dir_expanded.add(id(node))
-                current_lines = _count_lines(root)
-                continue
-
-            net_cost = n_items - 1
-            if current_lines + net_cost <= max_lines:
-                dir_expanded.add(id(node))
-                current_lines = _count_lines(root)
-                continue
-
-            if best_file:
-                best_type = "file"
-            else:
-                break
-
-        if best_type == "file":
-            _, _, fp, match_data = best_file
-            n_hits = match_data["count"]
-
-            if n_hits <= 1:
-                file_expanded.add(fp)
-                current_lines = _count_lines(root)
-                continue
-
-            net_cost = n_hits - 1
-            if current_lines + net_cost <= max_lines:
-                file_expanded.add(fp)
-                current_lines = _count_lines(root)
-                continue
-
-            budget_remaining = max_lines - current_lines
-            if budget_remaining < 2:
-                break
-            file_expanded.add(fp)
-            file_partial[fp] = budget_remaining
-            current_lines = _count_lines(root)
-            break
-
-    # ── Render ───────────────────────────────────────────────────
-    output = []
-
-    def render(node):
-        if id(node) not in dir_expanded:
-            if node["n_files"] == 1:
-                output.append(f"{node['path']}/ ({node['n_matches']} matches in 1 file)")
-            else:
-                output.append(f"{node['path']}/ ({node['n_matches']} matches in {node['n_files']} files)")
-            return
-
-        for fp in sorted(node["files"]):
-            match_data = node["files"][fp]
-            hits = match_data["hits"]
-            hit_count = match_data["count"]
-            if fp not in file_expanded:
-                output.append(f"{fp} ({hit_count} matches)")
-                continue
-            limit = file_partial.get(fp)
-            if limit is not None and limit < hit_count:
-                for line_num, text in hits[:limit]:
-                    output.append(f"{fp}:{line_num}: {text}")
-                output.append(f"{fp}: ... and {hit_count - limit} more matches")
-            else:
-                for line_num, text in hits:
-                    output.append(f"{fp}:{line_num}: {text}")
-
-        for name in sorted(node["children"]):
-            render(node["children"][name])
-
-    render(root)
-
-    n_files = len(file_matches)
-    header = f"{total_matches} matches across {n_files} files for {regex!r}"
-    has_collapsed = (
-        any(True for _ in _dir_candidates(root))
-        or any(True for _ in _file_candidates(root))
-        or bool(file_partial)
-    )
-    if has_collapsed:
-        header += f" (budget: {max_lines} lines, some entries collapsed)"
-
-    return header + "\n" + "\n".join(output)
+    header = f"{total_matches} matches across {matched_files} files for {regex!r}"
+    header += f"; searched {files_scanned - skipped_files} readable files (scope: {files_pattern!r}, base: {base})"
+    if total_matches > len(hits):
+        header += f"; showing {len(hits)}, {total_matches - len(hits)} omitted (traversal-order sample)"
+    if skipped_files:
+        header += f"; {skipped_files} binary or unreadable files skipped (counts cover readable text only)"
+    output = [f"{filepath}:{line_num}: {text}" for filepath, line_num, text in sorted(hits)]
+    return header + ("\n" + "\n".join(output) if output else "")
 '''
 
 
@@ -1259,61 +913,63 @@ def read_file(path, start, stop):
     if not os.path.exists(path):
         return f"Error: File not found: {path}"
 
-    # Negative endpoints need the final line count before their indices can be
-    # resolved. Preserve their existing behavior; positive ranges retain only
-    # the requested (capped) lines while streaming the file.
-    if start < 0 or stop < 0:
-        try:
-            with open(path, "r", errors="replace") as f:
-                content = f.read()
-        except OSError as e:
-            return f"Error: Cannot read {path}: {e}"
-
-        lines = content.split("\n")
-        if lines and lines[-1] == "":
-            lines = lines[:-1]
-        total_lines = len(lines)
-
+    # Count in fixed-size chunks, including files consisting of one huge line.
+    # A second bounded scan preserves negative indexing without loading the file.
+    cap = 50 * 1024
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            total_lines = 0
+            last = ""
+            while True:
+                chunk = f.read(8192)
+                if not chunk:
+                    break
+                total_lines += chunk.count("\n")
+                last = chunk[-1:]
+            total_lines += int(bool(last) and last != "\n")
         start_idx = max(0, total_lines + start) if start < 0 else max(0, start - 1)
-        if stop < 0:
-            end_idx = max(0, total_lines + stop)
-        elif stop > 0:
-            end_idx = stop - 1
-        else:
-            end_idx = total_lines
-        start_idx = max(0, min(start_idx, total_lines))
-        end_idx = max(start_idx, min(end_idx, total_lines))
-        end_idx = min(end_idx, start_idx + 2000)
-        selected = lines[start_idx:end_idx]
-    else:
-        start_idx = max(0, start - 1) if start else 0
-        requested_end = stop - 1 if stop else None
-        selected = []
-        total_lines = 0
-        try:
-            with open(path, "r", errors="replace") as f:
-                for line_idx, line in enumerate(f):
-                    total_lines = line_idx + 1
-                    if (line_idx >= start_idx
-                            and (requested_end is None or line_idx < requested_end)
-                            and len(selected) < 2000):
-                        selected.append(line[:-1] if line.endswith("\n") else line)
-        except OSError as e:
-            return f"Error: Cannot read {path}: {e}"
+        end_idx = total_lines + stop if stop < 0 else (stop - 1 if stop else total_lines)
         start_idx = min(start_idx, total_lines)
-        if requested_end is None:
-            end_idx = min(total_lines, start_idx + 2000)
-        else:
-            end_idx = max(start_idx, min(requested_end, total_lines, start_idx + 2000))
-
-    numbered = "\n".join(
-        f"{start_idx + i + 1}: {line}"
-        for i, line in enumerate(selected)
-    )
+        end_idx = max(start_idx, min(end_idx, total_lines, start_idx + 2000))
+        selected = bytearray()
+        line_idx = 0
+        clipped = False
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            while line_idx < end_idx and not clipped:
+                chunk = f.read(8192)
+                if not chunk:
+                    break
+                parts = chunk.split("\n")
+                for index, part in enumerate(parts):
+                    if line_idx >= end_idx:
+                        break
+                    terminated = index < len(parts) - 1
+                    if line_idx >= start_idx:
+                        raw_part = (part + ("\n" if terminated else "")).encode("utf-8")
+                        room = cap - len(selected)
+                        selected.extend(raw_part[:room])
+                        if len(raw_part) > room:
+                            clipped = True
+                            break
+                    if terminated:
+                        line_idx += 1
+        lines = selected.decode("utf-8", errors="replace").split("\n")
+        if lines and lines[-1] == "":
+            lines.pop()
+        numbered = "\n".join(f"{start_idx + i + 1}: {line}" for i, line in enumerate(lines))
+        # Line prefixes also count toward the preview budget.
+        raw = numbered.encode("utf-8")
+        clipped = clipped or len(raw) > cap
+        numbered = raw[:cap].decode("utf-8", errors="ignore")
+    except OSError as e:
+        return f"Error: Cannot read {path}: {e}"
     header = f"File: {path} ({total_lines} lines total)"
-    if start_idx > 0 or end_idx < total_lines:
+    if clipped:
+        header += f", requested lines {start_idx + 1}-{end_idx} (preview clipped)"
+    elif start_idx > 0 or end_idx < total_lines:
         header += f", showing lines {start_idx + 1}-{end_idx}"
-    return f"{header}\n{numbered}"
+    notice = f"\n[Text preview truncated at 50 KiB. Full file: {path}; use bash byte ranges or expose() for full access.]" if clipped else ""
+    return f"{header}\n{numbered}{notice}"
 '''
 
 
@@ -1433,22 +1089,39 @@ async def _upload_file(valves, sandbox_id: str, client: httpx.AsyncClient,
     resp.raise_for_status()
 
 
+class _ToolFailure(RuntimeError):
+    """An operation failed, rather than returning successful text containing an error."""
+
+
+def _checked_result(result: str) -> str:
+    # Legacy sandbox scripts have a reserved error prefix. Normalize it once at
+    # the internal boundary; user-facing wrappers and delegate tools render prose.
+    if result.startswith("Error:"):
+        raise _ToolFailure(result.removeprefix("Error:").strip())
+    return result
+
+
 async def _download_file(valves, sandbox_id: str, client: httpx.AsyncClient,
-                         path: str) -> str:
+                         path: str, *, max_bytes: int = _MAX_BYTES) -> str:
     """Download a file from the sandbox. Returns file content as text.
 
     Returns None if the file does not exist (404). Raises on other errors.
     """
-    resp = await client.get(
+    async with client.stream("GET",
         _toolbox(valves, sandbox_id, "/files/download"),
         params={"path": path},
         headers=_headers(valves),
         timeout=60.0,
-    )
-    if resp.status_code == 404:
-        return None
-    resp.raise_for_status()
-    return resp.text
+    ) as resp:
+        if resp.status_code == 404:
+            return None
+        resp.raise_for_status()
+        content = bytearray()
+        async for chunk in resp.aiter_bytes(chunk_size=8192):
+            if len(content) + len(chunk) > max_bytes:
+                raise _ToolFailure(f"File exceeds {max_bytes} byte text limit: {path}. Use read() for an explicit preview or prepare a smaller reference file.")
+            content.extend(chunk)
+        return content.decode("utf-8", errors="replace")
 
 
 async def _run_sandbox_script(valves, sandbox_id: str, client: httpx.AsyncClient,
@@ -1458,8 +1131,8 @@ async def _run_sandbox_script(valves, sandbox_id: str, client: httpx.AsyncClient
     """Execute a Python script on the sandbox and return its stdout.
 
     For short scripts, passes the script inline via ``python3 -c``.
-    Returns the script's stdout on success. On non-zero exit, returns
-    an error string prefixed with *error_prefix*.
+    Returns the script's stdout on success. Non-zero exit and the reserved
+    script error prefix raise _ToolFailure, rendered only at user boundaries.
     """
     resp = await client.post(
         _toolbox(valves, sandbox_id, "/process/execute"),
@@ -1475,8 +1148,8 @@ async def _run_sandbox_script(valves, sandbox_id: str, client: httpx.AsyncClient
     result = data.get("result", "")
     exit_code = data.get("exitCode", -1)
     if exit_code != 0:
-        return f"Error: {error_prefix} (exit {exit_code}).\n{result[:500]}"
-    return result
+        raise _ToolFailure(f"{error_prefix} (exit {exit_code}).\n{result[:500]}")
+    return _checked_result(result)
 
 
 # ── shared tool cores ───────────────────────────────────────────────
@@ -1576,7 +1249,7 @@ def _check_tool_params(kwargs: dict, annotated_fn) -> str | None:
 # method signature.
 _CORE_INFRA_PARAMS = frozenset({
     "valves", "sandbox_id", "client", "emit", "user_pairs",
-    "on_background", "chat_state", "chat_id",
+    "on_background", "chat_state", "chat_id", "interpreter_state",
 })
 
 
@@ -1603,7 +1276,7 @@ def _standard_tool(core_fn, *, emit_start: str, emit_done: str,
         emit_done: Status message emitted after the core returns.
         extra_core_kwargs: Optional callable(self, sandbox_id, __chat_id__)
             returning a dict of extra kwargs to pass to the core function
-            (e.g. chat_state and chat_id for interpret).
+            (e.g. interpreter_state and chat_id for interpret).
     """
     # ── Extract tool-visible parameters from the core function ───────
     core_sig = inspect.signature(core_fn)
@@ -1693,6 +1366,10 @@ def _standard_tool(core_fn, *, emit_start: str, emit_done: str,
             result = await core_fn(
                 self.valves, sandbox_id, client, **call_kwargs,
             )
+            # Interpreter output is arbitrary user stdout, not error-protocol
+            # text. Its failures already raise _ToolFailure.
+            if core_fn is not _core_interpret:
+                result = _checked_result(result)
 
             await _emit(__event_emitter__, emit_done, done=True)
             messages = _drain_harness_messages(
@@ -1724,7 +1401,9 @@ def _standard_tool(core_fn, *, emit_start: str, emit_done: str,
 
 async def _core_read(valves, sandbox_id: str, client: httpx.AsyncClient, *,
                      path: str, start: int = 1, stop: int = 0) -> str:
-    """Read a file from the sandbox. Returns numbered lines.
+    """Read a file from the sandbox. Returns numbered lines, capped at 2000 lines
+    and 50 KiB of text. A clipped preview is explicitly labeled; the original
+    file remains available via bash byte ranges or expose().
     Supports Python-style negative indexing: start=-10 reads from
     10 lines before the end, stop=-3 stops 3 lines before the end.
     All positive values are 1-indexed. stop is exclusive (half-open).
@@ -1796,12 +1475,13 @@ async def _core_edit(valves, sandbox_id: str, client: httpx.AsyncClient, *,
 async def _core_glob(valves, sandbox_id: str, client: httpx.AsyncClient, *,
                      pattern: str, max_lines: int = _GLOB_MAX_LINES) -> str:
     """Search for files in the sandbox workspace by glob pattern.
-    Returns a hierarchical listing of matches with absolute paths.
-    Dense directories are collapsed with match counts; narrow the
-    pattern or increase max_lines to expand them.
+    Returns concrete absolute paths and an exact count of discovered files.
+    Scans the full scope, but retains at most max_lines paths. The header
+    reports omissions; narrow the pattern to see other files. Truncated
+    results are a traversal-order sample, not a globally sorted prefix.
 
     :param pattern: Comma-separated globs, !-prefix to exclude. Supports *, ?, character classes, and ** as a complete component for directory recursion; brace expansion is not supported. Examples: '**/*.py', 'src/**/*.ts,!**/node_modules/**'.
-    :param max_lines: Max output lines (default: 100).
+    :param max_lines: Max concrete result lines, excluding the summary header (default: 100, clamped to 1–500).
     """
     clamped = max(1, min(500, max_lines))
     base_dir = "/home/daytona/workspace"
@@ -1818,13 +1498,15 @@ async def _core_grep(valves, sandbox_id: str, client: httpx.AsyncClient, *,
                      pattern: str, files: str = "**/*",
                      max_lines: int = _GREP_MAX_LINES) -> str:
     """Search file contents in the sandbox workspace by regex.
-    Returns matches grouped by file with line numbers. Dense
-    directories and files are collapsed with match counts;
-    narrow the file scope or increase max_lines to expand them.
+    Returns concrete absolute path:line: text hits and counts of matching
+    lines and files. Scans the full scope, skipping binary/unreadable files,
+    but retains at most max_lines hits (text clipped to 200 characters).
+    The header reports omissions; narrow files or pattern to see other hits.
+    Truncated results are a traversal-order sample, not a representative one.
 
     :param pattern: Regex to search for (e.g. 'import.*asyncio', 'TODO|FIXME').
     :param files: File scope as comma-separated globs (default: '**/*'). !-prefix to exclude. Supports *, ?, character classes, and ** as a complete component for directory recursion; brace expansion is not supported.
-    :param max_lines: Max output lines (default: 100).
+    :param max_lines: Max concrete result lines, excluding the summary header (default: 100, clamped to 1–500).
     """
     clamped = max(1, min(500, max_lines))
     base_dir = "/home/daytona/workspace"
@@ -1846,11 +1528,11 @@ async def _core_grep(valves, sandbox_id: str, client: httpx.AsyncClient, *,
 # a user image message (convert_output_to_messages with
 # flatten_tool_images=True, the open-webui#27126-equivalent fix).
 #
-# Two hard requirements fall out of that convention:
+# Three hard requirements fall out of that convention:
 #   1. The result must START with the data URI.  Any prepended text (e.g.
 #      harness messages) breaks OWUI's startswith() detection, and the
 #      base64 lands in the model's text context instead.  The Tools
-#      wrapper uses defer_harness_messages=True for this reason.
+#      wrapper leaves harness messages queued for a later text result.
 #   2. On OWUI < 0.11.0 the current turn works but replayed history is
 #      NOT flattened — strict providers reject the conversation on later
 #      turns.  Only deploy with view() on OWUI >= 0.11.0.
@@ -1996,19 +1678,19 @@ def _build_bash_script(command: str, user_pairs: list[tuple[str, str]],
 
 
 _BASH_COMPLETION_LEASE_SECONDS = 960
+_BASH_RESULT_RETENTION_SECONDS = 24 * 60 * 60
 
 
 def _build_bash_reap_script(preserve_log_for: str | None = None,
                             release_lease_for: str | None = None,
                             proc_root: str = "/proc") -> str:
-    """Build the sandbox-side completed-command scrubber."""
+    """Release completed processes independently of the 24-hour result lease."""
     return textwrap.dedent(f"""\
         import os
         import time
 
         root = {_EPHEMERAL_ROOT + '/cmd'!r}
         proc_root = {proc_root!r}
-        preserve = {preserve_log_for!r}
         release = {release_lease_for!r}
         if os.path.isdir(root):
             for command_id in os.listdir(root):
@@ -2047,19 +1729,11 @@ def _build_bash_reap_script(preserve_log_for: str | None = None,
                             break
                     except (OSError, ValueError, IndexError):
                         pass
-                for name in ("sh", "pid", "exit"):
+                for name in ("sh", "pid"):
                     try:
                         os.unlink(os.path.join(command_dir, name))
                     except OSError:
                         pass
-                if command_id == preserve and os.path.isfile(os.path.join(command_dir, "log")):
-                    open(os.path.join(command_dir, "spill"), "a").close()
-                else:
-                    for name in ("log", "spill"):
-                        try:
-                            os.unlink(os.path.join(command_dir, name))
-                        except OSError:
-                            pass
                 if live:
                     print("retain " + command_id)
                 else:
@@ -2068,14 +1742,24 @@ def _build_bash_reap_script(preserve_log_for: str | None = None,
                     except OSError:
                         pass
                     open(os.path.join(command_dir, "reap"), "a").close()
-                    print("delete " + command_id)
+                    if not os.path.isfile(os.path.join(command_dir, "session_done")):
+                        print("delete " + command_id)
+                    try:
+                        evidence = os.path.join(command_dir, "exit")
+                        if not os.path.exists(evidence):
+                            evidence = os.path.join(command_dir, "reap")
+                        completed = os.path.getmtime(evidence)
+                        if time.time() - completed >= {_BASH_RESULT_RETENTION_SECONDS}:
+                            print("expire " + command_id)
+                    except OSError:
+                        pass
         """)
 
 
 async def _reap_bash_commands(valves, sandbox_id: str, client: httpx.AsyncClient,
                               preserve_log_for: str | None = None,
                               release_lease_for: str | None = None) -> None:
-    """Scrub completed sidecars and delete sessions with no live background jobs."""
+    """Delete completed sessions; expire result files only after their lease."""
     try:
         result = await _run_sandbox_script(
             valves, sandbox_id, client,
@@ -2085,19 +1769,27 @@ async def _reap_bash_commands(valves, sandbox_id: str, client: httpx.AsyncClient
         if result.startswith("Error:"):
             logger.warning("%s", result)
             return
+        cleaned = []
+        failed_cleanup = set()
         for line in result.splitlines():
             action, _, command_id = line.partition(" ")
-            if action != "delete" or not command_id:
+            if action not in ("delete", "expire") or not command_id:
                 continue
-            response = await client.delete(
-                _toolbox(valves, sandbox_id, f"/process/session/lathe-cmd-{command_id}"),
-                headers=_headers(valves), timeout=30.0,
-            )
-            if response.status_code not in (204, 404):
-                logger.warning("bash cleanup: session %s returned HTTP %s",
-                               command_id, response.status_code)
-                continue
-            if command_id != preserve_log_for:
+            if action == "delete":
+                response = await client.delete(
+                    _toolbox(valves, sandbox_id, f"/process/session/lathe-cmd-{command_id}"),
+                    headers=_headers(valves), timeout=30.0,
+                )
+                if response.status_code not in (204, 404):
+                    logger.warning("bash cleanup: session %s returned HTTP %s",
+                                   command_id, response.status_code)
+                    failed_cleanup.add(command_id)
+                else:
+                    cleaned.append(command_id)
+            else:
+                if command_id in failed_cleanup:
+                    # Keep the retry record until session release succeeds.
+                    continue
                 response = await client.delete(
                     _toolbox(valves, sandbox_id, "/files/"),
                     params={"path": _bash_sidecar_dir(command_id), "recursive": "true"},
@@ -2106,6 +1798,15 @@ async def _reap_bash_commands(valves, sandbox_id: str, client: httpx.AsyncClient
                 if response.status_code not in (204, 404):
                     logger.warning("bash cleanup: sidecar %s returned HTTP %s",
                                    command_id, response.status_code)
+        if cleaned:
+            # A successful session release is recorded separately from evidence
+            # expiry, avoiding repeated HTTP deletes for every retained result.
+            script = f"import os\nroot={_EPHEMERAL_ROOT + '/cmd'!r}\n"
+            script += f"for command_id in {cleaned!r}:\n"
+            script += "    path = os.path.join(root, command_id, 'session_done')\n"
+            script += "    if os.path.isdir(os.path.dirname(path)):\n        open(path, 'a').close()\n"
+            await _run_sandbox_script(valves, sandbox_id, client, script,
+                                      error_prefix="bash session cleanup marker failed")
     except Exception as exc:
         logger.warning("bash cleanup failed: %s", exc)
 
@@ -2177,6 +1878,35 @@ def _format_bash_result(output: str, exit_code: int | None,
     return output
 
 
+async def _bash_log_preview(valves, sandbox_id, client, log_path, *, allow_missing=False):
+    """Acquire only a bounded tail over HTTP, leaving the full log on disk."""
+    script = textwrap.dedent(f"""\
+        import json, os
+        path = {log_path!r}
+        if {allow_missing!r} and not os.path.exists(path):
+            print(json.dumps({{'text': '', 'size': 0}}))
+            raise SystemExit(0)
+        with open(path, 'rb') as f:
+            size = os.fstat(f.fileno()).st_size
+            f.seek(max(0, size - {_MAX_BYTES}))
+            data = f.read({_MAX_BYTES})
+        print(json.dumps({{'text': data.decode('utf-8', errors='replace'), 'size': size}}))
+        """)
+    data = json.loads(await _run_sandbox_script(
+        valves, sandbox_id, client, script, error_prefix=f"bash log preview failed; full log: {log_path}",
+    ))
+    # Replacement decoding can expand invalid UTF-8, so bound the decoded text too.
+    decoded_bytes = data["text"].encode("utf-8")
+    text = decoded_bytes[-_MAX_BYTES:].decode("utf-8", errors="ignore")
+    output, truncated, meta = _truncate_tail(text)
+    if data["size"] > _MAX_BYTES or len(decoded_bytes) > _MAX_BYTES:
+        output += f"\n[Bounded tail preview, may begin mid-line. Full output ({_human_size(data['size'])}): {log_path}]"
+        # The fetched tail does not know the full file's line count. Its byte
+        # notice is authoritative; do not relabel tail-relative lines as global.
+        return output, False, {}
+    return output, truncated, meta
+
+
 async def _core_bash(valves, sandbox_id: str, client: httpx.AsyncClient, *,
                      command: str, workdir: str = "/home/daytona/workspace",
                      user_pairs: list[tuple[str, str]],
@@ -2186,7 +1916,9 @@ async def _core_bash(valves, sandbox_id: str, client: httpx.AsyncClient, *,
     """Execute a bash command in the sandbox. Non-interactive only.
     Commands that finish within the foreground window return output directly.
     Long-running commands auto-background and return a descriptor with log
-    file paths for monitoring.
+    file paths for monitoring. Text previews are capped at 50 KiB. Full logs and
+    exit status remain readable for 24 hours after completion, until a later
+    bash call reaps expired evidence. Sandbox stop/restart clears these files.
 
     When creating git commits, add an Assisted-by: Lathe trailer to the
     commit message to acknowledge AI assistance.
@@ -2297,14 +2029,14 @@ async def _core_bash(valves, sandbox_id: str, client: httpx.AsyncClient, *,
             last_status_at = now
 
     # ── Fetch logs ──────────────────────────────────────────────
-    logs_resp = await client.get(
-        _toolbox(valves, sandbox_id, f"/process/session/{session_id}/command/{session_cmd_id}/logs"),
-        headers=_headers(valves),
-        timeout=30.0,
-    )
-    result = logs_resp.text if logs_resp.status_code == 200 else ""
-
-    output, was_truncated, meta = _truncate_tail(result)
+    try:
+        output, was_truncated, meta = await _bash_log_preview(
+            valves, sandbox_id, client, log_path, allow_missing=not finished,
+        )
+    except Exception as exc:
+        logger.warning("bash preview unavailable: %s", exc)
+        output = f"[Preview unavailable. Full output: {log_path}; exit: {exit_path}]"
+        was_truncated, meta = False, {}
 
     if not finished:
         elapsed = int(time.time() - (deadline - fg_timeout))
@@ -2323,11 +2055,14 @@ async def _core_bash(valves, sandbox_id: str, client: httpx.AsyncClient, *,
         output, exit_code, was_truncated, meta,
         spill_path=spill_path,
     )
+    formatted += f"\n[Result files retained for 24 hours after completion: {log_path}, {exit_path}. Sandbox stop/restart clears them.]"
     await _reap_bash_commands(
         valves, sandbox_id, client,
         preserve_log_for=cmd_id if was_truncated else None,
         release_lease_for=cmd_id,
     )
+    if exit_code != 0:
+        raise _ToolFailure(formatted)
     return formatted
 
 
@@ -2384,16 +2119,12 @@ async def _poll_bg_bash(valves, sandbox_id: str, session_id: str,
             elapsed = int(time.time() - start_time)
             tail = ""
             try:
-                log_resp = await poll_client.get(
-                    _toolbox(valves, sandbox_id,
-                             f"/process/session/{session_id}/command/{session_cmd_id}/logs"),
-                    headers=_headers(valves),
-                    timeout=30.0,
+                tail, _, _ = await _bash_log_preview(
+                    valves, sandbox_id, poll_client, f"{_bash_sidecar_dir(cmd_id)}/log",
                 )
-                if log_resp.status_code == 200:
-                    tail = log_resp.text
             except Exception as e:
                 logger.debug("bg-poll: failed to fetch log tail: %s", e)
+                tail = "(Preview unavailable; use the full log path below.)"
 
             notice = _format_bg_bash_notice(cmd_id, exit_code, elapsed, tail)
             await _reap_bash_commands(
@@ -2409,9 +2140,9 @@ async def _poll_bg_bash(valves, sandbox_id: str, session_id: str,
 #
 # The Daytona toolbox exposes a persistent Python REPL via a WebSocket
 # endpoint.  Variables, imports, and definitions survive across calls
-# within the same "context".  We create one context per OWUI chat (keyed
-# by __chat_id__) and store its ID in _chat_state.  If the sandbox
-# restarts (killing the interpreter process), we detect the stale
+# within the same "context". Interpreter identity lives separately from
+# disposable chat notices, for the lifetime of one loaded Tools instance.
+# If the sandbox restarts (killing the interpreter process), we detect the stale
 # context, create a fresh one, and warn the model that state was lost.
 #
 # The WS protocol:
@@ -2428,55 +2159,49 @@ _INTERPRET_DEFAULT_TIMEOUT = 120  # seconds; server default is 600
 
 async def _ensure_interpreter_context(
     valves, sandbox_id: str, client: httpx.AsyncClient,
-    chat_state: LRUCache, chat_id: str,
-) -> str:
-    """Return the interpreter context ID for this chat, creating one if needed.
+    interpreter_state: dict, chat_id: str,
+) -> tuple[str, bool]:
+    """Resolve identity under a per-chat lock; only a valid list proves absence.
 
-    Stores the context ID in chat_state[chat_id]["interpreter_context_id"].
-    If the stored context is stale (404 on probe), creates a fresh one and
-    updates the state.  Returns (context_id, lost_state) where lost_state
-    is True if a previously valid context was replaced.
+    Records are intentionally non-evicting, scoped to one Tools instance.
+    A failed/ambiguous probe must never replace a healthy interpreter.
+    The lock covers identity resolution, not execution of user Python code.
     """
-    state = chat_state.get(chat_id, {})
-    ctx_id = state.get("interpreter_context_id")
-
-    if ctx_id:
-        # Probe: is the context still alive?  The list endpoint is cheap.
-        try:
+    if not chat_id:
+        raise ValueError("interpret() requires a conversation ID")
+    state = interpreter_state.setdefault(chat_id, {"lock": asyncio.Lock()})
+    async with state["lock"]:
+        ctx_id = state.get("id")
+        if ctx_id and state["sandbox_id"] == sandbox_id:
             resp = await client.get(
                 _toolbox(valves, sandbox_id, "/process/interpreter/context"),
                 headers=_headers(valves),
                 timeout=15.0,
             )
-            if resp.status_code == 200:
-                contexts = resp.json().get("contexts", [])
-                if any(c.get("id") == ctx_id for c in contexts):
-                    return ctx_id, False
-        except Exception as e:
-            logger.debug("interpreter context probe failed: %s", e)
-        # Context is gone (sandbox restarted, etc.)  Fall through to create.
+            resp.raise_for_status()
+            data = resp.json()
+            contexts = data.get("contexts") if isinstance(data, dict) else None
+            if not isinstance(contexts, list) or any(
+                not isinstance(c, dict) or not isinstance(c.get("id"), str)
+                or not c["id"] for c in contexts
+            ):
+                raise RuntimeError("Daytona returned an invalid interpreter context list")
+            if any(c["id"] == ctx_id for c in contexts):
+                return ctx_id, False
 
-    # Create a new context.
-    resp = await client.post(
-        _toolbox(valves, sandbox_id, "/process/interpreter/context"),
-        headers=_headers(valves),
-        json={"language": "python", "cwd": "/home/daytona/workspace"},
-        timeout=30.0,
-    )
-    resp.raise_for_status()
-    new_id = resp.json().get("id")
-    if not new_id:
-        raise RuntimeError("Daytona returned an interpreter context with no ID")
-
-    # Store in chat state.
-    if chat_id in chat_state:
-        chat_state[chat_id]["interpreter_context_id"] = new_id
-    else:
-        chat_state[chat_id] = {"init": True, "pending": [],
-                               "interpreter_context_id": new_id}
-
-    lost_state = ctx_id is not None  # had one before, now replaced
-    return new_id, lost_state
+        # Authoritative absence, a different sandbox, or first use.
+        resp = await client.post(
+            _toolbox(valves, sandbox_id, "/process/interpreter/context"),
+            headers=_headers(valves),
+            json={"language": "python", "cwd": "/home/daytona/workspace"},
+            timeout=30.0,
+        )
+        resp.raise_for_status()
+        new_id = resp.json().get("id")
+        if not isinstance(new_id, str) or not new_id:
+            raise RuntimeError("Daytona returned an interpreter context with no ID")
+        state.update(id=new_id, sandbox_id=sandbox_id)
+        return new_id, ctx_id is not None
 
 
 def _format_interpret_result(stdout: str, stderr: str,
@@ -2514,13 +2239,15 @@ def _format_interpret_result(stdout: str, stderr: str,
 
 
 async def _core_interpret(valves, sandbox_id: str, client: httpx.AsyncClient,
-                          chat_state: LRUCache, chat_id: str, *,
+                          interpreter_state: dict, chat_id: str, *,
                           code: str, timeout: int = _INTERPRET_DEFAULT_TIMEOUT) -> str:
     """Run Python code in a persistent REPL session. Variables, imports, and
     definitions survive across calls within the same conversation.
     Use this for iterative data exploration, incremental computation, or
     any workflow where you need state to persist between executions.
     For one-shot shell commands or non-Python work, prefer bash() instead.
+    Stream output is a 50 KiB preview; excess output is discarded explicitly.
+    Write large results to a sandbox file for full access via read() or expose().
 
     :param code: Python code to execute. Top-level await is not supported.
     :param timeout: Max execution time in seconds (default: 120). Use 0 for no limit.
@@ -2528,10 +2255,10 @@ async def _core_interpret(valves, sandbox_id: str, client: httpx.AsyncClient,
     from httpx_ws import aconnect_ws, WebSocketDisconnect
 
     if not code.strip():
-        return "Error: empty code. Provide Python code to execute."
+        raise _ToolFailure("empty code. Provide Python code to execute.")
 
     context_id, lost_state = await _ensure_interpreter_context(
-        valves, sandbox_id, client, chat_state, chat_id,
+        valves, sandbox_id, client, interpreter_state, chat_id,
     )
 
     # Build the WS URL from the proxy base (same host, /process/interpreter/execute).
@@ -2541,11 +2268,15 @@ async def _core_interpret(valves, sandbox_id: str, client: httpx.AsyncClient,
     stderr_parts: list[str] = []
     errors: list[dict] = []
     timed_out = False
+    preview_bytes = 0
+    preview_clipped = False
+    execution_failed = False
 
     try:
         async with aconnect_ws(
             ws_url, client,
             keepalive_ping_interval_seconds=20,
+            queue_size=1,
             headers=_headers(valves),
         ) as ws:
             # Send the execute request.
@@ -2565,15 +2296,28 @@ async def _core_interpret(valves, sandbox_id: str, client: httpx.AsyncClient,
                     break
 
                 msg_type = msg.get("type", "")
-                if msg_type == "stdout":
-                    stdout_parts.append(msg.get("text", ""))
-                elif msg_type == "stderr":
-                    stderr_parts.append(msg.get("text", ""))
-                elif msg_type == "error":
-                    errors.append(msg)
+                if msg_type not in ("stdout", "stderr", "error"):
+                    continue
+                if msg_type == "error":
+                    execution_failed = True
+                    text = msg.get("traceback") or f"{msg.get('name', 'Error')}: {msg.get('value', '')}"
+                else:
+                    text = msg.get("text", "")
+                raw = text.encode("utf-8")
+                room = _MAX_BYTES - preview_bytes
+                clipped = raw[:room].decode("utf-8", errors="ignore")
+                preview_bytes += len(clipped.encode("utf-8"))
+                preview_clipped = preview_clipped or len(raw) > room
+                if clipped:
+                    if msg_type == "stdout":
+                        stdout_parts.append(clipped)
+                    elif msg_type == "stderr":
+                        stderr_parts.append(clipped)
+                    else:
+                        errors.append({"traceback": clipped})
 
     except Exception as e:
-        return f"Error connecting to interpreter: {e}"
+        raise _ToolFailure(f"Error connecting to interpreter: {e}") from e
 
     stdout = "".join(stdout_parts)
     stderr = "".join(stderr_parts)
@@ -2581,6 +2325,10 @@ async def _core_interpret(valves, sandbox_id: str, client: httpx.AsyncClient,
     result = _format_interpret_result(stdout, stderr, errors, lost_state)
     if timed_out:
         result = f"[Execution timed out after {timeout}s]\n\n{result}"
+    if preview_clipped:
+        result += "\n[Text preview truncated at 50 KiB; excess stream output was discarded. For full output, write to a sandbox file in your Python code and use read() or expose().]"
+    if timed_out or execution_failed:
+        raise _ToolFailure(result)
 
     return result
 
@@ -2853,9 +2601,6 @@ async def _ensure_chat_init(
     if chat_id in chat_state and chat_state[chat_id].get("init"):
         return
     # First tool call in this chat: create state and run snapshot.
-    # Future: a "trace" key here (list of dicts) could accumulate a
-    # structured record of every tool call (tool name, key args, outcome)
-    # for flush to the persistent volume at handoff() time.  See #54.
     chat_state[chat_id] = {"init": True, "pending": []}
     await _chat_auto_init(
         valves, sandbox_id, client, chat_state, chat_id, user, emitter,
@@ -2963,15 +2708,6 @@ def _build_delegate_system_prompt(max_steps: int, *, has_volume: bool = True) ->
 # instructions and writes the handoff document as streamed reply text.
 # No tool calls, no sandbox I/O — the agent already has everything it
 # needs in context.
-#
-# Future (#54): handoff() could flush an in-memory trace (accumulated
-# via _drain_harness_messages / the _run closures) to a JSONL file on
-# the persistent volume, then reference it in _HANDOFF_INSTRUCTIONS so
-# the receiving agent can selectively grep it.  This would require
-# handoff() to acquire a client and sandbox_id (currently it bypasses
-# _tool_context entirely).  Deferred: the prose-only handoff is
-# adequate today, and the trace format should be co-designed with the
-# micro-compaction filter (#51) so both use a shared line schema.
 
 _HANDOFF_INSTRUCTIONS = textwrap.dedent("""\
     You just called handoff(). Your job now is to write a handoff
@@ -3020,11 +2756,9 @@ _HANDOFF_INSTRUCTIONS = textwrap.dedent("""\
 
     - Do NOT make any tool calls. Write the handoff as your reply
       text, then stop.
-    - Do NOT continue working on the task after writing the handoff.
-      The conversation is over. If the user replies asking you to
-      continue, tell them to delete the message that triggered the
-      handoff and continue from there instead — otherwise the handoff
-      text bloats the context with duplicated information.
+    - End this response after the handoff. If the user later asks to
+      continue here, follow their request; a handoff does not close the
+      conversation or override later user instructions.
     - The handoff body should be dense and factual. The next agent
       will read it cold — assume no prior context.
     - Reference sandbox file paths rather than inlining code. The
@@ -3098,6 +2832,10 @@ def _build_delegate_tool(core_fn, *, infra_args: tuple,
         "_infra_args": infra_args,
         "_extra_kwargs": extra_infra_kwargs or {},
         "_defaults": defaults,
+        # Execution output may legitimately start with "Error:". Those cores
+        # raise on failure; legacy structured tool replies reserve the prefix.
+        "_checked_result": (lambda result: result) if core_fn in (_core_bash, _core_interpret) else _checked_result,
+        "_ToolFailure": _ToolFailure,
     }
     # Import type names so annotations resolve in the exec'd function
     for p in tool_params:
@@ -3107,7 +2845,10 @@ def _build_delegate_tool(core_fn, *, infra_args: tuple,
 
     code = (
         f"async def {fn_name}({sig_str}) -> str:\n"
-        f"    return await _core_fn(*_infra_args, **_extra_kwargs, {kwargs_str})\n"
+        f"    try:\n"
+        f"        return _checked_result(await _core_fn(*_infra_args, **_extra_kwargs, {kwargs_str}))\n"
+        f"    except _ToolFailure as exc:\n"
+        f"        return f'Error: {{exc}}'\n"
     )
     exec(code, ns)
     fn = ns[fn_name]
@@ -3118,7 +2859,8 @@ def _build_delegate_tool(core_fn, *, infra_args: tuple,
 
 def _build_delegate_tools(valves, sandbox_id: str, client: httpx.AsyncClient,
                           user_pairs: list[tuple[str, str]],
-                          chat_state: LRUCache = None, chat_id: str = ""):
+                          chat_state: LRUCache = None, chat_id: str = "",
+                          interpreter_state: dict = None):
     """Build pydantic-ai Tool objects that operate against a resolved sandbox.
 
     Returns a list of Tool instances. Each tool is a thin closure over the
@@ -3140,12 +2882,11 @@ def _build_delegate_tools(valves, sandbox_id: str, client: httpx.AsyncClient,
         _build_delegate_tool(_core_grep, infra_args=infra),
     ]
 
-    # interpret needs chat context; only available when chat_state and chat_id
-    # are provided.  It also needs extra infra kwargs.
-    if chat_state and chat_id:
+    # Parent and delegates deliberately share one identity registry.
+    if interpreter_state is not None and chat_id:
         all_tools.append(_build_delegate_tool(
             _core_interpret, infra_args=infra,
-            extra_infra_kwargs={"chat_state": chat_state, "chat_id": chat_id},
+            extra_infra_kwargs={"interpreter_state": interpreter_state, "chat_id": chat_id},
         ))
 
     return all_tools
@@ -3491,35 +3232,32 @@ async def _ensure_volume(valves, volume_name: str, client: httpx.AsyncClient) ->
     raise RuntimeError(f"Volume '{volume_name}' did not reach ready state within 60s (state: {vol.get('state')})")
 
 
-async def _wait_for_toolbox(valves, sandbox_id: str, client: httpx.AsyncClient, emitter=None):
-    """Poll the toolbox API until it responds, then ensure workspace dir exists."""
-    for attempt in range(30):
+async def _wait_for_toolbox(valves, sandbox_id: str, client: httpx.AsyncClient, emitter=None, *, wait: bool = True):
+    """Ensure the workspace exists, retrying toolbox startup only during lifecycle work."""
+    attempts = 30 if wait else 1
+    for attempt in range(attempts):
         try:
             resp = await client.post(
                 _toolbox(valves, sandbox_id, "/process/execute"),
                 headers=_headers(valves),
-                json={"command": "echo ready", "timeout": 5000},
+                json={"command": "bash -c 'mkdir -p /home/daytona/workspace'", "timeout": 5000},
                 timeout=10.0,
             )
             if resp.status_code == 200:
                 data = resp.json()
-                if data.get("exitCode") == 0 and "ready" in data.get("result", ""):
-                    await client.post(
-                        _toolbox(valves, sandbox_id, "/process/execute"),
-                        headers=_headers(valves),
-                        json={
-                            "command": "bash -c 'mkdir -p /home/daytona/workspace'",
-                            "timeout": 5000,
-                        },
-                        timeout=10.0,
-                    )
+                if data.get("exitCode") == 0:
                     return
         except (httpx.HTTPError, httpx.TimeoutException) as e:
             logger.debug("wait-for-toolbox: attempt %d failed: %s", attempt, e)
+        if not wait:
+            raise RuntimeError(
+                "Sandbox was started but its workspace could not be prepared. "
+                "Retry this tool call; if it persists, ask the administrator to inspect the sandbox."
+            )
         await asyncio.sleep(1)
         if attempt == 2:
             await _emit(emitter, "Waiting for sandbox to become ready...")
-    raise RuntimeError("Sandbox started but toolbox daemon did not become responsive (30s)")
+    raise RuntimeError("Sandbox started but toolbox could not prepare the workspace (30 attempts)")
 
 
 _SANDBOX_START_STATES = frozenset({"stopped", "paused", "archived"})
@@ -3577,6 +3315,10 @@ async def _ensure_sandbox(valves, email: str, client: httpx.AsyncClient, emitter
         if matches else None
     )
     warning: str | None = None
+    # No readiness cache: only a sandbox found started by the authoritative
+    # per-ID lookup takes the steady-state path. Creation (including a losing
+    # concurrent create) and any observed transition still wait for toolbox.
+    wait_for_startup = sandbox is None or sandbox.get("state") != "started"
 
     if sandbox is None:
         if not valves.auto_create_sandbox:
@@ -3670,7 +3412,7 @@ async def _ensure_sandbox(valves, email: str, client: httpx.AsyncClient, emitter
         state = info.get("state", "unknown")
 
         if state == "started":
-            await _wait_for_toolbox(valves, sandbox_id, client, emitter)
+            await _wait_for_toolbox(valves, sandbox_id, client, emitter, wait=wait_for_startup)
             await _emit(emitter, "Sandbox ready", done=True)
             return sandbox_id, warning
 
@@ -3847,44 +3589,19 @@ class Tools:
 
     def __init__(self):
         self.valves = self.Valves()
-        # Chat-scoped harness message queue.  Keyed by chat_id, value is a
-        # list[str] of messages waiting to be prepended to the next tool
-        # result.  The auto-init snapshot deposits the first message;
-        # future producers (e.g. background job completion notifications)
-        # can push here too, and the next tool call drains the queue.
-        #
-        # LRU(1024) bounds memory.  Eviction of an old chat_id just means
-        # its pending messages are lost (acceptable: the chat is likely
-        # dead) and the next tool call in that chat re-runs auto-init
-        # (idempotent, ~150 tokens).
+        # Chat-scoped auto-init and background notices, drained into text results.
+        # LRU eviction drops pending messages; a later call re-runs auto-init.
         self._chat_state: LRUCache = LRUCache(maxsize=1024)
+        self._interpreter_state: dict = {}
 
     # ── agent-facing manual ──────────────────────────────────────────
     #
-    # The manpage system is the model's primary orientation surface.
-    # Design principles:
-    #   - Tool docstrings stay minimal; details are deferred here so
-    #     context budget is spent only when the model actually needs help.
-    #   - The tool catalog is introspected dynamically so it can never
-    #     drift from the actual method list.
-    #   - Manpage content is currently static strings, but the
-    #     architecture is designed to evolve:
-    #
-    # TODO(future): Valve-driven behavioral policy injection.
-    #   Valves already control mechanism (timeouts, sandbox language,
-    #   auto-stop). The next step is for Valve values to also inject
-    #   *policy guidance* into manpage content. Mechanism is fixed at
-    #   class scan time; policy is runtime-configurable through the manual.
-    #
-    # TODO(future): Information architecture expansion.
-    #   Add per-tool deep dives (manpage="bash"), workflow recipes
-    #   (manpage="expose-recipes"), and troubleshooting guides. Existing
-    #   tool docstrings can then be further scrunched by adding
-    #   breadcrumbs like 'see lathe(manpage="bash") for details'.
+    # Keep initial orientation short; defer recipes to task-specific pages.
+    # The tool catalog is introspected from the public methods.
 
     # Manpage strings are interpolated via plain str.replace() in the
     # lathe() method, NOT str.format().  Known placeholders today:
-    # {tool_catalog}, {volume_note}, {destroy_volume_note}.  Unknown
+    # {tool_catalog}, {volume_note}, {destroy_volume_note}, {preview_access_note}. Unknown
     # placeholders pass through unchanged (no KeyError), and literal
     # braces in shell/JSON/regex snippets (${VAR}, {pid,log,exit},
     # {"key":"value"}, {n,m}) are always safe.  If you add a new dynamic
@@ -3907,17 +3624,17 @@ class Tools:
 
             ## When curl fails: egress workarounds
 
-            If a request fails because the sandbox cannot reach a host
-            (connection timeout, connection refused on a host you know is
-            up), the host is not on the egress allowlist. There is no clean
-            way for the agent to independently bypass this — the
-            workarounds involve the user.
+            Timeouts or connection failures on a known-live host may indicate
+            egress filtering, but are not proof: check the URL and service too.
+            For a blocked host, the workarounds below involve the user.
 
             **Common — user downloads and uploads via dufs:**
             Ask the user to download the file on their own machine, then
             upload it to the sandbox through the dufs file browser. Call
-            expose(target="dufs", access="public") to get the URL. This handles any file
-            type and any host, subject to the deployment's upload limits.
+            expose(target="dufs", access="private") to get the URL. Choose public
+            only if the user explicitly requests public/world access; missing
+            private wrapping is not permission to downgrade. This handles any
+            file type and host, subject to the deployment's upload limits.
 
             **Rare — custom browser-side fetch service:**
             For repeated fetch needs (e.g. crawling an API the sandbox
@@ -3966,14 +3683,14 @@ class Tools:
             sandbox was restarted (in which case the PID is stale). To
             distinguish the two, check whether the PID is still alive.
             While a command runs, its sidecar remains available for monitoring.
-            Once Lathe observes completion, it removes the wrapper, PID, exit status,
-            and log, then deletes the Daytona session unless a live shell-backgrounded
-            job still depends on it. A short lease prevents another OWUI worker from
-            racing the background completion poller. A retained service session is
-            reduced to only a PID marker and is
-            reaped by a later bash() call after the job exits. A truncated foreground
-            command's full log remains readable until the next bash() call. Sandbox
-            stop or restart clears all sidecars and sessions.
+            Completion releases the Daytona session unless a live shell-backgrounded
+            job still depends on it. Cleanup removes the wrapper and PID, but keeps
+            the full log and exit status for 24 hours after completion. Unrelated
+            bash calls, including calls from other chats, do not shorten this lease.
+            A later bash call removes expired evidence once no retained job is live.
+            Previews are bounded to 50 KiB, and may begin mid-line. Use read() for
+            numbered previews, bash byte ranges, or expose() for full file access.
+            Sandbox stop or restart clears all sidecars and sessions.
 
             ## Recipes
 
@@ -4031,6 +3748,12 @@ class Tools:
               on the first interpret() call.
             - State persists across calls: define a function in one call, use
               it in the next. Import a module once, use it everywhere.
+            - Identity survives eviction/reconstruction of chat notices, but
+              only within one loaded toolkit instance. OWUI restart, toolkit
+              reload, or another worker does not reconnect to the old context.
+              Save important results to files; this is not durable storage.
+            - Transient context-list failures fail the call without replacing
+              state. Retry once the service recovers.
             - State is lost when the sandbox stops or restarts (idle timeout,
               destroy, etc.). The tool detects this and warns you to re-run
               setup code.
@@ -4067,12 +3790,13 @@ class Tools:
             Delegates (sub-agents) share the same interpreter context as the
             outer conversation. A delegate can define a variable that the
             outer model later reads, or vice versa. This is useful for
-            parallel data pipelines.
+            shared computations. Context creation is serialized, but Python
+            executions are not: avoid concurrent mutation of shared variables.
             """),
         "services": textwrap.dedent("""\
             # Lathe — Service Details
 
-            Use the expose() tool description or the overview's target table for
+            Use the expose() tool description for
             normal one-step operation. This page is for implementation details,
             recovery, and configurations outside the named fast paths.
 
@@ -4165,11 +3889,9 @@ class Tools:
             write, edit, glob, grep. It does NOT have: lathe, onboard,
             expose, destroy, or delegate (no recursion).
 
-            The sub-agent makes up to max_steps inference calls (default 10,
-            max 30), executing tools as needed. It knows its step budget
-            upfront and receives a wrap-up nudge when close to the limit, so
-            it can prioritize producing a useful summary over starting new
-            work.
+            max_steps caps inference calls (default 10, max 30), including
+            the final response. Reserve time for a summary; a wrap-up nudge
+            near the limit does not guarantee completion.
 
             A one-step delegation is context-only: the sub-agent receives the task
             and any context_files, but no tools. Use max_steps=1 for single-shot
@@ -4200,82 +3922,20 @@ class Tools:
             finishes. Absence of both means it's still running.
             Sidecars remain available until the sandbox stops or restarts.
 
-            ### Monitoring recipes
+            Read the returned result/error paths to collect completion, log
+            for progress, and usage for cost. Tell the user background work
+            is running; poll only when asked or when completion is expected.
 
-            **Check if done:**
-            ```
-            test -f $DELEGATE/result && echo DONE || test -f $DELEGATE/error && echo FAILED || echo RUNNING
-            ```
+            ## Scope and parallel work
 
-            **Read the result:**
-            ```
-            cat $DELEGATE/result
-            ```
+            Delegate bounded investigation, changes, or batch work, not a
+            single tool operation or work requiring user interaction/expose.
+            Include the goal, constraints, errors, and completion criteria
+            in task: the sub-agent cannot ask clarifying questions.
 
-            **Peek at progress:**
-            ```
-            cat $DELEGATE/log
-            ```
-
-            **Read usage stats:**
-            ```
-            cat $DELEGATE/usage
-            ```
-
-            ## Agent teams and swarms
-
-            Background delegation is the primitive for running agent teams:
-
-            1. Fire off multiple delegates with foreground_seconds=0 (or a
-               short window):
-               ```
-               delegate(task="Refactor module A...", foreground_seconds=0)
-               delegate(task="Fix tests in module B...", foreground_seconds=0)
-               delegate(task="Write docs for module C...", foreground_seconds=0)
-               ```
-            2. Each returns a DELEGATE id immediately.
-            3. Check completion by reading result files.
-            4. Delegates can coordinate through the shared filesystem —
-               writing task specs, partial results, or completion sentinels
-               for each other to read.
-
-            No special swarm API is needed. The pattern falls out naturally
-            from background delegation + shared sandbox filesystem.
-
-            ## When to use delegate
-
-            - **Exploration**: "Find all test files and determine the testing
-              framework and coverage structure."
-            - **Refactoring**: "Rename all occurrences of getFoo to get_foo
-              across the Python codebase, updating tests."
-            - **Debugging**: "The build fails with error X. Investigate,
-              identify the root cause, and fix it."
-            - **Research**: "Read the configuration files and summarize the
-              project's dependency tree."
-            - **Batch operations**: "Add type hints to all functions in
-              src/utils/ that are missing them."
-            - **Parallel work** (background): Fan out multiple independent
-              tasks, then collect results.
-
-            ## When NOT to use delegate
-
-            - Single-step operations (just call the tool directly).
-            - Tasks requiring user interaction (URLs, uploads, questions).
-            - Tasks requiring expose() or destroy().
-
-            ## Writing good task descriptions
-
-            The sub-agent cannot ask clarifying questions. Be specific
-            and include all relevant context (error messages, prior
-            findings, instructions) directly in the task string:
-
-            Bad:  "Fix the tests"
-            Good: "Run pytest in /home/daytona/workspace. For each failure,
-                   read the failing test and the source it tests, identify
-                   the bug, and fix it. Re-run pytest to confirm."
-
-            Bad:  task="Fix the build", context="Error: module X not found"
-            Good: task="Fix the build. The error is: module X not found"
+            For independent tasks, use foreground_seconds=0 and collect each
+            result. All delegates share the filesystem: assign disjoint edit
+            scopes or coordinate explicitly to avoid overwriting each other.
 
             ## The context_files parameter
 
@@ -4284,40 +3944,28 @@ class Tools:
             sub-agent's prompt. The files are fetched once at delegation
             time and appear as a "Reference Files" section — the sub-agent
             sees their full contents without spending steps reading them.
+            References have an aggregate 50 KiB budget including headings.
+            Oversized files fail before inference; they are never silently clipped.
+            Prepare smaller references, or have the sub-agent use read() previews.
 
-            This is the recommended way to pass project context. If you
-            discovered relevant files via onboard() or glob(), name them
-            here rather than pasting their contents into the task string.
+            Pass relevant AGENTS.md/SKILL.md paths discovered via onboard()
+            rather than duplicating their contents in task.
 
             All paths must be absolute. Delegation fails immediately if
             any path does not exist on the sandbox.
 
             ## Step budget and handoff behavior
 
-            The sub-agent's system prompt tells it how many steps it has
-            and instructs it to reserve time for a handoff summary.
-            Additionally, when 2 steps remain, Lathe injects a hard nudge
-            telling the sub-agent to stop making tool calls and write a
-            structured handoff: what was accomplished, what remains
-            unresolved, and absolute paths to critical sandbox files
-            needed to continue the work.
-
-            This means: even if the sub-agent misjudges its pacing, it
-            gets a hard nudge before the limit cuts it off. The "(no output)"
-            failure mode (sub-agent exhausts budget mid-investigation) should
-            be much less common. And when a sub-agent does run out of
-            steps, its output is actionable — you can immediately
-            delegate a follow-up with the named files as context_files.
-
-            If you find "(no output)" still happening, increase max_steps
-            or simplify the task.
+            With 2 steps remaining, Lathe nudges for a handoff: accomplished,
+            unresolved, and critical absolute file paths. A delegate can still
+            exhaust its budget without useful output. Simplify the task or
+            increase max_steps; use reported files as follow-up context_files.
 
             ## Cost model
 
             Each step is a full inference call billed to the same provider.
-            A 10-step delegation costs ~10x a single tool call in tokens.
-            The usage summary in the tool result shows exact token counts.
-            Use max_steps to cap cost for bounded tasks.
+            Token cost varies with context and output; max_steps caps calls,
+            not tokens or dollars. Inspect the returned usage summary.
             """),
         "handoff": textwrap.dedent("""\
             # Lathe — Handoff
@@ -4342,7 +3990,7 @@ class Tools:
             2. The tool returns formatting instructions.
             3. You write the handoff document as reply text, following
                those instructions exactly.
-            4. You stop. No more tool calls after the handoff.
+            4. End that response. Later user requests can continue here.
 
             The handoff has a short preamble in the user's language
             telling them what to do, a horizontal rule, then the
@@ -4367,137 +4015,50 @@ class Tools:
         "overview": textwrap.dedent("""\
             # Lathe Toolkit — Overview
 
-            Lathe is a coding-agent toolkit running inside Open WebUI. It gives
-            you a persistent Linux sandbox backed by a Daytona VM with a
-            cross-conversation filesystem. The sandbox is created transparently
-            on first tool use and survives across conversations for the same user.
-
-            - Documentation: https://lathe.tools
-            - Source: https://github.com/rndmcnlly/lathe
-
-            Read this page fully before your first tool call. It covers the
-            sandbox model, available workflows, and common mistakes.
-
-            ## Sandbox model
-
-            - One sandbox per user, identified by email. The sandbox starts,
-              stops, and recovers automatically — you never manage lifecycle.
-            - The default working directory is /home/daytona/workspace.
+            Work in a per-user Linux sandbox, shared across conversations.
+            Tools create/start/recover it automatically. Default working directory:
+            /home/daytona/workspace. Use absolute sandbox paths for file tools.
             {volume_note}\
-            - The sandbox auto-stops after a configurable idle timeout and
-              auto-archives after a further interval. Any tool call transparently
-              restarts it. The filesystem (including installed packages and user
-              files) survives both stop and archive — only running processes are
-              lost.
+            Files survive stop/archive; running processes and interpreter state do
+            not. Idle stop defaults to 15 minutes. Previews do not keep it awake.
 
-            ## Tool catalog
+            ## Start with project context
+
+            The first sandbox tool call attempts a workspace snapshot and skill
+            catalog, not AGENTS.md contents. Use onboard(path) for the project's listing, AGENTS.md,
+            and skill catalog (also searches ~/.agents/). Read a relevant SKILL.md
+            before using its workflow. Do not repeat onboarding just for a listing
+            already supplied. Use "" for the default workspace.
+
+            ## Operating safeguards
+
+            - Shell commands are non-interactive; use -y flags as needed.
+              Parallelize with separate bash calls, not shell-level & + wait.
+            - bash and delegate auto-background after their foreground window.
+              Use the returned sidecar paths to inspect progress/results. Bash
+              truncation retains the full log until the next bash call: inspect
+              needed sections first.
+            - {preview_access_note}
+            - Named expose targets manage service startup/recovery; http:<port>
+              requires an already-running service. ttyd/code-server are private-only.
+            - destroy is irreversible and requires user confirmation.{destroy_volume_note}
+
+            ## Read details only when needed
+
+            Call lathe(manpage="...") with:
+            - "interpret": persistent Python state and limitations (vs. one-shot bash).
+            - "delegate": bounded autonomous work, context files, background results, costs.
+            - "background": shell-job sidecars and peek/poll/kill recipes.
+            - "services": browser file transfer, sites, terminals, IDEs, headers, recovery.
+            - "egress": network allowlist and user-assisted workarounds for blocked hosts.
+            - "handoff": user-approved context transfer to a new conversation.
+            - "version": installed toolkit version.
+
+            ## Available tools
 
             {tool_catalog}
 
-            ## Key workflows
-
-            **Choosing browser access:**
-
-            | User need | expose target | Access constraint |
-            |---|---|---|
-            | Upload, download, or browse files | dufs[:/absolute/path] | public or private |
-            | Serve an existing static directory | site:/absolute/path | public or private |
-            | Lightweight interactive shell | ttyd | private only |
-            | Full editor, terminal, and extensions | code-server[:/absolute/path] | private only |
-            | Already-running custom web service | http:<port> | public or private |
-
-            Named targets install, start, and recover their services. For
-            http:<port>, start the service yourself before calling expose().
-            Headerless public requests fall back to the direct signed bearer URL if wrapping
-            is unavailable or refused. Private requests never downgrade to public.
-            The sandbox auto-stops on idle, which kills background processes —
-            call the same named target again to recover. See
-            lathe(manpage="services") only for custom configuration or diagnosis.
-
-            **Project context:**
-            Call onboard() at the start of a conversation to get a directory
-            listing and load any AGENTS.md or skills. Works even without agent
-            files (you still get the listing). Pass "" or the workspace path to
-            onboard the default directory. Searches both the project directory
-            and ~/.agents/ for global agent instructions and skills.
-
-            **Delegating multi-step work:**
-            Use delegate(task="...") to hand off autonomous multi-step tasks
-            to a sub-agent. The sub-agent has bash/read/write/edit/glob/grep
-            and runs against the same sandbox. Good for: exploration, refactoring,
-            debugging, test fixing, research. Use context_files= to inject
-            AGENTS.md, skills, or other reference files into the sub-agent's
-            prompt without re-reading them. The sub-agent cannot interact with
-            the user or expose URLs — it just works and returns a summary.
-            Like bash(), delegate() auto-backgrounds if the sub-agent takes longer
-            than foreground_seconds (default 30), returning a descriptor with
-            sidecar file paths. Use foreground_seconds=0 to fire-and-forget
-            multiple delegates in parallel (agent teams / swarms).
-            See lathe(manpage="delegate") for details.
-
-            **Persistent Python REPL:**
-            Use interpret(code="...") for iterative Python work where state
-            needs to persist across calls: data analysis, incremental
-            computation, prototyping. Variables, imports, and definitions
-            survive within the conversation. For one-shot commands or
-            non-Python work, prefer bash(). The interpreter context is
-            per-conversation and is lost on sandbox restart.
-            See lathe(manpage="interpret") for details.
-
-            **Network requests:**
-            Use bash("curl ...") or bash("wget ...") for HTTP requests. The
-            sandbox can reach a broad allowlist of hosts directly (package
-            registries, git hosts, CDNs, AI APIs, etc.), and bash gives you
-            streaming, piping, and natural access to env-var credentials.
-            If a request fails due to egress filtering, see
-            lathe(manpage="egress") for workarounds.
-
-            **Handing off to a new conversation:**
-            When context gets long or the user asks, call handoff() to write
-            a structured handoff document. The user pastes it into a new
-            conversation as their opening message, and the next agent picks
-            up where you left off. The sandbox persists, so all files survive.
-            See lathe(manpage="handoff") for details.
-
-            ## Gotchas
-
-            - Commands are non-interactive. No stdin prompts or curses UIs. Use
-              -y or equivalent flags. For an interactive terminal, expose ttyd;
-              use code-server when the user also needs a browser IDE.
-            - bash() auto-backgrounds commands that exceed ~30 seconds. When this
-              happens, it returns a background descriptor with CMD and PID paths.
-              Use foreground_seconds= to extend the wait (e.g. foreground_seconds=120
-              for known-slow commands or when waiting for a backgrounded command to
-              finish). The command keeps running even after backgrounding.
-              See lathe(manpage="background") for peek/poll/kill recipes.
-            - Do NOT use shell-level & + wait to parallelize work inside a single
-              bash() call. Each bash() call already gets its own independent session,
-              so the right way to parallelize is to make multiple bash() tool calls
-              simultaneously at the agent level. Shell-level & + wait adds no
-              benefit and risks tripping the foreground timeout on the wait builtin,
-              producing an alarming background descriptor even when the real work
-              is already done.
-            - bash() output is truncated to the last 2000 lines / 50 KB. If
-              truncated, the full output is available in the log file at
-              /dev/shm/lathe/cmd/<id>/log until the next bash() call — use read()
-              to inspect specific sections before running another command.
-            - edit() requires an exact string match (including whitespace). If
-              the match is ambiguous, provide more surrounding context or use
-              replace_all=true.
-            - delegate() auto-backgrounds after ~30 seconds (configurable via
-              foreground_seconds). Backgrounded delegates write to
-              /dev/shm/lathe/delegate/<id>/{log,result,error,usage}. Use foreground_seconds=0
-              to fire-and-forget for parallel agent teams.
-            - {preview_access_note}
-            - The sandbox stops on idle (~15 min default), killing servers.
-              A preview registration does not keep it awake or restart a service.
-            - destroy() prompts for user confirmation via a dialog before proceeding. Irreversible.{destroy_volume_note}
-            - **Network egress may be restricted.** Depending on the admin's
-              Daytona tier, the sandbox may only reach a curated allowlist of
-              hosts (package registries, git hosts, CDNs, AI APIs, etc.).
-              Requests to non-allowlisted hosts silently fail or time out.
-              If curl fails on a host you know is up, see
-              lathe(manpage="egress") for workarounds.
+            Users: https://lathe.tools · Source: https://github.com/rndmcnlly/lathe
             """),
     }
 
@@ -4521,8 +4082,8 @@ class Tools:
         __event_emitter__=None,
     ) -> str:
         """
-        Manual for the lathe toolkit. Call lathe(manpage="overview") before your first tool use in a new conversation to learn the sandbox model, available workflows, and gotchas. Costs one tool call, saves many.
-        :param manpage: Which manual page to return. Use "overview" for big-picture orientation, "version" for the installed version.
+        Read operational orientation or a task-specific manual page.
+        :param manpage: "overview" for safeguards and page index; "interpret", "delegate", "background", "services", "egress", "handoff" for details; "version" for installed version.
         """
         type_err = _check_tool_params({"manpage": manpage}, type(self).lathe)
         if type_err:
@@ -4587,7 +4148,7 @@ class Tools:
         __event_emitter__=None,
     ) -> str:
         """
-        Prepare a handoff document for continuing this work in a new conversation. Call this when the user asks to compact, hand off, or save context for a fresh chat. After calling, write the handoff as your reply — do not make any more tool calls.
+        Get formatting instructions for a user-approved handoff to a fresh chat. Write it as reply text, then end this response; later user requests may continue here.
         """
         await _emit(__event_emitter__, "Handoff", done=True)
         return _HANDOFF_INSTRUCTIONS
@@ -4724,11 +4285,10 @@ class Tools:
         __event_emitter__=None,
     ) -> str:
         """
-        Load project context (directory listing, AGENTS.md, skill catalog) at the start of a conversation.
-        Always returns a directory listing of the target path. Additionally
-        searches the project directory and ~/.agents/ for agent instructions and skills.
-        Use read() on a skill's SKILL.md path to load its full instructions later.
-        :param path: Absolute path to the project root (e.g. /home/daytona/workspace/myproject).
+        Load project listing, AGENTS.md, and skill catalog; also searches ~/.agents/.
+        Read relevant SKILL.md files for full instructions. Skip repeat onboarding
+        when the supplied context already covers this project.
+        :param path: Absolute project root; "" selects /home/daytona/workspace.
         """
         type_err = _check_tool_params({"path": path}, type(self).onboard)
         if type_err:
@@ -4830,7 +4390,10 @@ class Tools:
 
             # When the command auto-backgrounds, spawn a polling coroutine
             # to push a completion notice into the chat's message queue.
+            backgrounded = False
             def _on_bg(*, sandbox_id, session_id, session_cmd_id, cmd_id, start_time):
+                nonlocal backgrounded
+                backgrounded = True
                 asyncio.ensure_future(_poll_bg_bash(
                     self.valves, sandbox_id, session_id, session_cmd_id,
                     cmd_id, start_time,
@@ -4847,7 +4410,8 @@ class Tools:
                 on_background=_on_bg,
             )
 
-            await _emit(__event_emitter__, "Command complete", done=True)
+            status = "Command running in background" if backgrounded else "Command complete"
+            await _emit(__event_emitter__, status, done=True)
             messages = _drain_harness_messages(self._chat_state, __chat_id__, _sb_warning)
             return _prepend_harness_messages(result, messages)
 
@@ -4889,7 +4453,7 @@ class Tools:
         emit_start="Running Python...",
         emit_done="Execution complete",
         extra_core_kwargs=lambda self, sandbox_id, chat_id: {
-            "chat_state": self._chat_state,
+            "interpreter_state": self._interpreter_state,
             "chat_id": chat_id,
         },
     )
@@ -4935,7 +4499,7 @@ class Tools:
             )
 
             await _emit(__event_emitter__, f"Loading image {path}...")
-            result = await _core_view(self.valves, sandbox_id, client, path=path)
+            result = _checked_result(await _core_view(self.valves, sandbox_id, client, path=path))
 
             await _emit(__event_emitter__, "Image loaded", done=True)
             # The result must stay byte-identical to the core output: OWUI
@@ -4965,16 +4529,13 @@ class Tools:
         __event_emitter__=None,
     ) -> str:
         """
-        Delegate a multi-step task to an autonomous sub-agent with sandbox access.
-        The sub-agent runs the same model, has bash/read/write/edit/glob/grep tools,
-        and returns a summary when done. Use for exploration, refactoring, debugging,
-        or any multi-step work that doesn't need user interaction.
-        Long-running delegations auto-background and return a descriptor with log/result
-        file paths for monitoring, exactly like bash() does for long commands.
-        :param task: What the sub-agent should accomplish. Be specific — it cannot ask clarifying questions. Include any context (error messages, prior findings, instructions) directly in the task description.
-        :param context_files: Absolute sandbox file paths to inject into the sub-agent's prompt (e.g. AGENTS.md, SKILL.md, config files). Fetched at delegation time — the sub-agent sees their contents without spending steps reading them.
-        :param max_steps: Maximum inference calls the sub-agent may make (default: 10, max: 30). With max_steps=1, it receives the task and context_files but no tools, so it must answer directly from that supplied context. Use at least 2 for tasks requiring sandbox access or changes.
-        :param foreground_seconds: Seconds to wait before auto-backgrounding (default: 30, max: 300). Set 0 for immediate background (fire-and-forget). Omit or set -1 to use the default.
+        Run bounded autonomous work with the same model and shared sandbox.
+        Has bash/read/write/edit/glob/grep, not user interaction or expose.
+        Returns a summary or background sidecar paths; see lathe(manpage="delegate").
+        :param task: Specific goal, constraints, and findings; the sub-agent cannot ask questions.
+        :param context_files: Absolute sandbox reference files; missing or aggregate >50 KiB (including headings/separators) fails before inference, never silently clips.
+        :param max_steps: Inference-call budget, 1–30 (default 10). At 1, no tools: supplied-context analysis only. Use >=2 for sandbox work.
+        :param foreground_seconds: Wait before auto-backgrounding, 0–300 seconds; 0 backgrounds immediately, -1 uses default 30.
         """
         type_err = _check_tool_params(
             {"task": task, "context_files": context_files, "max_steps": max_steps,
@@ -5025,20 +4586,25 @@ class Tools:
                     err = _require_abs_path(fpath, "context_files entry")
                     if err:
                         return err
+                remaining = _MAX_BYTES - len("## Reference Files\n\n".encode("utf-8"))
                 for fpath in context_files:
-                    resp = await client.get(
-                        _toolbox(self.valves, sandbox_id, "/files/download"),
-                        params={"path": fpath},
-                        headers=_headers(self.valves),
-                        timeout=60.0,
+                    heading = f"### {fpath}\n\n"
+                    remaining -= len(heading.encode("utf-8")) + (2 if file_sections else 0)
+                    if remaining < 0:
+                        raise _ToolFailure("context_files exceed the aggregate 50 KiB limit including headings and separators.")
+                    content = await _download_file(
+                        self.valves, sandbox_id, client, fpath, max_bytes=remaining,
                     )
-                    if resp.status_code == 404:
+                    if content is None:
                         return (
                             f"Error: context_files entry not found on sandbox: {fpath}\n"
                             f"Verify the path exists before delegating."
                         )
-                    resp.raise_for_status()
-                    file_sections.append(f"### {fpath}\n\n{resp.text}")
+                    section = heading + content
+                    remaining -= len(content.encode("utf-8"))
+                    if remaining < 0:
+                        raise _ToolFailure("context_files exceed the aggregate 50 KiB limit including headings. Prepare smaller reference files; nothing was silently truncated.")
+                    file_sections.append(section)
 
             # ASGI transport — in-process call to OWUI's FastAPI app.
             # Uses /api/chat/completions which handles all model types:
@@ -5085,6 +4651,7 @@ class Tools:
                     _build_delegate_tools(
                         self.valves, sandbox_id, bg_client, user_pairs,
                         chat_state=self._chat_state, chat_id=__chat_id__,
+                        interpreter_state=self._interpreter_state,
                     )
                     if clamped_steps > 1 else []
                 )
@@ -5105,14 +4672,14 @@ class Tools:
                 usage_path = f"{delegate_dir}/usage"
                 task_path = f"{delegate_dir}/task"
 
-                await _core_write(
+                _checked_result(await _core_write(
                     self.valves, sandbox_id, client,
                     path=task_path, content=task,
-                )
-                await _core_write(
+                ))
+                _checked_result(await _core_write(
                     self.valves, sandbox_id, client,
                     path=log_path, content="",
-                )
+                ))
                 await _emit(__event_emitter__, "Sub-agent starting...")
             except BaseException:
                 await agent_clients.aclose()
@@ -5134,15 +4701,13 @@ class Tools:
             async def _append_log(line: str):
                 """Append a timestamped line to the in-memory log and sandbox file."""
                 ts = time.strftime("%H:%M:%S")
-                entry = f"[{ts}] {line}"
+                hint = line.encode("utf-8")[:1024].decode("utf-8", errors="ignore")
+                entry = f"[{ts}] {hint}"
                 log_lines.append(entry)
-                try:
-                    await _core_write(
-                        self.valves, sandbox_id, bg_client,
-                        path=log_path, content="\n".join(log_lines) + "\n",
-                    )
-                except Exception as e:
-                    logger.debug("delegate: sidecar log write failed: %s", e)
+                _checked_result(await _core_write(
+                    self.valves, sandbox_id, bg_client,
+                    path=log_path, content="\n".join(log_lines) + "\n",
+                ))
 
             # ── The actual sub-agent execution coroutine ─────────────
             # This is separated so it can either run inline (foreground)
@@ -5226,20 +4791,20 @@ class Tools:
                         result_output = agent_run.result.output if agent_run.result else "(no output)"
 
                     # ── Write sidecar result files ────────────────────
-                    await _core_write(
+                    _checked_result(await _core_write(
                         self.valves, sandbox_id, bg_client,
                         path=result_path, content=result_output,
-                    )
+                    ))
                     usage_data = {
                         "steps": step_count,
                         "tool_calls": usage.tool_calls,
                         "input_tokens": usage.input_tokens,
                         "output_tokens": usage.output_tokens,
                     }
-                    await _core_write(
+                    _checked_result(await _core_write(
                         self.valves, sandbox_id, bg_client,
                         path=usage_path, content=json.dumps(usage_data),
-                    )
+                    ))
                     await _append_log(
                         f"Completed: {step_count} steps, {usage.tool_calls} tool calls"
                     )
@@ -5275,12 +4840,13 @@ class Tools:
                         "step_count": step_count,
                     })
                     try:
-                        await _core_write(
+                        _checked_result(await _core_write(
                             self.valves, sandbox_id, bg_client,
                             path=error_path, content=error_msg,
-                        )
+                        ))
                         await _append_log(f"Error: {error_msg}")
                     except Exception as e2:
+                        agent_result["error"] += f"; failure evidence could not be persisted: {e2}"
                         logger.debug("delegate: sidecar error write failed: %s", e2)
 
                 finally:
@@ -5325,7 +4891,9 @@ class Tools:
                 await bg_task
 
                 if agent_result.get("ok"):
-                    result_output = agent_result["output"]
+                    result_output, clipped, _ = _truncate_tail(agent_result["output"])
+                    if clipped:
+                        result_output += f"\n[Bounded text preview; full delegate result: {result_path}]"
                     usage = agent_result["usage"]
                     step_count = agent_result["step_count"]
                     parts = [f"{step_count} step(s)", f"{usage.tool_calls} tool call(s)"]

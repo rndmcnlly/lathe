@@ -8,7 +8,7 @@ A single-file Open WebUI toolkit that gives any model a coding agent's tool surf
 
 Lathe registers fourteen tools that models can call in [Native function calling mode](https://docs.openwebui.com/features/extensibility/plugin/tools/). When a user's model calls a tool, Lathe creates, starts, or resumes a cloud sandbox VM via the Daytona control plane and toolbox APIs. All sandbox operations go outbound from your OWUI server.
 
-Lathe does not import `open_webui.*`, use OWUI file storage, or modify models, prompts, users, or other configuration. The `delegate()` tool does depend on runtime context injected by OWUI, an integration boundary that may change between OWUI releases.
+Lathe does not import `open_webui.*`, use OWUI file storage, or change stored model, prompt, user, or instance configuration. Its tool descriptions and results include operational instructions, project context, and background notices that influence the calling model. `delegate()` supplies its own sub-agent system prompt and depends on OWUI-injected runtime context, an integration boundary that may change between releases.
 
 ## Security and trust model
 
@@ -16,7 +16,7 @@ Lathe does not import `open_webui.*`, use OWUI file storage, or modify models, p
 - **Deployment label scoping** — Sandboxes are tagged with a `deployment_label` (e.g. `chat.example.com`), so multiple OWUI instances sharing a Daytona account do not collide.
 - **User secrets** — The `env_vars` UserValve is a password field (masked in UI), but its values are deliberately entrusted to the model through every `bash` command it can invoke. The model can read command environments and should be treated as able to disclose or misuse these credentials. Use narrowly scoped, revocable credentials only.
 - **Destroy confirmation guard** — The `destroy` tool requires confirmation through Open WebUI's interactive confirmation dialog.
-- **No model prompt modification** — Lathe does not inject system prompts or alter model behavior. It only exposes tools.
+- **Model-facing guidance, not configuration changes** — Tool outputs contain prescriptive guidance and discovered AGENTS.md/skill context. Treat these as model-visible instructions, not merely data; delegate calls also use a Lathe-authored system prompt.
 
 ## Requirements
 
@@ -167,64 +167,19 @@ cannot choose the hostname template or which trusted identity fields it exposes.
 
 #### Registration contract
 
-Lathe sends an HTTPS POST to `preview_wrapper_url` with
-`Authorization: Bearer <preview_wrapper_key>` and JSON:
+The authoritative wire protocol, client validation, identity requirements, and
+header forwarding contract are in [preview-wrapper/README.md](preview-wrapper/README.md#registration-contract).
+Independent wrappers must implement that contract, using their own deployment
+and storage mechanisms. Valid registration JSON does not prove that a wrapper
+enforces its browser-authentication claims: the configured wrapper is trusted.
 
-```json
-{"owner":{"subject":"injected-owui-user-id","email":"owner@example.edu"},"upstream_url":"https://temporary-upstream.example/","access":"private","tag":"vscode"}
-```
-
-`subject` and `email` come exclusively from trusted request context. `access`
-is exactly `public` or `private`; it is a
-requirement, not a preference. The wrapper either enforces it or fails the
-request. `tag` is an optional model-supplied display hint and may be ignored;
-neither Lathe nor the wrapper treats hostname text as an identity or access
-claim. Lathe sends no sandbox-management credential to the wrapper; the
-installation credential establishes only the registrar's authority.
-
-A successful response contains the wrapped URL and its expiry:
-
-```json
-{"url":"https://lathe-private-nonce.previews.example/","expires_at":"2026-09-18T19:00:00Z"}
-```
-
-Lathe verifies a distinct HTTPS destination and a future timezone-qualified
-expiry. It rejects responses that
-reflect the upstream hostname or installation credential in the returned URL.
-It never follows registration redirects or exposes raw response/error text.
-For public requests without upstream headers, any wrapper failure falls back to the
-direct signed URL. For private requests, missing configuration or identity,
-registration failure, and malformed responses all fail closed.
-The wrapper remains trusted to implement its claims; valid JSON alone cannot
-prove that it enforces browser ownership.
-
-Optional `upstream_headers` supplies fixed application headers, independently of
-public/private access:
-
-```python
-expose(target="http:8765", access="public", upstream_headers={"Authorization": "Bearer app-token"})
-```
-
-Lathe sends the dictionary in registration JSON only when nonempty. Success must
-then include `"upstream_headers_applied": true`; missing acknowledgement fails
-closed, including for public access. Direct Daytona URLs cannot provide header
-injection, so these calls never fall back or silently omit headers. Existing
-headerless behavior is unchanged. The model can supply values directly, without
-an additional approval dialog; ownership still governs only private access.
-
-The proxy replaces configured browser headers case-insensitively on HTTP and
-WebSocket requests. `Authorization` (including Basic) is supported. Limits and
-reserved names are specified in the [sidecar contract](preview-wrapper/README.md#upstream-headers).
-Values are not echoed in Lathe results, but remain in OWUI tool arguments and
-are entrusted to the application, which may reflect them. Public visitors can
-exercise the injected credential. Neither Lathe nor these headers establishes
-visitor identity or prevents alternate routes into the application. An app that
-trusts a proxy assertion must separately qualify trusted peers and direct bypass.
-
-The reference sidecar requires a separate encryption secret for header-bearing
-registrations. Independent wrappers, including BayLeaf's, must implement the
-same validation, forwarding, acknowledgement, and containment contract using
-their own storage and deployment mechanisms. See [Lathe #98](https://github.com/rndmcnlly/lathe/issues/98).
+`upstream_headers` can attach fixed application credentials to HTTP/WebSocket
+requests, independently of public/private access. They require a compatible
+wrapper and never fall back to a direct URL. Values remain in OWUI tool
+arguments and are entrusted to the application; public visitors can exercise
+them. They neither establish visitor identity nor prevent direct application
+bypass. See the [header contract](preview-wrapper/README.md#upstream-headers)
+for limits, acknowledgement, storage, and rotation requirements.
 
 #### Lifetime and browser behavior
 

@@ -1,4 +1,4 @@
-name: Python CI
+name: Offline CI
 
 on:
   pull_request:
@@ -10,6 +10,34 @@ permissions:
   contents: read
 
 jobs:
+  node:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            preview-wrapper/package-lock.json
+            demo-video/package-lock.json
+      - name: Install wrapper test tooling
+        working-directory: preview-wrapper
+        run: npm ci
+      - name: Check wrapper and run unit + workerd qualification
+        working-directory: preview-wrapper
+        run: npm run check && npm test
+      - name: Install demo test tooling (no browser download)
+        working-directory: demo-video
+        env:
+          PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: '1'
+        run: npm ci
+      - name: Run demo Node tests
+        working-directory: demo-video
+        run: npm test
   test:
     strategy:
       matrix:

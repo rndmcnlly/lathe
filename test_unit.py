@@ -7,6 +7,7 @@ its files and state. Live Daytona and OWUI checks remain explicit scripts.
 import __future__
 import asyncio
 import base64
+from contextlib import asynccontextmanager
 import hashlib
 import inspect
 import json
@@ -19,6 +20,7 @@ import subprocess
 import sys
 import tarfile
 import textwrap
+import time
 from types import ModuleType, SimpleNamespace
 import typing
 from unittest.mock import AsyncMock
@@ -176,7 +178,8 @@ def test_delegate_interface(module):
     for with_chat in (False, True):
         tools = module._build_delegate_tools(
             t.valves, "sb", None, [],
-            chat_state=t._chat_state if with_chat else None, chat_id="chat")
+            chat_state=t._chat_state if with_chat else None, chat_id="chat",
+            interpreter_state=t._interpreter_state if with_chat else None)
         expected_names = {"bash", "read", "write", "edit", "glob", "grep"}
         if with_chat:
             expected_names.add("interpret")
@@ -343,6 +346,9 @@ class GuardedFile:
     def read(self, size=-1):
         if size < 0: raise AssertionError("unbounded read")
         return self.file.read(size)
+    def readline(self, size=-1):
+        if size < 0: raise AssertionError("unbounded readline")
+        return self.file.readline(size)
 def guarded_open(*args, **kwargs): return GuardedFile(_real_open(*args, **kwargs))
 builtins.open = guarded_open
 print(read_file({str(path)!r}, 50_000, 50_003))
@@ -422,18 +428,53 @@ def test_wildcard_free_directories_are_recursive_and_files_remain_exact(tmp_path
 
 
 @pytest.mark.parametrize("kind,total", [("GLOB", 13), ("GREP", 22)])
-@pytest.mark.parametrize("budget", [4, 8, 100])
-def test_search_budget_conserves_matches(tree, kind, total, budget):
+@pytest.mark.parametrize("budget", [1, 4, 8, 100])
+def test_search_budget_keeps_concrete_evidence(tree, kind, total, budget):
     args = (str(tree), "**/*", budget) if kind == "GLOB" else (str(tree), "needle", "**/*", budget)
     result = script_call(kind, kind.lower() + "_hierarchy", *args)
     header, *body = result.splitlines()
     assert int(header.split()[0]) == total
-    assert len(body) <= budget
-    counts = [re.search(r"(?:\(|and )(\d+) (?:more )?matches", line) for line in body]
-    assert sum(int(m[1]) if m else 1 for m in counts) == total
-    if budget == 100:
-        assert all(line.startswith(str(tree)) for line in body)
-        assert len(body) == total
+    assert len(body) == min(total, budget)
+    for line in body:
+        if kind == "GLOB":
+            assert Path(line).is_file()
+        else:
+            path, number, text = line.rsplit(":", 2)
+            assert Path(path).read_text().splitlines()[int(number) - 1] == text.strip()
+            assert "needle" in text
+    if total > budget:
+        assert f"showing {budget}, {total - budget} omitted" in header
+    else:
+        assert "omitted" not in header
+
+
+@pytest.mark.parametrize("kind", ["GLOB", "GREP"])
+@pytest.mark.parametrize("count", [0, 1, 99, 100, 101, 2000])
+def test_search_thresholds_do_not_collapse_to_counts(tmp_path, kind, count):
+    root = tmp_path.resolve()
+    for i in range(count):
+        path = root / f"group-{i % 5}" / f"hit-{i}.txt"
+        path.parent.mkdir(exist_ok=True)
+        path.write_text(f"miss\nneedle {i}\n")
+    # Overlapping includes must neither duplicate evidence nor inflate totals.
+    scope = "**/*.txt,group-0/*.txt"
+    args = (str(root), scope, 100) if kind == "GLOB" else (
+        str(root), "needle", scope, 100)
+    header, *body = script_call(kind, kind.lower() + "_hierarchy", *args).splitlines()
+    assert int(header.split()[0]) == count
+    assert len(body) == min(count, 100)
+    assert len(set(body)) == len(body)
+    for line in body:
+        if kind == "GLOB":
+            assert Path(line).is_file()
+        else:
+            path, number, text = line.rsplit(":", 2)
+            assert number == "2"
+            assert text.strip() == Path(path).read_text().splitlines()[1]
+    if count > 100:
+        assert f"showing 100, {count - 100} omitted" in header
+    else:
+        assert "omitted" not in header
 
 
 def test_grep_invalid_regex_and_no_hits(tree):
@@ -461,12 +502,54 @@ def test_grep_skips_binary_and_bounds_large_file_matches(tmp_path):
 
     dense = script_call("GREP", "grep_hierarchy", str(tmp_path), "needle", "**/*", 5)
     assert dense.splitlines()[0].startswith("50000 matches across 1 files")
-    assert len(dense.splitlines()[1:]) <= 5
+    assert dense.splitlines()[1:] == [f"{large}:{i}: needle" for i in range(1, 6)]
+    assert "showing 5, 49995 omitted" in dense.splitlines()[0]
+    assert "1 binary or unreadable files skipped" in dense.splitlines()[0]
     assert str(binary) not in dense
 
     late = script_call("GREP", "grep_hierarchy", str(tmp_path), "late marker", "**/*", 5)
     assert f"{large}:50001: late marker" in late
     assert str(binary) not in late
+
+
+def test_grep_clips_concrete_long_hits(tmp_path):
+    path = tmp_path / "wide.txt"
+    path.write_text("needle" + "x" * 100_000 + "\n")
+    result = script_call("GREP", "grep_hierarchy", str(tmp_path), "needle", "**/*", 1)
+    assert result.splitlines()[1:] == [f"{path}:1: " + "needle" + "x" * 194 + "..."]
+
+
+def test_empty_grep_reports_readable_scope(tree):
+    result = script_call("GREP", "grep_hierarchy", str(tree), "absent", "**/*.py", 1)
+    assert "0 matches across 0 files" in result
+    assert "searched 12 readable files" in result
+    assert "**/*.py" in result and str(tree) in result
+
+
+def test_grep_discards_hits_from_failed_file_reads(tmp_path):
+    path = tmp_path / "partial.txt"
+    path.write_text("needle\nneedle\n")
+    source = lathe._GREP_SCRIPT + f'''
+import builtins
+_real_open = builtins.open
+class InterruptedFile:
+    def __init__(self, file): self.file = file
+    def __enter__(self): return self
+    def __exit__(self, *args): return self.file.__exit__(*args)
+    def __iter__(self):
+        yield next(iter(self.file))
+        raise OSError("injected read interruption")
+def interrupted_open(path, mode="r", **kwargs):
+    file = _real_open(path, mode, **kwargs)
+    return file if mode == "rb" else InterruptedFile(file)
+builtins.open = interrupted_open
+print(grep_hierarchy({str(tmp_path)!r}, "needle", "**/*.txt", 1))
+'''
+    result = run_script(source)
+    assert result.startswith("0 matches across 0 files")
+    assert "searched 0 readable files" in result
+    assert "1 binary or unreadable files skipped" in result
+    assert len(result.splitlines()) == 1
 
 
 @pytest.mark.parametrize("name,kwargs", [
@@ -570,6 +653,9 @@ async def test_completed_bash_retention_is_bounded(tools, monkeypatch, tmp_path,
     retained = sidecar("retained", pid=f"{retained_pid}:{retained_start}\n")
     old_spill = sidecar("old-spill", spill=True)
     leased = sidecar("leased", lease=True)
+    expired_failure = sidecar("expired-failure")
+    expired = time.time() - 24 * 60 * 60 - 1
+    os.utime(expired_failure / "exit", (expired, expired))
     deleted_sessions = []
     delete_attempts = {}
 
@@ -580,7 +666,7 @@ async def test_completed_bash_retention_is_bounded(tools, monkeypatch, tmp_path,
         if request.method == "DELETE" and "/process/session/" in request.url.path:
             session = request.url.path.rsplit("/", 1)[-1]
             delete_attempts[session] = delete_attempts.get(session, 0) + 1
-            if session == "lathe-cmd-ordinary" and delete_attempts[session] == 1:
+            if session in ("lathe-cmd-ordinary", "lathe-cmd-expired-failure") and delete_attempts[session] == 1:
                 return httpx.Response(503)
             deleted_sessions.append(session)
             return httpx.Response(204)
@@ -590,28 +676,31 @@ async def test_completed_bash_retention_is_bounded(tools, monkeypatch, tmp_path,
 
     async with httpx.AsyncClient(transport=transport(handler)) as client:
         await lathe._reap_bash_commands(tools.valves, "sb", client)
-        assert {p.name for p in ordinary.iterdir()} == {"reap"}
-        assert not old_spill.exists()
+        assert {p.name for p in ordinary.iterdir()} == {"exit", "log", "reap"}
+        assert old_spill.exists()
         assert leased.exists()
-        assert {p.name for p in retained.iterdir()} == {"keep"}
+        assert {p.name for p in retained.iterdir()} == {"keep", "log", "exit"}
         assert "lathe-cmd-retained" not in deleted_sessions
         assert "lathe-cmd-old-spill" in deleted_sessions
+        assert expired_failure.exists(), "failed session cleanup must retain its retry record"
 
         await lathe._reap_bash_commands(tools.valves, "sb", client)
-        assert not ordinary.exists()
+        assert (ordinary / "log").read_text() == "command output\n"
         assert delete_attempts["lathe-cmd-ordinary"] == 2
+        assert delete_attempts["lathe-cmd-expired-failure"] == 2
+        assert not expired_failure.exists()
 
         current = sidecar("current")
         await lathe._reap_bash_commands(
             tools.valves, "sb", client, preserve_log_for="current",
         )
-        assert {p.name for p in current.iterdir()} == {"log", "spill", "reap"}
+        assert {p.name for p in current.iterdir()} == {"log", "exit", "reap", "session_done"}
         assert "plaintext" not in "".join(p.read_text() for p in current.iterdir())
 
         await lathe._reap_bash_commands(
             tools.valves, "sb", client, release_lease_for="leased",
         )
-        assert not leased.exists()
+        assert (leased / "exit").read_text() == "0\n"
 
         # A reused PID with a different process start time is not retained.
         retained_proc.joinpath("stat").write_text(
@@ -620,10 +709,17 @@ async def test_completed_bash_retention_is_bounded(tools, monkeypatch, tmp_path,
             )
         )
         await lathe._reap_bash_commands(tools.valves, "sb", client)
-        assert not retained.exists()
+        assert "lathe-cmd-retained" in deleted_sessions
+        assert (retained / "log").read_text() == "command output\n"
 
         await lathe._reap_bash_commands(tools.valves, "sb", client)
-        assert not current.exists()
+        assert (current / "log").read_text() == "command output\n"
+        assert delete_attempts["lathe-cmd-current"] == 1, "retained evidence must not repeat session cleanup"
+        expired = time.time() - 24 * 60 * 60 - 1
+        for directory in (current, ordinary, retained, old_spill, leased):
+            os.utime(directory / "exit", (expired, expired))
+        await lathe._reap_bash_commands(tools.valves, "sb", client)
+        assert not list(command_root.iterdir())
 
 
 async def test_bash_launch_failure_discards_session_and_wrapper(tools, sandbox, http):
@@ -649,6 +745,180 @@ async def test_bash_launch_failure_discards_session_and_wrapper(tools, sandbox, 
     assert any(method == "DELETE" and path == "/sb/files/" for method, path in requests)
     assert any(method == "DELETE" and "/process/session/lathe-cmd-" in path
                for method, path in requests)
+
+
+@pytest.mark.parametrize("command,log_size", [
+    ("python3 -c 'print(\"x\" * 1000000)'", 1000001),
+    ("python3 -c 'import sys; sys.stdout.buffer.write(bytes([255]) * 20000)'", 20000),
+    ("python3 -c 'print(\"[Backgrounded after\" * 4000)'", 76001),
+])
+async def test_bash_large_log_survives_unrelated_chat(tools, sandbox, http, monkeypatch, tmp_path, clock, command, log_size):
+    monkeypatch.setattr(lathe, "_EPHEMERAL_ROOT", str(tmp_path / "lathe"))
+    for chat in ("a", "b"):
+        tools._chat_state[chat] = {"init": True, "pending": []}
+    deleted = []
+    exits = {}
+
+    def handler(request):
+        if request.method == "POST" and request.url.path == "/sb/files/upload":
+            path = Path(request.url.params["path"])
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(request.content.split(b"\r\n\r\n", 1)[1].rsplit(b"\r\n--", 1)[0])
+            return httpx.Response(200)
+        if request.method == "POST" and request.url.path == "/sb/process/session":
+            return httpx.Response(201)
+        if request.method == "POST" and request.url.path.endswith("/exec"):
+            command = json.loads(request.content)["command"]
+            process = subprocess.run(command, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=10)
+            exits[request.url.path.removesuffix("/exec")] = process.returncode
+            return httpx.Response(200, json={"cmdId": "cmd"})
+        if request.method == "POST" and request.url.path == "/sb/process/execute":
+            script = shlex.split(json.loads(request.content)["command"])[2]
+            return httpx.Response(200, json={"exitCode": 0, "result": run_script(script)})
+        if request.method == "GET" and "/process/session/" in request.url.path:
+            assert not request.url.path.endswith("/logs"), "unbounded log download"
+            return httpx.Response(200, json={"commands": [{"id": "cmd", "exitCode": exits[request.url.path]}]})
+        assert request.method == "DELETE" and "/process/session/" in request.url.path
+        deleted.append(request.url.path)
+        return httpx.Response(204)
+
+    http(handler)
+    events = []
+    async def emit(event):
+        events.append(event)
+    output = await tools.bash(command, workdir=str(tmp_path),
+                              __user__=USER, __chat_id__="a", __event_emitter__=emit)
+    assert events[-1]["data"]["description"] == "Command complete"
+    assert "Bounded tail preview" in output and len(output.encode()) < 53 * 1024
+    log = next((tmp_path / "lathe" / "cmd").glob("*/log"))
+    assert str(log) in output, "clipped previews must identify recoverable full output"
+    await tools.bash("echo unrelated", workdir=str(tmp_path), __user__=USER, __chat_id__="b")
+    preview = await tools.read(str(log), __user__=USER, __chat_id__="a")
+    assert "Text preview truncated" in preview and len(preview.encode()) < 53 * 1024
+    assert log.stat().st_size == log_size
+    assert (log.parent / "exit").read_text().strip() == "0"
+    assert deleted, "sessions should be cleaned independently of result files"
+    emissions = []
+    async def emit(event):
+        emissions.append(event)
+    failure = await tools.bash("echo failed; false", workdir=str(tmp_path), __user__=USER,
+                               __chat_id__="a", __event_emitter__=emit)
+    assert failure.startswith("Error: Exit code: 1") and "failed" in failure
+    assert not any(e["data"]["description"] == "Command complete" for e in emissions)
+    async with lathe.httpx.AsyncClient() as client:
+        delegate_bash = lathe._build_delegate_tools(tools.valves, "sb", client, [])[0]
+        literal = await delegate_bash.function(command="printf 'Error: expected output'", workdir=str(tmp_path))
+        assert literal.startswith("Error: expected output") and "Result files retained" in literal
+
+
+@pytest.mark.parametrize("start,stop", [(1, 0), (-1, 0), (1, -1)])
+def test_read_oversized_line_has_explicit_byte_preview(tmp_path, start, stop):
+    path = tmp_path / "huge.txt"
+    path.write_text("é" * 500000 + "\nlast\n")
+    result = run_script(lathe._READ_SCRIPT + f"\nprint(read_file({str(path)!r}, {start}, {stop}))")
+    assert len(result.encode()) < 53 * 1024
+    if start == -1:
+        assert "2: last" in result
+    else:
+        assert "Text preview truncated" in result and str(path) in result
+
+
+@pytest.mark.parametrize("newline", ["\r", "\r\n", "\n"])
+@pytest.mark.parametrize("start,stop", [(2, 0), (-2, 0), (1, -1)])
+def test_bounded_read_preserves_universal_newlines(tmp_path, newline, start, stop):
+    path = tmp_path / "newlines.txt"
+    path.write_bytes(newline.join(["a", "b", "c", ""]).encode())
+    result = script_call("READ", "read_file", str(path), start, stop)
+    expected = ["1: a", "2: b"] if stop == -1 else ["2: b", "3: c"]
+    assert "3 lines total" in result
+    assert result.splitlines()[1:] == expected
+    assert "\r" not in result
+
+
+def test_read_byte_clipping_labels_requested_not_shown_range(tmp_path):
+    path = tmp_path / "numbering.txt"
+    path.write_text(("x" * 24 + "\n") * 2000)
+    result = script_call("READ", "read_file", str(path), 1, 0)
+    assert "requested lines 1-2000 (preview clipped)" in result
+    assert "showing lines" not in result
+    assert "2000: " not in result
+
+
+@pytest.mark.parametrize("background", [False, True])
+@pytest.mark.parametrize("failure", ["http", "script", "malformed"])
+async def test_bash_preview_failure_preserves_lifecycle(
+    tools, sandbox, http, monkeypatch, tmp_path, clock, background, failure,
+):
+    monkeypatch.setattr(lathe, "_EPHEMERAL_ROOT", str(tmp_path / "lathe"))
+    tools._chat_state["chat"] = {"init": True, "pending": []}
+    polls = 0
+    previews = 0
+    deleted = []
+    def handler(request):
+        nonlocal polls, previews
+        if request.method == "POST" and request.url.path == "/sb/files/upload":
+            path = Path(request.url.params["path"])
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(request.content.split(b"\r\n\r\n", 1)[1].rsplit(b"\r\n--", 1)[0])
+            return httpx.Response(200)
+        if request.method == "POST" and request.url.path == "/sb/process/session":
+            return httpx.Response(201)
+        if request.method == "POST" and request.url.path.endswith("/exec"):
+            subprocess.run(json.loads(request.content)["command"], shell=True, check=True,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+            return httpx.Response(200, json={"cmdId": "cmd"})
+        if request.method == "GET" and "/process/session/" in request.url.path:
+            polls += 1
+            command = {"id": "cmd"}
+            if not background or polls > 1:
+                command["exitCode"] = 0
+            return httpx.Response(200, json={"commands": [command]})
+        if request.method == "POST" and request.url.path == "/sb/process/execute":
+            script = shlex.split(json.loads(request.content)["command"])[2]
+            if "f.seek" in script:
+                previews += 1
+                if previews == 1:
+                    if failure == "http": return httpx.Response(503)
+                    if failure == "script": return httpx.Response(200, json={"exitCode": 1, "result": "preview failed"})
+                    return httpx.Response(200, json={"exitCode": 0, "result": "not-json"})
+            return httpx.Response(200, json={"exitCode": 0, "result": run_script(script)})
+        assert request.method == "DELETE" and "/process/session/" in request.url.path
+        deleted.append(request.url.path)
+        return httpx.Response(204)
+    http(handler)
+    result = await tools.bash("echo lifecycle-output", workdir=str(tmp_path),
+        foreground_seconds=0 if background else 30, __user__=USER, __chat_id__="chat")
+    assert "Preview unavailable" in result
+    if background:
+        assert "Backgrounded after" in result
+        log = next((tmp_path / "lathe" / "cmd").glob("*/log"))
+        async with asyncio.timeout(5):
+            while True:
+                result = await tools.read(str(log), __user__=USER, __chat_id__="chat")
+                if "Background job completed" in result: break
+                await asyncio.sleep(0)
+        assert "lifecycle-output" in result
+    assert deleted, "finished session cleanup must survive a preview failure"
+    log = next((tmp_path / "lathe" / "cmd").glob("*/log"))
+    assert log.read_text() == "lifecycle-output\n"
+
+
+async def test_failed_write_does_not_emit_success(tools, sandbox, http, tmp_path):
+    tools._chat_state["chat"] = {"init": True, "pending": []}
+    parent_file = tmp_path / "not-a-directory"
+    parent_file.write_text("occupied")
+    emissions = []
+    def handler(request):
+        assert request.url.path == "/sb/process/execute"
+        script = shlex.split(json.loads(request.content)["command"])[2]
+        return httpx.Response(200, json={"exitCode": 0, "result": run_script(script)})
+    http(handler)
+    async def emit(event):
+        emissions.append(event)
+    result = await tools.write(str(parent_file / "file"), "data", __user__=USER,
+                               __chat_id__="chat", __event_emitter__=emit)
+    assert result.startswith("Error:")
+    assert not any(e["data"]["description"] == "Write complete" for e in emissions)
 
 
 @pytest.mark.parametrize("text", ["", "short\ntext", "x\n" * 3000, ("é" * 100 + "\n") * 600])
@@ -764,7 +1034,7 @@ async def test_chat_init_and_notice_delivery(tools, transport):
 async def test_interpreter_context_recovery(tools, transport, prior, live, expected, lost):
     tools._chat_state["a"] = {"init": True, "pending": []}
     if prior:
-        tools._chat_state["a"]["interpreter_context_id"] = prior
+        tools._interpreter_state["a"] = {"id": prior, "sandbox_id": "sb", "lock": asyncio.Lock()}
     calls = []
     def handler(request):
         calls.append(request.method)
@@ -772,9 +1042,121 @@ async def test_interpreter_context_recovery(tools, transport, prior, live, expec
         assert request.method in {"GET", "POST"}
         return httpx.Response(200, json={"contexts": live} if request.method == "GET" else {"id": "new"})
     async with httpx.AsyncClient(transport=transport(handler)) as client:
-        assert await lathe._ensure_interpreter_context(tools.valves, "sb", client, tools._chat_state, "a") == (expected, lost)
-    assert tools._chat_state["a"]["interpreter_context_id"] == expected
+        assert await lathe._ensure_interpreter_context(tools.valves, "sb", client, tools._interpreter_state, "a") == (expected, lost)
+    assert tools._interpreter_state["a"]["id"] == expected
     assert calls.count("POST") == (expected == "new")
+
+
+@pytest.mark.parametrize("failure", [503, 404, "transport", "missing-list", "bad-entry"])
+async def test_interpreter_probe_failure_preserves_identity(tools, transport, failure):
+    tools._interpreter_state["a"] = {"id": "healthy", "sandbox_id": "sb", "lock": asyncio.Lock()}
+    failed = True
+    def handler(request):
+        assert request.method == "GET"  # Never create on an ambiguous probe.
+        if not failed:
+            return httpx.Response(200, json={"contexts": [{"id": "healthy"}]})
+        if failure == "transport":
+            raise httpx.ConnectError("temporarily unavailable", request=request)
+        if isinstance(failure, int):
+            return httpx.Response(failure)
+        return httpx.Response(200, json={} if failure == "missing-list" else {"contexts": [{}]})
+    async with httpx.AsyncClient(transport=transport(handler)) as client:
+        with pytest.raises((httpx.HTTPError, RuntimeError)):
+            await lathe._ensure_interpreter_context(tools.valves, "sb", client, tools._interpreter_state, "a")
+        assert tools._interpreter_state["a"]["id"] == "healthy"
+        failed = False
+        assert await lathe._ensure_interpreter_context(tools.valves, "sb", client, tools._interpreter_state, "a") == ("healthy", False)
+
+
+async def test_interpreter_concurrent_creation_and_notice_reconstruction(tools, transport):
+    entered, release = asyncio.Event(), asyncio.Event()
+    posts = []
+    async def handler(request):
+        if request.method == "POST":
+            posts.append(request)
+            entered.set()
+            await release.wait()
+            return httpx.Response(200, json={"id": "shared"})
+        assert request.method == "GET"
+        return httpx.Response(200, json={"contexts": [{"id": "shared"}]})
+    async with httpx.AsyncClient(transport=transport(handler)) as client:
+        async def resolve():
+            return await lathe._ensure_interpreter_context(tools.valves, "sb", client, tools._interpreter_state, "a")
+        first = asyncio.create_task(resolve())
+        await entered.wait()
+        second = asyncio.create_task(resolve())
+        await asyncio.sleep(0)
+        release.set()
+        assert await asyncio.gather(first, second) == [("shared", False)] * 2
+        tools._chat_state["a"] = {"init": True, "pending": []}
+        for index in range(tools._chat_state.maxsize):
+            tools._chat_state[str(index)] = {"init": True, "pending": []}
+        assert "a" not in tools._chat_state
+        tools._chat_state["a"] = {"init": True, "pending": []}
+        assert await resolve() == ("shared", False)
+    assert len(posts) == 1
+
+
+async def test_interpreter_sandbox_replacement_and_failed_creation(tools, transport):
+    tools._interpreter_state["a"] = {"id": "old", "sandbox_id": "old-sb", "lock": asyncio.Lock()}
+    fail = True
+    def handler(request):
+        assert (request.method, request.url.path) == ("POST", "/new-sb/process/interpreter/context")
+        return httpx.Response(503) if fail else httpx.Response(200, json={"id": "new"})
+    async with httpx.AsyncClient(transport=transport(handler)) as client:
+        with pytest.raises(httpx.HTTPStatusError):
+            await lathe._ensure_interpreter_context(tools.valves, "new-sb", client, tools._interpreter_state, "a")
+        assert tools._interpreter_state["a"]["id"] == "old"
+        fail = False
+        assert await lathe._ensure_interpreter_context(tools.valves, "new-sb", client, tools._interpreter_state, "a") == ("new", True)
+
+
+async def test_interpreter_parent_delegate_share_identity(tools, sandbox, http, monkeypatch):
+    import httpx_ws
+    executions = []
+    posts = []
+    def handler(request):
+        assert request.url.path == "/sb/process/interpreter/context"
+        if request.method == "POST":
+            posts.append(request)
+            return httpx.Response(200, json={"id": "shared"})
+        assert request.method == "GET"
+        return httpx.Response(200, json={"contexts": [{"id": "shared"}]})
+    http(handler)
+    class Socket:
+        async def send_json(self, message):
+            executions.append(message)
+        async def receive_json(self):
+            raise httpx_ws.WebSocketDisconnect(1000)
+    @asynccontextmanager
+    async def connect(*args, **kwargs):
+        yield Socket()
+    monkeypatch.setattr(httpx_ws, "aconnect_ws", connect)
+    assert await tools.interpret("x = 1", __chat_id__="a", __user__=USER) == "(no output)"
+    tools._chat_state.clear()  # Delegate availability does not depend on notices.
+    async with lathe.httpx.AsyncClient() as client:
+        delegates = lathe._build_delegate_tools(
+            tools.valves, "sb", client, [], chat_state=tools._chat_state,
+            chat_id="a", interpreter_state=tools._interpreter_state)
+        interpret = next(tool for tool in delegates if tool.name == "interpret")
+        assert await interpret.function(code="x += 1") == "(no output)"
+    assert [call["contextId"] for call in executions] == ["shared", "shared"]
+    assert len(posts) == 1
+
+
+async def test_interpreter_conversations_are_isolated_and_require_identity(tools, transport):
+    created = []
+    def handler(request):
+        assert request.method == "POST"
+        context_id = f"context-{len(created)}"
+        created.append(context_id)
+        return httpx.Response(200, json={"id": context_id})
+    async with httpx.AsyncClient(transport=transport(handler)) as client:
+        with pytest.raises(ValueError, match="conversation ID"):
+            await lathe._ensure_interpreter_context(tools.valves, "sb", client, tools._interpreter_state, "")
+        for chat_id, expected in [("a", "context-0"), ("b", "context-1")]:
+            assert await lathe._ensure_interpreter_context(tools.valves, "sb", client, tools._interpreter_state, chat_id) == (expected, False)
+    assert created == ["context-0", "context-1"]
 
 
 async def test_background_bash_poll_delivers_once(tools, sandbox, http, clock):
@@ -785,6 +1167,9 @@ async def test_background_bash_poll_delivers_once(tools, sandbox, http, clock):
     def handler(request):
         requests.append(request.url.path)
         if (request.method, request.url.path) == ("POST", "/sb/process/execute"):
+            script = shlex.split(json.loads(request.content)["command"])[2]
+            if "f.seek" in script:
+                return httpx.Response(200, json={"exitCode": 0, "result": json.dumps({"text": "final output", "size": 12})})
             return httpx.Response(200, json={"exitCode": 0, "result": "caller output"})
         assert request.method == "GET"
         if request.url.path == "/sb/process/session/session":
@@ -816,6 +1201,130 @@ async def test_background_bash_poll_deadline(tools, http, clock, monkeypatch):
     assert clock() >= 5
     assert requests and len(requests) < 10
     assert tools._chat_state["chat"]["pending"] == []
+
+
+async def test_started_tool_request_budget(tools, http):
+    tools._chat_state["chat"] = {"init": True, "pending": []}
+    calls = []
+
+    def handler(request):
+        calls.append((request.method, request.url.path))
+        if request.url.path == "/sandbox":
+            return httpx.Response(200, json=[{
+                "id": "sb", "state": "started", "labels": {"test": USER["email"]},
+            }])
+        if request.url.path == "/sandbox/sb":
+            return httpx.Response(200, json={"id": "sb", "state": "started"})
+        assert (request.method, request.url.path) == ("POST", "/sb/process/execute")
+        command = json.loads(request.content)["command"]
+        result = "" if command == "bash -c 'mkdir -p /home/daytona/workspace'" else "file contents"
+        return httpx.Response(200, json={"exitCode": 0, "result": result})
+
+    http(handler)
+    for _ in range(2):
+        before = len(calls)
+        assert await tools.read("/file", __user__=USER, __chat_id__="chat") == "file contents"
+        assert len(calls) - before == 4
+        assert calls[before:before + 2] == [("GET", "/sandbox"), ("GET", "/sandbox/sb")]
+
+
+@pytest.mark.parametrize("initial", ["created", "conflicted", "stopped", "starting", "error"])
+@pytest.mark.parametrize("failure", ["http", "timeout", "mkdir"])
+async def test_startup_readiness_retries_and_creates_workspace(
+    tools, transport, clock, tmp_path, initial, failure,
+):
+    tools.valves.persistent_volume = False
+    observations = iter([initial, "started"])
+    workspace = tmp_path / "workspace with spaces"
+    attempts = []
+
+    def handler(request):
+        if request.url.path == "/sandbox" and request.method == "GET":
+            return httpx.Response(200, json=[] if initial in ("created", "conflicted") else [{
+                "id": "sb", "state": "started", "labels": {"test": USER["email"]},
+            }])
+        if request.url.path == "/sandbox" and request.method == "POST":
+            if initial == "conflicted":
+                return httpx.Response(409)
+            return httpx.Response(200, json={"id": "sb", "state": "started"})
+        if request.url.path == "/sandbox/test/owner@example.test":
+            return httpx.Response(200, json={
+                "id": "sb", "state": "started", "name": "test/owner@example.test",
+                "labels": {"test": USER["email"]},
+            })
+        if request.url.path == "/sandbox/sb" and request.method == "GET":
+            return httpx.Response(200, json={
+                "id": "sb", "state": next(observations), "recoverable": True,
+            })
+        if request.url.path in ("/sandbox/sb/start", "/sandbox/sb/recover"):
+            assert request.method == "POST"
+            return httpx.Response(200, json={})
+        assert (request.method, request.url.path) == ("POST", "/sb/process/execute")
+        command = json.loads(request.content)["command"]
+        attempts.append(command)
+        if len(attempts) == 1:
+            if failure == "timeout":
+                raise httpx.ReadTimeout("toolbox starting", request=request)
+            if failure == "http":
+                return httpx.Response(503)
+            return httpx.Response(200, json={"exitCode": 1, "result": "mkdir failed"})
+        # Execute the shipped readiness command, with only its absolute root
+        # redirected to a real temporary directory.
+        argv = shlex.split(command)
+        argv[2] = argv[2].replace("/home/daytona/workspace", shlex.quote(str(workspace)))
+        result = subprocess.run(argv, capture_output=True, text=True)
+        return httpx.Response(200, json={"exitCode": result.returncode, "result": result.stdout})
+
+    async with httpx.AsyncClient(transport=transport(handler)) as client:
+        sandbox_id, _ = await lathe._ensure_sandbox(tools.valves, USER["email"], client)
+    assert sandbox_id == "sb" and workspace.is_dir()
+    assert len(attempts) == 2 and clock() >= 1
+
+
+@pytest.mark.parametrize("failure", ["http", "timeout", "mkdir"])
+async def test_started_workspace_failure_never_runs_tool(tools, http, clock, failure):
+    tools._chat_state["chat"] = {"init": True, "pending": []}
+    calls = []
+
+    def handler(request):
+        calls.append((request.method, request.url.path))
+        if request.url.path == "/sandbox":
+            return httpx.Response(200, json=[{
+                "id": "sb", "labels": {"test": USER["email"]},
+            }])
+        if request.url.path == "/sandbox/sb":
+            return httpx.Response(200, json={"id": "sb", "state": "started"})
+        assert (request.method, request.url.path) == ("POST", "/sb/process/execute")
+        assert json.loads(request.content)["command"] == "bash -c 'mkdir -p /home/daytona/workspace'"
+        if failure == "timeout":
+            raise httpx.ReadTimeout("sandbox stopped after lookup", request=request)
+        if failure == "http":
+            return httpx.Response(503)
+        return httpx.Response(200, json={"exitCode": 1, "result": "workspace path is a file"})
+
+    http(handler)
+    result = await tools.read("/file", __user__=USER, __chat_id__="chat")
+    assert "workspace could not be prepared" in result and "Retry this tool call" in result
+    assert len(calls) == 3 and clock() == 0
+
+
+async def test_startup_workspace_failure_is_bounded(tools, transport, clock):
+    tools.valves.persistent_volume = False
+    attempts = []
+
+    def handler(request):
+        if (request.method, request.url.path) == ("GET", "/sandbox"):
+            return httpx.Response(200, json=[])
+        if (request.method, request.url.path) == ("POST", "/sandbox"):
+            return httpx.Response(200, json={"id": "sb", "state": "started"})
+        assert (request.method, request.url.path) == ("POST", "/sb/process/execute")
+        attempts.append(request)
+        return httpx.Response(200, json={"exitCode": 1, "result": "mkdir failed"})
+
+    async with httpx.AsyncClient(transport=transport(handler)) as client:
+        with pytest.raises(RuntimeError, match="could not prepare the workspace"):
+            await lathe._ensure_sandbox(tools.valves, USER["email"], client)
+    assert len(attempts) == 30 and clock() == 30
 
 
 @pytest.mark.parametrize("state,status", [
@@ -886,6 +1395,7 @@ async def test_concurrent_first_calls_converge_by_unique_name(tools, transport):
     ]
     assert label_lookups == 2 and create_calls == 2
     assert calls.count(("GET", "/sandbox/test/owner@example.test")) == 1
+    assert calls.count(("POST", "/winner/process/execute")) == 2
 
 
 async def test_create_conflict_without_authoritative_winner_is_retryable(tools, transport):
@@ -969,6 +1479,7 @@ async def test_lifecycle_ready_and_restartable_states(
     assert sandbox_id == "sb"
     assert (expected_warning is None and warning is None) or expected_warning in warning
     assert calls.count(("POST", "/sandbox/sb/start")) == start_calls
+    assert calls.count(("POST", "/sb/process/execute")) == 1
     assert (clock() > 0) == bool(start_calls)
 
 
@@ -1300,8 +1811,9 @@ async def test_ttyd_setup_failure_stops_before_preview(preview):
 
 @pytest.mark.parametrize("service", ["dufs", "code-server"])
 @pytest.mark.parametrize("fault", [None, "stale", "release", "digest"])
+@pytest.mark.parametrize("existing_listener", [False, True])
 def test_managed_archive_install_is_release_consistent_verified_and_atomic(
-    tmp_path, service, fault,
+    tmp_path, service, fault, existing_listener,
 ):
     install_root = tmp_path / "lathe"
     install_root.mkdir()
@@ -1383,6 +1895,18 @@ def test_managed_archive_install_is_release_consistent_verified_and_atomic(
         esac
         """))
     fake_curl.chmod(0o755)
+    # The fake listener's PID must have a coherent command identity. Never read
+    # the host's unrelated /proc/123, which may be missing or a different process.
+    proc_root = fixtures / "proc"
+    process = proc_root / "123"
+    process.mkdir(parents=True)
+    options = "\0--allow-upload\0--allow-delete\0--allow-search\0--allow-archive\0--allow-hash" if service == "dufs" else ""
+    process.joinpath("cmdline").write_bytes(f"{installed}\0{tmp_path}{options}\0".encode())
+    script = script.replace("/proc/", str(proc_root) + "/")
+    if existing_listener:
+        # Force the reuse path deterministically, instead of relying on which
+        # concurrent installer reaches the listener check first.
+        (install_root / (service + ".root")).write_text(str(tmp_path))
     fake_ss = fake_bin / "ss"
     fake_ss.write_text(
         f"#!/bin/sh\n"
@@ -1425,6 +1949,39 @@ def test_managed_archive_install_is_release_consistent_verified_and_atomic(
         assert not installed.exists()
         assert not any(path.name.startswith(".install.") for path in install_root.iterdir())
         assert len(calls) == (1 if fault == "release" else 2)
+
+
+@pytest.mark.parametrize("identity,error", [
+    ("matching", None), ("wrong-binary", "occupied by another process"),
+    ("wrong-root", "serving a different root"),
+])
+def test_code_server_fake_listener_preserves_identity_guards(tmp_path, identity, error):
+    root = tmp_path / "lathe"
+    project = tmp_path / "project"
+    project.mkdir()
+    binary = root / "code-server/bin/code-server"
+    binary.parent.mkdir(parents=True)
+    binary.write_text("#!/bin/sh\nexit 0\n")
+    binary.chmod(0o755)
+    (root / "code-server.root").write_text(str(project))
+    proc = tmp_path / "proc"
+    (proc / "123").mkdir(parents=True)
+    command = str(binary) if identity != "wrong-binary" else "/unrelated-service"
+    serve_root = str(project) if identity != "wrong-root" else "/wrong-project"
+    (proc / "123/cmdline").write_bytes(f"{command}\0{serve_root}\0".encode())
+    fake = tmp_path / "fake-bin"
+    fake.mkdir()
+    ss = fake / "ss"
+    ss.write_text('#!/bin/sh\necho \'LISTEN 0 128 0.0.0.0:8080 users:(("code-server",pid=123,fd=3))\'\n')
+    ss.chmod(0o755)
+    script = lathe._build_code_server_ensure_script(str(root), str(project))
+    script = script.replace("/home/daytona/workspace", str(tmp_path)).replace("/proc/", str(proc) + "/")
+    result = subprocess.run(["bash", "-c", script], capture_output=True, text=True,
+                            env={**os.environ, "PATH": f"{fake}:{os.environ['PATH']}"}, timeout=10)
+    if error:
+        assert result.returncode != 0 and error in result.stderr
+    else:
+        assert result.returncode == 0 and "READY PID=123" in result.stdout
 
 
 def test_dufs_launch_keeps_file_operations_without_outside_symlinks(tmp_path):
@@ -1738,11 +2295,16 @@ async def test_delegate_setup_exception_closes_every_owned_client(
     assert [client.close_calls for client in clients] == [1] * len(clients)
 
 
+@pytest.mark.parametrize("boundary", [False, True])
 async def test_one_step_delegate_answers_from_context_without_tools(
-    tools, sandbox, http, monkeypatch, tmp_path,
+    tools, sandbox, http, monkeypatch, tmp_path, boundary,
 ):
     source = tmp_path / "large-context.txt"
-    source.write_text("decisive evidence\n")
+    evidence = "decisive evidence\n"
+    if boundary:
+        overhead = len(f"## Reference Files\n\n### {source}\n\n".encode())
+        evidence += "x" * (50 * 1024 - overhead - len(evidence.encode()))
+    source.write_text(evidence)
     root = tmp_path / "sidecars"
     monkeypatch.setattr(lathe, "_EPHEMERAL_ROOT", str(root))
     tools._chat_state["chat"] = {"init": True, "pending": []}
@@ -1799,8 +2361,93 @@ async def test_one_step_delegate_answers_from_context_without_tools(
     assert [client.close_calls for client in clients[:3]] == [1, 1, 1]
 
 
-@pytest.mark.parametrize("background,fail", [(False, False), (True, False), (True, True)])
-async def test_real_delegate_execution_and_completion(tools, sandbox, http, monkeypatch, tmp_path, background, fail):
+@pytest.mark.parametrize("count", [1, 2])
+async def test_reference_budget_includes_outer_heading_and_separators(tools, sandbox, http, count):
+    tools._chat_state["chat"] = {"init": True, "pending": []}
+    paths = [f"/reference/{i}" for i in range(count)]
+    # Sections alone fit exactly. The complete block must be rejected.
+    available = 50 * 1024 - sum(len(f"### {p}\n\n".encode()) for p in paths)
+    sizes = [available // count] * count
+    sizes[-1] += available % count
+    def handler(request):
+        assert request.method == "GET" and request.url.path == "/sb/files/download"
+        return httpx.Response(200, content=b"x" * sizes[paths.index(request.url.params["path"])])
+    http(handler)
+    async def app(scope, receive, send):
+        pytest.fail("reference block exceeding budget reached inference")
+    result = await tools.delegate("Analyze", context_files=paths, max_steps=1,
+        __user__=USER, __chat_id__="chat", __model__={"id": "model"}, __request__=delegate_request(app))
+    assert result.startswith("Error:") and "byte text limit" in result
+
+
+@pytest.mark.parametrize("sizes", [(1000000,), (30000, 30000)])
+async def test_delegate_rejects_oversized_reference_before_inference(tools, sandbox, http, sizes):
+    tools._chat_state["chat"] = {"init": True, "pending": []}
+    chunks_received = 0
+    class ReferenceStream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            nonlocal chunks_received
+            for _ in range(125):
+                chunks_received += 1
+                yield b"x" * 8192
+    def handler(request):
+        assert request.method == "GET" and request.url.path == "/sb/files/download"
+        size = sizes[int(request.url.params["path"].rsplit("/", 1)[1])]
+        if size == 1000000:
+            return httpx.Response(200, stream=ReferenceStream())
+        return httpx.Response(200, content=b"x" * size)
+    http(handler)
+    async def app(scope, receive, send):
+        pytest.fail("oversized reference reached inference")
+    result = await tools.delegate("Analyze references", context_files=[f"/reference/{i}" for i in range(len(sizes))],
+        max_steps=1, __user__=USER, __chat_id__="chat", __model__={"id": "model"},
+        __request__=delegate_request(app))
+    assert result.startswith("Error:") and "byte text limit" in result
+    if sizes == (1000000,):
+        assert chunks_received <= 7, "reference must be rejected before full acquisition"
+
+
+@pytest.mark.parametrize("oversized", [False, True])
+async def test_interpret_bounds_oversized_and_many_frames(tools, sandbox, http, monkeypatch, oversized):
+    import contextlib
+    import httpx_ws
+    tools._chat_state["chat"] = {"init": True, "pending": []}
+    monkeypatch.setattr(lathe, "_ensure_interpreter_context", AsyncMock(return_value=("ctx", False)))
+    frames = iter(([{"type": "stdout", "text": "é" * 500000}] +
+                   [{"type": "stderr", "text": "discarded"}] * 1000) if oversized else
+                  [{"type": "stdout", "text": "Error: expected output"}])
+    received = 0
+    class WS:
+        async def send_json(self, message):
+            assert message["code"] == "print('large')"
+        async def receive_json(self):
+            nonlocal received
+            try:
+                frame = next(frames)
+            except StopIteration:
+                raise httpx_ws.WebSocketDisconnect(1000)
+            received += 1
+            return frame
+    @contextlib.asynccontextmanager
+    async def connect(*args, **kwargs):
+        assert kwargs["queue_size"] == 1
+        yield WS()
+    monkeypatch.setattr(httpx_ws, "aconnect_ws", connect)
+    http(lambda request: pytest.fail("unexpected HTTP"))
+    result = await tools.interpret("print('large')", __user__=USER, __chat_id__="chat")
+    assert received == (1001 if oversized else 1), "must drain execution even after preview fills"
+    assert len(result.encode()) < 53 * 1024
+    if oversized:
+        assert "Text preview truncated" in result and "discarded" in result
+    else:
+        assert result == "Error: expected output", "literal stdout is not the internal error protocol"
+
+
+@pytest.mark.parametrize("background,fail,persist_failure", [
+    (False, False, False), (True, False, False), (True, True, False),
+    (False, False, True), (True, False, True),
+])
+async def test_real_delegate_execution_and_completion(tools, sandbox, http, monkeypatch, tmp_path, background, fail, persist_failure):
     """Real Agent, tool cores and files; observe completion as the caller does."""
     release = asyncio.Event()
     if not background:
@@ -1818,6 +2465,9 @@ async def test_real_delegate_execution_and_completion(tools, sandbox, http, monk
         assert request.headers["authorization"] == "Bearer test-key"
         command = shlex.split(json.loads(request.content)["command"])
         assert command[:2] == ["python3", "-c"]
+        if persist_failure and "/result'" in command[2]:
+            # Execute the real shipped write path against a filesystem failure.
+            next((root / "delegate").iterdir()).joinpath("result").mkdir(exist_ok=True)
         return httpx.Response(200, json={"exitCode": 0, "result": run_script(command[2])})
     clients = http(execute)
 
@@ -1871,7 +2521,7 @@ async def test_real_delegate_execution_and_completion(tools, sandbox, http, monk
         sidecars = directories[0]
         assert (sidecars / "task").read_text() == task_description
         emission_count = len(emissions)
-        notice = "Background delegation failed" if fail else "Background delegation completed"
+        notice = "Background delegation failed" if fail or persist_failure else "Background delegation completed"
         if background:
             descriptor = re.search(r"^DELEGATE=(.+)$", result, re.MULTILINE)
             assert descriptor and sidecars.name == descriptor[1], result
@@ -1879,7 +2529,11 @@ async def test_real_delegate_execution_and_completion(tools, sandbox, http, monk
             assert [client.close_calls for client in delegate_clients] == [1, 0, 0]
             assert notice not in await read_in("chat")
         else:
-            assert "verified result" in result and "1 tool call(s)" in result
+            if persist_failure:
+                assert "Delegation failed" in result and "Cannot write" in result
+                assert not any(e["data"]["description"].startswith("Delegation complete") for e in emissions)
+            else:
+                assert "verified result" in result and "1 tool call(s)" in result
         release.set()
         async with asyncio.timeout(5):
             if background:
@@ -1893,9 +2547,9 @@ async def test_real_delegate_execution_and_completion(tools, sandbox, http, monk
             assert len(emissions) == emission_count, "delegate emitted to a closed foreground stream"
         assert notice not in await read_in("chat")
         assert notice not in await read_in("other")
-        if fail:
-            assert "synthetic model failure" in (sidecars / "error").read_text()
-            assert not (sidecars / "result").exists()
+        if fail or persist_failure:
+            assert ("Cannot write" if persist_failure else "synthetic model failure") in (sidecars / "error").read_text()
+            assert not (sidecars / "result").is_file()
         else:
             assert (sidecars / "result").read_text() == "verified result"
             assert json.loads((sidecars / "usage").read_text())["tool_calls"] == 1
