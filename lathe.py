@@ -838,6 +838,7 @@ def grep_hierarchy(base_dir, regex, files_pattern, max_lines):
 
     for filepath in _iter_matching_files(base, positive, negative):
         files_scanned += 1
+        previous_counts = total_matches, matched_files, len(hits)
         try:
             with open(filepath, "rb") as raw:
                 header = raw.read(8192)
@@ -858,6 +859,8 @@ def grep_hierarchy(base_dir, regex, files_pattern, max_lines):
                                 text = text[:_MAX_LINE_WIDTH] + "..."
                             hits.append((filepath, i, text))
         except (OSError, UnicodeDecodeError):
+            total_matches, matched_files, previous_hits = previous_counts
+            del hits[previous_hits:]
             skipped_files += 1
             continue
 
@@ -865,6 +868,7 @@ def grep_hierarchy(base_dir, regex, files_pattern, max_lines):
         return f"0 files match {files_pattern!r} in {base}"
 
     header = f"{total_matches} matches across {matched_files} files for {regex!r}"
+    header += f"; searched {files_scanned - skipped_files} readable files (scope: {files_pattern!r}, base: {base})"
     if total_matches > len(hits):
         header += f"; showing {len(hits)}, {total_matches - len(hits)} omitted (traversal-order sample)"
     if skipped_files:

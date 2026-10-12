@@ -513,6 +513,39 @@ def test_grep_clips_concrete_long_hits(tmp_path):
     assert result.splitlines()[1:] == [f"{path}:1: " + "needle" + "x" * 194 + "..."]
 
 
+def test_empty_grep_reports_readable_scope(tree):
+    result = script_call("GREP", "grep_hierarchy", str(tree), "absent", "**/*.py", 1)
+    assert "0 matches across 0 files" in result
+    assert "searched 12 readable files" in result
+    assert "**/*.py" in result and str(tree) in result
+
+
+def test_grep_discards_hits_from_failed_file_reads(tmp_path):
+    path = tmp_path / "partial.txt"
+    path.write_text("needle\nneedle\n")
+    source = lathe._GREP_SCRIPT + f'''
+import builtins
+_real_open = builtins.open
+class InterruptedFile:
+    def __init__(self, file): self.file = file
+    def __enter__(self): return self
+    def __exit__(self, *args): return self.file.__exit__(*args)
+    def __iter__(self):
+        yield next(iter(self.file))
+        raise OSError("injected read interruption")
+def interrupted_open(path, mode="r", **kwargs):
+    file = _real_open(path, mode, **kwargs)
+    return file if mode == "rb" else InterruptedFile(file)
+builtins.open = interrupted_open
+print(grep_hierarchy({str(tmp_path)!r}, "needle", "**/*.txt", 1))
+'''
+    result = run_script(source)
+    assert result.startswith("0 matches across 0 files")
+    assert "searched 0 readable files" in result
+    assert "1 binary or unreadable files skipped" in result
+    assert len(result.splitlines()) == 1
+
+
 @pytest.mark.parametrize("name,kwargs", [
     ("read", {}), ("write", {"content": "x"}),
     ("edit", {"old_string": "x", "new_string": "y"}), ("view", {}),
