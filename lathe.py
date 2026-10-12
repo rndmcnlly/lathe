@@ -1576,7 +1576,7 @@ def _check_tool_params(kwargs: dict, annotated_fn) -> str | None:
 # method signature.
 _CORE_INFRA_PARAMS = frozenset({
     "valves", "sandbox_id", "client", "emit", "user_pairs",
-    "on_background", "chat_state", "chat_id",
+    "on_background", "chat_state", "chat_id", "interpreter_state",
 })
 
 
@@ -1603,7 +1603,7 @@ def _standard_tool(core_fn, *, emit_start: str, emit_done: str,
         emit_done: Status message emitted after the core returns.
         extra_core_kwargs: Optional callable(self, sandbox_id, __chat_id__)
             returning a dict of extra kwargs to pass to the core function
-            (e.g. chat_state and chat_id for interpret).
+            (e.g. interpreter_state and chat_id for interpret).
     """
     # ── Extract tool-visible parameters from the core function ───────
     core_sig = inspect.signature(core_fn)
@@ -2409,9 +2409,9 @@ async def _poll_bg_bash(valves, sandbox_id: str, session_id: str,
 #
 # The Daytona toolbox exposes a persistent Python REPL via a WebSocket
 # endpoint.  Variables, imports, and definitions survive across calls
-# within the same "context".  We create one context per OWUI chat (keyed
-# by __chat_id__) and store its ID in _chat_state.  If the sandbox
-# restarts (killing the interpreter process), we detect the stale
+# within the same "context". Interpreter identity lives separately from
+# disposable chat notices, for the lifetime of one loaded Tools instance.
+# If the sandbox restarts (killing the interpreter process), we detect the stale
 # context, create a fresh one, and warn the model that state was lost.
 #
 # The WS protocol:
@@ -2428,55 +2428,49 @@ _INTERPRET_DEFAULT_TIMEOUT = 120  # seconds; server default is 600
 
 async def _ensure_interpreter_context(
     valves, sandbox_id: str, client: httpx.AsyncClient,
-    chat_state: LRUCache, chat_id: str,
-) -> str:
-    """Return the interpreter context ID for this chat, creating one if needed.
+    interpreter_state: dict, chat_id: str,
+) -> tuple[str, bool]:
+    """Resolve identity under a per-chat lock; only a valid list proves absence.
 
-    Stores the context ID in chat_state[chat_id]["interpreter_context_id"].
-    If the stored context is stale (404 on probe), creates a fresh one and
-    updates the state.  Returns (context_id, lost_state) where lost_state
-    is True if a previously valid context was replaced.
+    Records are intentionally non-evicting, scoped to one Tools instance.
+    A failed/ambiguous probe must never replace a healthy interpreter.
+    The lock covers identity resolution, not execution of user Python code.
     """
-    state = chat_state.get(chat_id, {})
-    ctx_id = state.get("interpreter_context_id")
-
-    if ctx_id:
-        # Probe: is the context still alive?  The list endpoint is cheap.
-        try:
+    if not chat_id:
+        raise ValueError("interpret() requires a conversation ID")
+    state = interpreter_state.setdefault(chat_id, {"lock": asyncio.Lock()})
+    async with state["lock"]:
+        ctx_id = state.get("id")
+        if ctx_id and state["sandbox_id"] == sandbox_id:
             resp = await client.get(
                 _toolbox(valves, sandbox_id, "/process/interpreter/context"),
                 headers=_headers(valves),
                 timeout=15.0,
             )
-            if resp.status_code == 200:
-                contexts = resp.json().get("contexts", [])
-                if any(c.get("id") == ctx_id for c in contexts):
-                    return ctx_id, False
-        except Exception as e:
-            logger.debug("interpreter context probe failed: %s", e)
-        # Context is gone (sandbox restarted, etc.)  Fall through to create.
+            resp.raise_for_status()
+            data = resp.json()
+            contexts = data.get("contexts") if isinstance(data, dict) else None
+            if not isinstance(contexts, list) or any(
+                not isinstance(c, dict) or not isinstance(c.get("id"), str)
+                or not c["id"] for c in contexts
+            ):
+                raise RuntimeError("Daytona returned an invalid interpreter context list")
+            if any(c["id"] == ctx_id for c in contexts):
+                return ctx_id, False
 
-    # Create a new context.
-    resp = await client.post(
-        _toolbox(valves, sandbox_id, "/process/interpreter/context"),
-        headers=_headers(valves),
-        json={"language": "python", "cwd": "/home/daytona/workspace"},
-        timeout=30.0,
-    )
-    resp.raise_for_status()
-    new_id = resp.json().get("id")
-    if not new_id:
-        raise RuntimeError("Daytona returned an interpreter context with no ID")
-
-    # Store in chat state.
-    if chat_id in chat_state:
-        chat_state[chat_id]["interpreter_context_id"] = new_id
-    else:
-        chat_state[chat_id] = {"init": True, "pending": [],
-                               "interpreter_context_id": new_id}
-
-    lost_state = ctx_id is not None  # had one before, now replaced
-    return new_id, lost_state
+        # Authoritative absence, a different sandbox, or first use.
+        resp = await client.post(
+            _toolbox(valves, sandbox_id, "/process/interpreter/context"),
+            headers=_headers(valves),
+            json={"language": "python", "cwd": "/home/daytona/workspace"},
+            timeout=30.0,
+        )
+        resp.raise_for_status()
+        new_id = resp.json().get("id")
+        if not isinstance(new_id, str) or not new_id:
+            raise RuntimeError("Daytona returned an interpreter context with no ID")
+        state.update(id=new_id, sandbox_id=sandbox_id)
+        return new_id, ctx_id is not None
 
 
 def _format_interpret_result(stdout: str, stderr: str,
@@ -2514,7 +2508,7 @@ def _format_interpret_result(stdout: str, stderr: str,
 
 
 async def _core_interpret(valves, sandbox_id: str, client: httpx.AsyncClient,
-                          chat_state: LRUCache, chat_id: str, *,
+                          interpreter_state: dict, chat_id: str, *,
                           code: str, timeout: int = _INTERPRET_DEFAULT_TIMEOUT) -> str:
     """Run Python code in a persistent REPL session. Variables, imports, and
     definitions survive across calls within the same conversation.
@@ -2531,7 +2525,7 @@ async def _core_interpret(valves, sandbox_id: str, client: httpx.AsyncClient,
         return "Error: empty code. Provide Python code to execute."
 
     context_id, lost_state = await _ensure_interpreter_context(
-        valves, sandbox_id, client, chat_state, chat_id,
+        valves, sandbox_id, client, interpreter_state, chat_id,
     )
 
     # Build the WS URL from the proxy base (same host, /process/interpreter/execute).
@@ -3118,7 +3112,8 @@ def _build_delegate_tool(core_fn, *, infra_args: tuple,
 
 def _build_delegate_tools(valves, sandbox_id: str, client: httpx.AsyncClient,
                           user_pairs: list[tuple[str, str]],
-                          chat_state: LRUCache = None, chat_id: str = ""):
+                          chat_state: LRUCache = None, chat_id: str = "",
+                          interpreter_state: dict = None):
     """Build pydantic-ai Tool objects that operate against a resolved sandbox.
 
     Returns a list of Tool instances. Each tool is a thin closure over the
@@ -3140,12 +3135,11 @@ def _build_delegate_tools(valves, sandbox_id: str, client: httpx.AsyncClient,
         _build_delegate_tool(_core_grep, infra_args=infra),
     ]
 
-    # interpret needs chat context; only available when chat_state and chat_id
-    # are provided.  It also needs extra infra kwargs.
-    if chat_state and chat_id:
+    # Parent and delegates deliberately share one identity registry.
+    if interpreter_state is not None and chat_id:
         all_tools.append(_build_delegate_tool(
             _core_interpret, infra_args=infra,
-            extra_infra_kwargs={"chat_state": chat_state, "chat_id": chat_id},
+            extra_infra_kwargs={"interpreter_state": interpreter_state, "chat_id": chat_id},
         ))
 
     return all_tools
@@ -3858,6 +3852,7 @@ class Tools:
         # dead) and the next tool call in that chat re-runs auto-init
         # (idempotent, ~150 tokens).
         self._chat_state: LRUCache = LRUCache(maxsize=1024)
+        self._interpreter_state: dict = {}
 
     # ── agent-facing manual ──────────────────────────────────────────
     #
@@ -4031,6 +4026,12 @@ class Tools:
               on the first interpret() call.
             - State persists across calls: define a function in one call, use
               it in the next. Import a module once, use it everywhere.
+            - Identity survives eviction/reconstruction of chat notices, but
+              only within one loaded toolkit instance. OWUI restart, toolkit
+              reload, or another worker does not reconnect to the old context.
+              Save important results to files; this is not durable storage.
+            - Transient context-list failures fail the call without replacing
+              state. Retry once the service recovers.
             - State is lost when the sandbox stops or restarts (idle timeout,
               destroy, etc.). The tool detects this and warns you to re-run
               setup code.
@@ -4067,7 +4068,8 @@ class Tools:
             Delegates (sub-agents) share the same interpreter context as the
             outer conversation. A delegate can define a variable that the
             outer model later reads, or vice versa. This is useful for
-            parallel data pipelines.
+            shared computations. Context creation is serialized, but Python
+            executions are not: avoid concurrent mutation of shared variables.
             """),
         "services": textwrap.dedent("""\
             # Lathe — Service Details
@@ -4889,7 +4891,7 @@ class Tools:
         emit_start="Running Python...",
         emit_done="Execution complete",
         extra_core_kwargs=lambda self, sandbox_id, chat_id: {
-            "chat_state": self._chat_state,
+            "interpreter_state": self._interpreter_state,
             "chat_id": chat_id,
         },
     )
@@ -5085,6 +5087,7 @@ class Tools:
                     _build_delegate_tools(
                         self.valves, sandbox_id, bg_client, user_pairs,
                         chat_state=self._chat_state, chat_id=__chat_id__,
+                        interpreter_state=self._interpreter_state,
                     )
                     if clamped_steps > 1 else []
                 )
