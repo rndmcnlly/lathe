@@ -202,10 +202,15 @@ http {{
     # Node's bundled trust store is not workerd's trust store. The slim image
     # needs OS CA certificates for Worker fetch() to verify Daytona upstreams.
     monitor.docker("run", "-d", "--name", WORKER, "--network", NETWORK,
+        "--env", f"LOCAL_UID={os.getuid()}", "--env", f"LOCAL_GID={os.getgid()}",
         "--mount", f"type=bind,src={path},dst=/local-demo", "--workdir", "/local-demo",
         "node:22-bookworm-slim", "sh", "-c",
-        "apt-get update -qq && apt-get install -y --no-install-recommends ca-certificates "
-        "&& exec npx --yes wrangler@4.136.1 dev --local --ip 0.0.0.0 --port 8787 "
+        "apt-get update -qq && apt-get install -y --no-install-recommends ca-certificates util-linux "
+        # Wrangler writes .wrangler/tmp beside its config even with --persist-to.
+        # Drop root before npm/Wrangler so host-owned temporary cleanup works.
+        "&& exec setpriv --reuid \"$LOCAL_UID\" --regid \"$LOCAL_GID\" --clear-groups "
+        "env HOME=/tmp NPM_CONFIG_CACHE=/tmp/npm-cache "
+        "npx --yes wrangler@4.136.1 dev --local --ip 0.0.0.0 --port 8787 "
         "--config wrangler.json --persist-to /tmp/wrangler-state")
     monitor.docker("run", "-d", "--name", TLS, "--network", NETWORK,
         "--network-alias", ZONE, "-p", "127.0.0.1:443:443",
@@ -254,7 +259,10 @@ def cleanup_demo(directory):
     for name in (TLS, WORKER):
         try:
             logs = monitor.docker("logs", name, check=False)
-            (directory / f"{name}.log").write_text(monitor.sanitize(logs.stdout + logs.stderr))
+            # Repeated cleanup must not replace real logs with "No such container".
+            if logs.returncode == 0:
+                with (directory / f"{name}.log").open("a") as out:
+                    out.write(monitor.sanitize(logs.stdout + logs.stderr))
             result = monitor.docker("rm", "-f", "-v", name, check=False)
             if result.returncode and "No such container" not in result.stderr:
                 errors.append(monitor.sanitize(result.stderr or f"Could not remove {name}"))
@@ -287,6 +295,7 @@ def qualify(directory):
               "requested_model": routing["requested_model"], "serving_models": routing["serving_models"],
               "deployment_label": environment["deployment_label"]}
     qualification.write_text(json.dumps(result, indent=2))
+    (directory / "qualification.json").write_text(json.dumps(result, indent=2))
 
 
 def main():

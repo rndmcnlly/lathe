@@ -17,6 +17,7 @@ import demo_local as demo
 def test_demo_cleanup_attempts_every_resource_and_fails_closed(tmp_path, monkeypatch, fault):
     (tmp_path / "environment.json").write_text(json.dumps({"deployment_label": "lathe-ci-demo-fixture"}))
     seen = []
+    (tmp_path / f"{demo.WORKER}.log").write_text("original startup evidence")
     def docker(*args, **kwargs):
         seen.append(args)
         if fault == "daemon":
@@ -35,6 +36,7 @@ def test_demo_cleanup_attempts_every_resource_and_fails_closed(tmp_path, monkeyp
     assert ("rm", "-f", "-v", demo.WORKER) in seen
     assert ("network", "rm", demo.NETWORK) in seen
     assert json.loads((tmp_path / "demo-cleanup.json").read_text())["success"] == (not fault)
+    assert (tmp_path / f"{demo.WORKER}.log").read_text() == "original startup evidence"
 
 
 @pytest.mark.parametrize("fault", [None, "capture", "cleanup", "model", "models", "requests", "evidence"])
@@ -145,6 +147,7 @@ async def test_identity_rejects_unbound_callbacks(callback):
 
 def test_infrastructure_uses_real_worker_private_auth_and_loopback_tls(tmp_path, monkeypatch):
     calls = []
+    real_run = subprocess.run
     def openssl(command, **kwargs):
         assert command[0] == "openssl"
         (tmp_path / "cert.pem").write_text("fixture certificate")
@@ -169,3 +172,27 @@ def test_infrastructure_uses_real_worker_private_auth_and_loopback_tls(tmp_path,
     assert "resolver 127.0.0.11" in nginx
     assert "proxy_pass $identity_upstream$request_uri;" in nginx
     assert any("127.0.0.1:443:443" in args for args in calls)
+    worker = next(args for args in calls if args[:4] == ("run", "-d", "--name", demo.WORKER))
+    assert f"LOCAL_UID={demo.os.getuid()}" in worker
+    assert f"LOCAL_GID={demo.os.getgid()}" in worker
+    # Execute the shipped startup shell with process boundaries replaced, not
+    # apt/network/root privileges. Observe the requested identity and npm env.
+    binaries = tmp_path / "bin"
+    binaries.mkdir()
+    for name, script in {
+        "apt-get": "#!/bin/sh\nexit 0\n",
+        "setpriv": '#!/bin/sh\nprintf "%s\\n" "$@" > "$DEMO_TEST_PRIVILEGES"\nshift 5\nexec "$@"\n',
+        "npx": '#!/bin/sh\ntest "$HOME" = /tmp && test "$NPM_CONFIG_CACHE" = /tmp/npm-cache || exit 1\n'
+               'mkdir -p .wrangler/tmp\nprintf "%s\\n" "$@" > worker-arguments\n',
+    }.items():
+        binary = binaries / name
+        binary.write_text(script)
+        binary.chmod(0o755)
+    env = {**demo.os.environ, "PATH": str(binaries) + ":" + demo.os.environ["PATH"],
+           "LOCAL_UID": str(demo.os.getuid()), "LOCAL_GID": str(demo.os.getgid()),
+           "DEMO_TEST_PRIVILEGES": str(tmp_path / "privileges")}
+    real_run(["sh", "-c", worker[-1]], cwd=tmp_path, env=env, check=True)
+    assert (tmp_path / "privileges").read_text().splitlines()[:5] == [
+        "--reuid", str(demo.os.getuid()), "--regid", str(demo.os.getgid()), "--clear-groups"]
+    assert (tmp_path / ".wrangler/tmp").is_dir()
+    assert "dev" in (tmp_path / "worker-arguments").read_text().splitlines()

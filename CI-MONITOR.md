@@ -185,6 +185,9 @@ The demo explicitly defaults to `z-ai/glm-5.3-flash`, overridable with
 `LATHE_MONITOR_MODEL`. It uses the same no-plugin direct-model relay policy as
 isolated deployment qualification. The Docker-exec process runs with host UID/GID
 so routing and teardown evidence remain host-writable on Linux runners.
+The Worker also drops to host UID/GID after its root-only CA installation,
+before npm/Wrangler creates files beside the bind-mounted configuration. This
+keeps temporary-directory removal host-owned, including `.wrangler/tmp`.
 
 The same scenario always asks for a **private managed code-server** editor and
 requires private `expose` arguments plus the owner-only access result before
@@ -215,6 +218,9 @@ Cleanup attempts removal directly and ignores only explicit missing-resource
 responses, not Docker daemon or inspection failures. `qualification.json` is
 written only after the browser take, model-serving evidence, inner staging
 teardown, and outer cleanup all succeed. It identifies the tested Git SHA.
+The small infrastructure artifact also contains that qualification manifest,
+so requested/served-model and checkout evidence do not require downloading the
+large video/Playwright archive. Repeated cleanup preserves original startup logs.
 
 Local live runs shared with other review sessions must hold the review lock for
 the full subprocess lifetime. After explicitly supplying both provider keys,
