@@ -720,18 +720,6 @@ def _prepare_globs(base, globs):
     return prepared
 
 
-def _is_excluded(filepath, negative_globs):
-    for root, pattern in negative_globs:
-        try:
-            rel = os.path.relpath(filepath, root)
-        except ValueError:
-            continue
-        if rel != os.pardir and not rel.startswith(os.pardir + os.sep):
-            if _glob_matches(rel, pattern):
-                return True
-    return False
-
-
 def _matches_any(filepath, globs):
     for root, pattern in globs:
         rel = os.path.relpath(filepath, root)
@@ -769,11 +757,15 @@ def _iter_matching_files(base, positive, negative):
             max_depth = max(max_depth, root_depth + len(parts))
         for filepath in _iter_tree_files(root, max_depth):
             if (_matches_any(filepath, positive_globs)
-                    and not _is_excluded(filepath, negative_globs)):
+                    and not _matches_any(filepath, negative_globs)):
                 yield filepath
 '''
 
-# ── hierarchical glob (runs on sandbox) ──────────────────────────────
+# ── bounded search results (runs on sandbox) ─────────────────────────
+# Scan the complete scope for exact counts, retaining only max_lines hits.
+# The header carries omissions, leaving even a one-line budget useful.
+# Traversal order is filesystem-dependent; sorting only the retained sample
+# must not be mistaken for a globally sorted prefix or representative sample.
 
 _GLOB_MAX_LINES = 100
 
@@ -794,173 +786,22 @@ def glob_hierarchy(base_dir, pattern, max_lines):
 
     matches = []
     match_count = 0
-    common_path = None
     for filepath in _iter_matching_files(base, positive, negative):
         match_count += 1
-        common_path = filepath if common_path is None else os.path.commonpath((common_path, filepath))
         if len(matches) < max_lines:
             matches.append(filepath)
 
     if match_count == 0:
         return f"0 matches for {pattern!r} in {base}"
 
-    # Detailed paths cannot fit in the output budget, so retaining a full trie
-    # would only consume memory for information the caller cannot receive.
-    if match_count > max_lines:
-        effective_base = common_path
-        if not os.path.isdir(effective_base):
-            effective_base = os.path.dirname(effective_base)
-        header = (
-            f"{match_count} matches for {pattern!r} in {effective_base} "
-            f"(budget: {max_lines} lines, some directories collapsed)"
-        )
-        return header + f"\n{effective_base}/ ({match_count} matches)"
-
-    matches.sort()
-
-    # ── Compute effective base for trie rendering ────────────────
-    # When all results are under the workspace, effective_base == base.
-    # When results span other directories, effective_base is their
-    # longest common directory prefix, so the trie stays coherent.
-    if all(m.startswith(str(base) + os.sep) for m in matches):
-        effective_base = str(base)
-    else:
-        effective_base = os.path.commonpath(matches)
-        # commonpath may return a file prefix — ensure it's a directory
-        if not os.path.isdir(effective_base):
-            effective_base = os.path.dirname(effective_base)
-
-    # ── Build trie ───────────────────────────────────────────────
-    root = {"children": {}, "files": [], "count": 0, "path": effective_base}
-
-    for filepath in matches:
-        rel = os.path.relpath(filepath, effective_base)
-        parts = rel.split(os.sep)
-        node = root
-        node["count"] += 1
-        for part in parts[:-1]:
-            if part not in node["children"]:
-                node["children"][part] = {
-                    "children": {},
-                    "files": [],
-                    "count": 0,
-                    "path": os.path.join(node["path"], part),
-                }
-            node = node["children"][part]
-            node["count"] += 1
-        node["files"].append(filepath)
-
-    # ── Budget-driven expansion ──────────────────────────────────
-    expanded = {id(root)}
-    partial_limit = {}
-
-    def _ordered_children(node):
-        items = []
-        for name in sorted(node["children"],
-                           key=lambda n: node["children"][n]["count"],
-                           reverse=True):
-            items.append(("dir", node["children"][name]))
-        for f in sorted(node["files"]):
-            items.append(("file", f))
-        return items
-
-    def _count_lines(node):
-        if id(node) not in expanded:
-            return 1
-        limit = partial_limit.get(id(node))
-        if limit is not None:
-            items = _ordered_children(node)
-            if limit < len(items):
-                total = 1  # the "... and N more" line
-                for kind, item in items[:limit]:
-                    total += 1 if kind == "file" else _count_lines(item)
-                return total
-        total = len(node["files"])
-        for child in node["children"].values():
-            total += _count_lines(child)
-        return total
-
-    def _collapsible(node):
-        if id(node) not in expanded:
-            yield (node["count"], node)
-            return
-        for child in node["children"].values():
-            yield from _collapsible(child)
-
-    current_lines = _count_lines(root)
-
-    while current_lines < max_lines:
-        candidates = list(_collapsible(root))
-        if not candidates:
-            break
-
-        candidates.sort(key=lambda x: x[0], reverse=True)
-        best_count, best_node = candidates[0]
-        n_children = len(best_node["files"]) + len(best_node["children"])
-
-        if n_children <= 1:
-            expanded.add(id(best_node))
-            current_lines = _count_lines(root)
-            continue
-
-        net_cost = n_children - 1
-        if current_lines + net_cost <= max_lines:
-            expanded.add(id(best_node))
-            current_lines = _count_lines(root)
-            continue
-
-        # Partial expansion
-        budget_for_children = max_lines - current_lines
-        if budget_for_children < 2:
-            break
-        expanded.add(id(best_node))
-        partial_limit[id(best_node)] = budget_for_children
-        current_lines = _count_lines(root)
-        break
-
-    # ── Render ───────────────────────────────────────────────────
-    output = []
-
-    def render(node):
-        if id(node) not in expanded:
-            output.append(f"{node['path']}/ ({node['count']} matches)")
-            return
-
-        items = _ordered_children(node)
-        limit = partial_limit.get(id(node))
-
-        if limit is not None and limit < len(items):
-            shown = items[:limit]
-            hidden_count = sum(
-                1 if k == "file" else item["count"]
-                for k, item in items[limit:]
-            )
-            for kind, item in shown:
-                if kind == "file":
-                    output.append(item)
-                else:
-                    render(item)
-            output.append(
-                f"{node['path']}/ ... and {hidden_count} more matches"
-            )
-        else:
-            for f in sorted(node["files"]):
-                output.append(f)
-            for name in sorted(node["children"]):
-                render(node["children"][name])
-
-    render(root)
-
-    header = f"{len(matches)} matches for {pattern!r} in {effective_base}"
-    has_collapsed = bool(list(_collapsible(root))) or bool(partial_limit)
-    if has_collapsed:
-        header += f" (budget: {max_lines} lines, some directories collapsed)"
-
-    return header + "\n" + "\n".join(output)
+    header = f"{match_count} matches for {pattern!r} (base: {base})"
+    if match_count > len(matches):
+        header += f"; showing {len(matches)}, {match_count - len(matches)} omitted (traversal-order sample)"
+    return header + "\n" + "\n".join(sorted(matches))
 '''
 
 
-# ── hierarchical grep (runs on sandbox) ──────────────────────────────
+# ── grep (runs on sandbox) ───────────────────────────────────────────
 
 _GREP_MAX_LINES = 100
 
@@ -988,246 +829,52 @@ def grep_hierarchy(base_dir, regex, files_pattern, max_lines):
     if not positive:
         return f"Error: files pattern must include at least one positive glob (got {files_pattern!r})"
 
-    # ── Scan files for matches ───────────────────────────────────
-    file_matches = {}
+    # Retain a single bounded list, not max_lines hits for every file.
+    hits = []
     files_scanned = 0
     matched_files = 0
-    matched_common_path = None
-    fully_collapsed = False
     total_matches = 0
+    skipped_files = 0
 
     for filepath in _iter_matching_files(base, positive, negative):
         files_scanned += 1
+        previous_counts = total_matches, matched_files, len(hits)
         try:
             with open(filepath, "rb") as raw:
                 header = raw.read(8192)
             if b"\0" in header:
+                skipped_files += 1
                 continue
             with open(filepath, "r", errors="replace") as f:
-                hits = []
-                hit_count = 0
+                file_matched = False
                 for i, line in enumerate(f, 1):
                     if pat.search(line):
-                        hit_count += 1
+                        total_matches += 1
+                        if not file_matched:
+                            matched_files += 1
+                            file_matched = True
                         if len(hits) < max_lines:
                             text = line.rstrip("\n\r")
                             if len(text) > _MAX_LINE_WIDTH:
                                 text = text[:_MAX_LINE_WIDTH] + "..."
-                            hits.append((i, text))
-            if hit_count:
-                matched_files += 1
-                matched_common_path = (
-                    filepath if matched_common_path is None
-                    else os.path.commonpath((matched_common_path, filepath))
-                )
-                total_matches += hit_count
-                if not fully_collapsed and len(file_matches) < max_lines:
-                    file_matches[filepath] = {"hits": hits, "count": hit_count}
-                else:
-                    # Once matching files exceed the output budget, no detailed
-                    # trie can be rendered. Keep exact aggregates only.
-                    fully_collapsed = True
-                    file_matches.clear()
+                            hits.append((filepath, i, text))
         except (OSError, UnicodeDecodeError):
+            total_matches, matched_files, previous_hits = previous_counts
+            del hits[previous_hits:]
+            skipped_files += 1
             continue
 
     if files_scanned == 0:
         return f"0 files match {files_pattern!r} in {base}"
 
-    if matched_files == 0:
-        return f"0 matches for {regex!r} in {files_scanned} files"
-
-    if fully_collapsed:
-        effective_base = matched_common_path
-        if not os.path.isdir(effective_base):
-            effective_base = os.path.dirname(effective_base)
-        header = (
-            f"{total_matches} matches across {matched_files} files for {regex!r} "
-            f"(budget: {max_lines} lines, some entries collapsed)"
-        )
-        files_label = "file" if matched_files == 1 else "files"
-        return header + f"\n{effective_base}/ ({total_matches} matches in {matched_files} {files_label})"
-
-    # ── Compute effective base for trie rendering ────────────────
-    matched_paths = list(file_matches.keys())
-    if all(m.startswith(str(base) + os.sep) for m in matched_paths):
-        effective_base = str(base)
-    else:
-        effective_base = os.path.commonpath(matched_paths)
-        if not os.path.isdir(effective_base):
-            effective_base = os.path.dirname(effective_base)
-
-    # ── Build trie of files with matches ─────────────────────────
-    root = {
-        "children": {}, "files": {}, "path": effective_base,
-        "n_files": 0, "n_matches": 0,
-    }
-
-    for filepath, match_data in sorted(file_matches.items()):
-        hit_count = match_data["count"]
-        rel = os.path.relpath(filepath, effective_base)
-        parts = rel.split(os.sep)
-        node = root
-        node["n_files"] += 1
-        node["n_matches"] += hit_count
-
-        for part in parts[:-1]:
-            if part not in node["children"]:
-                node["children"][part] = {
-                    "children": {}, "files": {}, "n_files": 0, "n_matches": 0,
-                    "path": os.path.join(node["path"], part),
-                }
-            node = node["children"][part]
-            node["n_files"] += 1
-            node["n_matches"] += hit_count
-
-        node["files"][filepath] = match_data
-
-    # ── Two-level budget-driven expansion ────────────────────────
-    dir_expanded = {id(root)}
-    file_expanded = set()
-    file_partial = {}
-
-    def _count_lines(node):
-        if id(node) not in dir_expanded:
-            return 1
-        total = 0
-        for fp, match_data in node["files"].items():
-            hit_count = match_data["count"]
-            if fp in file_expanded:
-                limit = file_partial.get(fp)
-                if limit is not None and limit < hit_count:
-                    total += limit + 1
-                else:
-                    total += hit_count
-            else:
-                total += 1
-        for child in node["children"].values():
-            total += _count_lines(child)
-        return total
-
-    def _dir_candidates(node):
-        if id(node) not in dir_expanded:
-            yield (node["n_matches"], "dir", node)
-            return
-        for child in node["children"].values():
-            yield from _dir_candidates(child)
-
-    def _file_candidates(node):
-        if id(node) not in dir_expanded:
-            return
-        for fp, match_data in node["files"].items():
-            if fp not in file_expanded:
-                yield (match_data["count"], "file", fp, match_data)
-        for child in node["children"].values():
-            yield from _file_candidates(child)
-
-    current_lines = _count_lines(root)
-
-    while current_lines < max_lines:
-        dir_cands = list(_dir_candidates(root))
-        file_cands = list(_file_candidates(root))
-
-        if not dir_cands and not file_cands:
-            break
-
-        best_dir = max(dir_cands, key=lambda x: x[0]) if dir_cands else None
-        best_file = max(file_cands, key=lambda x: x[0]) if file_cands else None
-
-        best_type = None
-        if best_dir and best_file:
-            best_type = "dir" if best_dir[0] >= best_file[0] else "file"
-        elif best_dir:
-            best_type = "dir"
-        else:
-            best_type = "file"
-
-        if best_type == "dir":
-            _, _, node = best_dir
-            n_items = len(node["files"]) + len(node["children"])
-
-            if n_items <= 1:
-                dir_expanded.add(id(node))
-                current_lines = _count_lines(root)
-                continue
-
-            net_cost = n_items - 1
-            if current_lines + net_cost <= max_lines:
-                dir_expanded.add(id(node))
-                current_lines = _count_lines(root)
-                continue
-
-            if best_file:
-                best_type = "file"
-            else:
-                break
-
-        if best_type == "file":
-            _, _, fp, match_data = best_file
-            n_hits = match_data["count"]
-
-            if n_hits <= 1:
-                file_expanded.add(fp)
-                current_lines = _count_lines(root)
-                continue
-
-            net_cost = n_hits - 1
-            if current_lines + net_cost <= max_lines:
-                file_expanded.add(fp)
-                current_lines = _count_lines(root)
-                continue
-
-            budget_remaining = max_lines - current_lines
-            if budget_remaining < 2:
-                break
-            file_expanded.add(fp)
-            file_partial[fp] = budget_remaining
-            current_lines = _count_lines(root)
-            break
-
-    # ── Render ───────────────────────────────────────────────────
-    output = []
-
-    def render(node):
-        if id(node) not in dir_expanded:
-            if node["n_files"] == 1:
-                output.append(f"{node['path']}/ ({node['n_matches']} matches in 1 file)")
-            else:
-                output.append(f"{node['path']}/ ({node['n_matches']} matches in {node['n_files']} files)")
-            return
-
-        for fp in sorted(node["files"]):
-            match_data = node["files"][fp]
-            hits = match_data["hits"]
-            hit_count = match_data["count"]
-            if fp not in file_expanded:
-                output.append(f"{fp} ({hit_count} matches)")
-                continue
-            limit = file_partial.get(fp)
-            if limit is not None and limit < hit_count:
-                for line_num, text in hits[:limit]:
-                    output.append(f"{fp}:{line_num}: {text}")
-                output.append(f"{fp}: ... and {hit_count - limit} more matches")
-            else:
-                for line_num, text in hits:
-                    output.append(f"{fp}:{line_num}: {text}")
-
-        for name in sorted(node["children"]):
-            render(node["children"][name])
-
-    render(root)
-
-    n_files = len(file_matches)
-    header = f"{total_matches} matches across {n_files} files for {regex!r}"
-    has_collapsed = (
-        any(True for _ in _dir_candidates(root))
-        or any(True for _ in _file_candidates(root))
-        or bool(file_partial)
-    )
-    if has_collapsed:
-        header += f" (budget: {max_lines} lines, some entries collapsed)"
-
-    return header + "\n" + "\n".join(output)
+    header = f"{total_matches} matches across {matched_files} files for {regex!r}"
+    header += f"; searched {files_scanned - skipped_files} readable files (scope: {files_pattern!r}, base: {base})"
+    if total_matches > len(hits):
+        header += f"; showing {len(hits)}, {total_matches - len(hits)} omitted (traversal-order sample)"
+    if skipped_files:
+        header += f"; {skipped_files} binary or unreadable files skipped (counts cover readable text only)"
+    output = [f"{filepath}:{line_num}: {text}" for filepath, line_num, text in sorted(hits)]
+    return header + ("\n" + "\n".join(output) if output else "")
 '''
 
 
@@ -1792,12 +1439,13 @@ async def _core_edit(valves, sandbox_id: str, client: httpx.AsyncClient, *,
 async def _core_glob(valves, sandbox_id: str, client: httpx.AsyncClient, *,
                      pattern: str, max_lines: int = _GLOB_MAX_LINES) -> str:
     """Search for files in the sandbox workspace by glob pattern.
-    Returns a hierarchical listing of matches with absolute paths.
-    Dense directories are collapsed with match counts; narrow the
-    pattern or increase max_lines to expand them.
+    Returns concrete absolute paths and an exact count of discovered files.
+    Scans the full scope, but retains at most max_lines paths. The header
+    reports omissions; narrow the pattern to see other files. Truncated
+    results are a traversal-order sample, not a globally sorted prefix.
 
     :param pattern: Comma-separated globs, !-prefix to exclude. Supports *, ?, character classes, and ** as a complete component for directory recursion; brace expansion is not supported. Examples: '**/*.py', 'src/**/*.ts,!**/node_modules/**'.
-    :param max_lines: Max output lines (default: 100).
+    :param max_lines: Max concrete result lines, excluding the summary header (default: 100, clamped to 1–500).
     """
     clamped = max(1, min(500, max_lines))
     base_dir = "/home/daytona/workspace"
@@ -1814,13 +1462,15 @@ async def _core_grep(valves, sandbox_id: str, client: httpx.AsyncClient, *,
                      pattern: str, files: str = "**/*",
                      max_lines: int = _GREP_MAX_LINES) -> str:
     """Search file contents in the sandbox workspace by regex.
-    Returns matches grouped by file with line numbers. Dense
-    directories and files are collapsed with match counts;
-    narrow the file scope or increase max_lines to expand them.
+    Returns concrete absolute path:line: text hits and counts of matching
+    lines and files. Scans the full scope, skipping binary/unreadable files,
+    but retains at most max_lines hits (text clipped to 200 characters).
+    The header reports omissions; narrow files or pattern to see other hits.
+    Truncated results are a traversal-order sample, not a representative one.
 
     :param pattern: Regex to search for (e.g. 'import.*asyncio', 'TODO|FIXME').
     :param files: File scope as comma-separated globs (default: '**/*'). !-prefix to exclude. Supports *, ?, character classes, and ** as a complete component for directory recursion; brace expansion is not supported.
-    :param max_lines: Max output lines (default: 100).
+    :param max_lines: Max concrete result lines, excluding the summary header (default: 100, clamped to 1–500).
     """
     clamped = max(1, min(500, max_lines))
     base_dir = "/home/daytona/workspace"
