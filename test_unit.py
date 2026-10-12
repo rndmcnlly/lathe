@@ -653,6 +653,9 @@ async def test_completed_bash_retention_is_bounded(tools, monkeypatch, tmp_path,
     retained = sidecar("retained", pid=f"{retained_pid}:{retained_start}\n")
     old_spill = sidecar("old-spill", spill=True)
     leased = sidecar("leased", lease=True)
+    expired_failure = sidecar("expired-failure")
+    expired = time.time() - 24 * 60 * 60 - 1
+    os.utime(expired_failure / "exit", (expired, expired))
     deleted_sessions = []
     delete_attempts = {}
 
@@ -663,7 +666,7 @@ async def test_completed_bash_retention_is_bounded(tools, monkeypatch, tmp_path,
         if request.method == "DELETE" and "/process/session/" in request.url.path:
             session = request.url.path.rsplit("/", 1)[-1]
             delete_attempts[session] = delete_attempts.get(session, 0) + 1
-            if session == "lathe-cmd-ordinary" and delete_attempts[session] == 1:
+            if session in ("lathe-cmd-ordinary", "lathe-cmd-expired-failure") and delete_attempts[session] == 1:
                 return httpx.Response(503)
             deleted_sessions.append(session)
             return httpx.Response(204)
@@ -679,10 +682,13 @@ async def test_completed_bash_retention_is_bounded(tools, monkeypatch, tmp_path,
         assert {p.name for p in retained.iterdir()} == {"keep", "log", "exit"}
         assert "lathe-cmd-retained" not in deleted_sessions
         assert "lathe-cmd-old-spill" in deleted_sessions
+        assert expired_failure.exists(), "failed session cleanup must retain its retry record"
 
         await lathe._reap_bash_commands(tools.valves, "sb", client)
         assert (ordinary / "log").read_text() == "command output\n"
         assert delete_attempts["lathe-cmd-ordinary"] == 2
+        assert delete_attempts["lathe-cmd-expired-failure"] == 2
+        assert not expired_failure.exists()
 
         current = sidecar("current")
         await lathe._reap_bash_commands(
@@ -744,6 +750,7 @@ async def test_bash_launch_failure_discards_session_and_wrapper(tools, sandbox, 
 @pytest.mark.parametrize("command,log_size", [
     ("python3 -c 'print(\"x\" * 1000000)'", 1000001),
     ("python3 -c 'import sys; sys.stdout.buffer.write(bytes([255]) * 20000)'", 20000),
+    ("python3 -c 'print(\"[Backgrounded after\" * 4000)'", 76001),
 ])
 async def test_bash_large_log_survives_unrelated_chat(tools, sandbox, http, monkeypatch, tmp_path, clock, command, log_size):
     monkeypatch.setattr(lathe, "_EPHEMERAL_ROOT", str(tmp_path / "lathe"))
@@ -776,8 +783,12 @@ async def test_bash_large_log_survives_unrelated_chat(tools, sandbox, http, monk
         return httpx.Response(204)
 
     http(handler)
+    events = []
+    async def emit(event):
+        events.append(event)
     output = await tools.bash(command, workdir=str(tmp_path),
-                              __user__=USER, __chat_id__="a")
+                              __user__=USER, __chat_id__="a", __event_emitter__=emit)
+    assert events[-1]["data"]["description"] == "Command complete"
     assert "Bounded tail preview" in output and len(output.encode()) < 53 * 1024
     log = next((tmp_path / "lathe" / "cmd").glob("*/log"))
     assert str(log) in output, "clipped previews must identify recoverable full output"

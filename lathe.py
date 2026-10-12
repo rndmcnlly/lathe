@@ -1770,6 +1770,7 @@ async def _reap_bash_commands(valves, sandbox_id: str, client: httpx.AsyncClient
             logger.warning("%s", result)
             return
         cleaned = []
+        failed_cleanup = set()
         for line in result.splitlines():
             action, _, command_id = line.partition(" ")
             if action not in ("delete", "expire") or not command_id:
@@ -1782,9 +1783,13 @@ async def _reap_bash_commands(valves, sandbox_id: str, client: httpx.AsyncClient
                 if response.status_code not in (204, 404):
                     logger.warning("bash cleanup: session %s returned HTTP %s",
                                    command_id, response.status_code)
+                    failed_cleanup.add(command_id)
                 else:
                     cleaned.append(command_id)
             else:
+                if command_id in failed_cleanup:
+                    # Keep the retry record until session release succeeds.
+                    continue
                 response = await client.delete(
                     _toolbox(valves, sandbox_id, "/files/"),
                     params={"path": _bash_sidecar_dir(command_id), "recursive": "true"},
@@ -4385,7 +4390,10 @@ class Tools:
 
             # When the command auto-backgrounds, spawn a polling coroutine
             # to push a completion notice into the chat's message queue.
+            backgrounded = False
             def _on_bg(*, sandbox_id, session_id, session_cmd_id, cmd_id, start_time):
+                nonlocal backgrounded
+                backgrounded = True
                 asyncio.ensure_future(_poll_bg_bash(
                     self.valves, sandbox_id, session_id, session_cmd_id,
                     cmd_id, start_time,
@@ -4402,7 +4410,7 @@ class Tools:
                 on_background=_on_bg,
             )
 
-            status = "Command running in background" if "[Backgrounded after" in result else "Command complete"
+            status = "Command running in background" if backgrounded else "Command complete"
             await _emit(__event_emitter__, status, done=True)
             messages = _drain_harness_messages(self._chat_state, __chat_id__, _sb_warning)
             return _prepend_harness_messages(result, messages)
