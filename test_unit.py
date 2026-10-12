@@ -728,6 +728,86 @@ def test_read_oversized_line_has_explicit_byte_preview(tmp_path, start, stop):
         assert "Text preview truncated" in result and str(path) in result
 
 
+@pytest.mark.parametrize("newline", ["\r", "\r\n", "\n"])
+@pytest.mark.parametrize("start,stop", [(2, 0), (-2, 0), (1, -1)])
+def test_bounded_read_preserves_universal_newlines(tmp_path, newline, start, stop):
+    path = tmp_path / "newlines.txt"
+    path.write_bytes(newline.join(["a", "b", "c", ""]).encode())
+    result = script_call("READ", "read_file", str(path), start, stop)
+    expected = ["1: a", "2: b"] if stop == -1 else ["2: b", "3: c"]
+    assert "3 lines total" in result
+    assert result.splitlines()[1:] == expected
+    assert "\r" not in result
+
+
+def test_read_byte_clipping_labels_requested_not_shown_range(tmp_path):
+    path = tmp_path / "numbering.txt"
+    path.write_text(("x" * 24 + "\n") * 2000)
+    result = script_call("READ", "read_file", str(path), 1, 0)
+    assert "requested lines 1-2000 (preview clipped)" in result
+    assert "showing lines" not in result
+    assert "2000: " not in result
+
+
+@pytest.mark.parametrize("background", [False, True])
+@pytest.mark.parametrize("failure", ["http", "script", "malformed"])
+async def test_bash_preview_failure_preserves_lifecycle(
+    tools, sandbox, http, monkeypatch, tmp_path, clock, background, failure,
+):
+    monkeypatch.setattr(lathe, "_EPHEMERAL_ROOT", str(tmp_path / "lathe"))
+    tools._chat_state["chat"] = {"init": True, "pending": []}
+    polls = 0
+    previews = 0
+    deleted = []
+    def handler(request):
+        nonlocal polls, previews
+        if request.method == "POST" and request.url.path == "/sb/files/upload":
+            path = Path(request.url.params["path"])
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(request.content.split(b"\r\n\r\n", 1)[1].rsplit(b"\r\n--", 1)[0])
+            return httpx.Response(200)
+        if request.method == "POST" and request.url.path == "/sb/process/session":
+            return httpx.Response(201)
+        if request.method == "POST" and request.url.path.endswith("/exec"):
+            subprocess.run(json.loads(request.content)["command"], shell=True, check=True,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+            return httpx.Response(200, json={"cmdId": "cmd"})
+        if request.method == "GET" and "/process/session/" in request.url.path:
+            polls += 1
+            command = {"id": "cmd"}
+            if not background or polls > 1:
+                command["exitCode"] = 0
+            return httpx.Response(200, json={"commands": [command]})
+        if request.method == "POST" and request.url.path == "/sb/process/execute":
+            script = shlex.split(json.loads(request.content)["command"])[2]
+            if "f.seek" in script:
+                previews += 1
+                if previews == 1:
+                    if failure == "http": return httpx.Response(503)
+                    if failure == "script": return httpx.Response(200, json={"exitCode": 1, "result": "preview failed"})
+                    return httpx.Response(200, json={"exitCode": 0, "result": "not-json"})
+            return httpx.Response(200, json={"exitCode": 0, "result": run_script(script)})
+        assert request.method == "DELETE" and "/process/session/" in request.url.path
+        deleted.append(request.url.path)
+        return httpx.Response(204)
+    http(handler)
+    result = await tools.bash("echo lifecycle-output", workdir=str(tmp_path),
+        foreground_seconds=0 if background else 30, __user__=USER, __chat_id__="chat")
+    assert "Preview unavailable" in result
+    if background:
+        assert "Backgrounded after" in result
+        log = next((tmp_path / "lathe" / "cmd").glob("*/log"))
+        async with asyncio.timeout(5):
+            while True:
+                result = await tools.read(str(log), __user__=USER, __chat_id__="chat")
+                if "Background job completed" in result: break
+                await asyncio.sleep(0)
+        assert "lifecycle-output" in result
+    assert deleted, "finished session cleanup must survive a preview failure"
+    log = next((tmp_path / "lathe" / "cmd").glob("*/log"))
+    assert log.read_text() == "lifecycle-output\n"
+
+
 async def test_failed_write_does_not_emit_success(tools, sandbox, http, tmp_path):
     tools._chat_state["chat"] = {"init": True, "pending": []}
     parent_file = tmp_path / "not-a-directory"
@@ -1836,11 +1916,16 @@ async def test_delegate_setup_exception_closes_every_owned_client(
     assert [client.close_calls for client in clients] == [1] * len(clients)
 
 
+@pytest.mark.parametrize("boundary", [False, True])
 async def test_one_step_delegate_answers_from_context_without_tools(
-    tools, sandbox, http, monkeypatch, tmp_path,
+    tools, sandbox, http, monkeypatch, tmp_path, boundary,
 ):
     source = tmp_path / "large-context.txt"
-    source.write_text("decisive evidence\n")
+    evidence = "decisive evidence\n"
+    if boundary:
+        overhead = len(f"## Reference Files\n\n### {source}\n\n".encode())
+        evidence += "x" * (50 * 1024 - overhead - len(evidence.encode()))
+    source.write_text(evidence)
     root = tmp_path / "sidecars"
     monkeypatch.setattr(lathe, "_EPHEMERAL_ROOT", str(root))
     tools._chat_state["chat"] = {"init": True, "pending": []}
@@ -1895,6 +1980,25 @@ async def test_one_step_delegate_answers_from_context_without_tools(
     assert (sidecars / "result").read_text() == "context-only answer"
     assert json.loads((sidecars / "usage").read_text())["tool_calls"] == 0
     assert [client.close_calls for client in clients[:3]] == [1, 1, 1]
+
+
+@pytest.mark.parametrize("count", [1, 2])
+async def test_reference_budget_includes_outer_heading_and_separators(tools, sandbox, http, count):
+    tools._chat_state["chat"] = {"init": True, "pending": []}
+    paths = [f"/reference/{i}" for i in range(count)]
+    # Sections alone fit exactly. The complete block must be rejected.
+    available = 50 * 1024 - sum(len(f"### {p}\n\n".encode()) for p in paths)
+    sizes = [available // count] * count
+    sizes[-1] += available % count
+    def handler(request):
+        assert request.method == "GET" and request.url.path == "/sb/files/download"
+        return httpx.Response(200, content=b"x" * sizes[paths.index(request.url.params["path"])])
+    http(handler)
+    async def app(scope, receive, send):
+        pytest.fail("reference block exceeding budget reached inference")
+    result = await tools.delegate("Analyze", context_files=paths, max_steps=1,
+        __user__=USER, __chat_id__="chat", __model__={"id": "model"}, __request__=delegate_request(app))
+    assert result.startswith("Error:") and "byte text limit" in result
 
 
 @pytest.mark.parametrize("sizes", [(1000000,), (30000, 30000)])

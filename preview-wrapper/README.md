@@ -70,7 +70,9 @@ Public wrapped previews remain available without OIDC.
 
 ## Registration Contract
 
-Lathe uses the existing wrapper protocol:
+This is the authoritative Lathe registration contract for the reference Worker
+and independently deployed wrappers. Worker-specific features are identified
+below.
 
 ```http
 POST /register
@@ -96,6 +98,24 @@ stored registration remains authoritative. The Worker returns:
 
 The sensitive upstream URL is never echoed. Early revocation is
 `DELETE /register/{label}` with the same bearer token.
+
+### Lathe client validation
+
+Lathe sends an HTTPS POST to its configured registration endpoint with an
+installation bearer credential, not a sandbox-management credential. Owner
+subject/email come only from OWUI's injected user context; the model controls
+neither identity nor the upstream URL. Access is a requirement, not a preference.
+
+Lathe requires a distinct HTTPS response URL and future timezone-qualified
+`expires_at`. It rejects URLs reflecting the upstream hostname or installation
+credential, follows no registration redirects, and exposes no raw registration
+response/error text. Private requests fail closed on missing identity/configuration,
+failure, or malformed responses. Headerless public requests may fall back to the
+direct Daytona signed bearer URL; nonempty upstream headers prohibit fallback.
+Only `url` and `expires_at` are required in a headerless success response: `host`
+is reference-Worker metadata. Valid JSON alone cannot prove browser authorization.
+
+### Reference Worker labels
 
 Other trusted producers may register an explicit label:
 
