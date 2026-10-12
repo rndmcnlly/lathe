@@ -3117,35 +3117,32 @@ async def _ensure_volume(valves, volume_name: str, client: httpx.AsyncClient) ->
     raise RuntimeError(f"Volume '{volume_name}' did not reach ready state within 60s (state: {vol.get('state')})")
 
 
-async def _wait_for_toolbox(valves, sandbox_id: str, client: httpx.AsyncClient, emitter=None):
-    """Poll the toolbox API until it responds, then ensure workspace dir exists."""
-    for attempt in range(30):
+async def _wait_for_toolbox(valves, sandbox_id: str, client: httpx.AsyncClient, emitter=None, *, wait: bool = True):
+    """Ensure the workspace exists, retrying toolbox startup only during lifecycle work."""
+    attempts = 30 if wait else 1
+    for attempt in range(attempts):
         try:
             resp = await client.post(
                 _toolbox(valves, sandbox_id, "/process/execute"),
                 headers=_headers(valves),
-                json={"command": "echo ready", "timeout": 5000},
+                json={"command": "bash -c 'mkdir -p /home/daytona/workspace'", "timeout": 5000},
                 timeout=10.0,
             )
             if resp.status_code == 200:
                 data = resp.json()
-                if data.get("exitCode") == 0 and "ready" in data.get("result", ""):
-                    await client.post(
-                        _toolbox(valves, sandbox_id, "/process/execute"),
-                        headers=_headers(valves),
-                        json={
-                            "command": "bash -c 'mkdir -p /home/daytona/workspace'",
-                            "timeout": 5000,
-                        },
-                        timeout=10.0,
-                    )
+                if data.get("exitCode") == 0:
                     return
         except (httpx.HTTPError, httpx.TimeoutException) as e:
             logger.debug("wait-for-toolbox: attempt %d failed: %s", attempt, e)
+        if not wait:
+            raise RuntimeError(
+                "Sandbox was started but its workspace could not be prepared. "
+                "Retry this tool call; if it persists, ask the administrator to inspect the sandbox."
+            )
         await asyncio.sleep(1)
         if attempt == 2:
             await _emit(emitter, "Waiting for sandbox to become ready...")
-    raise RuntimeError("Sandbox started but toolbox daemon did not become responsive (30s)")
+    raise RuntimeError("Sandbox started but toolbox could not prepare the workspace (30 attempts)")
 
 
 _SANDBOX_START_STATES = frozenset({"stopped", "paused", "archived"})
@@ -3203,6 +3200,10 @@ async def _ensure_sandbox(valves, email: str, client: httpx.AsyncClient, emitter
         if matches else None
     )
     warning: str | None = None
+    # No readiness cache: only a sandbox found started by the authoritative
+    # per-ID lookup takes the steady-state path. Creation (including a losing
+    # concurrent create) and any observed transition still wait for toolbox.
+    wait_for_startup = sandbox is None or sandbox.get("state") != "started"
 
     if sandbox is None:
         if not valves.auto_create_sandbox:
@@ -3296,7 +3297,7 @@ async def _ensure_sandbox(valves, email: str, client: httpx.AsyncClient, emitter
         state = info.get("state", "unknown")
 
         if state == "started":
-            await _wait_for_toolbox(valves, sandbox_id, client, emitter)
+            await _wait_for_toolbox(valves, sandbox_id, client, emitter, wait=wait_for_startup)
             await _emit(emitter, "Sandbox ready", done=True)
             return sandbox_id, warning
 
