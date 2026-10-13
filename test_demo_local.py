@@ -120,7 +120,8 @@ def test_capture_environment_does_not_inherit_hosted_targets_or_server_keys(monk
 
 
 @pytest.mark.parametrize("fault", [None, "verifier", "redirect", "secret", "expired"])
-async def test_identity_code_exchange_and_verified_user(fault):
+@pytest.mark.parametrize("method", ["GET", "POST"])
+async def test_identity_code_exchange_and_verified_user(fault, method):
     verifier = "fixture-verifier"
     challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).decode().rstrip("=")
     callback = f"https://lathe-private-abc.{demo.ZONE}/_lathe/auth/callback"
@@ -131,9 +132,7 @@ async def test_identity_code_exchange_and_verified_user(fault):
         discovery = await (await client.get(server.make_url("/demo-idp/.well-known/openid-configuration"))).json()
         assert discovery["issuer"] == demo.ISSUER
         assert discovery["authorization_endpoint"] == f"https://{demo.ZONE}/demo-idp/authorize"
-        signin = await client.get(server.make_url("/demo-idp/authorize"), params=query)
-        assert "Not Pocket ID" in await signin.text()
-        response = await client.post(server.make_url("/demo-idp/authorize"), params=query, allow_redirects=False)
+        response = await client.request(method, server.make_url("/demo-idp/authorize"), params=query, allow_redirects=False)
         assert response.status == 302
         returned = parse_qs(urlsplit(response.headers["Location"]).query)
         assert returned["state"] == [query["state"]]
@@ -167,9 +166,10 @@ async def test_identity_code_exchange_and_verified_user(fault):
     f"https://evil.invalid%2f.{demo.ZONE}/_lathe/auth/callback",
     f"https://private.{demo.ZONE}:443/_lathe/auth/callback",
     f"https://user@private.{demo.ZONE}/_lathe/auth/callback"])
-async def test_identity_rejects_unbound_callbacks(callback):
+@pytest.mark.parametrize("method", ["GET", "POST"])
+async def test_identity_rejects_unbound_callbacks(callback, method):
     async with TestServer(demo.demo_identity_app("secret")) as server, ClientSession() as client:
-        response = await client.post(server.make_url("/demo-idp/authorize"), params={
+        response = await client.request(method, server.make_url("/demo-idp/authorize"), params={
             "client_id": "lathe-demo", "response_type": "code", "state": "state",
             "redirect_uri": callback, "code_challenge": "challenge", "code_challenge_method": "S256"},
             allow_redirects=False)

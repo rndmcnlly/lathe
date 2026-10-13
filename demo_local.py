@@ -10,7 +10,6 @@ import argparse
 import asyncio
 import base64
 import hashlib
-import html
 import json
 import os
 from pathlib import Path
@@ -41,6 +40,7 @@ DEMO_MODEL = "z-ai/glm-5.3-flash"
 def demo_identity_app(client_secret, *, clock=time.monotonic):
     """Fixed synthetic identity, not real user authentication or a full OIDC IdP.
 
+    Auto-approves the fixed demo user without showing a sign-in page.
     Implements the Worker's discovery/code+PKCE/userinfo protocol. Only local
     Docker peers and the loopback TLS listener can reach this disposable fixture.
     It never accepts user-supplied identity and never bypasses Worker sessions.
@@ -64,12 +64,8 @@ def demo_identity_app(client_secret, *, clock=time.monotonic):
                 or not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\." + re.escape(ZONE), callback.hostname or "")
                 or callback.path != "/_lathe/auth/callback" or callback.query or callback.fragment):
             raise web.HTTPBadRequest()
-        if request.method == "GET":
-            return web.Response(content_type="text/html", text=
-                '<h1>Disposable demo identity provider</h1>'
-                '<p>Fixed synthetic identity: monitor@lathe.invalid. Not Pocket ID or passkey authentication.</p>'
-                f'<form method="post" action="?{html.escape(urlencode(dict(query)), quote=True)}">'
-                '<button>Sign in as demo user</button></form>')
+        # This isolated fixture has exactly one synthetic identity, not a user
+        # login decision. Keep the real Worker callback and PKCE exchange intact.
         code = secrets.token_urlsafe(32)
         codes[code] = (dict(query), clock() + 60)
         # Reconstruct from validated components, never redirect to a raw input URL.

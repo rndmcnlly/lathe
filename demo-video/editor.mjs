@@ -24,14 +24,16 @@ export async function replaceEditorLine(page, { path, line, text, before }, time
     throw new Error(`Editor content mismatch for ${path}: expected ${JSON.stringify(expected)}, saw ${JSON.stringify(actual)}`);
   }
   await input.waitFor({ state: "visible", timeout: timeoutMs });
-  await verify(before);
   await input.focus();
   await input.press("Control+Home");
   // Walk characters, not visual rows: the first relay line may soft-wrap.
   const prefix = lines.slice(0, line - 1).join("\n") + (line > 1 ? "\n" : "");
   for (let index = 0; index < prefix.length; index++) await input.press("ArrowRight");
-  for (let index = 0; index < lines[line - 1].length; index++) await input.press("Shift+ArrowRight");
+  // VS Code's Expand Line Selection includes the whole logical line and newline,
+  // even when an unexpected model-written answer spans several visual rows.
+  await input.press("ControlOrMeta+L");
   await input.pressSequentially(text, { delay: 55 });
+  await input.press("Enter");
   lines[line - 1] = text;
   await verify(lines.join("\n"));
   await input.press("ControlOrMeta+S");

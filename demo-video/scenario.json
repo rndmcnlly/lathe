@@ -1,6 +1,6 @@
 {
   "id": "lathe-shared-workspace",
-  "version": 7,
+  "version": 8,
   "steps": [
     {
       "id": "auth.owui",

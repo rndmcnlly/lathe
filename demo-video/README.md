@@ -53,6 +53,8 @@ installation window and the model's reply.
 
 The relay edit targets the file editor by URI, selects text with cursor movement,
 and verifies the rendered document before saving with the platform's shortcut.
+It replaces the entire second logical line, including any model-written joke,
+instead of assuming the model left the answer blank.
 It waits for the editor's dirty indicator to clear before leaving. The later Lathe read proves
 persistence independently. Editor failures reject the take as `ui_drift`;
 terminal editing cannot substitute for the demonstrated editor interaction.
@@ -64,7 +66,8 @@ all VS Code AI features are disabled and the secondary Chat sidebar starts hidde
 Local and hosted authentication use the same unmodified scenario. Managed
 code-server must be private: the oracle requires an actual `expose` call with
 private access and its owner-only result, not an assistant promise or a public
-HTTP-port substitute. The local identity fixture is explicitly synthetic, while
+HTTP-port substitute. The local identity fixture auto-approves its one fixed
+synthetic user without a visible sign-in page, while
 the real Worker performs PKCE exchange, owner-email authorization, and host-only
 session creation. It does not qualify Pocket ID or real passkey authentication.
 
