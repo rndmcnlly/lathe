@@ -5,10 +5,10 @@ description: Start a private browser IDE in a sandbox workspace.
 
 # Browser IDE
 
-Acquire the pinned recipe snapshot using `../README.md`, then run:
+Read `../../README.md` and acquire the pinned sandbox support snapshot, then run:
 
 ```sh
-python3 "$SNAPSHOT/app.py" code-server --root /home/daytona/workspace --port 8080
+python3 "$SNAPSHOT/scripts/apps.py" code-server --root /home/daytona/workspace --port 8080
 ```
 
 After READY, invoke `expose(target="http:8080", access="private")`. Never use

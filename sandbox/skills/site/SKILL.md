@@ -5,10 +5,10 @@ description: Preview a static workspace directory without installing an applicat
 
 # Static files
 
-Acquire the pinned recipe snapshot using `../README.md`, then run:
+Read `../../README.md` and acquire the pinned sandbox support snapshot, then run:
 
 ```sh
-python3 "$SNAPSHOT/app.py" site --root /home/daytona/workspace/my-site --port 8000
+python3 "$SNAPSHOT/scripts/apps.py" site --root /home/daytona/workspace/my-site --port 8000
 ```
 
 After READY, invoke `expose(target="http:8000", access="private")`. Only choose

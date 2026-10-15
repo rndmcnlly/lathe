@@ -5,10 +5,10 @@ description: Start an on-demand sandbox file browser for user uploads and downlo
 
 # File browser
 
-Acquire the pinned recipe snapshot using `../README.md`, then run:
+Read `../../README.md` and acquire the pinned sandbox support snapshot, then run:
 
 ```sh
-python3 "$SNAPSHOT/app.py" dufs --root /home/daytona/workspace --port 5000
+python3 "$SNAPSHOT/scripts/apps.py" dufs --root /home/daytona/workspace --port 5000
 ```
 
 Read the READY JSON, then invoke `expose(target="http:5000", access="private")`.

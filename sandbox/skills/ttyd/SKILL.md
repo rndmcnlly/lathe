@@ -5,10 +5,10 @@ description: Start a private interactive browser terminal in a sandbox.
 
 # Browser terminal
 
-Acquire the pinned recipe snapshot using `../README.md`, then run:
+Read `../../README.md` and acquire the pinned sandbox support snapshot, then run:
 
 ```sh
-python3 "$SNAPSHOT/app.py" ttyd --root /home/daytona/workspace --port 7681
+python3 "$SNAPSHOT/scripts/apps.py" ttyd --root /home/daytona/workspace --port 7681
 ```
 
 After READY, invoke `expose(target="http:7681", access="private")`. Never use

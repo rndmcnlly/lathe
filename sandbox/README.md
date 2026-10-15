@@ -1,15 +1,17 @@
-# On-demand sandbox recipes
+# Optional sandbox app support
 
-These are ordinary sandbox programs, not Open WebUI tools. Python 3.11+ and a
+These optional add-ons are ordinary sandbox programs, not Open WebUI tools.
+Lathe's core can also install applications from reachable intranet sources;
+this public-internet bundle adds convenience, not a prerequisite. Python 3.11+ and a
 blank x86_64 Linux sandbox suffice. No pip packages, curl, ss, or package manager
 are needed. `site` also runs on macOS for offline tests. Runtime code remains in
-`app.py`; each application's `SKILL.md` explains its use and security boundary.
+`scripts/apps.py`; each application's `skills/<app>/SKILL.md` explains its use and security boundary.
 
 ## Acquire one immutable snapshot
 
 Choose a **full 40-character commit** from a trusted Lathe release/tag. Resolve a
 tag once, record its commit, and keep using that commit. No fallback to a branch,
-`main`, or newer recipe code occurs. After the commit is published:
+`main`, or newer support code occurs. After the commit is published:
 
 ```sh
 REV=FULL_40_CHARACTER_COMMIT
@@ -17,43 +19,43 @@ python3 - "$REV" <<'PY'
 import re, sys, urllib.request
 revision = sys.argv[1]
 assert re.fullmatch('[0-9a-f]{40}', revision), 'full commit required'
-url = f'https://raw.githubusercontent.com/rndmcnlly/lathe/{revision}/recipes/bootstrap.sh'
+url = f'https://raw.githubusercontent.com/rndmcnlly/lathe/{revision}/sandbox/bootstrap.sh'
 with urllib.request.urlopen(url, timeout=60) as response:
     source = response.read()
-open('/tmp/lathe-recipe-bootstrap.sh', 'wb').write(source)
+open('/tmp/lathe-sandbox-bootstrap.sh', 'wb').write(source)
 PY
-SNAPSHOT=$(sh /tmp/lathe-recipe-bootstrap.sh "$REV")
-cat "$SNAPSHOT/dufs/SKILL.md"
-python3 "$SNAPSHOT/app.py" dufs --root /home/daytona/workspace --port 5000
+SNAPSHOT=$(sh /tmp/lathe-sandbox-bootstrap.sh "$REV")
+cat "$SNAPSHOT/skills/dufs/SKILL.md"
+python3 "$SNAPSHOT/scripts/apps.py" dufs --root /home/daytona/workspace --port 5000
 ```
 
 Bootstrap downloads the repository's commit archive through GitHub's HTTPS API,
 validates the expected layout, disallows archive links/traversal, and installs
-atomically into `~/.cache/lathe/recipes/$REV/` (or
-`$XDG_CACHE_HOME/lathe/recipes/$REV/`). Its only stdout is that directory.
+atomically into `~/.cache/lathe/$REV/` (or
+`$XDG_CACHE_HOME/lathe/$REV/`). Its only stdout is that directory.
 It records a source-tree SHA-256 **beside**, not inside, the snapshot and rechecks
 it before every cache reuse. It fails on changed cached bytes. Do not put runtime
 state, Python bytecode, or edited files inside a snapshot.
 
 Trust comes from choosing a reviewed commit and GitHub HTTPS, not from treating
-an arbitrary recipe as safe. An independently recorded source digest can be
+an arbitrary support program as safe. An independently recorded source digest can be
 required with `--sha256 DIGEST`. This hashes paths and file bytes, never compressed
 archive bytes; no circular self-hash or unpublished archive is needed.
 
 ## Exact unpublished trial / source manifest
 
-Commit only the reviewed recipe sources and tests locally, then obtain `REV` via
+Commit only the reviewed sandbox support sources and tests locally, then obtain `REV` via
 `git rev-parse HEAD`. This does not publish anything. Upload that exact commit's
-`recipes/` tree to a sandbox staging directory, for example `/tmp/recipe-source`.
+`sandbox/` tree to a sandbox staging directory, for example `/tmp/sandbox-source`.
 Do not use a later modified working tree and label it with an earlier commit.
 In the sandbox:
 
 ```sh
 REV=FULL_LOCAL_40_CHARACTER_COMMIT
-SOURCE=/tmp/recipe-source
+SOURCE=/tmp/sandbox-source
 DIGEST=$(sh "$SOURCE/bootstrap.sh" --hash "$SOURCE")
 SNAPSHOT=$(sh "$SOURCE/bootstrap.sh" "$REV" --seed "$SOURCE" --sha256 "$DIGEST")
-python3 "$SNAPSHOT/app.py" site --root /home/daytona/workspace --port 8000
+python3 "$SNAPSHOT/scripts/apps.py" site --root /home/daytona/workspace --port 8000
 ```
 
 `--hash DIRECTORY` is the reproducible source-manifest digest interface. It hashes
@@ -66,7 +68,7 @@ GitHub. After publication, the same commit resolves to the same source tree.
 ## Start, inspect, recover, expose
 
 ```sh
-python3 "$SNAPSHOT/app.py" APP --root /absolute/workspace/directory --port PORT
+python3 "$SNAPSHOT/scripts/apps.py" APP --root /absolute/workspace/directory --port PORT
 ```
 
 `APP` is `dufs`, `ttyd`, `code-server`, or `site`. Ports must be 3000–9999.
@@ -74,7 +76,7 @@ Defaults are 5000, 7681, 8080, and 8000 respectively. Root must already exist
 inside `/home/daytona/workspace`, including after symlink resolution. Paths with
 spaces work. stdout is one READY JSON object with service, port, root, log, PID,
 started/reused status, and `expose: "http:PORT"`. Only then call Lathe's generic
-`expose(target="http:PORT", access="private")`. `app.py` does not obtain preview
+`expose(target="http:PORT", access="private")`. `scripts/apps.py` does not obtain preview
 URLs or know preview credentials. A public static site or file browser requires
 the user's explicit request for public/world access. Never publish IDE/terminal.
 
@@ -92,7 +94,7 @@ App installers resolve one current upstream GitHub release on first use, use
 that release's asset URL and SHA-256 (ttyd uses upstream `SHA256SUMS`), and cache
 the executable. dufs uses static musl, ttyd's standalone x86_64 build, and
 code-server its Linux amd64 archive. `release.json` records the installed tag,
-asset, and digest. Recipe-code pinning does not pin upstream app versions. Never
+asset, and digest. Support-code pinning does not pin upstream app versions. Never
 silently replace a cached app: choose a fresh state directory to try an update.
 code-server requires the upstream Linux runtime/glibc baseline; errors are in
 its log. No distro package install is attempted.

@@ -1,4 +1,4 @@
-"""Offline contracts for the actual distributed recipe scripts."""
+"""Offline contracts for the actual distributed sandbox support scripts."""
 import hashlib
 import io
 import json
@@ -15,16 +15,17 @@ import urllib.request
 
 import pytest
 
-RECIPES = Path(__file__).parent / 'recipes'
-BOOTSTRAP = RECIPES / 'bootstrap.sh'
+SUPPORT = Path(__file__).parent / 'sandbox'
+APP = SUPPORT / 'scripts/apps.py'
+BOOTSTRAP = SUPPORT / 'bootstrap.sh'
 REVISION = 'a' * 40
 
 
 @pytest.fixture
 def app(tmp_path, monkeypatch):
     module = types.ModuleType('recipe_under_test')
-    module.__file__ = str(RECIPES / 'app.py')
-    exec(compile((RECIPES / 'app.py').read_text(), module.__file__, 'exec'), module.__dict__)
+    module.__file__ = str(APP)
+    exec(compile(APP.read_text(), module.__file__, 'exec'), module.__dict__)
     workspace = tmp_path / 'workspace'
     workspace.mkdir()
     monkeypatch.setattr(module, 'WORKSPACE', workspace)
@@ -56,32 +57,62 @@ def available_port():
 
 
 def bootstrap(*args, cache, environment=None):
+    guard = cache.parent / 'network-guard'
+    guard.mkdir(exist_ok=True)
+    (guard / 'sitecustomize.py').write_text(
+        'import urllib.request\n'
+        'def forbidden(*args, **kwargs):\n'
+        '    raise RuntimeError("unexpected bootstrap HTTP request")\n'
+        'urllib.request.urlopen = forbidden\n'
+    )
     return subprocess.run(['sh', str(BOOTSTRAP), *map(str, args)], text=True,
                           capture_output=True, env={**os.environ, 'XDG_CACHE_HOME': str(cache),
+                                                    'PYTHONPATH': str(guard),
                                                     **(environment or {})}, timeout=20)
 
 
 def test_exact_local_snapshot_and_cache_tampering(tmp_path):
     cache = tmp_path / 'cache'
-    digest = bootstrap('--hash', RECIPES, cache=cache)
+    digest = bootstrap('--hash', SUPPORT, cache=cache)
     assert digest.returncode == 0, digest.stderr
-    result = bootstrap(REVISION, '--seed', RECIPES, '--sha256', digest.stdout.strip(), cache=cache)
+    result = bootstrap(REVISION, '--seed', SUPPORT, '--sha256', digest.stdout.strip(), cache=cache)
     assert result.returncode == 0, result.stderr
     snapshot = Path(result.stdout.strip())
-    assert snapshot == cache / 'lathe/recipes' / REVISION
-    assert (snapshot / 'app.py').read_bytes() == (RECIPES / 'app.py').read_bytes()
+    assert snapshot == cache / 'lathe' / REVISION
+    assert {p.relative_to(snapshot): p.read_bytes() for p in snapshot.rglob('*') if p.is_file()} == {
+        p.relative_to(SUPPORT): p.read_bytes() for p in SUPPORT.rglob('*') if p.is_file()}
     # Reuse works without seed and does not attempt network acquisition.
     reused = bootstrap(REVISION, cache=cache)
     assert reused.returncode == 0, reused.stderr
-    (snapshot / 'app.py').write_text('tampered')
+    (snapshot / 'scripts/apps.py').write_text('tampered')
     changed = bootstrap(REVISION, cache=cache)
     assert changed.returncode != 0
-    assert 'cached recipe snapshot changed' in changed.stderr
+    assert 'cached sandbox support snapshot changed' in changed.stderr
+
+
+def test_source_digest_is_regular_file_content_not_metadata(tmp_path):
+    source = tmp_path / 'source'
+    source.mkdir()
+    (source / 'z').write_bytes(b'last')
+    (source / 'a').mkdir()
+    (source / 'a/first').write_bytes(b'first\x00bytes')
+    expected = hashlib.sha256()
+    for name, content in [('a/first', b'first\x00bytes'), ('z', b'last')]:
+        expected.update(name.encode() + b'\x00' + hashlib.sha256(content).digest())
+    first = bootstrap('--hash', source, cache=tmp_path / 'cache')
+    assert first.returncode == 0, first.stderr
+    assert first.stdout.strip() == expected.hexdigest()
+    (source / 'empty-directory').mkdir()
+    (source / 'z').chmod(0o755)
+    os.utime(source / 'z', (1, 1))
+    second = bootstrap('--hash', source, cache=tmp_path / 'cache')
+    assert second.returncode == 0, second.stderr
+    assert second.stdout == first.stdout
 
 
 @pytest.mark.parametrize('revision', ['main', 'latest', '../outside', 'a' * 39])
 def test_bootstrap_rejects_mutable_or_invalid_revision(tmp_path, revision):
-    result = bootstrap(revision, '--seed', RECIPES, cache=tmp_path)
+    result = bootstrap(revision, '--seed', SUPPORT, cache=tmp_path)
     assert result.returncode != 0
     assert 'full 40-character' in result.stderr
     assert not (tmp_path / 'lathe').exists()
@@ -94,10 +125,10 @@ def test_bootstrap_layout_digest_and_link_guards(tmp_path):
     result = bootstrap(REVISION, '--seed', source, cache=tmp_path / 'cache')
     assert result.returncode != 0
     assert 'expected app/bootstrap/skill layout' in result.stderr
-    result = bootstrap(REVISION, '--seed', RECIPES, '--sha256', '0' * 64, cache=tmp_path / 'cache')
+    result = bootstrap(REVISION, '--seed', SUPPORT, '--sha256', '0' * 64, cache=tmp_path / 'cache')
     assert result.returncode != 0
     assert 'digest mismatch' in result.stderr
-    (source / 'link').symlink_to(RECIPES / 'app.py')
+    (source / 'link').symlink_to(APP)
     result = bootstrap('--hash', source, cache=tmp_path / 'cache')
     assert result.returncode != 0
     assert 'cannot contain symlinks' in result.stderr
@@ -107,11 +138,11 @@ def test_bootstrap_layout_digest_and_link_guards(tmp_path):
 def test_bootstrap_actual_archive_path_with_fixture_transport(tmp_path, unsafe):
     archive_path = tmp_path / 'source.tar.gz'
     with tarfile.open(archive_path, 'w:gz') as archive:
-        for path in sorted(RECIPES.rglob('*')):
+        for path in sorted(SUPPORT.rglob('*')):
             if path.is_file():
-                archive.add(path, arcname='repo/recipes/' + path.relative_to(RECIPES).as_posix())
+                archive.add(path, arcname='repo/sandbox/' + path.relative_to(SUPPORT).as_posix())
         if unsafe:
-            member = tarfile.TarInfo('repo/recipes/../../escaped')
+            member = tarfile.TarInfo('repo/sandbox/../../escaped')
             archive.addfile(member, io.BytesIO())
     # Replace only the subprocess's network transport, not bootstrap logic.
     (tmp_path / 'sitecustomize.py').write_text(
@@ -124,11 +155,13 @@ def test_bootstrap_actual_archive_path_with_fixture_transport(tmp_path, unsafe):
     result = bootstrap(REVISION, cache=tmp_path / 'cache',
                        environment={'PYTHONPATH': str(tmp_path), 'FIXTURE_ARCHIVE': str(archive_path)})
     if unsafe:
-        assert result.returncode != 0 and 'unsafe recipe archive' in result.stderr
-        assert not (tmp_path / 'cache/lathe/recipes' / REVISION).exists()
+        assert result.returncode != 0 and 'unsafe sandbox archive' in result.stderr
+        assert not (tmp_path / 'cache/lathe' / REVISION).exists()
     else:
         assert result.returncode == 0, result.stderr
-        assert (Path(result.stdout.strip()) / 'app.py').read_bytes() == (RECIPES / 'app.py').read_bytes()
+        snapshot = Path(result.stdout.strip())
+        assert {p.relative_to(snapshot): p.read_bytes() for p in snapshot.rglob('*') if p.is_file()} == {
+            p.relative_to(SUPPORT): p.read_bytes() for p in SUPPORT.rglob('*') if p.is_file()}
 
 
 def test_root_resolution_requires_real_workspace_directory(app, tmp_path):
@@ -144,7 +177,7 @@ def test_root_resolution_requires_real_workspace_directory(app, tmp_path):
 
 
 def test_cli_rejects_root_before_install_or_state_creation(tmp_path):
-    result = subprocess.run([sys.executable, str(RECIPES / 'app.py'), 'dufs', '--root', 'relative',
+    result = subprocess.run([sys.executable, str(APP), 'dufs', '--root', 'relative',
                              '--state', str(tmp_path / 'state')], capture_output=True, text=True)
     assert result.returncode != 0
     assert 'absolute path' in result.stderr
