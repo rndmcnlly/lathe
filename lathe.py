@@ -1663,6 +1663,10 @@ async def _core_bash(valves, sandbox_id: str, client: httpx.AsyncClient, *,
     When creating git commits, add an Assisted-by: Lathe trailer to the
     commit message to acknowledge AI assistance.
 
+    For first-time application setup, read lathe(manpage="services") before
+    installing or launching; it routes to relevant skills and the configured
+    handbook. Inspection commands may come first.
+
     :param command: The bash command to execute.
     :param workdir: Working directory (default: /home/daytona/workspace).
     :param foreground_seconds: Seconds to wait before auto-backgrounding. Omit or set -1 to use the server default. Set 0 for immediate background (fire-and-forget). Use higher positive values for known-slow commands.
@@ -2275,7 +2279,8 @@ def _installation_guidance(valves) -> str:
         parts.append(
             "## Optional agent handbook\n\n"
             + valves.handbook_url.strip()
-            + "\nRead this reference when relevant using available tools. Lathe does not "
+            + "\nFor first-time application setup without an applicable skill, read the "
+            "index and relevant application page before installing or launching. Lathe does not "
             "fetch it for you. The URL does not guarantee network access; if unreachable, "
             "continue with available skills and local resources."
         )
@@ -2296,6 +2301,10 @@ async def _chat_auto_init(
     API (cpu, memory, disk, region) without an extra sandbox-side command.
     """
     parts: list[str] = ["[Auto-init: first tool call in this conversation]"]
+    parts.append(
+        'For first-time application setup, read lathe(manpage="services") '
+        "before installing or launching."
+    )
     guidance = _installation_guidance(valves)
     if guidance:
         parts.append(guidance)
