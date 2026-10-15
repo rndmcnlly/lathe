@@ -1,4 +1,4 @@
-"""Offline checks for disposable private-editor demo plumbing."""
+"""Offline checks for isolated visualization demo plumbing and independent reads."""
 
 import base64
 import hashlib
@@ -65,7 +65,7 @@ def test_demo_cleanup_attempts_every_resource_and_fails_closed(tmp_path, monkeyp
     assert (tmp_path / f"{demo.WORKER}.log").read_text() == "original startup evidence"
 
 
-@pytest.mark.parametrize("fault", [None, "capture", "cleanup", "model", "models", "requests", "evidence"])
+@pytest.mark.parametrize("fault", [None, "capture", "cleanup", "model", "models", "requests", "evidence", "files", "egress"])
 def test_publication_qualification_requires_independent_evidence(tmp_path, monkeypatch, fault):
     monkeypatch.setattr(demo, "ROOT", tmp_path)
     out = tmp_path / "demo-video/out"
@@ -76,6 +76,7 @@ def test_publication_qualification_requires_independent_evidence(tmp_path, monke
                "requests": 3, "evidence_errors": []}
     capture = {"status": "accepted"}
     cleanup = {"success": True}
+    files = {"verified": True, "networkBlockAll": True}
     if fault == "capture":
         capture["status"] = "rejected"
     if fault == "cleanup":
@@ -88,9 +89,14 @@ def test_publication_qualification_requires_independent_evidence(tmp_path, monke
         routing["requests"] = 0
     if fault == "evidence":
         routing["evidence_errors"] = ["routing contract"]
+    if fault == "files":
+        files["verified"] = False
+    if fault == "egress":
+        files["networkBlockAll"] = False
     for name, value in [("environment.json", environment), ("demo-routing.json", routing), ("demo-cleanup.json", cleanup)]:
         (tmp_path / name).write_text(json.dumps(value))
     (out / "capture-report.json").write_text(json.dumps(capture))
+    (tmp_path / "independent-files.json").write_text(json.dumps(files))
     (out / "qualification.json").write_text('{"accepted": true}')  # stale prior success
     if fault:
         with pytest.raises(RuntimeError, match="qualification failed"):
@@ -115,7 +121,7 @@ def test_capture_environment_does_not_inherit_hosted_targets_or_server_keys(monk
     assert env["DEMO_LOCAL_TOKEN"] == "disposable-token"
     assert env["DEMO_MODEL"] == demo.monitor.workspace_model()
     assert env["DEMO_PROXY_DOMAINS"] == demo.ZONE
-    assert env["DEMO_SKIP_PREWARM"] == "1"
+    assert "DEMO_SKIP_PREWARM" not in env
     assert "production-secret" not in env.values()
 
 
@@ -176,7 +182,9 @@ async def test_identity_rejects_unbound_callbacks(callback, method):
         assert response.status == 400
 
 
-def test_infrastructure_uses_real_worker_private_auth_and_loopback_tls(tmp_path, monkeypatch):
+@pytest.mark.parametrize("port", [443, 18443])
+def test_infrastructure_uses_real_worker_private_auth_and_loopback_tls(tmp_path, monkeypatch, port):
+    monkeypatch.setenv("DEMO_TLS_PORT", str(port))
     calls = []
     real_run = subprocess.run
     def openssl(command, **kwargs):
@@ -202,7 +210,7 @@ def test_infrastructure_uses_real_worker_private_auth_and_loopback_tls(tmp_path,
     assert f"set $identity_upstream http://{demo.monitor.CONTAINER}:9100;" in nginx
     assert "resolver 127.0.0.11" in nginx
     assert "proxy_pass $identity_upstream$request_uri;" in nginx
-    assert any("127.0.0.1:443:443" in args for args in calls)
+    assert any(f"127.0.0.1:{port}:443" in args for args in calls)
     worker = next(args for args in calls if args[:4] == ("run", "-d", "--name", demo.WORKER))
     assert f"LOCAL_UID={demo.os.getuid()}" in worker
     assert f"LOCAL_GID={demo.os.getgid()}" in worker
@@ -227,3 +235,136 @@ def test_infrastructure_uses_real_worker_private_auth_and_loopback_tls(tmp_path,
         "--reuid", str(demo.os.getuid()), "--regid", str(demo.os.getgid()), "--clear-groups"]
     assert (tmp_path / ".wrangler/tmp").is_dir()
     assert "dev" in (tmp_path / "worker-arguments").read_text().splitlines()
+
+
+@pytest.mark.parametrize("stale_cache", [False, True])
+async def test_setup_preserves_provider_and_lifecycle_policy(stale_cache):
+    model = {"id": demo.monitor.workspace_model(), "base_model_id": "provider/model", "name": "Demo",
+             "params": {"function_calling": "native", "max_tokens": 4096,
+                        "custom_params": {"provider": {"data_collection": "deny"}}},
+             "meta": {"capabilities": {"builtin_tools": False, "vision": True}}}
+    valves = {"sandbox_create_overrides": '{"ttlMinutes":30}', "auto_stop_minutes": 5,
+              "auto_delete_minutes": 0, "deployment_label": "lathe-ci-demo-fixture",
+              "preview_wrapper_key": "fixture-secret"}
+    seen = []
+    def respond(request):
+        nonlocal model, valves
+        body = json.loads(request.content) if request.content else None
+        seen.append((request.method, request.url.path, dict(request.url.params), body))
+        if request.url.path == "/api/models":
+            effective = json.loads(json.dumps(model))
+            if stale_cache and request.url.params.get("refresh") == "true":
+                effective["meta"]["capabilities"]["builtin_tools"] = True
+            return demo.httpx.Response(200, json={"data": [{"id": model["id"], "info": effective}]})
+        if request.url.path == "/api/v1/models/model/update":
+            model = body
+            return demo.httpx.Response(200, json=model)
+        if request.url.path == "/api/v1/tools/id/lathe_test/valves":
+            return demo.httpx.Response(200, json=valves)
+        if request.url.path == "/api/v1/tools/id/lathe_test/valves/update":
+            valves = body
+            return demo.httpx.Response(200, json=valves)
+        raise AssertionError(request.url)
+    async with demo.httpx.AsyncClient(base_url="http://fixture", transport=demo.httpx.MockTransport(respond)) as api:
+        if stale_cache:
+            with pytest.raises(RuntimeError, match="effective model"):
+                await demo.configure_demo(api)
+            assert not any(path.endswith("valves/update") for _, path, _, _ in seen)
+            return
+        await demo.configure_demo(api)
+    assert model["params"]["custom_params"] == {"provider": demo.PROVIDER_POLICY, "max_tokens": demo.MAX_OUTPUT_TOKENS}
+    assert model["params"]["function_calling"] == "native"
+    assert model["meta"]["capabilities"]["vision"] is True
+    assert model["meta"]["capabilities"]["builtin_tools"] is False
+    assert json.loads(valves["sandbox_create_overrides"]) == {"ttlMinutes": 30, "networkBlockAll": True}
+    assert valves["auto_stop_minutes"] == 5 and valves["auto_delete_minutes"] == 0
+    assert valves["preview_wrapper_key"] == "fixture-secret"
+    assert any(params.get("refresh") == "true" for _, _, params, _ in seen)
+
+
+@pytest.mark.parametrize("fault", [None, "egress", "volume", "identity", "html", "external"])
+async def test_independent_downloads_verify_policy_and_final_artifacts(tmp_path, monkeypatch, fault):
+    original_root = demo.ROOT
+    (tmp_path / "demo-video/out").mkdir(parents=True)
+    (tmp_path / "demo-video/repair-log.csv").write_bytes((original_root / "demo-video/repair-log.csv").read_bytes())
+    (tmp_path / "demo-video/out/artifact.json").write_text('{"path":"/workspace/impact.html"}')
+    monkeypatch.setattr(demo, "ROOT", tmp_path)
+    monkeypatch.setenv("LATHE_TEST_DEPLOYMENT_LABEL", "lathe-ci-demo-fixture")
+    sandbox = {"id": "sandbox-1", "labels": {"lathe-ci-demo-fixture": "monitor@lathe.invalid"},
+               "networkBlockAll": True, "volumes": []}
+    files = {"/workspace/impact.html": '<h1>Repair café</h1><p>12 items, 7 repaired</p>' + '<p>Volunteer impact</p>' * 30}
+    if fault == "egress":
+        sandbox["networkBlockAll"] = False
+    if fault == "volume":
+        sandbox["volumes"] = [{"id": "other"}]
+    if fault == "identity":
+        sandbox["labels"] = {"production": "monitor@lathe.invalid"}
+    if fault == "html":
+        files["/workspace/impact.html"] = "Assistant says everything worked."
+    if fault == "external":
+        files["/workspace/impact.html"] += '<script src="https://external.invalid/chart.js"></script>'
+    downloads = []
+    def respond(request):
+        if request.url.path == "/api/sandbox":
+            assert json.loads(request.url.params["labels"]) == {"lathe-ci-demo-fixture": "monitor@lathe.invalid"}
+            return demo.httpx.Response(200, json={"items": [sandbox]})
+        assert request.url.path == "/toolbox/sandbox-1/files/download"
+        path = request.url.params["path"]
+        downloads.append(path)
+        return demo.httpx.Response(200, text=files[path])
+    async with demo.httpx.AsyncClient(transport=demo.httpx.MockTransport(respond)) as http:
+        if fault:
+            with pytest.raises(RuntimeError):
+                await demo.verify_demo_files(http, tmp_path)
+            assert not (tmp_path / "independent-files.json").exists()
+        else:
+            await demo.verify_demo_files(http, tmp_path)
+            evidence = json.loads((tmp_path / "independent-files.json").read_text())
+            assert evidence["verified"] is True
+            assert evidence["files"] == files
+            assert len(downloads) == 1
+            assert evidence["reference_summary"] == {"items": 12, "repaired": 7, "minutes": 330}
+
+
+@pytest.mark.parametrize("fault", [None, "zdr", "deny", "price", "tokens", "budget"])
+async def test_live_relay_rejects_privacy_or_budget_drift_before_upstream(monkeypatch, fault):
+    from aiohttp import web
+    upstream = []
+    def trace(*args, **kwargs):
+        pass
+    async def forward(self, request):
+        upstream.append(await request.json())
+        self.requests += 1
+        return web.json_response({"forwarded": True})
+    monkeypatch.setattr(demo.monitor.RecordingRelay, "handle", forward)
+    relay = demo.DemoRelay(trace, "fixture")
+    payload = {"provider": json.loads(json.dumps(demo.PROVIDER_POLICY)), "max_tokens": demo.MAX_OUTPUT_TOKENS}
+    if fault == "zdr": payload["provider"]["zdr"] = False
+    if fault == "deny": payload["provider"]["data_collection"] = "allow"
+    if fault == "price": payload["provider"].pop("max_price")
+    if fault == "tokens": payload["max_tokens"] = demo.MAX_OUTPUT_TOKENS * 2
+    if fault == "budget": relay.reserved = 4.50
+    app = web.Application()
+    app.router.add_post("/v1/chat/completions", relay.handle)
+    async with TestServer(app) as server, ClientSession() as client:
+        response = await client.post(server.make_url("/v1/chat/completions"), json=payload)
+        assert response.status == (400 if fault else 200)
+    assert len(upstream) == (0 if fault else 1)
+    assert bool(relay.evidence_errors) == bool(fault)
+
+
+async def test_live_relay_accepts_screenshot_sized_requests_with_model_price_bound(monkeypatch):
+    from aiohttp import web
+    upstream = []
+    async def forward(self, request):
+        upstream.append(await request.json())
+        return web.json_response({"forwarded": True})
+    monkeypatch.setattr(demo.monitor.RecordingRelay, "handle", forward)
+    relay = demo.DemoRelay(lambda *args, **kwargs: None, "fixture")
+    payload = {"provider": demo.PROVIDER_POLICY, "max_tokens": demo.MAX_OUTPUT_TOKENS,
+               "messages": [{"role": "user", "content": "x" * (2 * 1024 * 1024)}]}
+    async with TestServer(demo.relay_app(relay)) as server, ClientSession() as client:
+        response = await client.post(server.make_url("/v1/chat/completions"), json=payload)
+        assert response.status == 200
+    assert len(upstream) == 1
+    assert 0 < relay.reserved < .50

@@ -1,236 +1,28 @@
 {
-  "id": "lathe-shared-workspace",
-  "version": 8,
+  "id": "lathe-everyday-infographic",
+  "version": 10,
   "steps": [
+    { "id": "auth.owui", "do": "auth.ensure-owui", "failureDomain": "authentication" },
+    { "id": "capture.start", "do": "capture.start" },
+    { "id": "chat.open", "do": "chat.open", "screenshot": "fresh-chat", "failureDomain": "ui_drift" },
+    { "id": "lathe.enable", "do": "owui.enable-tool", "screenshot": "lathe-enabled", "failureDomain": "ui_drift" },
     {
-      "id": "auth.owui",
-      "do": "auth.ensure-owui",
-      "required": true,
-      "intent": "Establish Open WebUI authentication outside the recording",
-      "failureDomain": "authentication"
-    },
-    {
-      "id": "sandbox.prewarm",
-      "do": "sandbox.prewarm",
-      "required": false,
-      "intent": "Wake the sandbox and clear prior demo state",
-      "failureDomain": "infrastructure"
-    },
-    {
-      "id": "capture.start",
-      "do": "capture.start",
-      "required": true,
-      "intent": "Begin the clean narrative frame",
-      "failureDomain": "infrastructure"
-    },
-    {
-      "id": "chat.open",
-      "do": "chat.open",
-      "required": true,
-      "intent": "Show a fresh Open WebUI conversation",
-      "screenshot": "fresh-chat",
-      "failureDomain": "ui_drift"
-    },
-    {
-      "id": "lathe.enable",
-      "do": "owui.enable-tool",
-      "required": true,
-      "intent": "Make Lathe available to the model",
-      "screenshot": "lathe-enabled",
-      "failureDomain": "ui_drift"
-    },
-    {
-      "id": "version.request",
-      "do": "chat.send",
-      "required": true,
-      "intent": "Ask which installed Lathe version this demo uses",
+      "id": "infographic.request", "do": "chat.send", "failureDomain": "model_behavior",
       "with": {
-        "prompt": "Which version of Lathe are we using?",
-        "timeoutMs": 60000
-      },
-      "failureDomain": "model_behavior"
+        "prompt": "Here's our repair-café log. Make an HTML infographic showing the volunteers what we accomplished and where we could improve.",
+        "dataFile": "repair-log.csv", "timeoutMs": 420000
+      }
     },
     {
-      "id": "version.prove-installed",
-      "do": "chat.await-tool-result",
-      "required": true,
-      "intent": "Show the installed toolkit version in the recorded conversation",
-      "screenshot": "lathe-version",
-      "with": {
-        "tools": ["lathe"],
-        "argumentContains": "version",
-        "outputContains": "Lathe toolkit version:"
-      },
-      "failureDomain": "lathe_behavior"
+      "id": "preview.request", "do": "chat.send", "failureDomain": "model_behavior",
+      "with": { "prompt": "Serve it up, private.", "timeoutMs": 180000 }
     },
     {
-      "id": "workspace.clone",
-      "do": "chat.send",
-      "required": true,
-      "intent": "Clone Lathe and introduce it in three readable bullets",
-      "screenshot": "lathe-overview",
-      "with": {
-        "prompt": "Clone https://github.com/rndmcnlly/lathe. Give me three short bullets: what Lathe lets you do, where the work runs, and what persists between conversations.",
-        "timeoutMs": 180000
-      },
-      "failureDomain": "model_behavior"
+      "id": "preview.prove", "do": "chat.await-tool-result", "screenshot": "private-preview-ready", "failureDomain": "lathe_behavior",
+      "with": { "tools": ["expose"], "argumentsEqual": { "access": "private" }, "outputContains": "Copying the URL does not grant access." }
     },
-    {
-      "id": "workspace.prove-cloned",
-      "do": "chat.await-tool-result",
-      "required": true,
-      "intent": "Verify cloning through tool evidence",
-      "with": {
-        "tools": ["bash"],
-        "argumentContains": "github.com/rndmcnlly/lathe"
-      },
-      "failureDomain": "model_behavior"
-    },
-    {
-      "id": "workspace.create",
-      "do": "chat.send",
-      "required": true,
-      "intent": "Write the relay while viewers read the overview",
-      "with": {
-        "prompt": "Create RELAY.md in the lathe folder with these two lines:\n\nLathe: What do you call a chat agent and an editor sharing one sandbox?\nYou:",
-        "timeoutMs": 90000
-      },
-      "failureDomain": "model_behavior"
-    },
-    {
-      "id": "workspace.prove-created",
-      "do": "chat.await-tool-result",
-      "required": true,
-      "intent": "Establish file creation from tool evidence rather than assistant prose",
-      "screenshot": "workspace-created",
-      "with": {
-        "tools": ["bash", "write"],
-        "argumentContains": "RELAY.md"
-      },
-      "failureDomain": "model_behavior"
-    },
-    {
-      "id": "editor.request",
-      "do": "chat.send",
-      "required": true,
-      "intent": "Ask Lathe to expose a private browser editor",
-      "with": {
-        "prompt": "Open private VS Code in the lathe folder. Consult lathe(manpage=\"services\") and use its pinned app.py recipe to launch code-server with --root set to the absolute lathe checkout and --port 8080. Then expose target=\"http:8080\" with access=\"private\". Tell me the access and expiry details.",
-        "timeoutMs": 360000
-      },
-      "failureDomain": "model_behavior"
-    },
-    {
-      "id": "editor.prove-launched",
-      "do": "chat.await-tool-result",
-      "required": true,
-      "intent": "Bind the checkout to a ready recipe service, not assistant prose",
-      "with": {
-        "tools": ["bash"],
-        "recipeReady": { "service": "code-server", "port": 8080 },
-        "bindCheckout": true
-      },
-      "failureDomain": "lathe_behavior"
-    },
-    {
-      "id": "editor.prove-exposed",
-      "do": "chat.await-tool-result",
-      "required": true,
-      "intent": "Establish that expose completed",
-      "screenshot": "private-editor-ready",
-      "with": {
-        "tools": ["expose"],
-        "argumentsEqual": { "target": "http:8080", "access": "private" },
-        "outputContains": "Copying the URL does not grant access."
-      },
-      "failureDomain": "lathe_behavior"
-    },
-    {
-      "id": "editor.open",
-      "do": "editor.open-via-explorer",
-      "fallback": ["editor.open-via-quick-open"],
-      "required": true,
-      "intent": "Present the same relay artifact in VS Code",
-      "screenshot": "shared-file-in-editor",
-      "with": { "path": "{{checkout}}/RELAY.md" },
-      "failureDomain": "ui_drift"
-    },
-    {
-      "id": "editor.edit",
-      "do": "editor.replace-line",
-      "required": true,
-      "intent": "Edit the shared artifact from the browser editor",
-      "screenshot": "relay-edited",
-      "with": {
-        "path": "{{checkout}}/RELAY.md",
-        "line": 2,
-        "text": "You: A shared state of mind.",
-        "before": "Lathe: What do you call a chat agent and an editor sharing one sandbox?\nYou:\n"
-      },
-      "failureDomain": "ui_drift"
-    },
-    {
-      "id": "chat.return",
-      "do": "chat.return",
-      "required": true,
-      "intent": "Return to the original conversation",
-      "failureDomain": "ui_drift"
-    },
-    {
-      "id": "relay.read",
-      "do": "chat.send",
-      "required": true,
-      "intent": "Have Lathe observe the editor's filesystem edit",
-      "with": {
-        "prompt": "Read RELAY.md. What did I write after 'You:'?",
-        "timeoutMs": 60000
-      },
-      "failureDomain": "model_behavior"
-    },
-    {
-      "id": "relay.prove-read",
-      "do": "chat.await-tool-result",
-      "required": true,
-      "intent": "Prove the edit through the read tool result",
-      "screenshot": "relay-confirmed",
-      "with": {
-        "tools": ["read", "bash"],
-        "argumentContains": "RELAY.md",
-        "outputContains": "A shared state of mind.",
-        "outputLineEquals": "You: A shared state of mind."
-      },
-      "failureDomain": "lathe_behavior"
-    },
-    {
-      "id": "service.stop",
-      "do": "chat.send",
-      "required": true,
-      "intent": "Stop the editor service after the shared-file demonstration",
-      "with": {
-        "prompt": "Stop code-server and check that port 8080 is closed. Then summarize what’s ready.",
-        "timeoutMs": 90000
-      },
-      "failureDomain": "model_behavior"
-    },
-    {
-      "id": "service.prove-stopped",
-      "do": "chat.await-tool-result",
-      "required": true,
-      "intent": "Observe the service shutdown check through bash",
-      "screenshot": "service-stopped",
-      "with": {
-        "tools": ["bash"],
-        "argumentContains": "8080"
-      },
-      "failureDomain": "model_behavior"
-    },
-    {
-      "id": "closing.hold",
-      "do": "camera.hold",
-      "required": false,
-      "intent": "Leave the completed result readable",
-      "with": { "milliseconds": 5000 },
-      "failureDomain": "editorial_qualification"
-    }
+    { "id": "infographic.prove", "do": "chat.find-artifact", "failureDomain": "lathe_behavior" },
+    { "id": "preview.open", "do": "preview.open", "screenshot": "repair-cafe-infographic", "failureDomain": "ui_drift" },
+    { "id": "closing.hold", "do": "camera.hold", "with": { "milliseconds": 6000 } }
   ]
 }

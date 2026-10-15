@@ -1,0 +1,13 @@
+date,item,outcome,minutes,notes
+2026-10-03,kettle,repaired,25,Loose connection
+2026-10-03,toaster,repaired,40,Replaced fuse
+2026-10-03,desk lamp,repaired,20,New switch
+2026-10-03,headphones,not repaired,35,Replacement cable unavailable
+2026-10-03,jacket zip,repaired,15,Realigned slider
+2026-10-03,blender,not repaired,30,Replacement coupling unavailable
+2026-10-10,chair,repaired,30,Reglued joint
+2026-10-10,bicycle,repaired,45,Adjusted brakes
+2026-10-10,printer,advice only,20,Helped identify compatible ink
+2026-10-10,radio,not repaired,25,Replacement component unavailable
+2026-10-10,laptop,advice only,15,Explained backup options
+2026-10-10,fan,repaired,30,Cleaned bearings

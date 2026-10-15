@@ -8,7 +8,7 @@ Every line of code in this repo was written by an AI coding agent, directed by a
 
 **What this means for contributors:**
 
-- Use a coding agent (Lathe itself, Claude, Cursor, Copilot, OpenCode, etc.) to write your changes. The agent does the typing; you do the thinking.
+- Use a coding agent (Lathe itself, Claude, Cursor, Copilot, OpenCode, etc.) to develop your changes. Reason, implement, and check the work together; as the contributor, take responsibility for what you submit.
 - If you need to hand-edit a line to fix something an agent can't get right, that's fine — pragmatism over purity. But if you find yourself hand-writing a whole feature, consider whether the friction is telling you something about the design.
 - Mention which agent you used in your PR description. Not for gatekeeping — for curiosity.
 
@@ -17,11 +17,11 @@ Every line of code in this repo was written by an AI coding agent, directed by a
 1. **Read `AGENTS.md`** — it has architecture notes, test procedures, and contribution rules that apply to both humans and agents working on the repo.
 2. **Run the offline tests**: `uv run pytest`. See `AGENTS.md` for live checks appropriate to your change.
 3. **Don't break the single-file constraint** — `lathe.py` is one file, deliberately. Resist the urge to split it.
-4. **Route documentation to the right home** — user-facing docs go in `docs/`, admin docs in `README.md`, agent/contributor docs in `AGENTS.md`. See the "Three audiences, three homes" section in `AGENTS.md`.
+4. **Route documentation to the right home**: `docs/` is the public landing page, `README.md` is for administrators, `handbook/` supplies optional agent-readable recipes, and `AGENTS.md` routes maintainer guidance and checks.
 
 ## Good first contributions
 
-- New service integrations for `lathe(manpage="services")` — tested bootstrap paths that work within Daytona's sandbox constraints.
+- Handbook recipes for applications: portable installation and operation guidance, explicit network requirements, and safe startup/shutdown procedures. Keep app-specific installers out of the core manual.
 - Bug reports with reproduction steps (even better: a failing test case).
 - Documentation improvements routed to the right audience.
 - Improvements to the demo video pipeline.

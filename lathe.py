@@ -4,7 +4,7 @@ author: Adam Smith
 author_url: https://adamsmith.as
 description: Coding agent tools (lathe, bash, read, write, edit, glob, grep, view, interpret, onboard, expose, destroy) backed by per-user sandbox VMs with transparent lifecycle management.
 required_open_webui_version: 0.12.0
-requirements: httpx, httpx-ws, pydantic, cachetools
+requirements: httpx, httpx-ws, pydantic>=2, cachetools, PyYAML
 version: 0.32.0
 licence: MIT
 """
@@ -22,14 +22,15 @@ import typing
 import urllib.parse
 import uuid
 from datetime import datetime, timezone
+from functools import lru_cache
 
 import httpx
 from cachetools import LRUCache
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, TypeAdapter, ValidationError
+import yaml
 
 
 logger = logging.getLogger("lathe")
-_RECIPE_REVISION = "66176be7817aaf3a0b8f30327a69e1bb716edebe"
 
 # ── module-level helpers (invisible to OWUI tool discovery) ──────────
 #
@@ -947,80 +948,31 @@ async def _run_sandbox_script(valves, sandbox_id: str, client: httpx.AsyncClient
 
 
 
-def _type_name(annotation) -> str:
-    """Render the supported runtime annotations without implementation noise."""
-    origin = typing.get_origin(annotation)
-    if origin is list:
-        args = typing.get_args(annotation)
-        member = _type_name(args[0]) if args else "Any"
-        return f"list[{member}]"
-    if origin is dict:
-        args = typing.get_args(annotation)
-        return f"dict[{', '.join(_type_name(arg) for arg in args)}]" if args else "dict"
-    return getattr(annotation, "__name__", str(annotation))
-
-
-def _check_param_type(name: str, value, expected_type) -> str | None:
-    """Recursively validate one value using exact runtime type semantics."""
-    origin = typing.get_origin(expected_type)
-    if origin is dict:
-        if type(value) is not dict:
-            return (
-                f"Error: parameter '{name}' expected type {_type_name(expected_type)}, "
-                f"got {type(value).__name__}"
-            )
-        args = typing.get_args(expected_type)
-        if args:
-            for index, (key, member) in enumerate(value.items()):
-                for location, item, annotation in (
-                    (f"{name}.key[{index}]", key, args[0]),
-                    (f"{name}.value[{index}]", member, args[1]),
-                ):
-                    error = _check_param_type(location, item, annotation)
-                    if error:
-                        return error
-        return None
-    if origin is list:
-        if type(value) is not list:
-            return (
-                f"Error: parameter '{name}' expected type {_type_name(expected_type)}, "
-                f"got {type(value).__name__}"
-            )
-        args = typing.get_args(expected_type)
-        if args:
-            for index, member in enumerate(value):
-                error = _check_param_type(f"{name}[{index}]", member, args[0])
-                if error:
-                    return error
-        return None
-
-    # All current tool annotations resolve to concrete classes. Keep this guard
-    # so a future unsupported annotation cannot reach type() comparison after an
-    # unusual loader has left it unresolved.
-    if not isinstance(expected_type, type):
-        return None
-    if type(value) is not expected_type:
-        return (
-            f"Error: parameter '{name}' expected type {_type_name(expected_type)}, "
-            f"got {type(value).__name__}"
-        )
-    return None
+@lru_cache(maxsize=128)
+def _param_adapter(annotated_fn, name):
+    # OWUI may exec this module with future annotations enabled.
+    hint = typing.get_type_hints(annotated_fn).get(name)
+    return hint, TypeAdapter(hint) if hint is not None else None
 
 
 def _check_tool_params(kwargs: dict, annotated_fn) -> str | None:
     """Strict type check for tool params at the wrapper boundary.
 
-    Resolve annotations through get_type_hints() for PEP 563 safety, then
-    recursively require exact runtime types. Error messages identify locations
-    and types but never include parameter values.
+    Pydantic strict mode rejects JSON coercions, including bool-for-int, and
+    validates container members. Unlike exact type identity it accepts Python
+    subclasses of built-ins, which OWUI's parsed JSON cannot contain.
+    Never render ValidationError: inputs AND dictionary-key locations can leak
+    secrets. Report only the parameter and its declared type.
     """
-    annotations = typing.get_type_hints(annotated_fn)
     for name, value in kwargs.items():
-        if name not in annotations:
+        hint, adapter = _param_adapter(annotated_fn, name)
+        if adapter is None:
             continue
-        error = _check_param_type(name, value, annotations[name])
-        if error:
-            return error
+        try:
+            adapter.validate_python(value, strict=True)
+        except ValidationError:
+            expected = str(hint) if typing.get_origin(hint) else hint.__name__
+            return f"Error: parameter '{name}' expected type {expected}"
     return None
 
 
@@ -2122,58 +2074,69 @@ async def _core_interpret(valves, sandbox_id: str, client: httpx.AsyncClient,
 
 _SKILL_CATALOG_SCRIPT = textwrap.dedent("""\
     # Shared discovery for explicit onboarding and the first-call snapshot.
+    LATHE = os.path.join(os.environ.get("XDG_DATA_HOME", os.path.expanduser("~/.local/share")), "lathe")
     sections.append(
         "# Skill Locations\\n\\n"
         "Scanning global skills via " + os.path.join(GLOBAL, "skills", "<skill-name>", "SKILL.md") + "\\n"
+        "Scanning Lathe skills via " + os.path.join(LATHE, "skills", "<skill-name>", "SKILL.md") + "\\n"
         "Scanning project skills via " + os.path.join(PROJECT, ".agents", "skills", "<skill-name>", "SKILL.md")
     )
 
-    def collect_skills(base):
+    skills = []
+    for base in (GLOBAL, LATHE, os.path.join(PROJECT, ".agents")):
         skills_dir = os.path.join(base, "skills")
         if not os.path.isdir(skills_dir):
-            return
-        for skill_md in sorted(glob.glob(os.path.join(skills_dir, "*/SKILL.md"))):
-            dir_name = os.path.basename(os.path.dirname(skill_md))
-            name = dir_name
-            desc = ""
+            continue
+        # Bounded records, no bodies, dependencies, installation, or networking.
+        paths = sorted(glob.glob(os.path.join(skills_dir, "*/SKILL.md")))
+        if len(paths) > 256:
+            sections.append("Skill discovery limited to the first 256 files in " + skills_dir)
+        for skill_md in paths[:256]:
+            metadata = ""
             try:
-                with open(skill_md) as f:
-                    lines = f.readlines()
-            except OSError:
+                with open(skill_md, encoding="utf-8") as f:
+                    lines = f.read(16385).splitlines()
+            except (OSError, UnicodeError):
                 continue
-            # Parse YAML frontmatter (minimal, no deps)
+            # Only frame the YAML here. The OWUI host owns safe YAML parsing.
             if lines and lines[0].strip() == "---":
-                for line in lines[1:]:
+                for index, line in enumerate(lines[1:], 1):
                     if line.strip() == "---":
+                        candidate = "\\n".join(lines[1:index])
+                        if len(candidate) <= 16384:
+                            metadata = candidate
                         break
-                    if line.startswith("name:"):
-                        name = line[len("name:"):].strip()
-                    elif line.startswith("description:"):
-                        desc = line[len("description:"):].strip()
-            yield name, desc, skill_md
-
-    # Global first, then project overrides on collision
-    skills = {}   # name -> (desc, path)
-    order = []    # first-seen order
-    for base in (GLOBAL, os.path.join(PROJECT, ".agents")):
-        for name, desc, path in collect_skills(base):
-            if name not in skills:
-                order.append(name)
-            skills[name] = (desc, path)
-
-    if order:
-        lines = [
-            "# Available Skills",
-            "",
-            "Load a skill's full instructions with read(path) when the task matches its description.",
-            "",
-        ]
-        for name in order:
-            desc, path = skills[name]
-            lines.append(f"- **{name}**: {desc}")
-            lines.append("  `" + path + "`")
-        sections.append("\\n".join(lines))
+            skills.append({"path": skill_md, "metadata": metadata})
 """)
+
+
+def _render_context(result: str) -> str:
+    """Render sandbox records with host-only YAML; bad metadata stays readable."""
+    context = json.loads(result)
+    skills = {}
+    # Records arrive in global, Lathe, project order: later names override.
+    for record in context["skills"]:
+        path = record["path"]
+        name = path.rsplit("/", 2)[-2]
+        desc = "Metadata unavailable; read the skill for instructions."
+        try:
+            metadata = yaml.safe_load(record["metadata"])
+            if isinstance(metadata, dict):
+                if isinstance(metadata.get("name"), str) and metadata["name"].strip():
+                    name = " ".join(metadata["name"].split())
+                if isinstance(metadata.get("description"), str):
+                    desc = " ".join(metadata["description"].split())
+        except (yaml.YAMLError, ValueError, OverflowError, RecursionError):
+            pass
+        skills[name] = (desc, path)
+    sections = context["sections"]
+    if skills:
+        lines = ["# Available Skills", "",
+                 "Load a skill's full instructions with read(path) when the task matches its description.", ""]
+        for name, (desc, path) in skills.items():
+            lines.extend([f"- **{name}**: {desc}", f"  `{path}`"])
+        sections.append("\n".join(lines))
+    return "\n\n---\n\n".join(sections)
 
 
 def _build_onboard_script(project_path: str) -> str:
@@ -2182,17 +2145,17 @@ def _build_onboard_script(project_path: str) -> str:
     Always produces a flat directory listing of project_path (one level,
     absolute paths, dirs marked with trailing /).  Additionally searches
     two locations for agent context:
-      1. ~/.agents/          — global agent instructions and skills
-      2. <project_path>/     — project-local instructions and skills
+      1. ~/.agents/          – global agent instructions and skills
+      2. <project_path>/     – project-local instructions and skills
 
-    Skills are merged into a single catalog.  On name collision, the
-    project-level entry wins (more specific scope takes precedence).
+    Existing Lathe-specific skills under XDG_DATA_HOME/lathe/skills override
+    shared global skills; project skills override both. Discovery is read-only.
     """
     # The script is a self-contained Python program executed on the sandbox.
     # project_path is injected via repr() so it's safely quoted as a
     # Python string literal.  The rest of the script uses no interpolation.
     return (
-        "import os, glob\n\nPROJECT = " + repr(project_path)
+        "import os, glob, json\n\nPROJECT = " + repr(project_path)
         + "\n" + textwrap.dedent("""\
         GLOBAL  = os.path.expanduser("~/.agents")
 
@@ -2235,7 +2198,7 @@ def _build_onboard_script(project_path: str) -> str:
         + textwrap.dedent("""\
         # ── Output ───────────────────────────────────────────────────
 
-        print("\\n\\n---\\n\\n".join(sections))
+        print(json.dumps({"sections": sections, "skills": skills}))
     """)
     )
 
@@ -2256,7 +2219,7 @@ def _build_onboard_script(project_path: str) -> str:
 def _build_snapshot_script(project_path: str) -> str:
     """Build first-call orientation with the same skill catalog as onboard()."""
     return (
-        "import subprocess, os, glob\n\nPROJECT = " + repr(project_path)
+        "import subprocess, os, glob, json\n\nPROJECT = " + repr(project_path)
         + "\n" + textwrap.dedent("""\
     GLOBAL = os.path.expanduser("~/.agents")
     sections = []
@@ -2292,12 +2255,31 @@ def _build_snapshot_script(project_path: str) -> str:
     if info_lines:
         sections.append("\\n".join(info_lines))
 
-    print("\\n\\n".join(sections))
+    print(json.dumps({"sections": sections, "skills": skills}))
     """)
     )
 
 
 _SNAPSHOT_SCRIPT = _build_snapshot_script("/home/daytona/workspace")
+
+
+def _installation_guidance(valves) -> str:
+    """Render admin-supplied references as text, without fetching them."""
+    parts = []
+    if valves.onboarding_instructions.strip():
+        parts.append(
+            "## Installation-specific guidance from your OWUI administrator\n\n"
+            + valves.onboarding_instructions
+        )
+    if valves.handbook_url.strip():
+        parts.append(
+            "## Optional agent handbook\n\n"
+            + valves.handbook_url.strip()
+            + "\nRead this reference when relevant using available tools. Lathe does not "
+            "fetch it for you. The URL does not guarantee network access; if unreachable, "
+            "continue with available skills and local resources."
+        )
+    return "\n\n".join(parts)
 
 
 async def _chat_auto_init(
@@ -2314,6 +2296,9 @@ async def _chat_auto_init(
     API (cpu, memory, disk, region) without an extra sandbox-side command.
     """
     parts: list[str] = ["[Auto-init: first tool call in this conversation]"]
+    guidance = _installation_guidance(valves)
+    if guidance:
+        parts.append(guidance)
 
     # ── Sandbox-side snapshot (workspace listing + versions) ─────
     try:
@@ -2326,7 +2311,7 @@ async def _chat_auto_init(
         if resp.status_code == 200:
             data = resp.json()
             if data.get("exitCode") == 0 and data.get("result", "").strip():
-                parts.append(data["result"].strip())
+                parts.append(_render_context(data["result"]))
     except Exception as e:
         logger.debug("auto-init: snapshot failed: %s", e)
 
@@ -2653,6 +2638,14 @@ async def _ensure_sandbox(valves, email: str, client: httpx.AsyncClient, emitter
 
 class Tools:
     class Valves(BaseModel):
+        onboarding_instructions: str = Field(
+            "",
+            description="Optional admin guidance delivered with the first sandbox-tool orientation per chat and in the overview manual. Use for local resources, conventions, or short recipes. Visible to the agent; do not put secrets here.",
+        )
+        handbook_url: str = Field(
+            "",
+            description="Optional agent handbook reference URL. Empty by default for network-restricted deployments. The agent chooses how to read it; Lathe never fetches it. May point to a public, intranet, or test Markdown resource.",
+        )
         daytona_api_key: str = Field(
             "",
             description="Daytona API key",
@@ -2751,7 +2744,7 @@ class Tools:
 
     # Manpage strings are interpolated via plain str.replace() in the
     # lathe() method, NOT str.format().  Known placeholders today:
-    # {tool_catalog}, {recipe_revision}, {preview_access_note}. Unknown
+    # {tool_catalog}, {preview_access_note}. Unknown
     # placeholders pass through unchanged (no KeyError), and literal
     # braces in shell/JSON/regex snippets (${VAR}, {pid,log,exit},
     # {"key":"value"}, {n,m}) are always safe.  If you add a new dynamic
@@ -2762,15 +2755,12 @@ class Tools:
 
             ## What can the sandbox reach?
 
-            The sandbox can directly reach a broad allowlist of hosts:
-            package registries (PyPI, npm, apt), git hosts (GitHub, GitLab,
-            Bitbucket), container registries (Docker Hub, ghcr.io), AI APIs
-            (OpenAI, Anthropic, OpenRouter, Groq, etc.), CDNs (Cloudflare,
-            jsDelivr, unpkg), select cloud storage (S3, GCS), and common
-            dev platforms (Vercel, Supabase, Sentry).
-
-            bash("curl ...") and bash("wget ...") work for all allowlisted
-            hosts. Most tasks never hit the limit.
+            Network access depends on the Daytona account and deployment.
+            An allowlist may permit some package registries and GitHub endpoints
+            without permitting every release asset, redirect, CDN, or dependency.
+            Test the actual source and its redirects. Do not assume all public
+            downloads work. Use preinstalled tools or reachable intranet mirrors
+            when available; Lathe does not require a public app repository.
 
             ## When curl fails: egress workarounds
 
@@ -2778,10 +2768,12 @@ class Tools:
             egress filtering, but are not proof: check the URL and service too.
             For a blocked host, the workarounds below involve the user.
 
-            **Common — user downloads and uploads via dufs:**
+            **User-assisted transfer through an available file browser:**
             Ask the user to download the file on their own machine, then
-            upload it to the sandbox through the dufs file browser. Run
-            the dufs recipe from the services manual, then
+            upload it through an installed file browser, such as dufs. If none
+            exists, consult the services manual and configured handbook before
+            installing from a reachable source; dufs is not preinstalled by Lathe.
+            After starting and checking the browser, use
             expose(target="http:5000", access="private") to get the URL. Choose public
             only if the user explicitly requests public/world access; missing
             private wrapping is not permission to downgrade. This handles any
@@ -2791,16 +2783,15 @@ class Tools:
             For repeated fetch needs (e.g. crawling an API the sandbox
             can't reach), build a small web service in the sandbox that
             presents a UI where the user clicks to initiate fetches from
-            their browser. The browser has unrestricted egress but is
-            subject to CORS — this only works automatically for targets
+            their browser. The browser uses the user's network and is
+            subject to CORS: this only works automatically for targets
             that set Access-Control-Allow-Origin headers. The service
             POSTs results back to itself for the agent to read.
 
-            **Clean solution — Daytona Tier 3:**
-            Daytona Tier 3 accounts have unrestricted egress. If the
-            admin's Daytona account is Tier 3, none of these workarounds
-            are needed — bash("curl ...") reaches any host. The admin can
-            check their tier at https://app.daytona.io.
+            **Administrator network policy:**
+            Ask the administrator about account-tier restrictions, approved
+            mirrors, or allowlist changes. Check the current policy at
+            https://app.daytona.io rather than assuming a tier guarantees access.
 
             ## What does NOT work
 
@@ -2943,39 +2934,109 @@ class Tools:
             access="private"). expose never installs or starts applications.
             Shells and IDEs provide arbitrary execution: always keep them private.
 
-            ## On-demand repository recipes
+            ## Install and operate ordinary programs
 
-            Choose a recipe by the user's task:
-            - dufs: browser file upload/download for the user (port 5000).
-            - ttyd: interactive browser shell (7681, private only).
-            - code-server: browser VS Code IDE (8080, private only).
-            - site: static website preview (8000).
+            Lathe has no app installer or managed application bundle. For a first
+            setup, read this manual, relevant existing skills, and the configured
+            agent handbook when needed. The handbook is an optional reference,
+            not executable setup or a required public dependency. Use installed
+            programs or sources the sandbox can reach, including intranet mirrors.
+            Examples include code-server (IDE), dufs (file browser), ttyd (terminal),
+            or a static HTTP server. Inspect the installed version and --help;
+            confirm architecture, dependencies, and published checksums before
+            installing. Never upgrade an existing installation merely to start it:
+            ask about version, extensions, configuration, and upgrade preferences.
 
-            Recipe revision: {recipe_revision}
-            Use the cached snapshot when present. Otherwise bootstrap the pinned
-            revision (never main or a moving tag):
-            ```sh
-            test -f "$HOME/.cache/lathe/recipes/{recipe_revision}/app.py" || {
-              curl -fsSL https://raw.githubusercontent.com/rndmcnlly/lathe/{recipe_revision}/recipes/bootstrap.sh -o /tmp/lathe-recipes-bootstrap.sh && sh /tmp/lathe-recipes-bootstrap.sh {recipe_revision}
-            }
-            ```
-            Before launching, use read() on the shared guide:
-            /home/daytona/.cache/lathe/recipes/{recipe_revision}/README.md
-            and the selected app's instructions:
-            /home/daytona/.cache/lathe/recipes/{recipe_revision}/<app>/SKILL.md
-            Replace <app> with dufs, ttyd, code-server, or site. These contain
-            app-specific capabilities, safeguards, startup and recovery guidance.
-            Then run with bash(), choosing an absolute existing workspace root:
-            ```sh
-            python3 ~/.cache/lathe/recipes/{recipe_revision}/app.py dufs --root /home/daytona/workspace --port 5000
-            ```
-            Read the JSON READY metadata, then expose http:5000 privately.
-            Recipes own installation, process identity checks, startup and logs.
-            After sandbox sleep, rerun the same recipe before renewing exposure.
+            Choose an existing absolute root and check the requested port before
+            launch. Inspect listeners with ss/lsof when installed, or /proc on
+            Linux. A PID file or open port alone does not identify the application.
+            Verify executable, command line, process start identity, root, and
+            authentication settings. Reuse a matching healthy instance without
+            restarting it. If another root or application owns the port, explain
+            the conflict and ask whether to reuse it, choose a different port, or
+            stop it. Never blindly kill a listener or stale PID.
+
+            Keep binaries, configuration, logs, and service records outside skill
+            directories. Start via bash; use its background sidecars to inspect
+            logs and exit status, or an explicitly detached process with recorded
+            PID/start identity. Check HTTP readiness with a bounded timeout and
+            inspect logs on failure before exposing. Verify browser behavior too:
+            a listening socket does not prove IDE or terminal WebSockets work.
+            Use the least reachable bind address the proxy can actually access.
+            Disable app authentication only behind a verified private authenticated
+            proxy with no unauthenticated direct path; otherwise retain app auth.
+            Private registration does not secure other routes to the same app.
+
+            For shutdown, recheck the recorded identity before sending TERM to
+            that process (or a deliberately created, verified process group).
+            Wait and check port release. Do not escalate to KILL or stop unrelated
+            processes without permission. After sandbox sleep, verify or restart
+            the intended application before renewing exposure.
             The ordinary sandbox filesystem survives stop/archive, not destroy.
             Preview registration neither keeps a sandbox awake nor restarts a process.
 
             {preview_access_note}
+
+            ## Develop reusable skills with the user
+
+            Transagency describes both the capacity to act that develops through human–agent collaboration and the expanded agency a participant experiences through it. Build skills that support both: agentic skills help you work independently in the Daytona sandbox, while transagentic skills help you and the user coordinate through Open WebUI. Offer to preserve successful practices, and develop them with the user’s preferences about what to remember, automate, share, revise, or forget.
+
+            Choose a skill’s location according to who should discover it: ~/.local/share/lathe/skills/<name>/SKILL.md for Lathe-specific practices, ~/.agents/skills/<name>/SKILL.md for sandbox-wide practices shared with compatible agents, or <project>/.agents/skills/<name>/SKILL.md for project-local knowledge. onboard() catalogs available skills; read the relevant SKILL.md before applying one. Shared skills should describe portable procedures without assuming another agent has Lathe’s expose() tool or communicates through Open WebUI.
+
+            XDG_DATA_HOME replaces ~/.local/share when configured. On a name
+            collision, project skills override Lathe-specific skills, which
+            override shared global skills. After a successful setup, OFFER to save
+            a skill and wait for approval before writing it. Record the tested
+            version, installation/source paths, start/stop/readiness checks,
+            process identity, port-reuse choices, and upgrade preferences, not
+            secrets or expiring preview URLs. Do not install prepackaged skills
+            or grow skills automatically. Deletion means forget: an absent skill
+            may be offered again after use, never silently regenerated.
+
+            ## Worked example: a static site, then a reusable skill
+
+            A simple static preview needs only the Python 3 already used by Lathe;
+            no handbook, package installation, or outbound download is necessary.
+            For example, use write() to create
+            /home/daytona/workspace/site/index.html with the user's page. Serve a
+            dedicated directory containing only intended public-facing content,
+            not the entire workspace. Python's HTTP server lists directories and
+            follows symlinks: check for links that could expose files outside this
+            root. This is a development preview, not a hardened hosting service.
+
+            Check port 8000 using the identity/reuse procedure above, then start:
+
+            bash(command="python3 -m http.server 8000 --bind 127.0.0.1 --directory /home/daytona/workspace/site",
+                 foreground_seconds=0)
+
+            Keep the returned background descriptor. In a subsequent bash call,
+            fetch http://127.0.0.1:8000/index.html using Python's urllib.request
+            with a short timeout. Check the actual page content, not merely a 200
+            status, and inspect the background log if startup fails. Then call:
+
+            expose(target="http:8000", access="private")
+
+            Verify that the preview reaches this server. If the proxy cannot reach
+            loopback, diagnose its routing before changing the bind address; do not
+            silently switch to public access. Public exposure requires the user's
+            explicit request. Editing files under the served root needs only a
+            browser refresh, not a server restart.
+
+            After success, ask: "Would you like me to save our tested preview
+            procedure as a skill for next time?" With approval, write a SKILL.md
+            in the appropriate location above, with YAML name and description.
+            Capture the root, chosen port and bind address, launch command,
+            readiness/content check, verified process-identity and shutdown steps,
+            and the user's port-reuse/access preferences. Teach rechecking identity
+            rather than treating today's PID as permanent. Include how to restart
+            after sandbox sleep and obtain a fresh preview URL. Keep credentials
+            and temporary URLs out of the skill. A shared skill should separate
+            portable server operation from Lathe-specific expose() instructions.
+
+            In a fresh conversation, discover and read that skill, inspect whether
+            the intended server is already running, then reuse it or restart it
+            safely. The saved skill is the user's adapted knowledge, not a newly
+            installed tool or a named expose target.
 
             ## Upstream application headers
 
@@ -3014,7 +3075,8 @@ class Tools:
 
             The first sandbox tool call attempts a workspace snapshot and skill
             catalog, not AGENTS.md contents. Use onboard(path) for the project's listing, AGENTS.md,
-            and skill catalog (also searches ~/.agents/). Read a relevant SKILL.md
+            and skill catalog (shared ~/.agents/skills, Lathe-specific
+            ~/.local/share/lathe/skills, and project .agents/skills). Read a relevant SKILL.md
             before using its workflow. Do not repeat onboarding just for a listing
             already supplied. Use "" for the default workspace.
 
@@ -3027,8 +3089,11 @@ class Tools:
               logs and exit status remain readable for 24 hours after completion;
               later bash calls reap expired results. Sandbox stop/restart clears them.
             - {preview_access_note}
-            - Start services with bash or repository recipes, then expose http:<port>.
+            - Start services with bash, check readiness, then expose http:<port>.
               Never expose shells or IDEs publicly.
+            - For a first app setup, consult the services manual and configured
+              handbook when needed. After success, offer to save a skill; wait
+              for user approval. Skills are never created automatically.
             - destroy is irreversible and requires user confirmation.
 
             ## Read details only when needed
@@ -3055,7 +3120,7 @@ class Tools:
         "interpret": "Persistent Python REPL: state model, when to use vs bash, limitations.",
         "services": "Advanced service details: lifecycle, ports, logs, manual configuration, and recovery.",
         "background": "Background job sidecar files, and peek/poll/kill recipes.",
-        "egress": "Egress restrictions, workarounds (dufs upload, browser-side fetch), Tier 3.",
+        "egress": "Deployment-dependent network access, mirrors, and user-assisted transfers.",
         "version": "Show the installed Lathe toolkit version.",
     }
 
@@ -3089,7 +3154,6 @@ class Tools:
             # up with KeyError, and so missing placeholders are silently
             # tolerated rather than fatal.
             content = content.replace("{tool_catalog}", tool_catalog)
-            content = content.replace("{recipe_revision}", _RECIPE_REVISION)
             preview_note = (
                 "HTTP expose requires an explicit public/private access choice. Public requests try the wrapper, "
                 "then fall back to a direct signed bearer URL if wrapping is unavailable or refused (unless upstream_headers are requested). "
@@ -3102,6 +3166,10 @@ class Tools:
             )
             preview_note += f" Upstream HTTP access lasts up to {self.valves.preview_expiry_seconds / 3600:g} hour(s); call expose again to renew."
             content = content.replace("{preview_access_note}", preview_note)
+            if manpage in ("overview", "services"):
+                guidance = _installation_guidance(self.valves)
+                if guidance:
+                    content += "\n\n" + guidance
             await _emit(__event_emitter__, f"Manual page: {manpage}", done=True)
             return content
 
@@ -3236,7 +3304,7 @@ class Tools:
         __event_emitter__=None,
     ) -> str:
         """
-        Load project listing, AGENTS.md, and skill catalog; also searches ~/.agents/.
+        Load project listing, AGENTS.md, and shared, Lathe-specific, and project skills.
         Read relevant SKILL.md files for full instructions. Skip repeat onboarding
         when the supplied context already covers this project.
         :param path: Absolute project root; "" selects /home/daytona/workspace.
@@ -3291,8 +3359,9 @@ class Tools:
                 await _emit(__event_emitter__, "Error loading context", done=True)
                 return f"Error: onboard script failed (exit {exit_code}): {result[:500]}"
 
+            rendered = _render_context(result)
             await _emit(__event_emitter__, "Project context loaded", done=True)
-            return result if result else "(empty project context)"
+            return rendered if rendered else "(empty project context)"
 
         return await _tool_context(__event_emitter__, _run, harness)
 
@@ -3473,9 +3542,9 @@ class Tools:
     ) -> str:
         """Expose an already-running HTTP/WebSocket service. Does not install or start applications.
         For user file upload/download, interactive shells, browser VS Code IDEs,
-        or static websites, first read lathe(manpage="services") for recipe choices
-        and their app-specific instructions, then launch with bash.
-        :param target: "http:<port>" for a service listening on port 1024–65535. Start it with bash first. See lathe(manpage="services") for recipes.
+        or static websites, first read lathe(manpage="services") for lifecycle
+        guidance and optional handbook references, then launch with bash.
+        :param target: "http:<port>" for a service listening on port 1024–65535. Start it with bash first. See lathe(manpage="services") for lifecycle and access safeguards.
         :param access: Required policy: "private" authenticates the owner and fails closed; "public" allows anyone with the URL and may fall back to a direct bearer URL. Choose private unless the user explicitly requests public/world access. Shells and IDEs should always be private.
         :param tag: Optional untrusted hostname hint: lowercase letters, digits, internal hyphens, max 32 characters. Hostname text never proves identity or purpose.
         :param upstream_headers: Fixed application headers for HTTP/WebSocket forwarding, independent of access. Replaces browser values case-insensitively; supports Authorization. Requires a compatible wrapper, never direct fallback. Max 16 headers, 64-byte names, printable ASCII values up to 4096 bytes, 8192 bytes total. Routing/transport headers forbidden. Values remain in tool arguments; see services manual for trust boundaries.
@@ -3497,7 +3566,7 @@ class Tools:
             return "Error: tag must be a lowercase DNS label (max 32 characters)."
         match = re.fullmatch(r"http:([0-9]{1,5})", target.strip().lower())
         if not match:
-            return 'Error: target must be "http:<port>". Start applications using bash and the services recipes.'
+            return 'Error: target must be "http:<port>". Start applications using bash; see lathe(manpage="services") for lifecycle and access safeguards.'
         port = int(match[1])
         if not 1024 <= port <= 65535:
             return "Error: port must be between 1024 and 65535."

@@ -48,6 +48,10 @@ curl -X POST "https://your-owui.example.com/api/v1/tools/create" \
 
 Then configure the admin Valves (below) through the OWUI UI or API.
 
+Open WebUI installs the source's declared Python requirements on its host,
+including Pydantic 2 and PyYAML. Skill discovery needs no sandbox package
+installation or public network access.
+
 ## Updating
 
 Open WebUI stores the uploaded copy of `lathe.py`; it does not track this repository or update the toolkit automatically. Check the installed version with `lathe(manpage="version")`, or inspect the `version:` field in the installed tool source's frontmatter.
@@ -55,6 +59,21 @@ Open WebUI stores the uploaded copy of `lathe.py`; it does not track this reposi
 To apply updates, review and download the current `lathe.py` from the `main` branch, then replace the tool source in Open WebUI. API installations can use `/api/v1/tools/id/lathe/update` with the same payload shape as installation. Lathe has no built-in update or notification mechanism. See the [security policy](SECURITY.md#supported-versions) for support and security-fix details.
 
 ## Valves (admin configuration)
+
+`onboarding_instructions` is an optional, empty-by-default string for local
+resources, conventions, and short recipes. It is labeled as administrator
+guidance in the first sandbox-tool orientation per chat and is also available
+in the overview and services manuals. Image results remain images; pending
+orientation is delivered with the next text result. This is agent-visible
+guidance, not a place for secrets or an enforced policy.
+
+`handbook_url` is an optional reference, also empty by default. For deployments
+whose sandbox egress permits public application downloads, point it to the
+Lathe Handbook at <https://github.com/rndmcnlly/lathe/blob/main/handbook/README.md>. An intranet reference or test
+Markdown page works too. Lathe only displays the URL: the agent chooses how to
+read it, and handles unavailable resources using local knowledge and skills.
+Short customizations belong in `onboarding_instructions`; a separate handbook
+is useful for substantial guidance. Neither valve causes automatic fetching.
 
 | Valve | Default | Purpose |
 |-------|---------|---------|
@@ -117,10 +136,20 @@ through `bash`, then call `expose(target="http:8080", access="private")` (substi
 its port). Only `http:<port>` targets on ports 1024–65535 are accepted; Lathe does
 not install applications through `expose` or provide SSH access.
 
-Optional repository recipes launch static sites, dufs file browsers, ttyd
-terminals, and code-server editors. Consult `lathe(manpage="services")` for the
-pinned acquisition and launch commands. Recipes are ordinary sandbox programs,
-not additional OWUI tools. A browser editor's initial folder is not confinement:
+The optional [agent handbook](handbook/README.md) describes static sites, dufs
+file browsers, ttyd terminals, and code-server editors. These are reference
+guides, not managed application tools or core requirements. On first setup, ask
+the agent to consult the handbook when available, install through `bash`, verify
+the process and HTTP readiness, and expose privately. After a successful setup,
+the agent can offer to save the working procedure as a skill for later chats.
+Lathe-only skills live at `~/.local/share/lathe/skills/<name>/SKILL.md` and are
+discovered by `onboard`; portable knowledge can use `~/.agents/skills/` or a
+project's `.agents/skills/`. Saving requires user approval, not automatic
+overwriting or regeneration. Consult `lathe(manpage="services")` for generic
+service operations and skill cultivation. Where public web access is restricted,
+the core can use dependencies and applications from intranet sources the sandbox
+can reach. Daytona's hosted control plane still requires connectivity.
+A browser editor's initial folder is not confinement:
 its terminal can access the full sandbox. Keep editors, terminals, and writable
 file browsers private unless the user explicitly authorizes public/world access.
 
@@ -240,6 +269,14 @@ a separate handoff tool.
 
 ## Testing
 
+For hands-on design iteration in a retained Docker OWUI installation, use
+[the interactive trial playbook](INTERACTIVE-TRIAL.md): development handbook
+serving, first-use and fresh-chat skill journeys, preview TLS, and cleanup.
+
+For handbook-dependent agent trials, serve the **current development checkout**,
+not the public deployment's handbook. See the development-handbook playbook in
+`CI-MONITOR.md`. A plain Markdown HTTP response suffices; GitHub need not be mocked.
+
 ```bash
 uv run pytest                               # offline, no credentials (~2s)
 uv run python test_integration.py            # needs DAYTONA_API_KEY in .env
@@ -271,7 +308,7 @@ including dependency requirements. The focused run does not qualify the other to
 | File | Purpose |
 |------|---------|
 | `lathe.py` | The OWUI toolkit (single file, deployed via OWUI admin API) |
-| `recipes/` | Optional, revision-pinned sandbox application launchers |
+| `handbook/` | Mutable agent reference guides for optional applications |
 | `DESIGN.md` | Human-facing tool story and responsibility boundaries |
 | `preview-wrapper/` | Optional Cloudflare Worker for branded, cookie-isolated preview origins |
 | `test_unit.py` | Offline behavioral contracts (pytest, no sandbox) |

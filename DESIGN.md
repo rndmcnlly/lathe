@@ -24,32 +24,57 @@ even when models have large context windows and can manage their own intake.
 - **Lathe owns the authenticated sandbox connection and tool contracts:**
   per-user sandbox lifecycle, file operations, command execution, interpreter
   identity, and explicit access to running services.
-- **Sandbox programs own application behavior:** installation, startup,
-  readiness, reuse, and recovery of particular applications belong in ordinary
-  scripts and discoverable recipes, rather than the OWUI adapter.
+- **The agent operates ordinary sandbox programs:** installation, startup,
+  readiness, reuse, and recovery belong to the agent's inspected commands and
+  user-approved practices, rather than a Lathe-managed app installer.
 
 `expose` publishes a running service with an explicit access policy. It does not
 need to know how an editor, terminal, file browser, or website was installed.
 Keeping the access boundary in Lathe is compatible with moving application
 management out of it.
 
-## Optional recipes
+## Optional applications and reference material
 
-Repository-hosted recipes are fetched on demand, pinned to a Git commit, and
-cached by that revision in the sandbox. Their source is inspectable and their
-invocation works through `bash`. First acquisition needs network access;
-reusing a cached script need not. Application dependencies may still need the
-network.
+File browsers, terminals, IDEs, and static servers are ordinary optional
+applications. Lathe ships no app installer, pinned support bundle, cache receipts,
+or prepackaged app skills. The agent can use preinstalled programs, reachable
+intranet repositories, or other approved sources. Dependencies such as ripgrep
+can be supplied that way too; public Internet access is not a core prerequisite.
 
-Extracting scripts makes the core smaller and gives application maintenance a
-clear home. It is not counted as eliminating those scripts from the whole
-system. Local trials may preseed the exact pinned source before its commit is
-published.
+The internal services manual teaches installation checks, readiness, process
+identity, safe shutdown, port negotiation, and private/public proxy boundaries.
+Application-specific details live in the mutable agent reference `handbook/`.
+The administrator may set `handbook_url` to a public, intranet, or test Markdown
+reference. Its default is empty. Lathe displays configured guidance but never
+fetches or executes it. Agents consult references when needed and adapt them to
+installed versions and actual network access. `docs/` remains exclusively the
+public landing page, not an agent handbook.
 
-Extraction must preserve discovery: tool descriptions and the services manual
-name the user-facing capabilities and route to the pinned recipes' shared guide
-and per-app skills before launch. Application expertise stays available just in
-time without duplicating it in the runtime.
+## Skills grown with consent
+
+Successful procedures can become skills only when the user requests or approves
+preserving them. Transagency includes both the capacity developed through
+human–agent collaboration and the participant's expanded experience of agency.
+Agentic skills support independent sandbox work; transagentic skills support
+coordination through Open WebUI. Both develop with the user's choices about
+what to remember, automate, share, revise, or forget.
+
+Discovery reads existing `SKILL.md` frontmatter from three scopes. Shared
+`~/.agents/skills` provides sandbox-wide defaults; Lathe-specific
+`~/.local/share/lathe/skills` overrides those defaults; project
+`<project>/.agents/skills` overrides both on a name collision. `XDG_DATA_HOME`
+replaces `~/.local/share` when configured. Global and project `AGENTS.md`
+discovery is unchanged. Shared skills must not assume other agents have Lathe's
+`expose` tool or communicate through Open WebUI.
+
+Discovery neither installs nor creates skills. A first successful app setup is
+an opportunity to offer a skill recording the tested version, paths, process
+identity, start/stop checks, port-reuse decisions, and upgrade preferences.
+Existing skills are read before use, not silently overwritten from the handbook.
+Deleting a skill does not trigger regeneration. A later successful use may
+prompt another offer, still requiring approval. Binaries, configuration, logs,
+and service state stay outside skill directories; secrets and expiring preview
+URLs do not belong in saved procedures.
 
 ## State
 

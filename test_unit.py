@@ -180,8 +180,8 @@ def test_tools_interface(module):
     ("expose", {"target": "http:5000", "access": 7}, "access", "str", "int"),
     ("expose", {"target": "http:5000", "access": "private", "tag": 7}, "tag", "str", "int"),
     ("expose", {"target": "http:5000", "access": "public", "upstream_headers": []}, "upstream_headers", "dict[str, str]", "list"),
-    ("expose", {"target": "http:5000", "access": "public", "upstream_headers": {7: "x"}}, "upstream_headers.key[0]", "str", "int"),
-    ("expose", {"target": "http:5000", "access": "public", "upstream_headers": {"Authorization": 7}}, "upstream_headers.value[0]", "str", "int"),
+    ("expose", {"target": "http:5000", "access": "public", "upstream_headers": {7: "x"}}, "upstream_headers", "dict[str, str]", "int"),
+    ("expose", {"target": "http:5000", "access": "public", "upstream_headers": {"Authorization": 7}}, "upstream_headers", "dict[str, str]", "int"),
 ])
 async def test_bad_types_rejected_before_io(
     module, monkeypatch, name, kwargs, location, expected, actual,
@@ -189,7 +189,7 @@ async def test_bad_types_rejected_before_io(
     context = AsyncMock(side_effect=AssertionError("invalid input reached I/O"))
     monkeypatch.setattr(module, "_tool_context", context)
     result = await getattr(module.Tools(), name)(**kwargs)
-    assert result == f"Error: parameter '{location}' expected type {expected}, got {actual}"
+    assert result == f"Error: parameter '{location}' expected type {expected}"
     assert "7" not in result
     context.assert_not_called()
 
@@ -211,6 +211,49 @@ async def test_valid_types_pass_wrapper_boundary(module, monkeypatch, name, kwar
 
 async def test_valid_lathe_string_passes_wrapper_boundary(module):
     assert "Lathe toolkit version:" in await module.Tools().lathe("version")
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"upstream_headers": {"secret-key-canary": 7}},
+    {"upstream_headers": {7: "secret-value-canary"}},
+    {"upstream_headers": {"Authorization": ["secret-value-canary"]}},
+])
+async def test_validation_never_renders_inputs_or_dictionary_key_locations(module, monkeypatch, kwargs):
+    context = AsyncMock(side_effect=AssertionError("invalid input reached I/O"))
+    monkeypatch.setattr(module, "_tool_context", context)
+    result = await module.Tools().expose("http:5000", "private", **kwargs)
+    assert result == "Error: parameter 'upstream_headers' expected type dict[str, str]"
+    assert "secret" not in result and "Authorization" not in result
+    context.assert_not_called()
+
+
+@pytest.mark.parametrize("items", [("secret",), [7], [{"secret-key": False}]])
+async def test_factory_strictly_validates_nested_list_members(module, monkeypatch, items):
+    async def core(items: list[dict[str, str]]) -> str:
+        raise AssertionError("invalid input reached core")
+    method = module._standard_tool(core, emit_start="Starting", emit_done="Done")
+    context = AsyncMock(side_effect=AssertionError("invalid input reached I/O"))
+    monkeypatch.setattr(module, "_tool_context", context)
+    result = await method(module.Tools(), items)
+    assert result == "Error: parameter 'items' expected type list[dict[str, str]]"
+    context.assert_not_called()
+
+
+@pytest.mark.parametrize("start", ["1", 1.0, None])
+async def test_strict_validation_does_not_coerce_json_scalars(module, monkeypatch, start):
+    context = AsyncMock(side_effect=AssertionError("invalid input reached I/O"))
+    monkeypatch.setattr(module, "_tool_context", context)
+    assert await module.Tools().read("/x", start=start) == "Error: parameter 'start' expected type int"
+    context.assert_not_called()
+
+
+async def test_strict_validation_accepts_python_builtin_subclasses(module, monkeypatch):
+    class Offset(int):
+        pass
+    context = AsyncMock(return_value="accepted")
+    monkeypatch.setattr(module, "_tool_context", context)
+    assert await module.Tools().read("/x", start=Offset(1)) == "accepted"
+    context.assert_awaited_once()
 
 
 async def test_loaded_wrapper_dispatches_typed_arguments(module, monkeypatch, tmp_path):
@@ -829,7 +872,7 @@ def test_onboarding_merges_global_and_project_skills(tmp_path, build_script):
     unique = home / ".agents" / "skills" / "global-only"
     unique.mkdir()
     (unique / "SKILL.md").write_text("---\nname: global-only\ndescription: unique global skill\n---\nPRIVATE BODY")
-    result = run_script(build_script(str(project)), env={**os.environ, "HOME": str(home)})
+    result = lathe._render_context(run_script(build_script(str(project)), env={**os.environ, "HOME": str(home)}))
     if build_script is lathe._build_onboard_script:
         assert "global instructions" in result and "project instructions" in result
         assert str(project / "AGENTS.md") in result
@@ -854,17 +897,159 @@ def test_onboarding_announces_skill_locations_even_without_skills(tmp_path, exis
     if existing:
         global_skills.mkdir(parents=True)
         project_skills.mkdir(parents=True)
-    result = run_script(build_script(str(project)), env={**os.environ, "HOME": str(home)})
+    result = lathe._render_context(run_script(build_script(str(project)), env={**os.environ, "HOME": str(home)}))
     assert f"Scanning global skills via {global_skills}/<skill-name>/SKILL.md" in result
     assert f"Scanning project skills via {project_skills}/<skill-name>/SKILL.md" in result
     assert "<skill-name>/SKILL.md" in result
 
 
+@pytest.mark.parametrize("build_script", [lathe._build_onboard_script, lathe._build_snapshot_script])
+@pytest.mark.parametrize("xdg", [False, True])
+def test_skill_catalog_scopes_precedence_and_read_only_discovery(tmp_path, build_script, xdg):
+    home = tmp_path / "home"
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "AGENTS.md").write_text("project instructions")
+    data = tmp_path / "custom data" if xdg else home / ".local/share"
+    environment = {**os.environ, "HOME": str(home)}
+    environment.pop("XDG_DATA_HOME", None)
+    if xdg:
+        environment["XDG_DATA_HOME"] = str(data)
+    # Discovery works without a skill store and may neither fetch nor grow one.
+    guard = (
+        "import socket\n"
+        "def forbidden(*args, **kwargs):\n"
+        "    raise AssertionError('catalog attempted network access')\n"
+        "socket.socket = forbidden\n"
+    )
+    script = guard + build_script(str(project))
+    cold = lathe._render_context(run_script(script, env=environment))
+    assert str(project) in cold
+    if build_script is lathe._build_onboard_script:
+        assert "project instructions" in cold
+    assert "# Available Skills" not in cold
+    assert not data.exists()
+
+    # Old bundles and other applications' skill stores are not discovery roots.
+    for base in (home / ".cache/lathe" / ("a" * 40), data / "other-agent"):
+        stale = base / "skills/stale/SKILL.md"
+        stale.parent.mkdir(parents=True)
+        stale.write_text("---\nname: stale-support\ndescription: ignored\n---\n")
+    if xdg:
+        ignored = home / ".local/share/lathe/skills/ignored/SKILL.md"
+        ignored.parent.mkdir(parents=True)
+        ignored.write_text("---\nname: ignored-default-root\n---\n")
+
+    shared = home / ".agents"
+    local = data / "lathe"
+    project_agents = project / ".agents"
+    for base, label in [(shared, "shared"), (local, "Lathe"), (project_agents, "project")]:
+        skill = base / "skills" / "my-file-browser" / "SKILL.md"
+        skill.parent.mkdir(parents=True)
+        skill.write_text(f"---\nname: file-browser\ndescription: {label}\n---\nPRIVATE BODY")
+        unique = base / "skills" / "unique" / "SKILL.md"
+        unique.parent.mkdir()
+        unique.write_text(f"---\nname: {label}-only\ndescription: unique\n---\n")
+        result = lathe._render_context(run_script(script, env=environment))
+        assert f"- **file-browser**: {label}" in result
+        assert f"`{skill}`" in result
+        assert result.count("- **file-browser**:") == 1
+        assert "PRIVATE BODY" not in result
+        assert "stale-support" not in result and "ignored-default-root" not in result
+    for base in (shared, local, project_agents):
+        assert f"`{base / 'skills/unique/SKILL.md'}`" in result
+
+    # Forgetting is literal: later discovery does not regenerate deleted skills.
+    for base, fallback in [(project_agents, "Lathe"), (local, "shared"), (shared, None)]:
+        skill = base / "skills/my-file-browser/SKILL.md"
+        skill.unlink()
+        result = lathe._render_context(run_script(script, env=environment))
+        assert not skill.exists()
+        if fallback:
+            assert f"- **file-browser**: {fallback}" in result
+        else:
+            assert "- **file-browser**:" not in result
+
+
 def test_auto_init_scans_default_workspace_skills(tmp_path):
     home = tmp_path / "home"
-    result = run_script(lathe._SNAPSHOT_SCRIPT, env={**os.environ, "HOME": str(home)})
+    result = lathe._render_context(run_script(lathe._SNAPSHOT_SCRIPT, env={**os.environ, "HOME": str(home)}))
     assert f"Scanning global skills via {home / '.agents' / 'skills'}/<skill-name>/SKILL.md" in result
     assert "Scanning project skills via /home/daytona/workspace/.agents/skills/<skill-name>/SKILL.md" in result
+
+
+@pytest.mark.parametrize("build_script", [lathe._build_onboard_script, lathe._build_snapshot_script])
+def test_skill_catalog_real_yaml_and_malformed_neighbors(tmp_path, build_script):
+    project = tmp_path / "project"
+    root = project / ".agents/skills"
+    contents = {
+        "quoted": 'name: "quoted: skill"\ndescription: "Handles colons: and # hashes"',
+        "folded": 'name: folded\ndescription: >-\n  Two lines\n  folded together.',
+        "broken": 'name: [unterminated',
+        "unsafe": "!!python/object/apply:builtins.dict [[[name, injected]]]",
+        "wrong-shape": '[not, a, mapping]',
+        "wrong-types": 'name: [not, a, string]\ndescription: 3',
+        "bad-timestamp": 'description: 2026-99-99',
+        "huge": 'description: ' + 'x' * 17000,
+        "deep": 'name: ' + '[' * 1500 + 'x' + ']' * 1500,
+    }
+    for name, metadata in contents.items():
+        path = root / name / "SKILL.md"
+        path.parent.mkdir(parents=True)
+        path.write_text(f"---\n{metadata}\n---\nPRIVATE BODY")
+    # Simulate blank sandbox Python: even an accidental host-library import fails.
+    guard = (
+        "import builtins, socket\n"
+        "original_import = builtins.__import__\n"
+        "def limited_import(name, *args, **kwargs):\n"
+        "    if name in ('yaml', 'pydantic', 'httpx'):\n"
+        "        raise AssertionError('sandbox imported host dependency')\n"
+        "    return original_import(name, *args, **kwargs)\n"
+        "builtins.__import__ = limited_import\n"
+        "def forbidden(*args, **kwargs):\n"
+        "    raise AssertionError('sandbox attempted network')\n"
+        "socket.socket = forbidden\n"
+    )
+    raw = run_script(guard + build_script(str(project)),
+                     env={**os.environ, "HOME": str(tmp_path / "home")})
+    assert "PRIVATE BODY" not in raw
+    records = json.loads(raw)["skills"]
+    assert all(len(record["metadata"]) <= 16384 for record in records)
+    result = lathe._render_context(raw)
+    assert "- **quoted: skill**: Handles colons: and # hashes" in result
+    assert "- **folded**: Two lines folded together." in result
+    for name in ("broken", "unsafe", "wrong-shape", "wrong-types", "bad-timestamp", "huge", "deep"):
+        assert f"- **{name}**: Metadata unavailable; read the skill for instructions." in result
+        assert f"`{root / name / 'SKILL.md'}`" in result
+
+
+async def test_onboard_and_first_snapshot_render_yaml_on_host(tools, sandbox, monkeypatch, http, tmp_path):
+    skill = tmp_path / ".agents/skills/example/SKILL.md"
+    skill.parent.mkdir(parents=True)
+    skill.write_text('---\nname: "host: parsed"\ndescription: >-\n  folded\n  description\n---\nPRIVATE BODY')
+    uploaded = {}
+    async def upload(valves, sandbox_id, client, path, content):
+        uploaded[path] = content.decode()
+    monkeypatch.setattr(lathe, "_upload_file", upload)
+    monkeypatch.setattr(lathe, "_SNAPSHOT_SCRIPT", lathe._build_snapshot_script(str(tmp_path)))
+    def handler(request):
+        if request.url.path == "/sandbox/sb":
+            return httpx.Response(200, json={"cpu": 2})
+        assert request.url.path == "/sb/process/execute"
+        command = shlex.split(json.loads(request.content)["command"])
+        script = command[2] if command[1] == "-c" else uploaded[command[1]]
+        raw = run_script(script, env={**os.environ, "HOME": str(tmp_path / "home")})
+        return httpx.Response(200, json={"exitCode": 0, "result": raw})
+    http(handler)
+    onboard = await tools.onboard(str(tmp_path), __user__=USER)
+    tools._chat_state["yaml"] = {"init": True, "pending": []}
+    async with lathe.httpx.AsyncClient() as client:
+        await lathe._chat_auto_init(tools.valves, "sb", client, tools._chat_state, "yaml", USER)
+    snapshot = "\n".join(lathe._drain_harness_messages(tools._chat_state, "yaml", None))
+    for result in (onboard, snapshot):
+        assert "- **host: parsed**: folded description" in result
+        assert f"`{skill}`" in result
+        assert "PRIVATE BODY" not in result
 
 
 @pytest.mark.parametrize("wrapped", [False, True])
@@ -880,12 +1065,16 @@ async def test_rendered_manual(tools, wrapped):
     assert "overview" in await tools.lathe("nonexistent")
 
 
-async def test_chat_init_and_notice_delivery(tools, transport):
+@pytest.mark.parametrize("configured", [False, True])
+async def test_chat_init_and_notice_delivery(tools, transport, configured):
+    if configured:
+        tools.valves.onboarding_instructions = "Use /opt/intranet packages. Keep ${HOME} literal."
+        tools.valves.handbook_url = "https://handbook.test/draft.md"
     calls = []
     def handler(request):
         calls.append(request)
         if (request.method, request.url.path) == ("POST", "/sb/process/execute"):
-            return httpx.Response(200, json={"exitCode": 0, "result": "workspace snapshot"})
+            return httpx.Response(200, json={"exitCode": 0, "result": json.dumps({"sections": ["workspace snapshot"], "skills": []})})
         assert (request.method, request.url.path) == ("GET", "/sandbox/sb")
         return httpx.Response(200, json={"cpu": 2})
     user = {**USER, "valves": tools.UserValves(env_vars='{"TOKEN":"hidden-value"}')}
@@ -899,7 +1088,50 @@ async def test_chat_init_and_notice_delivery(tools, transport):
     delivered = "\n".join(lathe._drain_harness_messages(tools._chat_state, "a", "restarted"))
     assert all(value in delivered for value in ["workspace snapshot", "TOKEN", "job complete", "restarted"])
     assert "hidden-value" not in delivered
+    if configured:
+        assert tools.valves.onboarding_instructions in delivered
+        assert tools.valves.handbook_url in delivered
     assert lathe._drain_harness_messages(tools._chat_state, "a", None) == []
+
+
+@pytest.mark.parametrize("field", ["onboarding_instructions", "handbook_url"])
+async def test_installation_manual_guidance_is_literal_and_optional(tools, field):
+    assert getattr(tools.valves, field) == ""
+    assert lathe._installation_guidance(tools.valves) == ""
+    before = {page: await tools.lathe(page) for page in ("overview", "services")}
+    value = "https://handbook.test/draft.md?x={preview_access_note}&y=${HOME}"
+    setattr(tools.valves, field, value)
+    for page in before:
+        result = await tools.lathe(page)
+        assert result.startswith(before[page])
+        assert value in result
+    setattr(tools.valves, field, " \n ")
+    for page in before:
+        assert await tools.lathe(page) == before[page]
+
+
+async def test_first_image_queues_admin_guidance(tools, monkeypatch, http):
+    monkeypatch.setattr(lathe, "_ensure_sandbox", AsyncMock(return_value=("sb", None)))
+    tools.valves.onboarding_instructions = "Use the local package mirror."
+    tools.valves.handbook_url = "https://handbook.test/current.md"
+
+    def handler(request):
+        if request.url.path == "/sandbox/sb":
+            return httpx.Response(503)
+        if request.url.path == "/sb/files/download":
+            return httpx.Response(200, content=PNG)
+        assert (request.method, request.url.path) == ("POST", "/sb/process/execute")
+        return httpx.Response(200, json={"exitCode": 0, "result": "sandbox text"})
+
+    http(handler)
+    image = await tools.view("/image", __user__=USER, __chat_id__="admin-guidance")
+    assert image == "data:image/png;base64," + base64.b64encode(PNG).decode()
+    result = await tools.read("/text", __user__=USER, __chat_id__="admin-guidance")
+    assert tools.valves.onboarding_instructions in result
+    assert tools.valves.handbook_url in result
+    result = await tools.read("/text", __user__=USER, __chat_id__="admin-guidance")
+    assert tools.valves.onboarding_instructions not in result
+    assert tools.valves.handbook_url not in result
 
 
 @pytest.mark.parametrize("tool", ["read", "view"])
@@ -918,7 +1150,7 @@ async def test_first_failure_delivers_context_once(tools, monkeypatch, http, tmp
             script = shlex.split(json.loads(request.content)["command"])[2]
             if not snapshot_done:
                 snapshot_done = True
-                return httpx.Response(200, json={"exitCode": 0, "result": "workspace snapshot"})
+                return httpx.Response(200, json={"exitCode": 0, "result": json.dumps({"sections": ["workspace snapshot"], "skills": []})})
             if failing and failure == "http":
                 return httpx.Response(503, text="temporarily unavailable")
             return httpx.Response(200, json={"exitCode": 0, "result": run_script(script)})

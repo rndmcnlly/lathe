@@ -1,83 +1,80 @@
-# Demo capture
+# Everyday visualization demo
 
-The demo is a live synthetic monitor of Open WebUI, Lathe, Daytona, the preview wrapper, and the configured model. `scenario.json` owns the narrative, prompts, required outcomes, and bounded presentation fallbacks. `interpreter.mjs` validates and executes that data through the finite operation set implemented by `capture.mjs`.
+A real GLM 5.3 Flash conversation in Open WebUI: raw repair-café data and two
+short requests, not a scripted coding-agent capabilities showcase.
 
-Run the offline tests (including a local browser UI fixture) with:
+1. Enable Lathe visibly through **Integrations → Tools → Lathe**.
+2. “Here's our repair-café log. Make an HTML infographic showing the volunteers
+   what we accomplished and where we could improve.” The message includes
+   `repair-log.csv` as a pasted CSV block of individual repair records.
+3. “Serve it up, private.” Open the resulting private preview and scroll through
+   the infographic.
+
+The model chooses its calculations, conclusions, implementation, file paths and
+service port. There are no subagents, version question, exact-answer phrases,
+prescribed tool sequence, output schema, installer recipes or editor choreography.
+The model gets only an ordinary deployment fact as additional system context:
+sandbox Internet access is blocked, so use available tools and self-contained assets.
+
+## Run
+
+With Docker, OpenSSL, Node/npm, and exported `DAYTONA_API_KEY` and
+`OPENROUTER_API_KEY`:
 
 ```sh
-npx playwright install --only-shell chromium
-npm test
-```
-
-The supported capture entry point uses disposable local infrastructure and only
-exported `DAYTONA_API_KEY` and `OPENROUTER_API_KEY`. It never imports production
-OWUI configuration. See [CI-MONITOR.md](../CI-MONITOR.md) for prerequisites:
-
-```sh
+npm ci --prefix demo-video
+npm exec --prefix demo-video -- playwright install chromium
 uv run python demo_local.py
 ```
 
-For local iteration after the sandbox is already awake, skip the throwaway
-prewarm model turn with `DEMO_SKIP_PREWARM=1 uv run python demo_local.py`.
-The browser adapter still supports explicit hosted passkey credentials for
-maintainer diagnostics, but no workflow runs that mode or publishes it.
+If another trial owns loopback port 443, use `DEMO_TLS_PORT=18443`. Chromium maps
+only demo hostnames to that separate loopback port; HTTPS/OIDC URLs and
+Docker-side connections retain port 443. No existing identity fixture, server or
+sandbox is reused. Temporary TLS trust is confined to disposable browser contexts
+and OWUI's temporary CA bundle, never the OS or keychain.
 
-Every run starts with a clean `out/` directory and writes available evidence:
-`capture-report.json`, `demo.webm`, `last-page.png`, `playwright-trace.zip`, and
-a redacted `sanitized-chat.json`. Scenario-marked main-sequence frames go in
-`out/screenshots/` with stable narrative names; failed fallback attempts go in
-`out/diagnostics/`. Login and prewarm occur before the recorded context exists
-and are never captured as release screenshots. A failed or rejected take remains
-diagnostic evidence but cannot replace the `demo-video-latest` video or screenshots.
+The runner creates disposable OWUI, local Wrangler running the actual preview
+Worker, and loopback HTTPS infrastructure. A fixed synthetic identity exercises
+the Worker's PKCE/session flow, not Pocket ID or real passkeys. OWUI still reaches
+the model provider and Daytona control plane; the sandbox has actual
+`networkBlockAll=true` and no extra volumes. No production OWUI configuration,
+hosted login, or `.env` is imported by the runner. The upstream relay enforces ZDR,
+data-collection denial, price ceilings, a conservative $4.50 reservation cap, and
+request/output-token limits. See [CI-MONITOR.md](../CI-MONITOR.md).
 
-Chat navigation waits for the visible composer, not `networkidle`: OWUI's
-realtime traffic can keep the network busy indefinitely. Release notes are
-acknowledged before recording, with browser storage carried into the take.
-The disposable demo disables prompt suggestions, follow-up generation, and the
-built-in code interpreter. Model and toolkit display names omit staging labels;
-hidden staging IDs still protect cleanup isolation.
+## Evidence and checks
 
-The recorded activation beat deliberately animates a tutorial cursor through
-`Integrations → Tools → Lathe`, with recognition and confirmation pauses. Keep
-that choreography when changing selectors: activation is instructional content,
-not incidental browser mechanics.
+`scenario.json` is a linear take. The adapter preserves real multiline editor
+input and waits for visible chat readiness instead of `networkidle`. Failures
+reject the take, without narrative retries or alternate routes.
 
-The first recorded question asks Lathe for its installed version. The capture
-requires a matching `lathe(manpage="version")` result and saves a version frame,
-so the video identifies the deployed toolkit rather than the checkout version.
-Conversational prompts keep test instructions out of the visible dialogue.
-The overview precedes the relay-writing turn. The pinned recipe's ready result
-supplies the actual checkout path rather than a hardcoded clone destination;
-the later private `http:8080` exposure only registers access to that service.
-Cold IDE setup gets a six-minute turn budget for installation and the model's reply.
+Persisted tool records identify the model's HTML path and prove an actual private
+`expose` result, not an assistant promise. The runner independently downloads that
+HTML through Daytona, checks basic computed counts against the raw CSV, rejects
+external assets, and verifies the actual sandbox egress policy and absence of
+extra volumes. This is not an automatic judgment of every visual or editorial
+claim: inspect the screenshots and infographic as part of reviewing a take.
 
-The relay edit targets the file editor by URI, selects text with cursor movement,
-and verifies the rendered document before saving with the platform's shortcut.
-It replaces the entire second logical line, including any model-written joke,
-instead of assuming the model left the answer blank.
-It waits for the editor's dirty indicator to clear before leaving. The later Lathe read proves
-persistence independently. Editor failures reject the take as `ui_drift`;
-terminal editing cannot substitute for the demonstrated editor interaction.
-Prewarm sets code-server user preferences, not settings in a parent folder:
-all VS Code AI features are disabled and the secondary Chat sidebar starts hidden.
+`out/` contains the video, screenshots, full-page final image, redacted chat,
+sanitized trace, artifact path and capture/qualification reports. Infrastructure
+evidence includes exact deployed-source hashes, downloaded HTML with independently
+computed reference totals, model usage and cleanup records. A later take replaces
+`out/`; copy accepted captures into their run's artifact directory before rerunning.
 
-## Capture policy and automation
+```sh
+npm test --prefix demo-video
+uv run pytest test_demo_local.py
+```
 
-Local and hosted authentication use the same unmodified scenario. Recipe-launched
-code-server must be private: the oracle requires a ready recipe result and an
-actual `expose(target="http:8080", access="private")` call with its owner-only
-result, not an assistant promise or public substitute. The services manual owns
-the pinned acquisition command; unpublished local trials must preseed that exact
-revision's recipe cache rather than fetch mutable source. The local identity fixture auto-approves its one fixed
-synthetic user without a visible sign-in page, while
-the real Worker performs PKCE exchange, owner-email authorization, and host-only
-session creation. It does not qualify Pocket ID or real passkey authentication.
+Offline checks do not qualify real inference, private previews or Docker/Daytona
+boundaries. `render-demo.yml` uses GLM 5.3 Flash on Wednesdays at 14:17 UTC and
+manual dispatch. Publication defaults off; only explicit default-branch publication
+after capture, model/source and cleanup gates may update `demo-video-latest`.
+Local captures and source edits never replace the existing public video.
 
-`render-demo.yml` runs this disposable stack every Wednesday at 14:17 UTC and
-on manual dispatch, using `z-ai/glm-5.3-flash` and existing repository provider
-secrets under the `lathe-demo` environment. Scheduled and branch runs check and
-retain evidence only. Manual dispatch with `publish=true` on the default branch
-can refresh the existing `demo-video-latest` release after exact-checkout,
-accepted-capture, requested/served-model, and cleanup gates. Publication defaults
-off. The regular weekly isolated monitor remains separate and does not record
-this video. No hosted personal OWUI or cloud Worker is used.
+## Current qualification status
+
+As of 2026-10-15, the everyday-use storyboard has no accepted live capture.
+Iteration was paused after capture/relay fixes and provider rate limiting;
+trial cleanup succeeded. Offline checks pass, but a future accepted end-to-end
+take is still required before publishing a replacement video.

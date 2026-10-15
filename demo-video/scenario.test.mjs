@@ -5,40 +5,20 @@ import { matchesToolExpectation } from "./evidence.mjs";
 import { runScenario } from "./interpreter.mjs";
 
 const scenario = JSON.parse(readFileSync(new URL("./scenario.json", import.meta.url)));
-const exposure = scenario.steps.find((step) => step.id === "editor.prove-exposed").with;
+const exposure = scenario.steps.find((step) => step.id === "preview.prove").with;
 
-test("shipped scenario requires the private recipe port, not removed managed targets", () => {
-  const event = { tool: "expose", arguments: { target: "http:8080", access: "private" },
+test("private preview accepts the model's chosen port but never public access", () => {
+  const event = { tool: "expose", arguments: { target: "http:8765", access: "private" },
     output: "Owner-only wrapped preview: Copying the URL does not grant access." };
   assert.equal(matchesToolExpectation(event, exposure), true);
-  for (const arguments_ of [{ target: "http:8080", access: "public" },
-    { target: "http:8081", access: "private" },
-    { target: "code-server:/home/daytona/workspace", access: "private" },
-    { target: "code-server:relative", access: "private" },
-    { target: "not-code-server", access: "private" }, { target: "code-server", access: "private" }]) {
-    assert.equal(matchesToolExpectation({ ...event, arguments: arguments_ }, exposure), false);
-  }
-  assert.equal(matchesToolExpectation({ ...event, output: "Public wrapped preview: https://example.invalid" }, exposure), false);
+  assert.equal(matchesToolExpectation({ ...event, arguments: { target: "http:8765", access: "public" } }, exposure), false);
 });
 
-test("shipped scenario executes with independent tool and file-read evidence", async () => {
-  const events = [
-    { tool: "lathe", arguments: { manpage: "version" }, output: "Lathe toolkit version: fixture" },
-    { tool: "bash", arguments: { command: "git clone https://github.com/rndmcnlly/lathe" }, output: "Cloned" },
-    { tool: "write", arguments: { path: "/workspace/RELAY.md" }, output: "Saved" },
-    { tool: "bash", arguments: { command: `python3 ~/.cache/lathe/recipes/${"a".repeat(40)}/app.py code-server --root /workspace --port 8080` },
-      output: JSON.stringify({ service: "code-server", root: "/workspace", port: 8080, expose: "http:8080", status: "started" }) },
-    { tool: "expose", arguments: { target: "http:8080", access: "private" }, output: "Copying the URL does not grant access." },
-    { tool: "read", arguments: { path: "/workspace/RELAY.md" }, output: "2: You: A shared state of mind." },
-    { tool: "bash", arguments: { command: "ss -ltn | grep 8080" }, output: "Stopped" },
-  ];
-  const adapter = Object.fromEntries(scenario.steps.flatMap((step) => [step.do, ...(step.fallback || [])])
-    .map((operation) => [operation, async () => ({})]));
-  adapter["chat.await-tool-result"] = async (expected) => {
-    assert.ok(events.some((event) => matchesToolExpectation(event, expected)));
-  };
-  assert.equal((await runScenario(scenario, adapter, { variables: { checkout: "/workspace" } })).status, "accepted");
-  events.find((event) => event.tool === "read").output = "Assistant says the edit worked";
-  await assert.rejects(runScenario(scenario, adapter, { variables: { checkout: "/workspace" } }),
-    (error) => error.report.failed_step === "relay.prove-read");
+test("missing artifact evidence stops the storyboard before the private preview", async () => {
+  let previewed = false;
+  const adapter = Object.fromEntries(scenario.steps.map((step) => [step.do, async () => ({})]));
+  adapter["chat.find-artifact"] = async () => { throw new Error("no saved infographic"); };
+  adapter["preview.open"] = async () => { previewed = true; };
+  await assert.rejects(runScenario(scenario, adapter), (error) => error.report.failed_step === "infographic.prove");
+  assert.equal(previewed, false);
 });

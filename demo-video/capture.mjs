@@ -9,10 +9,9 @@ import { fileURLToPath } from "node:url";
 import { chromium } from "playwright";
 import { strFromU8, strToU8, unzipSync, zipSync } from "fflate";
 
-import { normalizedToolEvents, matchesToolExpectation, recipeReadyRoot } from "./evidence.mjs";
+import { normalizedToolEvents, matchesToolExpectation, privatePreviewUrl } from "./evidence.mjs";
 import { runScenario } from "./interpreter.mjs";
-import { replaceEditorLine } from "./editor.mjs";
-import { openOwuiChat } from "./owui.mjs";
+import { openOwuiChat, typeMessage } from "./owui.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const OUT_DIR = resolve(__dirname, "out");
@@ -24,27 +23,18 @@ mkdirSync(resolve(OUT_DIR, "diagnostics"), { recursive: true });
 mkdirSync(VIDEO_TMP, { recursive: true });
 
 const LOCAL_TOKEN = process.env.DEMO_LOCAL_TOKEN;
-if (!LOCAL_TOKEN) try {
-  for (const line of readFileSync(resolve(__dirname, "..", ".env"), "utf-8").split("\n")) {
-    const match = line.match(/^([A-Za-z_]\w*)=(.*)$/);
-    if (match && !(match[1] in process.env)) process.env[match[1]] = match[2];
-  }
-} catch {}
-
 const SCENARIO = JSON.parse(readFileSync(resolve(__dirname, "scenario.json"), "utf-8"));
 const OWUI_URL = (process.env.DEMO_OWUI_URL || "").replace(/\/+$/, "");
-const MODEL = (process.env.DEMO_MODEL || process.env.OWUI_MODEL || "")
+const MODEL = (process.env.DEMO_MODEL || "")
   .replace(/^(["'])(.*)\1$/, "$2");
-let PASSKEY;
-try { PASSKEY = JSON.parse(process.env.DEMO_PASSKEY || ""); } catch {}
 if (LOCAL_TOKEN) {
   const local = new URL(OWUI_URL);
   if (local.protocol !== "http:" || local.hostname !== "127.0.0.1") {
     throw new Error("Disposable-token capture requires a loopback Open WebUI URL");
   }
 }
-if (!OWUI_URL || !MODEL || (!LOCAL_TOKEN && (!PASSKEY?.rpId || !PASSKEY?.id || !PASSKEY?.privateKey))) {
-  const message = "Set DEMO_OWUI_URL, DEMO_PASSKEY, and DEMO_MODEL";
+if (!OWUI_URL || !MODEL || !LOCAL_TOKEN) {
+  const message = "Run demo_local.py: capture requires disposable loopback OWUI credentials";
   const now = new Date().toISOString();
   await writeFile(resolve(OUT_DIR, "capture-report.json"), `${JSON.stringify({
     schema_version: 1,
@@ -65,14 +55,13 @@ const CHAT_URL = `${OWUI_URL}/?model=${encodeURIComponent(MODEL)}`;
 const VIEWPORT = { width: 1280, height: 720 };
 const ALLOWED_PROXY_DOMAINS = (
   process.env.DEMO_PROXY_DOMAINS
-  || "adamsmith.systems,daytonaproxy01.net,proxy.app.daytona.io,proxy.daytona.work"
+  || "lathe-preview.test"
 ).split(",").map((item) => item.trim().toLowerCase()).filter(Boolean);
 
 const TARGETS = {
   "owui.chat-input": ["#chat-input"],
   "owui.send": ["#send-message-button"],
   "owui.integration-menu": ["#integration-menu-button", "#tools-menu-button"],
-  "editor.workbench": [".monaco-workbench"],
 };
 
 const started = Date.now();
@@ -173,24 +162,6 @@ async function hideTutorialCursor(page) {
     document.getElementById("_demo_cursor_ring")?.remove();
   });
   await page.waitForTimeout(250);
-}
-
-async function typeMessage(page, text) {
-  const input = page.locator(target("owui.chat-input"));
-  await input.waitFor({ state: "visible", timeout: 15000 });
-  await input.evaluate((element) => {
-    element.focus();
-    element.innerHTML = "<p></p>";
-    element.dispatchEvent(new Event("input", { bubbles: true }));
-  });
-  for (const character of text) {
-    await input.evaluate((element, value) => {
-      const paragraph = element.querySelector("p") || element;
-      paragraph.textContent += value;
-      element.dispatchEvent(new Event("input", { bubbles: true }));
-    }, character);
-    await page.waitForTimeout(7);
-  }
 }
 
 async function sendMessage(page) {
@@ -306,31 +277,10 @@ async function failUnknownAuth(page, flow) {
   throw new Error(`${flow} authentication reached an unknown state at ${page.url()}: ${snapshot.title}\n${snapshot.text}`);
 }
 
-async function ensureOwuiAuth(page) {
-  await page.goto(`${OWUI_URL}/auth`);
-  const deadline = Date.now() + 90000;
-  while (Date.now() < deadline) {
-    const url = new URL(page.url());
-    const token = await page.evaluate(() => localStorage.getItem("token")).catch(() => null);
-    if (url.origin === OWUI_URL && token && !url.pathname.startsWith("/auth")) return token;
-    const pattern = url.origin === OWUI_URL
-      ? /continue|sign in|log in|single sign-on|sso/i
-      : /sign in|continue|authorize|allow|approve/i;
-    const action = await visibleButton(page, pattern);
-    if (action) {
-      log("auth", `${url.origin}: ${JSON.stringify(await action.innerText())}`);
-      await action.click();
-    } else {
-      await page.waitForTimeout(750);
-    }
-  }
-  await failUnknownAuth(page, "Open WebUI");
-}
-
 async function ensurePreviewAuth(page, previewOrigin) {
   const deadline = Date.now() + 90000;
   while (Date.now() < deadline) {
-    if (await page.locator(target("editor.workbench")).isVisible().catch(() => false)) return;
+    if (await page.getByRole("heading", { name: /repair|café|cafe/i }).first().isVisible().catch(() => false)) return;
     const url = new URL(page.url());
     const action = await visibleButton(page, /sign in|continue|authorize|allow|approve/i);
     if (action) {
@@ -349,8 +299,8 @@ function chatIdFromUrl(url) {
   return url?.match(/\/c\/([a-f0-9-]+)/i)?.[1] || null;
 }
 
-async function fetchChat(state) {
-  const chatId = chatIdFromUrl(state.chatUrl || state.page?.url());
+async function fetchChat(state, id) {
+  const chatId = id || chatIdFromUrl(state.chatUrl || state.page?.url());
   if (!chatId || !state.token) return null;
   const response = await fetch(`${OWUI_URL}/api/v1/chats/${chatId}`, {
     headers: { Authorization: `Bearer ${state.token}` },
@@ -377,23 +327,9 @@ async function awaitToolResult(state, expected) {
   );
 }
 
-function findExposeUrl(page) {
-  return page.evaluate((domains) => {
-    for (const anchor of document.querySelectorAll("a[href]")) {
-      try {
-        const url = new URL(anchor.getAttribute("href"));
-        const host = url.hostname.toLowerCase();
-        if (url.protocol === "https:" && !url.username && !url.password
-          && domains.some((domain) => host === domain || host.endsWith(`.${domain}`))) return url.href;
-      } catch {}
-    }
-    return null;
-  }, ALLOWED_PROXY_DOMAINS);
-}
-
 async function openPreview(state) {
   if (state.previewReady) return;
-  const url = state.previewUrl || await findExposeUrl(state.page);
+  const url = state.previewUrl;
   if (!url) throw new Error("No trusted HTTPS preview URL found in the response");
   state.previewUrl = url;
   await state.page.goto(url);
@@ -454,7 +390,7 @@ async function sanitizeTrace(path) {
 let browser;
 try {
   browser = await chromium.launch({ headless: true, args: LOCAL_TOKEN ? [
-    "--host-resolver-rules=MAP *.lathe-preview.test 127.0.0.1, MAP lathe-preview.test 127.0.0.1",
+    `--host-resolver-rules=MAP *.lathe-preview.test 127.0.0.1:${process.env.DEMO_TLS_PORT || "443"}, MAP lathe-preview.test 127.0.0.1:${process.env.DEMO_TLS_PORT || "443"}`,
   ] : [] });
 } catch (error) {
   const now = new Date().toISOString();
@@ -474,7 +410,6 @@ try {
 }
 const state = {
   browser,
-  variables: {},
   loginContext: null,
   context: null,
   page: null,
@@ -493,7 +428,7 @@ const state = {
       await state.page.screenshot({ path: resolve(OUT_DIR, "screenshots", name) });
       state.releaseScreenshots.push(name);
     } else if (state.page && event.phase === "step-failed") {
-      const name = `${event.step}-${event.attempt}-${event.operation}`.replace(/[^a-z0-9._-]+/gi, "-");
+      const name = `${event.step}-${event.operation}`.replace(/[^a-z0-9._-]+/gi, "-");
       await state.page.screenshot({
         path: resolve(OUT_DIR, "diagnostics", `${name}.png`),
       }).catch(() => {});
@@ -513,40 +448,14 @@ const state = {
 
 const adapter = {
   "auth.ensure-owui": async () => {
-    state.loginContext = await browser.newContext({ viewport: VIEWPORT, ignoreHTTPSErrors: Boolean(LOCAL_TOKEN),
-      storageState: LOCAL_TOKEN ? { cookies: [], origins: [{ origin: OWUI_URL,
-        localStorage: [{ name: "token", value: LOCAL_TOKEN }] }] } : undefined });
-    if (!LOCAL_TOKEN) {
-      await state.loginContext.credentials.create(PASSKEY.rpId, PASSKEY);
-      await state.loginContext.credentials.install();
-    }
+    state.loginContext = await browser.newContext({ viewport: VIEWPORT, ignoreHTTPSErrors: true,
+      storageState: { cookies: [], origins: [{ origin: OWUI_URL,
+        localStorage: [{ name: "token", value: LOCAL_TOKEN }] }] } });
     state.loginPage = await state.loginContext.newPage();
-    if (LOCAL_TOKEN) {
-      state.token = LOCAL_TOKEN;
-    } else {
-      state.token = await ensureOwuiAuth(state.loginPage);
-    }
-    // Acknowledge release notes before recording, even when prewarm is skipped.
+    state.token = LOCAL_TOKEN;
+    // Acknowledge release notes before recording.
     await openOwuiChat(state.loginPage, CHAT_URL);
     return { observations: ["auth.state=owui-authenticated"] };
-  },
-
-  "sandbox.prewarm": async () => {
-    if (process.env.DEMO_SKIP_PREWARM === "1") {
-      return { result: "skipped", observations: ["sandbox.prewarm=skipped-local"] };
-    }
-    const page = state.loginPage;
-    await openOwuiChat(page, CHAT_URL);
-    await suppressIncidentalUi(page);
-    await enableLathe(page);
-    await typeMessage(page, "Run exactly: mkdir -p \"$HOME/.local/share/code-server/User\" && printf '%s\\n' '{\"chat.disableAIFeatures\":true,\"workbench.secondarySideBar.defaultVisibility\":\"hidden\"}' > \"$HOME/.local/share/code-server/User/settings.json\" && echo warm");
-    await sendMessage(page);
-    await waitForResponse(page, 120000);
-    const chatId = chatIdFromUrl(page.url());
-    if (chatId) await fetch(`${OWUI_URL}/api/v1/chats/${chatId}`, {
-      method: "DELETE", headers: { Authorization: `Bearer ${state.token}` },
-    });
-    return { observations: ["sandbox.state=ready"] };
   },
 
   "capture.start": async () => {
@@ -561,10 +470,6 @@ const adapter = {
       recordVideo: { dir: VIDEO_TMP, size: VIEWPORT },
     });
     await state.context.tracing.start({ screenshots: true, snapshots: true, sources: false });
-    if (!LOCAL_TOKEN) {
-      await state.context.credentials.create(PASSKEY.rpId, PASSKEY);
-      await state.context.credentials.install();
-    }
     state.page = await state.context.newPage();
     return { observations: ["capture.state=recording"] };
   },
@@ -580,10 +485,11 @@ const adapter = {
     observations: [`owui.integration-menu=${await enableLathe(state.page, { tutorial: true })}`, "owui.tool.Lathe=enabled"],
   }),
 
-  "chat.send": async ({ prompt, timeoutMs }) => {
+  "chat.send": async ({ prompt, dataFile, timeoutMs }) => {
     state.toolBaseline = normalizedToolEvents(await fetchChat(state).catch(() => null)).length;
     await scrollChatToBottom(state.page);
-    await typeMessage(state.page, prompt);
+    const text = dataFile ? `${prompt}\n\n\`\`\`csv\n${await readFile(resolve(__dirname, dataFile), "utf8")}\`\`\`` : prompt;
+    await typeMessage(state.page, text);
     await sendMessage(state.page);
     await waitForResponse(state.page, timeoutMs);
     state.chatUrl = state.page.url();
@@ -592,47 +498,33 @@ const adapter = {
 
   "chat.await-tool-result": async (expected) => {
     const event = await awaitToolResult(state, expected);
-    if (expected.bindCheckout) {
-      state.variables.checkout = recipeReadyRoot(event, expected.recipeReady);
-    }
+    if (event.tool === "expose") state.previewUrl = privatePreviewUrl(event, ALLOWED_PROXY_DOMAINS);
     return { observations: [`chat.tool=${event.tool}`, "chat.tool.status=completed"] };
   },
 
-  "editor.open-via-explorer": async ({ path }) => {
-    await openPreview(state);
-    await state.page.keyboard.press("Control+Shift+E");
-    // VS Code opens the exposed checkout as its root; no assumed clone folder.
-    const file = state.page.getByText("RELAY.md", { exact: true }).last();
-    await file.waitFor({ state: "visible", timeout: 5000 });
-    await file.dblclick();
-    await state.page.waitForTimeout(750);
-    return { observations: [`editor.open-path=${path}`, "editor.route=explorer"] };
-  },
-
-  "editor.open-via-quick-open": async ({ path }) => {
-    await openPreview(state);
-    await state.page.keyboard.press("Control+P");
-    const quickInput = state.page.locator(".quick-input-widget input").first();
-    await quickInput.waitFor({ state: "visible", timeout: 1500 });
-    await quickInput.fill(path);
-    await quickInput.press("Enter");
-    await state.page.getByText("RELAY.md", { exact: true }).last().waitFor({ state: "visible", timeout: 10000 });
-    await state.page.waitForTimeout(750);
-    return { observations: [`editor.open-path=${path}`, "editor.route=quick-open"] };
-  },
-
-  "editor.replace-line": async (params) => replaceEditorLine(state.page, params),
-
-  "chat.return": async () => {
-    await openOwuiChat(state.page, state.chatUrl);
-    await suppressIncidentalUi(state.page);
+  "chat.find-artifact": async () => {
+    const events = normalizedToolEvents(await fetchChat(state));
+    const event = [...events].reverse().find((event) => event.output
+      && typeof event.arguments?.path === "string" && event.arguments.path.startsWith("/")
+      && event.arguments.path.toLowerCase().endsWith(".html"));
+    if (!event) throw new Error("No HTML artifact path found in completed file-tool records");
+    await writeFile(resolve(OUT_DIR, "artifact.json"), `${JSON.stringify({ path: event.arguments.path, tool: event.tool })}\n`);
     await scrollChatToBottom(state.page);
-    await enableLathe(state.page);
-    return { observations: ["chat.state=restored"] };
+    return { observations: [`artifact.path=${event.arguments.path}`] };
+  },
+
+  "preview.open": async () => {
+    await openPreview(state);
+    const text = await state.page.locator("body").innerText();
+    if (text.length < 200) throw new Error("Infographic has too little rendered content");
+    return { observations: ["preview.private=rendered", "infographic.content=present"] };
   },
 
   "camera.hold": async ({ milliseconds }) => {
-    await scrollChatToBottom(state.page);
+    if (state.previewReady) {
+      await state.page.waitForTimeout(2000);
+      await state.page.evaluate(() => window.scrollTo({ top: document.body.scrollHeight, behavior: "smooth" }));
+    } else await scrollChatToBottom(state.page);
     await state.page.waitForTimeout(milliseconds);
     return { observations: ["camera.state=held"] };
   },
@@ -695,4 +587,7 @@ try {
   await browser.close();
 }
 
-if (captureError) throw captureError;
+if (captureError) {
+  console.error(captureError.message);
+  process.exitCode = 1;
+}

@@ -1,26 +1,24 @@
-export function recipeReadyRoot(event, expected) {
-  if (event.tool !== "bash" || !event.arguments?.command?.includes("app.py")) return null;
-  for (const line of event.output.split(/\r?\n/)) {
-    let result;
-    try { result = JSON.parse(line); } catch { continue; }
-    if (result.service === expected.service && result.port === expected.port
-        && result.expose === `http:${expected.port}`
-        && ["started", "reused"].includes(result.status)
-        && typeof result.root === "string" && result.root.startsWith("/")) return result.root;
-  }
-  return null;
-}
-
 export function matchesToolExpectation(event, expected) {
-  const contains = (value, text) => !text || JSON.stringify(value).toLowerCase().includes(text.toLowerCase());
+  const contains = (value, text) => !text || (typeof value === "string" ? value : JSON.stringify(value))
+    .toLowerCase().includes(text.toLowerCase());
   return expected.tools.includes(event.tool)
     && Object.entries(expected.argumentsEqual || {}).every(([key, value]) =>
       event.arguments?.[key] === value)
-    && (!expected.recipeReady || Boolean(recipeReadyRoot(event, expected.recipeReady)))
     && contains(event.arguments, expected.argumentContains)
     && contains(event.output, expected.outputContains)
     && (!expected.outputLineEquals || event.output.split(/\r?\n/).some((line) =>
       line.replace(/^\d+: /, "") === expected.outputLineEquals));
+}
+
+export function privatePreviewUrl(event, domains) {
+  if (event.tool !== "expose" || event.arguments?.access !== "private") throw new Error("Expected private exposure evidence");
+  const match = event.output.match(/^Service URL:\s+(https:\/\/\S+)/m);
+  const url = new URL(match?.[1] || "invalid");
+  if (url.protocol !== "https:" || url.username || url.password
+      || !domains.some((domain) => url.hostname === domain || url.hostname.endsWith(`.${domain}`))) {
+    throw new Error("Untrusted private preview URL");
+  }
+  return url.href;
 }
 
 export function normalizedToolEvents(payload) {

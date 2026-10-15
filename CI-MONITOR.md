@@ -83,6 +83,37 @@ Existing repository secrets permit GitHub runs, not local credential recovery.
 
 ## Checks and budgets
 
+### Development handbook trials
+
+For a retained installation the user will explore between experiments, follow
+`INTERACTIVE-TRIAL.md`. Keep its handbook server and valve override active until
+the interactive trial ends; the cleanup below applies to disposable checks.
+
+When qualifying handbook-guided work, serve the working checkout's `handbook/`
+directory rather than reading the public default branch. Once the handbook is
+present, a trivial server is enough:
+
+```sh
+python3 -m http.server 8765 --bind 127.0.0.1 --directory handbook
+```
+
+Make that server reachable from the trial's Daytona sandbox using an approved
+test route or tunnel, then set the **test toolkit's** `handbook_url` valve to
+`https://YOUR-TEST-HOST/README.md`. Localhost in Daytona is not the development
+machine or the OWUI container. Serve only the handbook directory. A temporary
+directory containing a Markdown stub can stand in for it for focused tests.
+
+Ask the agent to consult the handbook for a relevant task. Verify the returned
+tool evidence contains a distinctive detail from the current draft, then
+independently inspect any claimed sandbox result. The handbook request should
+come from the agent's chosen tool, never an automatic Lathe fetch. Also exercise
+an empty URL and an unreachable URL: local-resource workflows must remain useful.
+
+Record the checkout revision and any uncommitted handbook edits with the trial
+evidence. Stop the server/tunnel and remove the test override afterward. This is
+a manual trial setup recommendation; the monitor does not provision this server
+or override automatically.
+
 The monitor reuses `test_deployment.py`: byte-identical source, the complete
 independent schema contract, bash, write/read, interpreter, and image middleware.
 It then runs a first-time journey with a separate read-back check:
@@ -160,7 +191,7 @@ headers, or raw logs are uploaded. `environment.json` intentionally preserves
 non-secret image identifiers. Startup failures may occur before a suite summary
 exists; use the host error and OWUI log in that case.
 
-## Local private-editor demo video
+## Local everyday-visualization demo video
 
 With the same two provider keys exported and Docker running:
 
@@ -170,7 +201,7 @@ npm exec --prefix demo-video -- playwright install chromium
 uv run python demo_local.py
 ```
 
-This records the shared-editor scenario against a fresh local deployment. It
+This records a repair-café HTML infographic against a fresh local deployment. It
 starts three containers: Open WebUI, the actual preview Worker under local
 Wrangler, and an Nginx HTTPS entry point. The entry point binds only
 `127.0.0.1:443`, so that port must be available. Chromium resolves the generated
@@ -178,6 +209,13 @@ Wrangler, and an Nginx HTTPS entry point. The entry point binds only
 over the private Docker network and trusts a temporary certificate bundle.
 The capture browser accepts that temporary certificate only in its disposable
 browser contexts; nothing is installed in the laptop's trust store.
+
+If a retained interactive trial owns loopback port 443, run with
+`DEMO_TLS_PORT=18443`. Chromium's demo-only hostname mapping connects to that
+loopback host port without changing the public HTTPS/OIDC port, Docker-side
+port 443, existing trial containers, or system trust. The capture still creates
+its own identity fixture and fresh sandbox. Provider requests enforce ZDR and
+data-collection denial with price ceilings and a $4.50 reservation cap.
 
 The demo explicitly defaults to `z-ai/glm-5.3-flash`, overridable with
 `LATHE_MONITOR_MODEL`. It uses the same no-plugin direct-model relay policy as
@@ -187,15 +225,27 @@ The Worker also drops to host UID/GID after its root-only CA installation,
 before npm/Wrangler creates files beside the bind-mounted configuration. This
 keeps temporary-directory removal host-owned, including `.wrangler/tmp`.
 
-The same scenario always asks for a **private code-server** editor, launched
-through the pinned optional recipe described by `lathe(manpage="services")`.
-The oracle binds the checkout to the launcher's actual ready result, then
-requires `expose(target="http:8080", access="private")` plus the owner-only
-access result before opening it. No public workaround is permitted. A disposable identity
-fixture runs inside OWUI on port 9100, reachable only over the Docker network
-and the loopback TLS listener's `/demo-idp/` route. Its sign-in button explicitly
-identifies the fixed synthetic user `monitor@lathe.invalid`. This is not Pocket
-ID, real user authentication, or a full OIDC implementation. The actual Worker
+The staging sandbox has `networkBlockAll=true`: no clone, installer, external
+asset, or ripgrep bootstrap is needed. OWUI still reaches OpenRouter and the
+Daytona control plane. The user gives raw individual repair records and asks for
+an HTML infographic about accomplishments and improvements. Their only follow-up
+is “Serve it up, private.” The model chooses calculations, implementation, paths
+and service port. No subagents or built-in interpreter are enabled: this is an
+everyday productivity task, not an orchestration demonstration.
+
+The browser checks the private preview and scrolls through the infographic.
+Persisted tool records identify the saved HTML path and actual private exposure;
+a separate Daytona download checks the HTML, basic computed counts against the
+raw CSV, actual egress policy, and absence of extra volumes. Human review still
+checks the infographic's other numerical and editorial claims. The runner does
+not prescribe answer wording, output schemas or tool order. There are no IDE
+selectors, warm-up model turns, fallback routes or app-install recipes.
+The service ends with sandbox cleanup.
+
+A disposable identity fixture runs inside OWUI on port 9100, reachable only over
+the Docker network and the loopback TLS listener's `/demo-idp/` route. It
+auto-approves the fixed synthetic user `monitor@lathe.invalid`, without a sign-in
+page. This is not Pocket ID, real user authentication, or a full OIDC implementation. The actual Worker
 uses its unchanged discovery, authorization-code + S256 PKCE, userinfo,
 verified-email matching, and host-scoped session path. Single-use codes expire
 after 60 seconds; the fixture checks the client secret and redirect binding.
@@ -206,8 +256,8 @@ local; the signed upstream Daytona URL remains a remote bearer capability held
 by the wrapper.
 
 `DEMO_LOCAL_TOKEN` is handed directly from bootstrap to the browser process;
-capture accepts this mode only with a loopback OWUI URL and skips `.env`.
-The token changes OWUI login only, never the narrative or preview policy.
+capture requires a loopback OWUI URL and never reads `.env` or hosted passkeys.
+The token changes OWUI login only, never the preview policy.
 Output is `demo-video/out/demo.webm`, with screenshots and a qualification report.
 Infrastructure evidence goes into a unique `monitor-artifacts/demo-*` directory.
 Normal completion and exceptions clean up containers, local KV state, temporary
@@ -216,8 +266,11 @@ Use `--artifacts PATH` for a known fresh evidence directory, and
 `demo_local.py --cleanup --artifacts PATH` for repeated last-resort teardown.
 Cleanup attempts removal directly and ignores only explicit missing-resource
 responses, not Docker daemon or inspection failures. `qualification.json` is
-written only after the browser take, model-serving evidence, inner staging
-teardown, and outer cleanup all succeed. It identifies the tested Git SHA.
+written only after the browser take and independent file evidence,
+model-serving evidence, inner staging teardown, and outer cleanup all succeed.
+It identifies the tested Git SHA. Redacted chat and artifact-path records go in
+`demo-video/out/`; independent artifact downloads are retained in
+the infrastructure directory's `independent-files.json`.
 The small infrastructure artifact also contains that qualification manifest,
 so requested/served-model and checkout evidence do not require downloading the
 large video/Playwright archive. Repeated cleanup preserves original startup logs.
@@ -268,6 +321,6 @@ gh workflow run render-demo.yml --repo rndmcnlly/lathe \
   --ref review/demo-alignment -f publish=false
 ```
 
-Linux live qualification is still required; offline tests do not qualify
-Docker/Wrangler/TLS/editor behavior. Pocket ID/passkeys remain outside the
+Linux live qualification is still required; offline tests do not qualify real
+blocked-egress Daytona previews or Docker/Wrangler/TLS behavior. Pocket ID/passkeys remain outside the
 synthetic identity fixture's qualification boundary.

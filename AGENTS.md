@@ -1,8 +1,8 @@
 # Agent Instructions: Lathe
 
 Single-file Open WebUI toolkit (`lathe.py`). Keep the OWUI runtime implementation
-in that file. Optional `recipes/` programs run inside the sandbox via `bash`, not
-as imported runtime modules; the optional `preview-wrapper/` Cloudflare Worker
+in that file. Optional applications are installed by the agent via `bash`, guided
+by `handbook/`, not imported runtime modules; the optional `preview-wrapper/` Cloudflare Worker
 is separate infrastructure. Read [DESIGN.md](DESIGN.md) for the human-facing tool
 story and responsibility boundaries before changing the tool surface.
 
@@ -10,7 +10,11 @@ story and responsibility boundaries before changing the tool surface.
 
 - Users: [lathe.tools](https://lathe.tools), `docs/` is exclusively the public landing page.
 - Admins: root `README.md` for installation, valves, and security.
+- Agents: `handbook/README.md` and its app guides are mutable references, not
+  shipped or cached skills. Save a proven procedure only with user approval;
+  never automatically overwrite or regenerate an existing skill.
 - Maintainers: this file for invariants/tests; `CI-MONITOR.md` for live CI;
+  `INTERACTIVE-TRIAL.md` for retained Docker design/handbook trials with the user;
   `preview-wrapper/README.md` for the authoritative wrapper protocol/deployment.
 
 Keep implementation detail out of the installation README. Runtime orientation
@@ -31,6 +35,11 @@ uv run python test_deployment.py [--verbose]     # also OWUI_URL, OWUI_TOKEN, OW
 Run offline tests before committing any `lathe.py` change. `uv run python
 test_unit.py` is an equivalent pytest entry point and accepts pytest options.
 
+For handbook-dependent agent trials, serve the checkout's current `handbook/`
+over a sandbox-reachable test URL and set the test toolkit's `handbook_url`.
+Use a Markdown stub for focused checks, not a GitHub imitation. See
+`CI-MONITOR.md` for the server, reachability, evidence, and cleanup playbook.
+
 ### Testing policy
 
 Protect observable contracts and known failure modes, not function inventories,
@@ -46,7 +55,7 @@ not custom runners or handwritten HTTP response classes.
   through subsequent tool calls, not private task names. Use a Lathe-scoped
   advancing/yielding clock, never global no-op sleeps.
 - Daytona (`test_integration.py`): remote execution, interpreter state, background
-  notices, previews, and persistent-volume recreation. Phases share a sandbox and
+  notices, previews, and ordinary filesystem persistence across sandbox restart. Phases share a sandbox and
   stop after the first failure; cleanup failure fails the run. Type/capability
   policy matrices belong offline.
 - OWUI (`test_deployment.py`): actual loader/schema/middleware and real-model
