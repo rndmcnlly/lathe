@@ -142,24 +142,45 @@ async def _emit(emitter, description: str, done: bool = False):
         )
 
 
-async def _tool_context(emitter, fn):
+async def _tool_context(emitter, fn, harness=None):
     """Open a shared HTTP client, call fn(client), catch standard tool exceptions."""
     try:
         async with httpx.AsyncClient() as client:
-            return await fn(client)
+            result = await fn(client)
     except RuntimeError as e:
         await _emit(emitter, f"Error: {e}", done=True)
-        return f"Error: {e}"
+        result = f"Error: {e}"
     except httpx.HTTPStatusError as e:
         await _emit(emitter, f"API error: HTTP {e.response.status_code}", done=True)
         try:
             detail = e.response.text[:500]
         except httpx.ResponseNotRead:
             detail = "(streamed error body not buffered)"
-        return f"API error: HTTP {e.response.status_code}: {detail}"
+        result = f"API error: HTTP {e.response.status_code}: {detail}"
     except Exception as e:
         await _emit(emitter, f"Error: {e}", done=True)
-        return f"Error: {e}"
+        result = f"Error: {e}"
+    return harness.deliver(result) if harness is not None else result
+
+
+class _HarnessDelivery:
+    """Per-call lifecycle context, delivered alongside the final text response."""
+
+    def __init__(self, chat_state, chat_id, *, image_result=False):
+        self.chat_state = chat_state
+        self.chat_id = chat_id
+        self.warning = None
+        self.image_result = image_result
+
+    def deliver(self, result):
+        if self.image_result and result.startswith("data:image/"):
+            # OWUI lifts only byte-exact image results. Defer context to text.
+            if self.warning:
+                _push_bg_notice(self.chat_state, self.chat_id, self.warning)
+            return result
+        return _prepend_harness_messages(result, _drain_harness_messages(
+            self.chat_state, self.chat_id, self.warning,
+        ))
 
 
 def _prepend_harness_messages(result: str, messages: list[str]) -> str:
@@ -1339,9 +1360,11 @@ def _standard_tool(core_fn, *, emit_start: str, emit_done: str,
         if type_err:
             return type_err
 
+        harness = _HarnessDelivery(self._chat_state, __chat_id__)
+
         async def _run(client):
             email = _get_email(__user__)
-            sandbox_id, _sb_warning = await _ensure_sandbox(
+            sandbox_id, harness.warning = await _ensure_sandbox(
                 self.valves, email, client, __event_emitter__,
             )
             await _ensure_chat_init(
@@ -1372,12 +1395,9 @@ def _standard_tool(core_fn, *, emit_start: str, emit_done: str,
                 result = _checked_result(result)
 
             await _emit(__event_emitter__, emit_done, done=True)
-            messages = _drain_harness_messages(
-                self._chat_state, __chat_id__, _sb_warning,
-            )
-            return _prepend_harness_messages(result, messages)
+            return result
 
-        return await _tool_context(__event_emitter__, _run)
+        return await _tool_context(__event_emitter__, _run, harness)
 
     # ── Set the correct signature, annotations, and docstring ────────
     _method.__signature__ = synth_sig
@@ -1878,8 +1898,9 @@ def _format_bash_result(output: str, exit_code: int | None,
     return output
 
 
-async def _bash_log_preview(valves, sandbox_id, client, log_path, *, allow_missing=False):
-    """Acquire only a bounded tail over HTTP, leaving the full log on disk."""
+async def _read_bash_log_tail(valves, sandbox_id, client, log_path, *,
+                              max_bytes=_MAX_BYTES, allow_missing=False):
+    """Read bounded raw log text and its full byte size, without presentation."""
     script = textwrap.dedent(f"""\
         import json, os
         path = {log_path!r}
@@ -1888,13 +1909,20 @@ async def _bash_log_preview(valves, sandbox_id, client, log_path, *, allow_missi
             raise SystemExit(0)
         with open(path, 'rb') as f:
             size = os.fstat(f.fileno()).st_size
-            f.seek(max(0, size - {_MAX_BYTES}))
-            data = f.read({_MAX_BYTES})
+            f.seek(max(0, size - {max_bytes}))
+            data = f.read({max_bytes})
         print(json.dumps({{'text': data.decode('utf-8', errors='replace'), 'size': size}}))
         """)
-    data = json.loads(await _run_sandbox_script(
+    return json.loads(await _run_sandbox_script(
         valves, sandbox_id, client, script, error_prefix=f"bash log preview failed; full log: {log_path}",
     ))
+
+
+async def _bash_log_preview(valves, sandbox_id, client, log_path, *, allow_missing=False):
+    """Format a bounded foreground preview with recovery information."""
+    data = await _read_bash_log_tail(
+        valves, sandbox_id, client, log_path, allow_missing=allow_missing,
+    )
     # Replacement decoding can expand invalid UTF-8, so bound the decoded text too.
     decoded_bytes = data["text"].encode("utf-8")
     text = decoded_bytes[-_MAX_BYTES:].decode("utf-8", errors="ignore")
@@ -1914,6 +1942,13 @@ async def _core_bash(valves, sandbox_id: str, client: httpx.AsyncClient, *,
                      emit=None,
                      on_background=None) -> str:
     """Execute a bash command in the sandbox. Non-interactive only.
+    Each call uses a fresh non-login Bash shell; rc files are not sourced and
+    shell state (such as exports and cd) does not persist between calls.
+    Runs with set -e -o pipefail: an unhandled command or pipeline failure can
+    abort the remaining script. Handle expected probe failures explicitly
+    (for example, with if); use && for commands with dependent prerequisites.
+    Nonzero command exits return an exit status and captured output, distinct
+    from errors launching or observing execution.
     Commands that finish within the foreground window return output directly.
     Long-running commands auto-background and return a descriptor with log
     file paths for monitoring. Text previews are capped at 50 KiB. Full logs and
@@ -2055,14 +2090,11 @@ async def _core_bash(valves, sandbox_id: str, client: httpx.AsyncClient, *,
         output, exit_code, was_truncated, meta,
         spill_path=spill_path,
     )
-    formatted += f"\n[Result files retained for 24 hours after completion: {log_path}, {exit_path}. Sandbox stop/restart clears them.]"
     await _reap_bash_commands(
         valves, sandbox_id, client,
         preserve_log_for=cmd_id if was_truncated else None,
         release_lease_for=cmd_id,
     )
-    if exit_code != 0:
-        raise _ToolFailure(formatted)
     return formatted
 
 
@@ -2119,9 +2151,11 @@ async def _poll_bg_bash(valves, sandbox_id: str, session_id: str,
             elapsed = int(time.time() - start_time)
             tail = ""
             try:
-                tail, _, _ = await _bash_log_preview(
+                data = await _read_bash_log_tail(
                     valves, sandbox_id, poll_client, f"{_bash_sidecar_dir(cmd_id)}/log",
+                    max_bytes=2048,
                 )
+                tail = data["text"]
             except Exception as e:
                 logger.debug("bg-poll: failed to fetch log tail: %s", e)
                 tail = "(Preview unavailable; use the full log path below.)"
@@ -4036,8 +4070,8 @@ class Tools:
               Parallelize with separate bash calls, not shell-level & + wait.
             - bash and delegate auto-background after their foreground window.
               Use the returned sidecar paths to inspect progress/results. Bash
-              truncation retains the full log until the next bash call: inspect
-              needed sections first.
+              logs and exit status remain readable for 24 hours after completion;
+              later bash calls reap expired results. Sandbox stop/restart clears them.
             - {preview_access_note}
             - Named expose targets manage service startup/recovery; http:<port>
               requires an already-running service. ttyd/code-server are private-only.
@@ -4294,9 +4328,11 @@ class Tools:
         if type_err:
             return type_err
 
+        harness = _HarnessDelivery(self._chat_state, __chat_id__)
+
         async def _run(client):
             email = _get_email(__user__)
-            sandbox_id, _sb_warning = await _ensure_sandbox(self.valves, email, client, __event_emitter__)
+            sandbox_id, harness.warning = await _ensure_sandbox(self.valves, email, client, __event_emitter__)
             await _ensure_chat_init(
                 self.valves, sandbox_id, client,
                 self._chat_state, __chat_id__, __user__, __event_emitter__,
@@ -4339,10 +4375,9 @@ class Tools:
                 return f"Error: onboard script failed (exit {exit_code}): {result[:500]}"
 
             await _emit(__event_emitter__, "Project context loaded", done=True)
-            messages = _drain_harness_messages(self._chat_state, __chat_id__, _sb_warning)
-            return _prepend_harness_messages(result if result else "(empty project context)", messages)
+            return result if result else "(empty project context)"
 
-        return await _tool_context(__event_emitter__, _run)
+        return await _tool_context(__event_emitter__, _run, harness)
 
     async def bash(
         self,
@@ -4361,9 +4396,11 @@ class Tools:
         if type_err:
             return type_err
 
+        harness = _HarnessDelivery(self._chat_state, __chat_id__)
+
         async def _run(client):
             email = _get_email(__user__)
-            sandbox_id, _sb_warning = await _ensure_sandbox(self.valves, email, client, __event_emitter__)
+            sandbox_id, harness.warning = await _ensure_sandbox(self.valves, email, client, __event_emitter__)
             await _ensure_chat_init(
                 self.valves, sandbox_id, client,
                 self._chat_state, __chat_id__, __user__, __event_emitter__,
@@ -4412,10 +4449,9 @@ class Tools:
 
             status = "Command running in background" if backgrounded else "Command complete"
             await _emit(__event_emitter__, status, done=True)
-            messages = _drain_harness_messages(self._chat_state, __chat_id__, _sb_warning)
-            return _prepend_harness_messages(result, messages)
+            return result
 
-        return await _tool_context(__event_emitter__, _run)
+        return await _tool_context(__event_emitter__, _run, harness)
     bash.__doc__ = inspect.getdoc(_core_bash)
 
     read = _standard_tool(
@@ -4490,9 +4526,11 @@ class Tools:
                 f"(e.g. OCR or metadata inspection via bash)."
             )
 
+        harness = _HarnessDelivery(self._chat_state, __chat_id__, image_result=True)
+
         async def _run(client):
             email = _get_email(__user__)
-            sandbox_id, _sb_warning = await _ensure_sandbox(self.valves, email, client, __event_emitter__)
+            sandbox_id, harness.warning = await _ensure_sandbox(self.valves, email, client, __event_emitter__)
             await _ensure_chat_init(
                 self.valves, sandbox_id, client,
                 self._chat_state, __chat_id__, __user__, __event_emitter__,
@@ -4502,17 +4540,9 @@ class Tools:
             result = _checked_result(await _core_view(self.valves, sandbox_id, client, path=path))
 
             await _emit(__event_emitter__, "Image loaded", done=True)
-            # The result must stay byte-identical to the core output: OWUI
-            # detects image tool results with startswith("data:image/"), and
-            # prepended harness text would silently break that detection and
-            # flood the model's text context with base64.  Defer (don't drop)
-            # the sandbox warning; leave pending messages queued for the
-            # next non-deferring tool call.
-            if _sb_warning:
-                _push_bg_notice(self._chat_state, __chat_id__, _sb_warning)
             return result
 
-        return await _tool_context(__event_emitter__, _run)
+        return await _tool_context(__event_emitter__, _run, harness)
     view.__doc__ = inspect.getdoc(_core_view)
 
     async def delegate(
@@ -4545,9 +4575,11 @@ class Tools:
         if type_err:
             return type_err
 
+        harness = _HarnessDelivery(self._chat_state, __chat_id__)
+
         async def _run(client):
             email = _get_email(__user__)
-            sandbox_id, _sb_warning = await _ensure_sandbox(self.valves, email, client, __event_emitter__)
+            sandbox_id, harness.warning = await _ensure_sandbox(self.valves, email, client, __event_emitter__)
             await _ensure_chat_init(
                 self.valves, sandbox_id, client,
                 self._chat_state, __chat_id__, __user__, __event_emitter__,
@@ -4905,13 +4937,11 @@ class Tools:
                         f"Delegation complete ({step_count} steps, {usage.tool_calls} tool calls)",
                         done=True,
                     )
-                    messages = _drain_harness_messages(self._chat_state, __chat_id__, _sb_warning)
-                    return _prepend_harness_messages(result_output + usage_note, messages)
+                    return result_output + usage_note
                 else:
                     error_msg = agent_result.get("error", "Unknown error")
                     await _emit(__event_emitter__, "Delegation failed", done=True)
-                    messages = _drain_harness_messages(self._chat_state, __chat_id__, _sb_warning)
-                    return _prepend_harness_messages(error_msg, messages)
+                    return error_msg
 
             else:
                 # ── Backgrounded — return descriptor ─────────────────
@@ -4932,13 +4962,9 @@ class Tools:
                     f"Delegation backgrounded after {elapsed}s",
                     done=True,
                 )
-                messages = _drain_harness_messages(self._chat_state, __chat_id__, _sb_warning)
-                return _prepend_harness_messages(
-                    _format_delegate_background(delegate_id, elapsed, preview),
-                    messages,
-                )
+                return _format_delegate_background(delegate_id, elapsed, preview)
 
-        return await _tool_context(__event_emitter__, _run)
+        return await _tool_context(__event_emitter__, _run, harness)
 
     async def expose(
         self,
@@ -5008,6 +5034,8 @@ class Tools:
                 "execution and access to the sandbox environment. Use access=\"private\"."
             )
 
+        harness = _HarnessDelivery(self._chat_state, __chat_id__)
+
         async def _run(client):
 
             if access_stripped not in ("public", "private"):
@@ -5030,7 +5058,7 @@ class Tools:
                 )
 
             email = _get_email(__user__)
-            sandbox_id, _sb_warning = await _ensure_sandbox(self.valves, email, client, __event_emitter__)
+            sandbox_id, harness.warning = await _ensure_sandbox(self.valves, email, client, __event_emitter__)
             await _ensure_chat_init(
                 self.valves, sandbox_id, client,
                 self._chat_state, __chat_id__, __user__, __event_emitter__,
@@ -5073,8 +5101,7 @@ class Tools:
                 )
 
                 await _emit(__event_emitter__, ready_status, done=True)
-                messages = _drain_harness_messages(self._chat_state, __chat_id__, _sb_warning)
-                return _prepend_harness_messages(result_msg(url, pid) + "\n\n" + access_note, messages)
+                return result_msg(url, pid) + "\n\n" + access_note
 
             if dufs_root is not None:
                 return await _ensure_and_sign(
@@ -5175,4 +5202,4 @@ class Tools:
                 ),
             )
 
-        return await _tool_context(__event_emitter__, _run)
+        return await _tool_context(__event_emitter__, _run, harness)

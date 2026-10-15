@@ -801,14 +801,19 @@ async def test_bash_large_log_survives_unrelated_chat(tools, sandbox, http, monk
     emissions = []
     async def emit(event):
         emissions.append(event)
+    tools._chat_state["a"]["pending"].extend(["workspace orientation", "background job finished"])
     failure = await tools.bash("echo failed; false", workdir=str(tmp_path), __user__=USER,
                                __chat_id__="a", __event_emitter__=emit)
-    assert failure.startswith("Error: Exit code: 1") and "failed" in failure
-    assert not any(e["data"]["description"] == "Command complete" for e in emissions)
+    assert failure == "workspace orientation\n\nbackground job finished\n\nExit code: 1\nfailed\n"
+    assert emissions[-1]["data"]["description"] == "Command complete"
+    subsequent = await tools.bash("printf next", workdir=str(tmp_path), __user__=USER, __chat_id__="a")
+    assert subsequent == "next"
     async with lathe.httpx.AsyncClient() as client:
         delegate_bash = lathe._build_delegate_tools(tools.valves, "sb", client, [])[0]
         literal = await delegate_bash.function(command="printf 'Error: expected output'", workdir=str(tmp_path))
-        assert literal.startswith("Error: expected output") and "Result files retained" in literal
+        assert literal == "Error: expected output"
+        delegate_failure = await delegate_bash.function(command="echo failed; false", workdir=str(tmp_path))
+        assert delegate_failure == "Exit code: 1\nfailed\n"
 
 
 @pytest.mark.parametrize("start,stop", [(1, 0), (-1, 0), (1, -1)])
@@ -1027,6 +1032,44 @@ async def test_chat_init_and_notice_delivery(tools, transport):
     assert lathe._drain_harness_messages(tools._chat_state, "a", None) == []
 
 
+@pytest.mark.parametrize("tool", ["read", "view"])
+@pytest.mark.parametrize("failure", ["http", "missing"])
+async def test_first_failure_delivers_context_once(tools, monkeypatch, http, tmp_path, tool, failure):
+    monkeypatch.setattr(lathe, "_ensure_sandbox", AsyncMock(
+        side_effect=[("sb", "sandbox recreated"), ("sb", None)]))
+    snapshot_done = False
+    failing = True
+
+    def handler(request):
+        nonlocal snapshot_done
+        if request.url.path == "/sandbox/sb":
+            return httpx.Response(200, json={"cpu": 2})
+        if request.url.path == "/sb/process/execute":
+            script = shlex.split(json.loads(request.content)["command"])[2]
+            if not snapshot_done:
+                snapshot_done = True
+                return httpx.Response(200, json={"exitCode": 0, "result": "workspace snapshot"})
+            if failing and failure == "http":
+                return httpx.Response(503, text="temporarily unavailable")
+            return httpx.Response(200, json={"exitCode": 0, "result": run_script(script)})
+        assert request.url.path == "/sb/files/download"
+        assert tool == "view" and failing
+        return httpx.Response(503 if failure == "http" else 404)
+
+    http(handler)
+    user = {**USER, "valves": tools.UserValves(env_vars='{"GITHUB_TOKEN":"hidden-value"}')}
+    result = await getattr(tools, tool)(str(tmp_path / "missing"), __user__=user, __chat_id__="a")
+    assert all(s in result for s in ["sandbox recreated", "workspace snapshot", "GITHUB_TOKEN"])
+    assert "hidden-value" not in result
+    assert "error:" in result.lower()
+    failing = False
+    path = tmp_path / "next.txt"
+    path.write_text("next result")
+    subsequent = await tools.read(str(path), __user__=user, __chat_id__="a")
+    assert "next result" in subsequent
+    assert not any(s in subsequent for s in ["sandbox recreated", "workspace snapshot", "GITHUB_TOKEN"])
+
+
 @pytest.mark.parametrize("prior,live,expected,lost", [
     (None, [], "new", False), ("old", [{"id": "old"}], "old", False),
     ("old", [], "new", True),
@@ -1159,7 +1202,13 @@ async def test_interpreter_conversations_are_isolated_and_require_identity(tools
     assert created == ["context-0", "context-1"]
 
 
-async def test_background_bash_poll_delivers_once(tools, sandbox, http, clock):
+@pytest.mark.parametrize("prefix", ["", "earlier output\n" * 10000], ids=["short", "large"])
+async def test_background_bash_poll_delivers_once(tools, sandbox, http, clock, tmp_path, monkeypatch, prefix):
+    monkeypatch.setattr(lathe, "_EPHEMERAL_ROOT", str(tmp_path))
+    log = tmp_path / "cmd" / "job" / "log"
+    log.parent.mkdir(parents=True)
+    ending = "\n".join(f"final output {n}" for n in range(5))
+    log.write_text(prefix + ending + "\n")
     tools._chat_state["chat"] = {"init": True, "pending": []}
     statuses = iter([httpx.Response(503), httpx.Response(200, json={"commands": [{"id": "cmd"}]}),
                      httpx.Response(200, json={"commands": [{"id": "cmd", "exitCode": 7}]})])
@@ -1169,7 +1218,7 @@ async def test_background_bash_poll_delivers_once(tools, sandbox, http, clock):
         if (request.method, request.url.path) == ("POST", "/sb/process/execute"):
             script = shlex.split(json.loads(request.content)["command"])[2]
             if "f.seek" in script:
-                return httpx.Response(200, json={"exitCode": 0, "result": json.dumps({"text": "final output", "size": 12})})
+                return httpx.Response(200, json={"exitCode": 0, "result": run_script(script)})
             return httpx.Response(200, json={"exitCode": 0, "result": "caller output"})
         assert request.method == "GET"
         if request.url.path == "/sb/process/session/session":
@@ -1184,6 +1233,8 @@ async def test_background_bash_poll_delivers_once(tools, sandbox, http, clock):
     result = await tools.read("/file", __user__=USER, __chat_id__="chat")
     assert result.count("Background job completed") == 1
     assert all(s in result for s in ["job", "Exit code: 7", "final output", "caller output"])
+    displayed_tail = result.split("Last lines of output:\n", 1)[1].split("\nFull output:", 1)[0]
+    assert displayed_tail == "\n".join(f"  {line}" for line in ending.splitlines())
     assert await tools.read("/file", __user__=USER, __chat_id__="chat") == "caller output"
 
 
