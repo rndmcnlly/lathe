@@ -1,14 +1,16 @@
 # Lathe
 
-A single-file Open WebUI toolkit that gives any model a coding agent's tool surface — `bash`, `read`, `write`, `edit`, `glob`, `grep`, `view`, `delegate`, `onboard`, `expose`, `destroy` — executing against per-user cloud sandboxes via [Daytona](https://www.daytona.io/).
+A single-file Open WebUI toolkit that gives any model a coding agent's tool surface: `bash`, `read`, `write`, `edit`, `glob`, `grep`, `view`, `onboard`, `expose`, `destroy`, executing against per-user cloud sandboxes via [Daytona](https://www.daytona.io/).
 
 **For users**: See [lathe.tools](https://lathe.tools) for what Lathe can do, how to use it, and example workflows.
 
+**Design**: [A legible sandbox interface](DESIGN.md) explains the human-facing tool story and the boundary between Lathe, Open WebUI, and optional sandbox recipes.
+
 ## What it does to your instance
 
-Lathe registers fourteen tools that models can call in [Native function calling mode](https://docs.openwebui.com/features/extensibility/plugin/tools/). When a user's model calls a tool, Lathe creates, starts, or resumes a cloud sandbox VM via the Daytona control plane and toolbox APIs. All sandbox operations go outbound from your OWUI server.
+Lathe registers twelve tools that models can call in [Native function calling mode](https://docs.openwebui.com/features/extensibility/plugin/tools/). When a user's model calls a tool, Lathe creates, starts, or resumes a cloud sandbox VM via the Daytona control plane and toolbox APIs. All sandbox operations go outbound from your OWUI server.
 
-Lathe does not import `open_webui.*`, use OWUI file storage, or change stored model, prompt, user, or instance configuration. Its tool descriptions and results include operational instructions, project context, and background notices that influence the calling model. `delegate()` supplies its own sub-agent system prompt and depends on OWUI-injected runtime context, an integration boundary that may change between releases.
+Lathe does not import `open_webui.*`, use OWUI file storage, or change stored model, prompt, user, or instance configuration. Its tool descriptions and results include operational instructions, project context, and background notices that influence the calling model.
 
 ## Security and trust model
 
@@ -16,15 +18,15 @@ Lathe does not import `open_webui.*`, use OWUI file storage, or change stored mo
 - **Deployment label scoping** — Sandboxes are tagged with a `deployment_label` (e.g. `chat.example.com`), so multiple OWUI instances sharing a Daytona account do not collide.
 - **User secrets** — The `env_vars` UserValve is a password field (masked in UI), but its values are deliberately entrusted to the model through every `bash` command it can invoke. The model can read command environments and should be treated as able to disclose or misuse these credentials. Use narrowly scoped, revocable credentials only.
 - **Destroy confirmation guard** — The `destroy` tool requires confirmation through Open WebUI's interactive confirmation dialog.
-- **Model-facing guidance, not configuration changes** — Tool outputs contain prescriptive guidance and discovered AGENTS.md/skill context. Treat these as model-visible instructions, not merely data; delegate calls also use a Lathe-authored system prompt.
+- **Model-facing guidance, not configuration changes**: Tool outputs contain prescriptive guidance and discovered AGENTS.md/skill context. Treat these as model-visible instructions, not merely data.
 
 ## Requirements
 
 1. **Daytona account** with an API key ([daytona.io](https://www.daytona.io/))
-2. **Open WebUI ≥ 0.11.0** with Native function calling mode enabled
+2. **Open WebUI ≥ 0.12.0** with Native function calling mode enabled
 3. Models that support tool/function calling (`view()` additionally needs a vision-capable model)
 
-The 0.11.0 floor is behavioral: it is the first release with the image-history behavior required by `view()` and it provides the OWUI runtime behavior required by `delegate()`.
+The toolkit requires Open WebUI 0.12.0 or newer, including its native conversation orchestration and image-history support for `view()`.
 
 This floor identifies the oldest release with the required known behavior, not a promise that every OWUI patch release is tested. Compatibility is checked against the OWUI instance configured for the deployment suite.
 
@@ -66,7 +68,6 @@ To apply updates, review and download the current `lathe.py` from the `main` bra
 | `auto_stop_minutes` | `15` | Idle timeout before sandbox stops |
 | `auto_archive_minutes` | `60` | Minutes after stop before sandbox archives |
 | `auto_delete_minutes` | `-1` | Minutes after archive before permanent deletion (`-1` = never) |
-| `persistent_volume` | `true` | Mount a persistent S3/FUSE volume at `/home/daytona/volume` |
 | `auto_create_sandbox` | `true` | Auto-create a sandbox when none exists. Disable when sandboxes are provisioned externally |
 | `sandbox_missing_message` | *(empty)* | Message shown to the agent when no sandbox exists and `auto_create_sandbox` is off |
 | `sandbox_create_overrides` | `{}` | JSON of extra Daytona create args (see below) |
@@ -84,9 +85,10 @@ create request, letting you control sandbox shape without a valve per field:
 Resource fields (`cpu`, `memory`, `disk`, `gpu`) are integers in cores / GB /
 units; `snapshot` selects the base image; `target` picks a region. Any field
 the Daytona [`POST /sandbox`](https://www.daytona.io/docs/en/tools/api/) body
-accepts works here. The keys `name`, `labels`, and `volumes` are managed by
-lathe (per-user lookup invariant and the `persistent_volume` valve) and are
-rejected with a clear error if you try to set them.
+accepts works here except reserved identity/storage fields. The keys `name`,
+`labels`, and `volumes` are rejected: Lathe owns per-user lookup and does not
+provision extra volumes. Ordinary workspace files survive stop/archive, but not
+sandbox destruction. Export important work or commit it to a remote repository.
 
 ### HTTP preview access and wrapping
 
@@ -95,7 +97,7 @@ rejected with a clear error if you try to set them.
 > credential: anyone who sees or copies it can access the service until it
 > expires or stops working. A raw URL exposed in chat, a screen share, or a
 > recording can disclose an intentionally public custom terminal service or a writable
-> file browser. Managed ttyd and code-server now require private access. After several months of personal and institutional use, this has
+> file browser. After several months of personal and institutional use, this has
 > been Lathe's most significant recurring security sharp edge.
 
 Every `expose()` call requires the agent to choose `access="public"` or
@@ -110,21 +112,17 @@ Direct signed URLs can be appropriate for intentionally public, personal, or
 otherwise low-risk services. Configure `preview_wrapper_url` and
 `preview_wrapper_key` to add a distinct branded origin, cookie isolation, and,
 when the wrapper supports it, browser authentication. Wrapping applies to
-arbitrary HTTP services, managed static sites, dufs, ttyd, and code-server before
-a URL reaches the model or user. `site:/absolute/path` starts a managed static
-server without requiring the model to choose a port or background process;
-multiple paths can remain live at once. `dufs:/absolute/path` and
-`code-server:/absolute/path` select a directory (bare names use the workspace).
-Named directory roots must exist within `/home/daytona/workspace`, including
-after symlink resolution. Dufs and code-server each use one fixed port, so a
-running instance with another root must stop before switching roots. Both
-`ttyd` and `code-server` are private-only. The code-server folder is an initial
-working folder, not confinement: its terminal can access the full sandbox.
-Managed dufs allows upload, delete, search, ZIP download, and file hashes,
-but not symlinks outside its served root. A running dufs instance started with
-broader permissions must be stopped before Lathe will expose it again. Static
-sites use Python's HTTP server and can follow symlinks inside the site directory.
-Lathe does not provide SSH access.
+running HTTP services before a URL reaches the model or user. Start the service
+through `bash`, then call `expose(target="http:8080", access="private")` (substitute
+its port). Only `http:<port>` targets on ports 1024–65535 are accepted; Lathe does
+not install applications through `expose` or provide SSH access.
+
+Optional repository recipes launch static sites, dufs file browsers, ttyd
+terminals, and code-server editors. Consult `lathe(manpage="services")` for the
+pinned acquisition and launch commands. Recipes are ordinary sandbox programs,
+not additional OWUI tools. A browser editor's initial folder is not confinement:
+its terminal can access the full sandbox. Keep editors, terminals, and writable
+file browsers private unless the user explicitly authorizes public/world access.
 
 #### What a wrapper does
 
@@ -186,7 +184,7 @@ for limits, acknowledgement, storage, and rotation requirements.
 `preview_expiry_seconds` controls the upstream signed URL (default and maximum:
 24 hours). The wrapper chooses its own registration lifetime; Lathe reports the
 two clocks separately. Sandbox sleep, service failure, or explicit shutdown can
-end availability sooner. Calling `expose()` again prepares the service and
+end availability sooner. Calling `expose()` again registers the running service and
 replaces or renews the registration. The wrapper may invalidate existing
 browser sessions and WebSocket connections when replacing it.
 
@@ -227,14 +225,18 @@ flow, e.g. *"Visit https://example.com/setup to create your sandbox first."*
 | `read(path, start, stop)` | Read file with line numbers; supports positive and negative half-open ranges |
 | `write(path, content)` | Write/create file (auto-creates parent dirs) |
 | `edit(path, old_string, new_string, replace_all)` | Exact string replacement |
-| `glob(pattern, max_lines)` | Search for files by glob pattern (hierarchical output, collapsed directories) |
-| `grep(pattern, files, max_lines)` | Search file contents by regex (grouped by file with line numbers) |
+| `glob(pattern, max_lines)` | List workspace files using one native ripgrep glob |
+| `grep(pattern, files, max_lines)` | Search workspace text using ripgrep regex and one native file glob |
 | `view(path)` | Load an image into the model's visual context (PNG/JPEG/GIF/WebP, ≤ 4 MB, content-sniffed) |
 | `interpret(code, timeout)` | Run Python in a conversation-scoped persistent interpreter |
-| `delegate(task, context_files, max_steps, foreground_seconds)` | Dispatch a sub-agent to perform a multi-step task autonomously |
-| `expose(target, access)` | Expose an HTTP service, file browser, or browser IDE with required `public` or `private` access |
-| `handoff()` | Prepare instructions for continuing work in a fresh conversation |
+| `expose(target, access)` | Publish a running `http:<port>` service with explicit `public` or `private` access |
 | `destroy()` | Permanently delete the sandbox after interactive confirmation |
+
+Search scopes are workspace-relative, with ripgrep's brace, `!`, ignore, and
+hidden-file rules. There is no comma-separated glob language or exact-total
+guarantee. Use `bash` for absolute search scopes or additional ripgrep flags.
+Open WebUI owns conversation continuation and compaction; Lathe does not provide
+a separate handoff tool.
 
 ## Testing
 
@@ -246,9 +248,9 @@ uv run python test_deployment.py [--verbose] # also needs OWUI_URL, OWUI_TOKEN, 
 
 The tiers cover different boundaries:
 
-- The offline suite checks local behavior without provisioning resources. Use `uv run pytest -k delegate` for a focused selection; `uv run python test_unit.py` is also supported.
-- `test_integration.py` verifies the live Daytona API using an isolated test identity. It retains one named test volume for reuse and deletes test sandboxes on exit. Cleanup failure makes the run fail.
-- `test_deployment.py` is a disposable end-to-end OWUI smoke test for local source, loaded schema, and model-mediated dispatch, including `view()` and `delegate()`. It uses isolated staging identities and cleans them up on exit.
+- The offline suite checks local behavior without provisioning resources. Use `uv run pytest -k interpreter` for a focused selection; `uv run python test_unit.py` is also supported.
+- `test_integration.py` verifies the live Daytona API using an isolated test identity and deletes test sandboxes on exit. Cleanup failure makes the run fail.
+- `test_deployment.py` is a disposable end-to-end OWUI smoke test for local source, loaded schema, and model-mediated dispatch, including `view()`. It uses isolated staging identities and cleans them up on exit.
 
 Run only one instance of each live suite at a time: staging identities are shared.
 See [AGENTS.md](AGENTS.md#testing-policy) for contributor testing policy.
@@ -261,16 +263,16 @@ For transient hostnames, use `LATHE_PREVIEW_EXPECTED_PATTERN` instead of the
 exact URL and `{label}` in the revoke URL; cleanup uses the validated returned
 hostname. The disposable suite refuses the production toolkit ID `lathe`.
 This checks staged source/schema and model-mediated exposure, then revokes the
-test registration. It removes only the dependency-install frontmatter from the
-staging copy, so testing `expose` beside an older toolkit does not upgrade that
-instance's shared Pydantic AI dependency. It does not qualify the other tools or
-a full dependency migration.
+test registration. Both focused and full runs stage the exact local source,
+including dependency requirements. The focused run does not qualify the other tools.
 
 ## Files
 
 | File | Purpose |
 |------|---------|
 | `lathe.py` | The OWUI toolkit (single file, deployed via OWUI admin API) |
+| `recipes/` | Optional, revision-pinned sandbox application launchers |
+| `DESIGN.md` | Human-facing tool story and responsibility boundaries |
 | `preview-wrapper/` | Optional Cloudflare Worker for branded, cookie-isolated preview origins |
 | `test_unit.py` | Offline behavioral contracts (pytest, no sandbox) |
 | `testing_support.py` | Shared public schema contract |

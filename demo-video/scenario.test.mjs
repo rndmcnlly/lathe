@@ -7,13 +7,13 @@ import { runScenario } from "./interpreter.mjs";
 const scenario = JSON.parse(readFileSync(new URL("./scenario.json", import.meta.url)));
 const exposure = scenario.steps.find((step) => step.id === "editor.prove-exposed").with;
 
-test("shipped scenario rejects public IDE and generic port substitutes", () => {
-  const event = { tool: "expose", arguments: { target: "code-server:/home/daytona/workspace", access: "private" },
+test("shipped scenario requires the private recipe port, not removed managed targets", () => {
+  const event = { tool: "expose", arguments: { target: "http:8080", access: "private" },
     output: "Owner-only wrapped preview: Copying the URL does not grant access." };
   assert.equal(matchesToolExpectation(event, exposure), true);
-  for (const arguments_ of [{ target: "code-server", access: "public" },
-    { target: "http:8080", access: "private" },
-    { target: "http:8080", access: "private", tag: "code-server" },
+  for (const arguments_ of [{ target: "http:8080", access: "public" },
+    { target: "http:8081", access: "private" },
+    { target: "code-server:/home/daytona/workspace", access: "private" },
     { target: "code-server:relative", access: "private" },
     { target: "not-code-server", access: "private" }, { target: "code-server", access: "private" }]) {
     assert.equal(matchesToolExpectation({ ...event, arguments: arguments_ }, exposure), false);
@@ -26,9 +26,10 @@ test("shipped scenario executes with independent tool and file-read evidence", a
     { tool: "lathe", arguments: { manpage: "version" }, output: "Lathe toolkit version: fixture" },
     { tool: "bash", arguments: { command: "git clone https://github.com/rndmcnlly/lathe" }, output: "Cloned" },
     { tool: "write", arguments: { path: "/workspace/RELAY.md" }, output: "Saved" },
-    { tool: "expose", arguments: { target: "code-server:/workspace", access: "private" }, output: "Copying the URL does not grant access." },
+    { tool: "bash", arguments: { command: `python3 ~/.cache/lathe/recipes/${"a".repeat(40)}/app.py code-server --root /workspace --port 8080` },
+      output: JSON.stringify({ service: "code-server", root: "/workspace", port: 8080, expose: "http:8080", status: "started" }) },
+    { tool: "expose", arguments: { target: "http:8080", access: "private" }, output: "Copying the URL does not grant access." },
     { tool: "read", arguments: { path: "/workspace/RELAY.md" }, output: "2: You: A shared state of mind." },
-    { tool: "delegate", arguments: {}, output: "Backgrounded" },
     { tool: "bash", arguments: { command: "ss -ltn | grep 8080" }, output: "Stopped" },
   ];
   const adapter = Object.fromEntries(scenario.steps.flatMap((step) => [step.do, ...(step.fallback || [])])

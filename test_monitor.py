@@ -35,11 +35,11 @@ def test_registered_secrets_and_failure_evidence(tmp_path, monkeypatch):
     monkeypatch.setenv("OPENROUTER_API_KEY", "unusual-provider-key")
     monkeypatch.setattr(monitor, "SECRETS", ["generated-password"])
     trace = monitor.Trace(tmp_path)
-    trace("scenario_start", name="delegate")
+    trace("scenario_start", name="file copy")
     trace("scenario_fail", error="unusual-provider-key generated-password")
     trace("scenario_start", name="cleanup")
     trace("fatal", error="another failure")
-    assert trace.first_failure == "delegate"
+    assert trace.first_failure == "file copy"
     assert "unusual-provider-key" not in trace.path.read_text()
     assert "generated-password" not in trace.path.read_text()
 
@@ -48,7 +48,7 @@ def test_registered_secrets_and_failure_evidence(tmp_path, monkeypatch):
 @pytest.mark.parametrize("streaming", [True, False])
 async def test_relay_forwards_real_body_and_records_concrete_model(tmp_path, monkeypatch, streaming, selected):
     # Exercise the HTTP handler itself. An independent upstream boundary checks
-    # exact forwarding, including plugins and the delegate's non-streaming path.
+    # exact forwarding, including plugins and both response formats.
     monkeypatch.setenv("LATHE_MONITOR_MODEL", selected)
     payload = {"model": selected,
                "messages": [{"role": "user", "content": "hello"}], "stream": streaming}
@@ -207,7 +207,9 @@ async def test_cleanup_owns_only_exact_run_and_follows_pages(suite, monkeypatch)
 
 
 @pytest.mark.parametrize("display_name", ["Lathe Test", "Lathe"])
-async def test_staging_deployment_disables_volumes_and_sets_expiry(suite, monkeypatch, display_name):
+@pytest.mark.parametrize("preview_only", [False, True])
+async def test_staging_deployment_accepts_current_valves_and_sets_expiry(suite, monkeypatch, display_name, preview_only):
+    monkeypatch.setattr(suite.sys, "argv", ["test_deployment.py"] + (["--preview-only"] if preview_only else []))
     seen = []
     def owui(request):
         if request.method == "GET":
@@ -225,28 +227,53 @@ async def test_staging_deployment_disables_volumes_and_sets_expiry(suite, monkey
     assert seen[0]["name"] == display_name
     valves = seen[1]
     assert valves["deployment_label"] == "lathe-ci-this-run"
-    assert valves["persistent_volume"] is False
+    # Exercise the actual valve parser: removed valves must not be posted to OWUI.
+    from lathe import Tools
+    Tools.Valves(**valves)
+    assert set(valves) <= set(Tools.Valves.model_fields)
     assert valves["auto_stop_minutes"] == 5
     assert valves["auto_delete_minutes"] == 0
     assert json.loads(valves["sandbox_create_overrides"])["ttlMinutes"] == 30
 
 
-@pytest.mark.parametrize("fault", [None, "no_manual", "no_delegate", "no_inspection", "claim_only", "over_budget"])
-def test_journey_oracle_rejects_plausible_false_success(suite, fault):
+@pytest.mark.parametrize("copy_tool,copy_args", [
+    ("bash", {"command": "cp /source.txt /copy.txt"}),
+    ("interpret", {"code": "import shutil; shutil.copyfile('/source.txt', '/copy.txt')"}),
+    ("write", {"path": "/copy.txt", "content": "FRESH_CANARY"}),
+])
+@pytest.mark.parametrize("fault", [
+    None, "no_manual", "no_copy", "no_inspection", "claim_only", "over_budget",
+    "failed_manual", "failed_copy", "wrong_destination", "wrong_marker",
+    "inspect_before_copy", "copy_before_manual", "combined_copy_and_inspection",
+])
+def test_journey_oracle_rejects_plausible_false_success(suite, copy_tool, copy_args, fault):
     output = []
-    for name, args, text in [
+    steps = [
         ("lathe", {}, "# Lathe Toolkit – Overview"),
-        ("delegate", {"task": "copy the source"}, "finished"),
+        (copy_tool, copy_args, "finished"),
         ("read", {"path": "/copy.txt"}, "File: /copy.txt\n1: FRESH_CANARY"),
-    ]:
-        if (fault, name) in (("no_manual", "lathe"), ("no_delegate", "delegate"), ("no_inspection", "read")):
+    ]
+    if fault == "inspect_before_copy":
+        steps[1], steps[2] = steps[2], steps[1]
+    if fault == "copy_before_manual":
+        steps[0], steps[1] = steps[1], steps[0]
+    if fault == "combined_copy_and_inspection":
+        steps = [steps[0], ("bash", {"command": "cp /source.txt /copy.txt; cat /copy.txt"}, "FRESH_CANARY")]
+    for name, args, text in steps:
+        if (fault, name) in (("no_manual", "lathe"), ("no_copy", copy_tool), ("no_inspection", "read")):
             continue
+        if (fault, name) in (("failed_manual", "lathe"), ("failed_copy", copy_tool)):
+            text = "Error: operation failed"
+        if fault == "wrong_destination" and name == "read":
+            args = {"path": "/source.txt"}
+        if fault == "wrong_marker" and name == "read":
+            text = "File: /copy.txt\n1: stale content"
         output.extend([
             {"type": "function_call", "name": name, "call_id": name, "arguments": json.dumps(args)},
             {"type": "function_call_output", "call_id": name, "output": text},
         ])
     if fault == "claim_only":
-        output = [{"type": "message", "content": "I consulted the overview, delegated, and verified FRESH_CANARY"}]
+        output = [{"type": "message", "content": "I consulted the overview, copied, and verified FRESH_CANARY"}]
     if fault == "over_budget":
         output.extend([{"type": "function_call", "name": "bash"}] * 10)
     if fault:
@@ -254,29 +281,6 @@ def test_journey_oracle_rejects_plausible_false_success(suite, fault):
             suite.verify_journey(output, "/copy.txt", "FRESH_CANARY")
     else:
         suite.verify_journey(output, "/copy.txt", "FRESH_CANARY")
-
-
-@pytest.mark.parametrize("expected", ["delegate", "read"])
-def test_single_dispatch_allows_only_optional_first_use_overview(suite, expected):
-    def call(name, arguments=None):
-        item = {"type": "function_call", "name": name}
-        if arguments is not None:
-            item["arguments"] = arguments
-        return item
-
-    suite.require_single_dispatch([call(expected)], expected)
-    suite.require_single_dispatch([call("lathe"), call(expected)], expected)
-    for invalid in (
-        [call("lathe")],
-        [call(expected), call("lathe")],
-        [call("lathe"), call("lathe"), call(expected)],
-        [call("lathe", '{"manpage":"services"}'), call(expected)],
-        [call("lathe", {"manpage": "version"}), call(expected)],
-        [call("bash"), call(expected)],
-        [call(expected), call(expected)],
-    ):
-        with pytest.raises(AssertionError):
-            suite.require_single_dispatch(invalid, expected)
 
 
 @pytest.mark.parametrize("selected", [None, "z-ai/glm-5.3-flash"])

@@ -41,8 +41,7 @@ There is no reusable data volume.
 
 `bootstrap()` creates the first admin headlessly and configures a native-tool
 workspace model. Its base model is `openrouter/pareto-code`. OWUI's workspace
-model `custom_params` inject this request-level configuration, including on
-the delegate's in-process calls back into OWUI:
+model `custom_params` inject this request-level configuration:
 
 ```json
 {
@@ -63,7 +62,7 @@ the monitor fails visibly rather than silently testing another tier.
 The regular monitor still defaults to Pareto Medium. To qualify a checkout with
 the demo's direct model, export `LATHE_MONITOR_MODEL=z-ai/glm-5.3-flash` before
 running `monitor_e2e.py`. Both bootstrap and the real-provider relay use that
-selection, including delegate calls. Direct models get **no Pareto plugin**.
+selection. Direct models get **no Pareto plugin**.
 The relay rejects mismatched model/plugin requests instead of rewriting them.
 Data collection remains denied. `environment.json`, per-request trace entries,
 and summaries distinguish requested and actually served models; a direct model
@@ -85,20 +84,19 @@ Existing repository secrets permit GitHub runs, not local credential recovery.
 ## Checks and budgets
 
 The monitor reuses `test_deployment.py`: byte-identical source, the complete
-independent schema contract, bash, write/read, interpreter, image middleware,
-and delegation with a separately verified file effect. It then runs a first-time
-journey whose prompt describes the goal without naming tool functions:
+independent schema contract, bash, write/read, interpreter, and image middleware.
+It then runs a first-time journey with a separate read-back check:
 
 1. Consult the built-in overview.
 2. Create a uniquely named file containing a fresh canary.
-3. Ask a subagent to make an exact copy.
+3. Make an exact copy.
 4. Inspect the copied contents.
 
 The oracle checks actual tool calls and returned outputs, then independently
 downloads both files through Daytona and compares their bytes with the canary.
-The journey permits 12 outer tool calls and four minutes of wall time for the chat.
-Delegates retain Lathe's own step limits. OWUI also caps tool-call iterations at
-12. The container execution has a 25-minute limit, the live Actions step 35
+The journey permits 12 tool calls and four minutes of wall time for the chat.
+OWUI also caps tool-call iterations at 12. The container execution has a
+25-minute limit, the live Actions step 35
 minutes (including image pull), and the job 45 minutes to leave cleanup time.
 
 This is one nondeterministic smoke test, not a model benchmark. A red run can
@@ -118,7 +116,7 @@ The label is recorded in `environment.json`. Cleanup follows pagination and
 deletes only sandboxes with that exact key, then polls their per-ID endpoints
 until deletion is confirmed. The synthetic user's email is stable, but different
 label keys keep simultaneous test instances from discovering each other's VMs.
-Persistent volumes are always disabled.
+Lathe provisions no extra volumes; monitor qualification checks the actual sandbox.
 
 Three teardown layers serve different failure modes:
 
@@ -189,9 +187,11 @@ The Worker also drops to host UID/GID after its root-only CA installation,
 before npm/Wrangler creates files beside the bind-mounted configuration. This
 keeps temporary-directory removal host-owned, including `.wrangler/tmp`.
 
-The same scenario always asks for a **private managed code-server** editor and
-requires private `expose` arguments plus the owner-only access result before
-opening it. No public HTTP-port workaround is permitted. A disposable identity
+The same scenario always asks for a **private code-server** editor, launched
+through the pinned optional recipe described by `lathe(manpage="services")`.
+The oracle binds the checkout to the launcher's actual ready result, then
+requires `expose(target="http:8080", access="private")` plus the owner-only
+access result before opening it. No public workaround is permitted. A disposable identity
 fixture runs inside OWUI on port 9100, reachable only over the Docker network
 and the loopback TLS listener's `/demo-idp/` route. Its sign-in button explicitly
 identifies the fixed synthetic user `monitor@lathe.invalid`. This is not Pocket
@@ -245,7 +245,7 @@ seam for a future video driver. A video workflow should create its own run
 identity (include a job suffix if several jobs share one Actions run ID), use
 the same two repository secrets, capture the loopback-published OWUI instance,
 and upload video artifacts labeled with the tested ref and commit. Keep its
-unique Daytona label, disabled volumes, and expiry policy. Its browser and
+unique Daytona label, no-extra-volume contract, and expiry policy. Its browser and
 capture code must never fall back to a configured daily-use OWUI URL.
 
 `render-demo.yml` now runs this same disposable lifecycle every Wednesday at

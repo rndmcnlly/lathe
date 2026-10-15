@@ -115,10 +115,22 @@
       "required": true,
       "intent": "Ask Lathe to expose a private browser editor",
       "with": {
-        "prompt": "Expose private VS Code in the lathe folder. Tell me the access and expiry details.",
+        "prompt": "Open private VS Code in the lathe folder. Consult lathe(manpage=\"services\") and use its pinned app.py recipe to launch code-server with --root set to the absolute lathe checkout and --port 8080. Then expose target=\"http:8080\" with access=\"private\". Tell me the access and expiry details.",
         "timeoutMs": 360000
       },
       "failureDomain": "model_behavior"
+    },
+    {
+      "id": "editor.prove-launched",
+      "do": "chat.await-tool-result",
+      "required": true,
+      "intent": "Bind the checkout to a ready recipe service, not assistant prose",
+      "with": {
+        "tools": ["bash"],
+        "recipeReady": { "service": "code-server", "port": 8080 },
+        "bindCheckout": true
+      },
+      "failureDomain": "lathe_behavior"
     },
     {
       "id": "editor.prove-exposed",
@@ -128,9 +140,7 @@
       "screenshot": "private-editor-ready",
       "with": {
         "tools": ["expose"],
-        "managedTarget": "code-server",
-        "bindCheckout": true,
-        "argumentsEqual": { "access": "private" },
+        "argumentsEqual": { "target": "http:8080", "access": "private" },
         "outputContains": "Copying the URL does not grant access."
       },
       "failureDomain": "lathe_behavior"
@@ -192,45 +202,22 @@
       "failureDomain": "lathe_behavior"
     },
     {
-      "id": "delegate.start",
+      "id": "service.stop",
       "do": "chat.send",
       "required": true,
-      "intent": "Start a bounded architecture review in the background",
+      "intent": "Stop the editor service after the shared-file demonstration",
       "with": {
-        "prompt": "Delegate a quick review of _standard_tool in lathe.py: one strength and one tradeoff. Run it in the background so we can keep working.",
-        "timeoutMs": 60000
-      },
-      "failureDomain": "model_behavior"
-    },
-    {
-      "id": "delegate.prove-backgrounded",
-      "do": "chat.await-tool-result",
-      "required": true,
-      "intent": "Prove delegation from its tool result rather than a cinematic line",
-      "screenshot": "delegation-backgrounded",
-      "with": {
-        "tools": ["delegate"],
-        "outputContains": "Backgrounded"
-      },
-      "failureDomain": "lathe_behavior"
-    },
-    {
-      "id": "concurrency.work",
-      "do": "chat.send",
-      "required": true,
-      "intent": "Show that the main agent remains useful while delegated work runs",
-      "with": {
-        "prompt": "While the review runs, stop code-server and check that port 8080 is closed. Then check on the review and summarize what’s ready.",
+        "prompt": "Stop code-server and check that port 8080 is closed. Then summarize what’s ready.",
         "timeoutMs": 90000
       },
       "failureDomain": "model_behavior"
     },
     {
-      "id": "concurrency.prove-main-agent",
+      "id": "service.prove-stopped",
       "do": "chat.await-tool-result",
       "required": true,
-      "intent": "Prove the main agent independently used bash during delegated work",
-      "screenshot": "concurrent-review-complete",
+      "intent": "Observe the service shutdown check through bash",
+      "screenshot": "service-stopped",
       "with": {
         "tools": ["bash"],
         "argumentContains": "8080"

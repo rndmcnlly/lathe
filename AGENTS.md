@@ -1,7 +1,10 @@
 # Agent Instructions: Lathe
 
-Single-file Open WebUI toolkit (`lathe.py`). Keep runtime implementation in that
-file; the optional `preview-wrapper/` Cloudflare Worker is separate infrastructure.
+Single-file Open WebUI toolkit (`lathe.py`). Keep the OWUI runtime implementation
+in that file. Optional `recipes/` programs run inside the sandbox via `bash`, not
+as imported runtime modules; the optional `preview-wrapper/` Cloudflare Worker
+is separate infrastructure. Read [DESIGN.md](DESIGN.md) for the human-facing tool
+story and responsibility boundaries before changing the tool surface.
 
 ## Documentation routing
 
@@ -20,7 +23,7 @@ Credentials: gitignored `.env`, documented in `.env.example`. Use `uv run`.
 
 ```sh
 uv run pytest                                  # offline, no credentials
-uv run pytest -k delegate                       # focused selection
+uv run pytest -k interpreter                    # focused selection
 uv run python test_integration.py               # DAYTONA_API_KEY
 uv run python test_deployment.py [--verbose]     # also OWUI_URL, OWUI_TOKEN, OWUI_MODEL
 ```
@@ -36,10 +39,9 @@ under test, never a copied implementation. Use pytest fixtures/parametrization,
 not custom runners or handwritten HTTP response classes.
 
 - Offline (`test_unit.py`): real temporary files and shipped scripts; loading
-  with/without future annotations; wrapper/delegate schemas, HTTP failures,
+  with/without future annotations; wrapper schemas, HTTP failures,
   lifecycle/message delivery, preview credentials, and byte-exact images.
-  Delegate tests run the real Pydantic AI loop with a scripted in-process ASGI
-  model. Block real HTTP; record unexpected requests/responder assertions and
+  Block real HTTP; record unexpected requests/responder assertions and
   fail teardown even if production catches them. Observe background completion
   through subsequent tool calls, not private task names. Use a Lathe-scoped
   advancing/yielding clock, never global no-op sleeps.
@@ -48,12 +50,12 @@ not custom runners or handwritten HTTP response classes.
   stop after the first failure; cleanup failure fails the run. Type/capability
   policy matrices belong offline.
 - OWUI (`test_deployment.py`): actual loader/schema/middleware and real-model
-  dispatch. Verify delegate-created files by a separate read, not an echoed
+  dispatch. Verify created files by a separate read, not an echoed
   canary. This is a nondeterministic smoke test, not a model simulation or a
   minimum-version matrix: it qualifies local source against `OWUI_URL`.
 
 `testing_support.py` specifies the public schema contract independently of Lathe,
-shared by local/deployed checks; delegate differences must be explicit.
+shared by local/deployed checks.
 When replacing coverage, demonstrate detection of plausible injected faults in
 in-memory copies or disposable workspaces, never a deployed toolkit. Assertion
 counts and line coverage are not goals.
@@ -63,9 +65,9 @@ counts and line coverage are not goals.
 Run only one instance of each live suite at a time: staging identities are shared.
 Neither live suite belongs in default pytest collection.
 
-- Integration retains one named test volume for reuse; cleanup deletes sandboxes.
+- Integration provisions no extra volumes; cleanup deletes sandboxes.
 - Deployment owns `lathe_test`, never production `lathe`, with a separate Daytona
-  label and volumes disabled. It deletes its toolkit/sandboxes on exit, including
+  label and no extra volumes. It deletes its toolkit/sandboxes on exit, including
   failures and `--no-deploy`. Override with `LATHE_TEST_TOOL_ID`; use `--no-deploy`
   only for intentionally staged source that may be deleted afterward.
 - `monitor_e2e.py` uses fresh Docker OWUI, real OpenRouter/Daytona, environment
@@ -75,7 +77,7 @@ Neither live suite belongs in default pytest collection.
   sanitized evidence. Operation: `CI-MONITOR.md`.
 
 For closing issues: offline tests pass; run integration for Daytona-facing
-changes and deployment for loader/schema/wrapper/interpreter/delegate behavior
+changes and deployment for loader/schema/wrapper/interpreter behavior
 changes. Unit tests do not qualify live HTTP/OWUI boundaries. Pure prose/comment
 edits need offline tests, not paid model qualification solely for wording.
 
@@ -96,17 +98,12 @@ edits need offline tests, not paid model qualification solely for wording.
   making annotations strings. Test both loading modes.
 - **Schema factories**: `_standard_tool` must set both `__signature__` (names,
   defaults) and resolved `__annotations__` (types). OWUI reads both; missing
-  annotations silently degrade schema types. Delegate closures use exec-created
-  real signatures because Pydantic AI reads get_type_hints, not patched signatures.
-- **Docstrings**: `_core_*` `:param:` docs are shared by both wrapper surfaces.
-  Change common behavior in cores; test interface parity at both surfaces.
-- **OWUI floor**: 0.11.0 supports view's image-history conversion. Raise the
+  annotations silently degrade schema types.
+- **Docstrings**: `_core_*` `:param:` docs supply the public tool descriptions.
+  Change tool behavior in cores.
+- **OWUI floor**: 0.12.0 is the supported minimum. Raise the
   frontmatter floor only for concrete required behavior/verified incompatibility,
   backed by upstream evidence, not a speculative version matrix.
-- **Delegate routing**: OWUI-injected request/model metadata and caller token,
-  with `httpx.ASGITransport` into `__request__.app`'s `/api/chat/completions`, preserve
-  connection/workspace/pipe/manifold routing. This is not a separately versioned
-  public API; qualify changes through deployment.
 - **Cold start**: bootstrap from a blank x86_64 Linux Daytona sandbox. Egress
   allowlist only; resolve versions via GitHub API rather than hardcoded URLs;
   install to `/tmp`, prefer static `*-musl` builds. Details: services manpage.
@@ -114,12 +111,12 @@ edits need offline tests, not paid model qualification solely for wording.
 ## Runtime boundaries
 
 Shared `_core_*` functions own tool I/O, without OWUI dunders or sandbox lifecycle.
-Tools wrappers and delegate closures both call them; view is Tools-only. Shared
+Tools wrappers call them. Shared
 Daytona helpers centralize upload/download/script execution. Read actual function
 signatures rather than maintaining a parallel signature catalog here.
 
 `_tool_context` owns HTTP client/error handling for sandbox operations except
-destroy. Manual/handoff calls need no sandbox. Sandbox-backed wrappers call `_ensure_sandbox` for
+destroy. Manual calls need no sandbox. Sandbox-backed wrappers call `_ensure_sandbox` for
 create/start/recover/poll and `_ensure_chat_init` for chat context. Destroy manages
 its own client without creating/recovering a sandbox.
 
@@ -127,8 +124,7 @@ View must return the core `data:image/...;base64,` result byte-identically: OWUI
 uses startswith detection, so prepended text breaks image lifting. Keep harness
 messages queued for a later text result. Reject known non-vision models before
 I/O: architecture input modalities are authoritative, capabilities.vision=false
-is fallback, unknown allows. Do not give view to delegates: their plain-text
-result channel would receive base64 rather than an image.
+is fallback, unknown allows.
 
 ## Preview security
 

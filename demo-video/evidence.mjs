@@ -1,7 +1,14 @@
-export function managedTargetRoot(event, target) {
-  const value = event.arguments?.target;
-  return typeof value === "string" && value.startsWith(`${target}:/`)
-    ? value.slice(target.length + 1) : null;
+export function recipeReadyRoot(event, expected) {
+  if (event.tool !== "bash" || !event.arguments?.command?.includes("app.py")) return null;
+  for (const line of event.output.split(/\r?\n/)) {
+    let result;
+    try { result = JSON.parse(line); } catch { continue; }
+    if (result.service === expected.service && result.port === expected.port
+        && result.expose === `http:${expected.port}`
+        && ["started", "reused"].includes(result.status)
+        && typeof result.root === "string" && result.root.startsWith("/")) return result.root;
+  }
+  return null;
 }
 
 export function matchesToolExpectation(event, expected) {
@@ -9,10 +16,7 @@ export function matchesToolExpectation(event, expected) {
   return expected.tools.includes(event.tool)
     && Object.entries(expected.argumentsEqual || {}).every(([key, value]) =>
       event.arguments?.[key] === value)
-    && (!expected.managedTarget || event.arguments?.target === expected.managedTarget
-      || (typeof event.arguments?.target === "string"
-        && event.arguments.target.startsWith(`${expected.managedTarget}:/`)))
-    && (!expected.bindCheckout || Boolean(managedTargetRoot(event, expected.managedTarget)))
+    && (!expected.recipeReady || Boolean(recipeReadyRoot(event, expected.recipeReady)))
     && contains(event.arguments, expected.argumentContains)
     && contains(event.output, expected.outputContains)
     && (!expected.outputLineEquals || event.output.split(/\r?\n/).some((line) =>

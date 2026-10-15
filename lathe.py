@@ -2,17 +2,15 @@
 title: Lathe
 author: Adam Smith
 author_url: https://adamsmith.as
-description: Coding agent tools (lathe, bash, read, write, edit, glob, grep, view, interpret, delegate, onboard, expose, destroy) backed by per-user sandbox VMs with transparent lifecycle management.
-required_open_webui_version: 0.11.0
-requirements: httpx, httpx-ws, pydantic-ai-slim[openai]~=2.5, cachetools
+description: Coding agent tools (lathe, bash, read, write, edit, glob, grep, view, interpret, onboard, expose, destroy) backed by per-user sandbox VMs with transparent lifecycle management.
+required_open_webui_version: 0.12.0
+requirements: httpx, httpx-ws, pydantic, cachetools
 version: 0.32.0
 licence: MIT
 """
 
 import asyncio
 import base64
-import contextlib
-import hashlib
 import inspect
 import io
 import json
@@ -31,6 +29,7 @@ from pydantic import BaseModel, Field
 
 
 logger = logging.getLogger("lathe")
+_RECIPE_REVISION = "66176be7817aaf3a0b8f30327a69e1bb716edebe"
 
 # ── module-level helpers (invisible to OWUI tool discovery) ──────────
 #
@@ -246,46 +245,16 @@ def _format_bg_bash_notice(cmd_id: str, exit_code: int | None,
     return "\n".join(lines)
 
 
-def _format_bg_delegate_notice(delegate_id: str, elapsed: int,
-                               step_count: int, tool_calls: int,
-                               result_preview: str, error: str | None) -> str:
-    if error:
-        error = error.encode("utf-8")[:2048].decode("utf-8", errors="ignore")
-        lines = [
-            f"[Background delegation failed: DELEGATE-{delegate_id}]",
-            f"Failed after {elapsed}s: {error}",
-        ]
-    else:
-        lines = [
-            f"[Background delegation completed: DELEGATE-{delegate_id}]",
-            f"{step_count} step(s), {tool_calls} tool call(s) (took {elapsed}s)",
-        ]
-        preview = result_preview.encode("utf-8")[-2048:].decode("utf-8", errors="ignore").strip()
-        if preview:
-            lines.append("Result preview:")
-            lines.extend(f"  {pl}" for pl in preview.splitlines()[-10:])
-        else:
-            lines.append("(no result text)")
-    lines.append(f"Result/evidence files: {_delegate_sidecar_dir(delegate_id)}/{{result,error,usage,log}} (failed writes may be unavailable).")
-    return "\n".join(lines)
-
-
 def _shell_quote(s: str) -> str:
     return "'" + s.replace("'", "'\\''") + "'"
 
 
 _EPHEMERAL_ROOT = "/dev/shm/lathe"
-_DURABLE_ROOT = "/tmp/lathe"
 
 
 def _bash_sidecar_dir(cmd_id: str) -> str:
     """Return the tmpfs directory for one bash invocation."""
     return f"{_EPHEMERAL_ROOT}/cmd/{cmd_id}"
-
-
-def _delegate_sidecar_dir(delegate_id: str) -> str:
-    """Return the tmpfs directory for one delegate invocation."""
-    return f"{_EPHEMERAL_ROOT}/delegate/{delegate_id}"
 
 
 def _onboard_script_path(script_id: str) -> str:
@@ -338,7 +307,7 @@ def _parse_env_vars(env_vars: str) -> list[tuple[str, str]]:
 
 # Keys lathe manages itself; admin create-overrides may not clobber them.
 # - name/labels: the per-user lookup invariant (one sandbox per email).
-# - volumes: managed by the persistent_volume valve and _ensure_volume.
+# - volumes: forbidden; Lathe never provisions or mounts volumes.
 _PROTECTED_CREATE_KEYS = frozenset({"name", "labels", "volumes"})
 
 
@@ -372,7 +341,7 @@ def _parse_create_overrides(raw: str) -> dict:
         raise ValueError(
             f"Valves sandbox_create_overrides may not set lathe-managed keys: "
             f"{', '.join(sorted(clobbered))}. These are derived per user "
-            f"(name/labels) or controlled by the persistent_volume valve (volumes)."
+            f"(name/labels) or forbidden (volumes)."
         )
     return overrides
 
@@ -382,12 +351,6 @@ def _get_email(user: dict) -> str:
     if not email:
         raise RuntimeError("No email found for user. Cannot provision sandbox.")
     return email
-
-
-def _extract_pid(output: str) -> str:
-    """Extract PID=<number> from ensure-script output. Returns the number or '?'."""
-    m = re.search(r"PID=(\d+)", output)
-    return m.group(1) if m else "?"
 
 
 _UPSTREAM_HEADER_BLOCKED = frozenset({
@@ -629,286 +592,107 @@ def _human_size(n: int) -> str:
     return f"{b:,.1f} TB"
 
 
-# ── shared glob infrastructure (runs on sandbox) ────────────────────
-#
-# Both _GLOB_SCRIPT and _GREP_SCRIPT need to parse comma-separated
-# glob patterns, resolve absolute vs. relative patterns, and collect
-# matching files.  This shared fragment is prepended to both scripts
-# so the logic lives in one place.
-
-_GLOB_COMMON = r'''
-import fnmatch
+# ── ripgrep adapter (runs on sandbox) ────────────────────────────────
+# Use standard rg matching, ignore rules and traversal, not a second language.
+_GLOB_MAX_LINES = _GREP_MAX_LINES = 100
+_SEARCH_SCRIPT = r'''
+import fcntl
+import hashlib
+import io
+import json
 import os
-import sys
 from pathlib import Path
-
-
-def _parse_pattern(pattern):
-    """Parse comma-separated glob string into (positive, negative) lists.
-
-    Braces are deliberately unsupported rather than silently treated as
-    literals. !-prefixed terms go into the negative list.
-    """
-    if "{" in pattern or "}" in pattern:
-        raise ValueError(
-            "brace expansion is not supported; use comma-separated globs instead"
-        )
-    terms = [term.strip() for term in pattern.split(",")]
-    positive, negative = [], []
-    for term in terms:
-        if not term:
-            continue
-        glob = term[1:] if term.startswith("!") else term
-        if any("**" in part and part != "**" for part in glob.split(os.sep)):
-            raise ValueError("recursive wildcard ** must be a complete path component")
-        if term.startswith("!"):
-            negative.append(term[1:])
-        else:
-            positive.append(term)
-    return positive, negative
-
-
-def _resolve_glob(base, g):
-    """Return (root, relative_pattern) for a glob term.
-
-    Python 3.14 rejects non-relative patterns in Path.glob().
-    For relative patterns, root is the workspace base.
-    For absolute patterns, we extract the longest non-glob prefix
-    as the root and glob relative to it, so the agent can glob
-    anywhere on the filesystem, not just within the workspace.
-    """
-    absolute = g.startswith("/")
-    parts = g.split(os.sep)
-    prefix = []
-    for i, part in enumerate(parts):
-        if any(c in part for c in ("*", "?", "[")):
-            break
-        prefix.append(part)
-    else:
-        path = Path(g) if absolute else base / g
-        if path.is_dir():
-            return path.resolve(), "**/*"
-        return path.parent.resolve(), path.name
-    if absolute:
-        root_dir = Path(os.sep.join(prefix) or os.sep).resolve()
-    else:
-        root_dir = (base / os.sep.join(prefix)).resolve()
-    rel = os.sep.join(parts[i:])
-    return root_dir, rel
-
-
-def _glob_matches(path, pattern):
-    """Match slash-separated path components with explicit ** semantics."""
-    path_parts = path.replace(os.sep, "/").split("/") if path else []
-    pattern_parts = pattern.replace(os.sep, "/").split("/")
-    memo = {}
-
-    def match(path_i, pattern_i):
-        key = (path_i, pattern_i)
-        if key in memo:
-            return memo[key]
-        if pattern_i == len(pattern_parts):
-            result = path_i == len(path_parts)
-        elif pattern_parts[pattern_i] == "**":
-            result = match(path_i, pattern_i + 1) or (
-                path_i < len(path_parts) and match(path_i + 1, pattern_i)
-            )
-        else:
-            result = (
-                path_i < len(path_parts)
-                and fnmatch.fnmatchcase(path_parts[path_i], pattern_parts[pattern_i])
-                and match(path_i + 1, pattern_i + 1)
-            )
-        memo[key] = result
-        return result
-
-    return match(0, 0)
-
-
-def _iter_tree_files(root, max_depth=None, depth=1):
-    """Yield files depth-first without retaining the traversed tree."""
-    try:
-        entries = os.scandir(root)
-    except OSError:
-        return
-    with entries:
-        for entry in entries:
-            try:
-                if entry.is_dir(follow_symlinks=False):
-                    if max_depth is None or depth < max_depth:
-                        yield from _iter_tree_files(entry.path, max_depth, depth + 1)
-                elif entry.is_file():
-                    yield os.path.abspath(entry.path)
-            except OSError:
-                continue
-
-
-def _prepare_globs(base, globs):
-    prepared = []
-    for g in globs:
-        root, rel = _resolve_glob(base, g)
-        if root.is_dir():
-            prepared.append((str(root), rel))
-    return prepared
-
-
-def _matches_any(filepath, globs):
-    for root, pattern in globs:
-        rel = os.path.relpath(filepath, root)
-        if rel != os.pardir and not rel.startswith(os.pardir + os.sep):
-            if _glob_matches(rel, pattern):
-                return True
-    return False
-
-
-def _traversal_roots(globs):
-    """Return non-overlapping roots so each candidate file is visited once."""
-    roots = []
-    for root in sorted({root for root, _ in globs}, key=lambda p: (p.count(os.sep), p)):
-        if not any(os.path.commonpath((root, kept)) == kept for kept in roots):
-            roots.append(root)
-    return roots
-
-
-def _iter_matching_files(base, positive, negative):
-    """Yield included files once without retaining candidates."""
-    negative_globs = _prepare_globs(base, negative)
-    positive_globs = _prepare_globs(base, positive)
-    for root in _traversal_roots(positive_globs):
-        max_depth = 0
-        for glob_root, pattern in positive_globs:
-            if os.path.commonpath((glob_root, root)) != root:
-                continue
-            parts = pattern.split(os.sep)
-            if "**" in parts:
-                max_depth = None
-                break
-            root_depth = len(os.path.relpath(glob_root, root).split(os.sep))
-            if glob_root == root:
-                root_depth = 0
-            max_depth = max(max_depth, root_depth + len(parts))
-        for filepath in _iter_tree_files(root, max_depth):
-            if (_matches_any(filepath, positive_globs)
-                    and not _matches_any(filepath, negative_globs)):
-                yield filepath
-'''
-
-# ── bounded search results (runs on sandbox) ─────────────────────────
-# Scan the complete scope for exact counts, retaining only max_lines hits.
-# The header carries omissions, leaving even a one-line budget useful.
-# Traversal order is filesystem-dependent; sorting only the retained sample
-# must not be mistaken for a globally sorted prefix or representative sample.
-
-_GLOB_MAX_LINES = 100
-
-_GLOB_SCRIPT = _GLOB_COMMON + r'''
-
-
-def glob_hierarchy(base_dir, pattern, max_lines):
-    base = Path(base_dir).resolve()
-    if not base.is_dir():
-        return f"Error: not a directory: {base_dir}"
-
-    try:
-        positive, negative = _parse_pattern(pattern)
-    except ValueError as e:
-        return f"Error: invalid glob pattern {pattern!r}: {e}"
-    if not positive:
-        return f"Error: pattern must include at least one positive glob (got {pattern!r})"
-
-    matches = []
-    match_count = 0
-    for filepath in _iter_matching_files(base, positive, negative):
-        match_count += 1
-        if len(matches) < max_lines:
-            matches.append(filepath)
-
-    if match_count == 0:
-        return f"0 matches for {pattern!r} in {base}"
-
-    header = f"{match_count} matches for {pattern!r} (base: {base})"
-    if match_count > len(matches):
-        header += f"; showing {len(matches)}, {match_count - len(matches)} omitted (traversal-order sample)"
-    return header + "\n" + "\n".join(sorted(matches))
-'''
-
-
-# ── grep (runs on sandbox) ───────────────────────────────────────────
-
-_GREP_MAX_LINES = 100
-
-_GREP_SCRIPT = _GLOB_COMMON + r'''
 import re
+import shutil
+import subprocess
+import tarfile
+import tempfile
+import urllib.request
 
-_MAX_LINE_WIDTH = 200
+
+def _ripgrep():
+    installed = shutil.which("rg")
+    if installed:
+        return installed
+    root = Path("/tmp/lathe")
+    root.mkdir(parents=True, exist_ok=True)
+    binary = root / "rg"
+    with (root / "rg.lock").open("w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if binary.is_file() and os.access(binary, os.X_OK):
+            return str(binary)
+        def fetch(url, limit):
+            with urllib.request.urlopen(url, timeout=20) as response:
+                data = response.read(limit + 1)
+            if len(data) > limit:
+                raise ValueError("ripgrep download exceeds size limit")
+            return data
+        release = json.loads(fetch("https://api.github.com/repos/BurntSushi/ripgrep/releases/latest", 2_000_000))
+        tag = release["tag_name"]
+        if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", tag):
+            raise ValueError("invalid ripgrep release tag")
+        name = f"ripgrep-{tag}-x86_64-unknown-linux-musl"
+        asset, = (a for a in release["assets"] if a["name"] == name + ".tar.gz")
+        url = f"https://github.com/BurntSushi/ripgrep/releases/download/{tag}/{name}.tar.gz"
+        digest = asset.get("digest", "")
+        if asset["browser_download_url"] != url or not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
+            raise ValueError("ripgrep asset lacks a verified URL/digest")
+        archive = fetch(url, 32_000_000)
+        if hashlib.sha256(archive).hexdigest() != digest[7:]:
+            raise ValueError("ripgrep checksum mismatch")
+        with tarfile.open(fileobj=io.BytesIO(archive), mode="r:gz") as tar:
+            member = tar.getmember(name + "/rg")
+            if not member.isfile() or member.size > 32_000_000:
+                raise ValueError("invalid ripgrep archive member")
+            data = tar.extractfile(member).read()
+        with tempfile.NamedTemporaryFile(dir=root, delete=False) as staged:
+            staged.write(data)
+        try:
+            os.chmod(staged.name, 0o755)
+            os.replace(staged.name, binary)
+        finally:
+            if os.path.exists(staged.name):
+                os.unlink(staged.name)
+    return str(binary)
 
 
-def grep_hierarchy(base_dir, regex, files_pattern, max_lines):
+def search(base_dir, pattern, files, max_lines):
     base = Path(base_dir).resolve()
     if not base.is_dir():
-        return f"Error: not a directory: {base_dir}"
-
-    # ── Compile regex ────────────────────────────────────────────
-    try:
-        pat = re.compile(regex)
-    except re.error as e:
-        return f"Error: invalid regex {regex!r}: {e}"
-
-    try:
-        positive, negative = _parse_pattern(files_pattern)
-    except ValueError as e:
-        return f"Error: invalid files pattern {files_pattern!r}: {e}"
-    if not positive:
-        return f"Error: files pattern must include at least one positive glob (got {files_pattern!r})"
-
-    # Retain a single bounded list, not max_lines hits for every file.
-    hits = []
-    files_scanned = 0
-    matched_files = 0
-    total_matches = 0
-    skipped_files = 0
-
-    for filepath in _iter_matching_files(base, positive, negative):
-        files_scanned += 1
-        previous_counts = total_matches, matched_files, len(hits)
-        try:
-            with open(filepath, "rb") as raw:
-                header = raw.read(8192)
-            if b"\0" in header:
-                skipped_files += 1
-                continue
-            with open(filepath, "r", errors="replace") as f:
-                file_matched = False
-                for i, line in enumerate(f, 1):
-                    if pat.search(line):
-                        total_matches += 1
-                        if not file_matched:
-                            matched_files += 1
-                            file_matched = True
-                        if len(hits) < max_lines:
-                            text = line.rstrip("\n\r")
-                            if len(text) > _MAX_LINE_WIDTH:
-                                text = text[:_MAX_LINE_WIDTH] + "..."
-                            hits.append((filepath, i, text))
-        except (OSError, UnicodeDecodeError):
-            total_matches, matched_files, previous_hits = previous_counts
-            del hits[previous_hits:]
-            skipped_files += 1
-            continue
-
-    if files_scanned == 0:
-        return f"0 files match {files_pattern!r} in {base}"
-
-    header = f"{total_matches} matches across {matched_files} files for {regex!r}"
-    header += f"; searched {files_scanned - skipped_files} readable files (scope: {files_pattern!r}, base: {base})"
-    if total_matches > len(hits):
-        header += f"; showing {len(hits)}, {total_matches - len(hits)} omitted (traversal-order sample)"
-    if skipped_files:
-        header += f"; {skipped_files} binary or unreadable files skipped (counts cover readable text only)"
-    output = [f"{filepath}:{line_num}: {text}" for filepath, line_num, text in sorted(hits)]
-    return header + ("\n" + "\n".join(output) if output else "")
+        return "Error: search base is not a directory"
+    if files.startswith("/"):
+        return "Error: use a workspace-relative ripgrep glob, or bash for other roots"
+    args = [_ripgrep(), "--color=never", "--no-config", "--glob", files]
+    if pattern is None:
+        args += ["--files"]
+    else:
+        args += ["--line-number", "--with-filename", "--max-columns", "200",
+                 "--max-columns-preview", "--regexp", pattern]
+    args += ["--", str(base)]
+    lines = []
+    with tempfile.TemporaryFile() as errors:
+        with subprocess.Popen(args, cwd=base, stdout=subprocess.PIPE, stderr=errors) as proc:
+            try:
+                for line in proc.stdout:
+                    lines.append(line.decode("utf-8", errors="replace").rstrip("\r\n"))
+                    if len(lines) > max_lines:
+                        proc.terminate()
+                        break
+            finally:
+                proc.stdout.close()
+                proc.wait()
+            limited = len(lines) > max_lines
+            errors.seek(0)
+            error = errors.read(2000).decode("utf-8", errors="replace").strip()
+            if not limited and proc.returncode not in (0, 1):
+                return "Error: ripgrep: " + (error or f"exit {proc.returncode}")
+    header = f"{min(len(lines), max_lines)} results" + (" (limit reached; narrow search, total not counted)" if limited else "")
+    if error:
+        header += "\nWarning: " + error
+    return header + ("\n" + "\n".join(lines[:max_lines]) if lines else "")
 '''
 
+_GLOB_SCRIPT = _GREP_SCRIPT = _SEARCH_SCRIPT
 
 # ── read script (runs on sandbox) ───────────────────────────────────
 #
@@ -1116,33 +900,10 @@ class _ToolFailure(RuntimeError):
 
 def _checked_result(result: str) -> str:
     # Legacy sandbox scripts have a reserved error prefix. Normalize it once at
-    # the internal boundary; user-facing wrappers and delegate tools render prose.
+    # the internal boundary; user-facing wrappers render prose.
     if result.startswith("Error:"):
         raise _ToolFailure(result.removeprefix("Error:").strip())
     return result
-
-
-async def _download_file(valves, sandbox_id: str, client: httpx.AsyncClient,
-                         path: str, *, max_bytes: int = _MAX_BYTES) -> str:
-    """Download a file from the sandbox. Returns file content as text.
-
-    Returns None if the file does not exist (404). Raises on other errors.
-    """
-    async with client.stream("GET",
-        _toolbox(valves, sandbox_id, "/files/download"),
-        params={"path": path},
-        headers=_headers(valves),
-        timeout=60.0,
-    ) as resp:
-        if resp.status_code == 404:
-            return None
-        resp.raise_for_status()
-        content = bytearray()
-        async for chunk in resp.aiter_bytes(chunk_size=8192):
-            if len(content) + len(chunk) > max_bytes:
-                raise _ToolFailure(f"File exceeds {max_bytes} byte text limit: {path}. Use read() for an explicit preview or prepare a smaller reference file.")
-            content.extend(chunk)
-        return content.decode("utf-8", errors="replace")
 
 
 async def _run_sandbox_script(valves, sandbox_id: str, client: httpx.AsyncClient,
@@ -1175,15 +936,13 @@ async def _run_sandbox_script(valves, sandbox_id: str, client: httpx.AsyncClient
 
 # ── shared tool cores ───────────────────────────────────────────────
 #
-# Each _core_* function encapsulates the I/O logic for a tool.  Both
-# the Tools class methods and the delegate closures call these, so
-# behavior stays in sync.  The dependency signature is explicit:
+# Each _core_* function encapsulates the I/O logic for a tool, called
+# by the Tools class methods. The dependency signature is explicit:
 # (valves, sandbox_id, client, **tool_params) -> str.
 #
 # Docstrings on _core_* are the **single source of truth** for tool
-# descriptions and parameter docs.  Use :param: format.  Both OWUI and
-# pydantic-ai parse :param: natively.  _standard_tool and
-# _build_delegate_tool copy docstrings onto their generated functions;
+# descriptions and parameter docs. Use :param: format, parsed natively
+# by OWUI. _standard_tool copies docstrings onto generated functions;
 # hand-written methods (bash) set __doc__ directly.
 
 
@@ -1495,22 +1254,21 @@ async def _core_edit(valves, sandbox_id: str, client: httpx.AsyncClient, *,
 async def _core_glob(valves, sandbox_id: str, client: httpx.AsyncClient, *,
                      pattern: str, max_lines: int = _GLOB_MAX_LINES) -> str:
     """Search for files in the sandbox workspace by glob pattern.
-    Returns concrete absolute paths and an exact count of discovered files.
-    Scans the full scope, but retains at most max_lines paths. The header
-    reports omissions; narrow the pattern to see other files. Truncated
-    results are a traversal-order sample, not a globally sorted prefix.
+    Thin ripgrep --files adapter: returns bounded absolute paths, not exhaustive
+    counts. Uses rg ignore/hidden-file rules and traversal order.
 
-    :param pattern: Comma-separated globs, !-prefix to exclude. Supports *, ?, character classes, and ** as a complete component for directory recursion; brace expansion is not supported. Examples: '**/*.py', 'src/**/*.ts,!**/node_modules/**'.
+    :param pattern: One workspace-relative ripgrep glob, e.g. '**/*.py' or '*.{js,ts}'. No comma-separated pattern language. rg supports braces and ! exclusion. Use bash with rg for multiple globs, hidden/ignored files, or other roots.
     :param max_lines: Max concrete result lines, excluding the summary header (default: 100, clamped to 1–500).
     """
     clamped = max(1, min(500, max_lines))
     base_dir = "/home/daytona/workspace"
     script = (
         _GLOB_SCRIPT
-        + f"\nprint(glob_hierarchy({base_dir!r}, {pattern!r}, {clamped!r}))"
+        + f"\nprint(search({base_dir!r}, None, {pattern!r}, {clamped!r}))"
     )
     return await _run_sandbox_script(
         valves, sandbox_id, client, script, error_prefix="glob script failed",
+        timeout_ms=120000, http_timeout=150.0,
     )
 
 
@@ -1518,24 +1276,23 @@ async def _core_grep(valves, sandbox_id: str, client: httpx.AsyncClient, *,
                      pattern: str, files: str = "**/*",
                      max_lines: int = _GREP_MAX_LINES) -> str:
     """Search file contents in the sandbox workspace by regex.
-    Returns concrete absolute path:line: text hits and counts of matching
-    lines and files. Scans the full scope, skipping binary/unreadable files,
-    but retains at most max_lines hits (text clipped to 200 characters).
-    The header reports omissions; narrow files or pattern to see other hits.
-    Truncated results are a traversal-order sample, not a representative one.
+    Thin ripgrep adapter: returns bounded absolute path:line:text hits with
+    rg regex, ignore and binary-file semantics. Stops at the result limit,
+    without exhaustive counts. Long matches use rg's 200-column preview.
 
-    :param pattern: Regex to search for (e.g. 'import.*asyncio', 'TODO|FIXME').
-    :param files: File scope as comma-separated globs (default: '**/*'). !-prefix to exclude. Supports *, ?, character classes, and ** as a complete component for directory recursion; brace expansion is not supported.
+    :param pattern: Ripgrep regex, e.g. 'import.*asyncio' or 'TODO|FIXME'. No Python lookaround/backreferences.
+    :param files: One workspace-relative ripgrep glob (default: '**/*'); braces supported. Use bash with rg for multiple globs, hidden/ignored files, or other roots.
     :param max_lines: Max concrete result lines, excluding the summary header (default: 100, clamped to 1–500).
     """
     clamped = max(1, min(500, max_lines))
     base_dir = "/home/daytona/workspace"
     script = (
         _GREP_SCRIPT
-        + f"\nprint(grep_hierarchy({base_dir!r}, {pattern!r}, {files!r}, {clamped!r}))"
+        + f"\nprint(search({base_dir!r}, {pattern!r}, {files!r}, {clamped!r}))"
     )
     return await _run_sandbox_script(
         valves, sandbox_id, client, script, error_prefix="grep script failed",
+        timeout_ms=120000, http_timeout=150.0,
     )
 
 
@@ -1561,10 +1318,6 @@ async def _core_grep(valves, sandbox_id: str, client: httpx.AsyncClient, *,
 #      then reject every later turn.  The Tools wrapper refuses view() up
 #      front for such models (_model_supports_vision), before any sandbox
 #      work happens.
-#
-# view() is deliberately withheld from the delegate sub-agent: pydantic-ai
-# returns tool results to the sub-model as plain text, so the data URI
-# convention never fires and the base64 would flood the sub-agent context.
 
 _VIEW_MAX_BYTES = 4 * 1024 * 1024  # 4 MiB, under Anthropic's 5 MB/image limit
 
@@ -2511,8 +2264,7 @@ def _build_snapshot_script(project_path: str) -> str:
         + _SKILL_CATALOG_SCRIPT
         + textwrap.dedent("""\
     # ── Directory listing (flat, one level) ──────────────────────
-    for label, path in [("Workspace", PROJECT),
-                        ("Volume", "/home/daytona/volume")]:
+    for label, path in [("Workspace", PROJECT)]:
         if os.path.isdir(path):
             entries = sorted(os.listdir(path))
             lines = []
@@ -2641,631 +2393,6 @@ async def _ensure_chat_init(
     )
 
 
-# ── delegate() sub-agent infrastructure ─────────────────────────────
-
-# Default foreground wait for delegate() before auto-backgrounding.
-_DELEGATE_FOREGROUND_SECONDS = 30
-
-
-def _format_delegate_background(delegate_id: str, elapsed: int, log_preview: str) -> str:
-    """Format the background descriptor returned when a delegate is auto-backgrounded."""
-    did = delegate_id
-    if not log_preview.strip():
-        log_preview = "(no progress yet)"
-    return (
-        f"{log_preview}\n\n"
-        f"[Backgrounded after {elapsed}s — sub-agent is still running]\n"
-        f"DELEGATE={did}\n"
-        f"Ref {_EPHEMERAL_ROOT}/delegate/$DELEGATE/{{task,log,result,error,usage}}\n"
-        f"See lathe(manpage=\"delegate\") for background monitoring recipes.\n"
-        f"Tell the user the delegate is running. Don't poll until they ask or "
-        f"you have a concrete reason to expect completion."
-    )
-
-
-def _build_delegate_prompt(task: str, file_sections: list[str]) -> str:
-    """Build the user message for a delegate sub-agent."""
-    parts: list[str] = [f"## Task\n\n{task}"]
-    if file_sections:
-        parts.append(f"## Reference Files\n\n" + "\n\n".join(file_sections))
-    return "\n\n".join(parts)
-
-
-
-def _build_delegate_system_prompt(max_steps: int, *, has_volume: bool = True) -> str:
-    """Build the delegate system prompt, embedding the step budget."""
-    volume_line = (
-        "- /home/daytona/volume is persistent storage that survives sandbox destruction.\n"
-        if has_volume else ""
-    )
-    step_word = "step" if max_steps == 1 else "steps"
-    return textwrap.dedent(f"""\
-        You are a focused sub-agent with direct access to a Linux sandbox.
-        You have been delegated a specific task by the calling agent.
-
-        ## Step budget
-
-        You have {max_steps} {step_word} total. Each step is one inference call (thinking +
-        tool calls count as one step). When you stop calling tools and produce a
-        text response, that is your final step.
-
-        Plan accordingly:
-        - With a one-step budget, finish directly from the task and reference files.
-          No tools are available. If the task requires sandbox access or changes,
-          state that it cannot be completed with max_steps=1 and that the caller
-          should retry with max_steps>=2. Do not claim unperformed work was completed.
-        - For a {max_steps}-step budget, reserve at least the last step for writing
-          your summary. Do not start new investigation branches when you are near
-          the limit.
-        - If you are running low on steps, hand off your work rather than rushing
-          to finish. A clear handoff is far more valuable than getting cut off
-          with no output. Your handoff should include:
-            1. What you accomplished.
-            2. What remains unresolved — specific next steps, not vague TODOs.
-            3. Absolute paths to critical files in the sandbox that the calling
-               agent or a follow-up sub-agent would need to pick up the work
-               (source files you modified, test files that are failing, config
-               you discovered, logs worth reading).
-
-        ## Rules
-
-        - Be autonomous. Make decisions. Do not ask questions — the user cannot see you.
-        - Your final text response (when you stop calling tools) is your deliverable.
-          It will be returned to the calling agent as a single tool result. Make it a
-          concise summary of what you did and what you found. Include relevant data,
-          file paths, error messages, or code snippets — whatever the caller needs to
-          act on your findings.
-        - Do not repeat the task description back. Jump straight into working.
-        - All file paths must be absolute (e.g. /home/daytona/workspace/file.py).
-        - The default working directory is /home/daytona/workspace.
-        {volume_line}\
-        - Commands are non-interactive. Use -y flags where needed.
-        - You cannot expose URLs or interact with the user. Focus on the sandbox.
-        - If you encounter an error, try to recover or work around it. Report what
-          happened in your final summary.
-        """)
-
-# Tools withheld from the sub-agent and their reasons (for reference):
-#   lathe()    — sub-agent gets instructions via system prompt
-#   onboard()  — caller already has project context
-#   expose()   — user-facing; sub-agent has no user to give a URL to
-#   destroy()  — irreversible lifecycle operation
-#   delegate() — no recursion
-#   view()     — data-URI image returns only fire through OWUI's tool
-#                middleware; the sub-agent's pydantic-ai result channel is
-#                plain text, so the base64 would flood its context
-
-
-# ── handoff() instructions ──────────────────────────────────────────
-#
-# Returned verbatim by the handoff() tool.  The agent reads these
-# instructions and writes the handoff document as streamed reply text.
-# No tool calls, no sandbox I/O — the agent already has everything it
-# needs in context.
-
-_HANDOFF_INSTRUCTIONS = textwrap.dedent("""\
-    You just called handoff(). Your job now is to write a handoff
-    document as your reply to the user. Follow these rules exactly:
-
-    ## Format
-
-    Your reply has three parts, in order:
-
-    1. **User instruction** — a short sentence telling the user to
-       start a new conversation (with agent tools enabled) and paste
-       everything below the line as their opening message.
-
-    2. **Horizontal rule** — a markdown `---` on its own line.
-
-    3. **Handoff body** — everything below the line is what the user
-       will paste into the new conversation. The next agent reads it
-       cold.        Start with a single orienting sentence in the user's
-       evident chat style (same language, register, formality),
-       e.g. "We were just working in a long session on the task
-       below." Then the structured sections
-       (skip any that are empty):
-
-       ### Goal
-       What the user is trying to accomplish. Include verbatim quotes
-       of key user requests to prevent drift.
-
-       ### Accomplished
-       What was done in this conversation. Be specific: name files
-       modified, commands run, decisions made and why.
-
-       ### Unresolved
-       What remains. Specific next steps, not vague TODOs. If a task
-       was partially done, say exactly where it left off.
-
-       ### Key files
-       Absolute sandbox paths the next agent should read or pass as
-       context_files. Only include paths that actually exist and
-       matter — not every file touched.
-
-       ### What didn't work
-       Approaches that were tried and failed, so the next agent
-       doesn't repeat them. Skip this section if nothing failed.
-
-    ## Rules
-
-    - Do NOT make any tool calls. Write the handoff as your reply
-      text, then stop.
-    - End this response after the handoff. If the user later asks to
-      continue here, follow their request; a handoff does not close the
-      conversation or override later user instructions.
-    - The handoff body should be dense and factual. The next agent
-      will read it cold — assume no prior context.
-    - Reference sandbox file paths rather than inlining code. The
-      sandbox persists across conversations — files written in this
-      session will be there in the next one. The next agent can read
-      them or pass them as context_files to delegate().
-    - Keep the total handoff under ~2000 words. A focused handoff is
-      more useful than an exhaustive one.
-    """)
-
-
-_DELEGATE_BASH_FOREGROUND_SECONDS = 15
-
-# Nudge threshold: inject a wrap-up reminder when this many steps remain.
-_DELEGATE_NUDGE_REMAINING = 2
-
-def _build_delegate_tool(core_fn, *, infra_args: tuple,
-                         default_overrides: dict | None = None,
-                         extra_infra_kwargs: dict | None = None):
-    """Build a single pydantic-ai Tool from a _core_* function.
-
-    Creates a closure with the correct Python signature (param names,
-    types, defaults) so pydantic-ai can introspect it for JSON schema.
-    Uses exec() to produce a real function (pydantic-ai reads
-    get_type_hints(), which ignores __signature__ patches).
-
-    Args:
-        core_fn: The _core_* function to wrap.
-        infra_args: Positional args to prepend (valves, sandbox_id, client).
-        default_overrides: Override default values for specific params,
-            e.g. {"foreground_seconds": 15} for bash in delegate context.
-        extra_infra_kwargs: Extra keyword args passed to core_fn that are
-            NOT tool-visible (e.g. user_pairs for bash).
-    """
-    from pydantic_ai import Tool
-
-    core_sig = inspect.signature(core_fn)
-    tool_params = []
-    for name, param in core_sig.parameters.items():
-        if name in _CORE_INFRA_PARAMS:
-            continue
-        if default_overrides and name in default_overrides:
-            param = param.replace(default=default_overrides[name])
-        tool_params.append(param)
-
-    # Build the function source with correct signature
-    param_parts = []
-    for p in tool_params:
-        ann = p.annotation
-        ann_name = ann.__name__ if hasattr(ann, "__name__") else str(ann)
-        if p.default != inspect.Parameter.empty:
-            param_parts.append(f"{p.name}: {ann_name} = _defaults[{p.name!r}]")
-        else:
-            param_parts.append(f"{p.name}: {ann_name}")
-    sig_str = ", ".join(param_parts)
-
-    kwarg_parts = [f"{p.name}={p.name}" for p in tool_params]
-    kwargs_str = ", ".join(kwarg_parts)
-
-    defaults = {
-        p.name: p.default
-        for p in tool_params
-        if p.default != inspect.Parameter.empty
-    }
-
-    fn_name = core_fn.__name__.replace("_core_", "")
-
-    # The exec namespace provides the captured variables and type annotations
-    ns: dict = {
-        "_core_fn": core_fn,
-        "_infra_args": infra_args,
-        "_extra_kwargs": extra_infra_kwargs or {},
-        "_defaults": defaults,
-        # Execution output may legitimately start with "Error:". Those cores
-        # raise on failure; legacy structured tool replies reserve the prefix.
-        "_checked_result": (lambda result: result) if core_fn in (_core_bash, _core_interpret) else _checked_result,
-        "_ToolFailure": _ToolFailure,
-    }
-    # Import type names so annotations resolve in the exec'd function
-    for p in tool_params:
-        ann = p.annotation
-        if hasattr(ann, "__name__") and ann.__name__ not in ns:
-            ns[ann.__name__] = ann
-
-    code = (
-        f"async def {fn_name}({sig_str}) -> str:\n"
-        f"    try:\n"
-        f"        return _checked_result(await _core_fn(*_infra_args, **_extra_kwargs, {kwargs_str}))\n"
-        f"    except _ToolFailure as exc:\n"
-        f"        return f'Error: {{exc}}'\n"
-    )
-    exec(code, ns)
-    fn = ns[fn_name]
-    fn.__doc__ = inspect.getdoc(core_fn) or ""
-
-    return Tool(fn)
-
-
-def _build_delegate_tools(valves, sandbox_id: str, client: httpx.AsyncClient,
-                          user_pairs: list[tuple[str, str]],
-                          chat_state: LRUCache = None, chat_id: str = "",
-                          interpreter_state: dict = None):
-    """Build pydantic-ai Tool objects that operate against a resolved sandbox.
-
-    Returns a list of Tool instances. Each tool is a thin closure over the
-    already-resolved sandbox_id and client -- no per-call sandbox lookup.
-    The closures delegate to the shared _core_* functions.
-    """
-    infra = (valves, sandbox_id, client)
-
-    all_tools = [
-        _build_delegate_tool(
-            _core_bash, infra_args=infra,
-            default_overrides={"foreground_seconds": _DELEGATE_BASH_FOREGROUND_SECONDS},
-            extra_infra_kwargs={"user_pairs": user_pairs},
-        ),
-        _build_delegate_tool(_core_read, infra_args=infra),
-        _build_delegate_tool(_core_write, infra_args=infra),
-        _build_delegate_tool(_core_edit, infra_args=infra),
-        _build_delegate_tool(_core_glob, infra_args=infra),
-        _build_delegate_tool(_core_grep, infra_args=infra),
-    ]
-
-    # Parent and delegates deliberately share one identity registry.
-    if interpreter_state is not None and chat_id:
-        all_tools.append(_build_delegate_tool(
-            _core_interpret, infra_args=infra,
-            extra_infra_kwargs={"interpreter_state": interpreter_state, "chat_id": chat_id},
-        ))
-
-    return all_tools
-
-
-VOLUME_MOUNT_PATH = "/home/daytona/volume"
-
-# ── Service fast-path constants ──────────────────────────────────────
-
-_DUFS_BIN = f"{_DURABLE_ROOT}/dufs"
-_DUFS_PORT = 5000  # dufs default
-_DUFS_ROOT = "/home/daytona/workspace"
-
-
-def _service_root_check(root: str) -> str:
-    """Validate the real sandbox directory before starting a rooted service."""
-    return textwrap.dedent(f"""\
-        python3 - {_shell_quote(root)} <<'PY'
-        import os
-        import sys
-        root = os.path.realpath(sys.argv[1])
-        workspace = os.path.realpath('/home/daytona/workspace')
-        if not os.path.isdir(root) or os.path.commonpath((root, workspace)) != workspace:
-            raise SystemExit('Service root must be an existing directory within /home/daytona/workspace')
-        PY
-        """)
-
-def _build_verified_archive_install(repo: str, product: str,
-                                    install_root: str) -> str:
-    """Build the shared GitHub release-asset verification and install block."""
-    return textwrap.dedent(f"""\
-        TMP=$(mktemp -d {_shell_quote(install_root + '/.install.XXXXXX')})
-        trap 'rm -rf "$TMP"' EXIT
-        curl -fsSL https://api.github.com/repos/{repo}/releases/latest -o "$TMP/release.json"
-        python3 - "$TMP/release.json" "$TMP/asset.json" <<'PY'
-        import json
-        import re
-        import sys
-
-        repo = {repo!r}
-        product = {product!r}
-        release = json.load(open(sys.argv[1]))
-        tag = release.get("tag_name")
-        canonical = release.get("url")
-        if not isinstance(tag, str) or not re.fullmatch(r"[A-Za-z0-9._-]+", tag):
-            raise SystemExit("invalid release tag")
-        if not isinstance(canonical, str) or not re.fullmatch(
-            rf"https://api\\.github\\.com/repos/{{re.escape(repo)}}/releases/[1-9][0-9]*",
-            canonical,
-        ):
-            raise SystemExit("release document has no canonical release ID")
-        if product == "dufs":
-            name = f"dufs-{{tag}}-x86_64-unknown-linux-musl.tar.gz"
-        else:
-            if not tag.startswith("v") or len(tag) == 1:
-                raise SystemExit("invalid code-server release tag")
-            name = f"code-server-{{tag[1:]}}-linux-amd64.tar.gz"
-        matches = [asset for asset in release.get("assets", []) if asset.get("name") == name]
-        if len(matches) != 1:
-            raise SystemExit(f"expected exactly one release asset named {{name}}")
-        asset = matches[0]
-        expected_url = f"https://github.com/{{repo}}/releases/download/{{tag}}/{{name}}"
-        if asset.get("browser_download_url") != expected_url:
-            raise SystemExit("release asset URL is inconsistent with its release")
-        digest = asset.get("digest")
-        if not isinstance(digest, str) or not re.fullmatch(r"sha256:[0-9a-f]{{64}}", digest):
-            raise SystemExit("release asset has no valid SHA-256 digest")
-        json.dump({{"name": name, "url": expected_url, "sha256": digest[7:]}}, open(sys.argv[2], "w"))
-        PY
-        ASSET_URL=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["url"])' "$TMP/asset.json")
-        EXPECTED=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["sha256"])' "$TMP/asset.json")
-        curl -fsSL "$ASSET_URL" -o "$TMP/archive.tar.gz"
-        ACTUAL=$(sha256sum "$TMP/archive.tar.gz" | cut -d' ' -f1)
-        test "$ACTUAL" = "$EXPECTED"
-        mkdir "$TMP/unpack"
-        tar -xzf "$TMP/archive.tar.gz" -C "$TMP/unpack"
-        """)
-
-
-def _build_dufs_ensure_script(install_root: str = _DURABLE_ROOT,
-                              serve_root: str = _DUFS_ROOT) -> str:
-    """Build dufs' idempotent, verified install and startup script."""
-    binary = f"{install_root}/dufs"
-    script = textwrap.dedent(f"""\
-        set -e
-        {_service_root_check(serve_root).rstrip()}
-        mkdir -p {_shell_quote(install_root)}
-        if ! test -x {_shell_quote(binary)}; then
-        """)
-    script += _build_verified_archive_install("sigoden/dufs", "dufs", install_root)
-    script += textwrap.dedent(f"""\
-          test -f "$TMP/unpack/dufs"
-          chmod 755 "$TMP/unpack/dufs"
-          python3 -c 'import os,sys; os.replace(sys.argv[1], sys.argv[2])' \
-            "$TMP/unpack/dufs" {_shell_quote(binary)}
-        fi
-        PID=$(ss -tlnp | grep ':{_DUFS_PORT} ' | grep -o 'pid=[0-9]*' | head -1 | cut -d= -f2 || true)
-        if test -n "$PID"; then
-          CMD=$(tr '\\0' ' ' < "/proc/$PID/cmdline")
-          printf '%s' "$CMD" | grep -Fq {_shell_quote(binary)} \
-            || {{ echo 'Port {_DUFS_PORT} is occupied by another process' >&2; exit 1; }}
-          printf '%s' "$CMD" | grep -Fq {_shell_quote(serve_root)} \
-            || {{ echo 'dufs is serving a different root' >&2; exit 1; }}
-          test -f {_shell_quote(install_root + '/dufs.root')} && test "$(cat {_shell_quote(install_root + '/dufs.root')})" = {_shell_quote(serve_root)} \
-            || {{ echo 'dufs is already serving a different root' >&2; exit 1; }}
-          if printf '%s' "$CMD" | grep -Eq -- '(^| )--allow-(all|symlink)( |$)'; then
-            echo 'Running dufs permits outside-root symlinks; stop it and call expose again' >&2
-            exit 1
-          fi
-          for FLAG in --allow-upload --allow-delete --allow-search --allow-archive --allow-hash; do
-            printf '%s' "$CMD" | grep -Eq -- "(^| )$FLAG( |$)" \
-              || {{ echo 'Running dufs lacks the managed file-browser options; stop it and call expose again' >&2; exit 1; }}
-          done
-        else
-          printf '%s' {_shell_quote(serve_root)} > {_shell_quote(install_root + '/dufs.root')}
-          nohup {_shell_quote(binary)} {_shell_quote(serve_root)} \
-            --allow-upload --allow-delete --allow-search --allow-archive --allow-hash \
-            > {_shell_quote(install_root + '/dufs.log')} 2>&1 &
-          for i in 1 2 3 4 5; do
-            ss -tlnp | grep -q ':{_DUFS_PORT} ' && break
-            sleep 0.2
-          done
-        fi
-        PID=$(ss -tlnp | grep ':{_DUFS_PORT} ' | grep -o 'pid=[0-9]*' | head -1 | cut -d= -f2)
-        test -n "$PID"
-        echo "READY PID=$PID"
-        """)
-    return script
-
-
-_DUFS_ENSURE_SCRIPT = _build_dufs_ensure_script()
-
-_TTYD_BIN = f"{_DURABLE_ROOT}/ttyd"
-_TTYD_PORT = 7681
-_TTYD_ROOT = "/home/daytona/workspace"
-
-# Resolve both assets from one release document, verify before installation,
-# then refuse to treat an unrelated listener on ttyd's port as success.
-_TTYD_ENSURE_SCRIPT = textwrap.dedent(f"""\
-    set -e
-    mkdir -p {_DURABLE_ROOT}
-    if ! test -x {_TTYD_BIN}; then
-      TMP=$(mktemp -d)
-      trap 'rm -rf "$TMP"' EXIT
-      curl -fsSL https://api.github.com/repos/tsl0922/ttyd/releases/latest -o "$TMP/release.json"
-      BIN_URL=$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(next(a["browser_download_url"] for a in d["assets"] if a["name"] == "ttyd.x86_64"))' "$TMP/release.json")
-      SUMS_URL=$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(next(a["browser_download_url"] for a in d["assets"] if a["name"] == "SHA256SUMS"))' "$TMP/release.json")
-      curl -fsSL "$BIN_URL" -o "$TMP/ttyd.x86_64"
-      curl -fsSL "$SUMS_URL" -o "$TMP/SHA256SUMS"
-      EXPECTED=$(python3 -c 'import pathlib,sys; print(next(line.split()[0] for line in pathlib.Path(sys.argv[1]).read_text().splitlines() if line.split() and line.split()[-1].lstrip("*") == "ttyd.x86_64"))' "$TMP/SHA256SUMS")
-      ACTUAL=$(sha256sum "$TMP/ttyd.x86_64" | cut -d' ' -f1)
-      test "$ACTUAL" = "$EXPECTED"
-      install -m 755 "$TMP/ttyd.x86_64" {_TTYD_BIN}
-    fi
-    if ss -tlnp | grep -q ':{_TTYD_PORT} '; then
-      ss -tlnp | grep ':{_TTYD_PORT} ' | grep -q ttyd \
-        || {{ echo 'Port {_TTYD_PORT} is occupied by a non-ttyd process' >&2; exit 1; }}
-    else
-      nohup {_TTYD_BIN} -W -p {_TTYD_PORT} -w {_TTYD_ROOT} /bin/bash \
-        > {_DURABLE_ROOT}/ttyd.log 2>&1 &
-      for i in 1 2 3 4 5; do
-        ss -tlnp | grep -q ':{_TTYD_PORT} ' && break
-        sleep 0.2
-      done
-    fi
-    PID=$(ss -tlnp | grep ':{_TTYD_PORT} ' | grep -o 'pid=[0-9]*' | head -1 | cut -d= -f2)
-    test -n "$PID"
-    echo "READY PID=$PID"
-    """)
-
-_SITE_STATE_DIR = f"{_DURABLE_ROOT}/site"
-
-
-def _site_port(site_root: str) -> int:
-    """Map a site root stably into the high unprivileged port range."""
-    digest = hashlib.sha256(site_root.encode("utf-8")).digest()
-    return 20000 + int.from_bytes(digest[:2], "big") % 40000
-
-
-def _build_site_ensure_script(site_root: str, port: int) -> str:
-    """Build an idempotent static-site server script for one absolute root."""
-    root = _shell_quote(site_root)
-    state_dir = f"{_SITE_STATE_DIR}/{port}"
-    return textwrap.dedent(f"""\
-        set -e
-        SITE_ROOT={root}
-        {_service_root_check(site_root).rstrip()}
-        mkdir -p {state_dir}
-        PID=$(ss -tlnp | grep ':{port} ' | grep -o 'pid=[0-9]*' | head -1 | cut -d= -f2 || true)
-        if test -n "$PID"; then
-          CMD=$(tr '\\0' ' ' < "/proc/$PID/cmdline")
-          printf '%s' "$CMD" | grep -Fq 'python3 -m http.server {port}' \
-            || {{ echo 'Assigned site port {port} is occupied by another process' >&2; exit 1; }}
-          if test -f {state_dir}/root && test "$(cat {state_dir}/root)" = "$SITE_ROOT"; then
-            echo "READY PID=$PID"
-            exit 0
-          fi
-          echo 'Assigned site port {port} belongs to a different Lathe site (hash collision)' >&2
-          exit 1
-        fi
-        printf '%s' "$SITE_ROOT" > {state_dir}/root
-        nohup python3 -m http.server {port} --bind 0.0.0.0 --directory "$SITE_ROOT" \
-          > {state_dir}/log 2>&1 &
-        for i in 1 2 3 4 5; do
-          ss -tlnp | grep -q ':{port} ' && break
-          sleep 0.2
-        done
-        PID=$(ss -tlnp | grep ':{port} ' | grep -o 'pid=[0-9]*' | head -1 | cut -d= -f2)
-        test -n "$PID"
-        echo "READY PID=$PID"
-        """)
-
-_CS_BIN = f"{_DURABLE_ROOT}/code-server/bin/code-server"
-_CS_PORT = 8080
-_CS_ROOT = "/home/daytona/workspace"
-
-def _build_code_server_ensure_script(install_root: str = _DURABLE_ROOT,
-                                     serve_root: str = _CS_ROOT) -> str:
-    """Build code-server's idempotent, verified install and startup script."""
-    install_dir = f"{install_root}/code-server"
-    binary = f"{install_dir}/bin/code-server"
-    script = textwrap.dedent(f"""\
-        set -e
-        {_service_root_check(serve_root).rstrip()}
-        mkdir -p {_shell_quote(install_root)}
-        if ! test -x {_shell_quote(binary)}; then
-        """)
-    script += _build_verified_archive_install("coder/code-server", "code-server", install_root)
-    script += textwrap.dedent(f"""\
-          NAME=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["name"])' "$TMP/asset.json")
-          VERSION=${{NAME#code-server-}}
-          VERSION=${{VERSION%-linux-amd64.tar.gz}}
-          STAGED="$TMP/unpack/code-server-$VERSION-linux-amd64"
-          test -x "$STAGED/bin/code-server"
-          python3 - "$STAGED" {_shell_quote(install_dir)} {_shell_quote(install_root + '/.code-server-install.lock')} <<'PY'
-        import fcntl
-        import os
-        import shutil
-        import sys
-
-        staged, destination, lock_path = sys.argv[1:]
-        with open(lock_path, "w") as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX)
-            binary = os.path.join(destination, "bin", "code-server")
-            if os.access(binary, os.X_OK):
-                raise SystemExit(0)
-            if os.path.isdir(destination) and not os.path.islink(destination):
-                shutil.rmtree(destination)
-            elif os.path.lexists(destination):
-                os.unlink(destination)
-            os.rename(staged, destination)
-        PY
-        fi
-        PID=$(ss -tlnp | grep ':{_CS_PORT} ' | grep -o 'pid=[0-9]*' | head -1 | cut -d= -f2 || true)
-        if test -n "$PID"; then
-          CMD=$(tr '\\0' ' ' < "/proc/$PID/cmdline")
-          printf '%s' "$CMD" | grep -Fq {_shell_quote(binary)} \
-            || {{ echo 'Port {_CS_PORT} is occupied by another process' >&2; exit 1; }}
-          printf '%s' "$CMD" | grep -Fq {_shell_quote(serve_root)} \
-            || {{ echo 'code-server is serving a different root' >&2; exit 1; }}
-          test -f {_shell_quote(install_root + '/code-server.root')} && test "$(cat {_shell_quote(install_root + '/code-server.root')})" = {_shell_quote(serve_root)} \
-            || {{ echo 'code-server is already serving a different root' >&2; exit 1; }}
-        else
-          printf '%s' {_shell_quote(serve_root)} > {_shell_quote(install_root + '/code-server.root')}
-          nohup {_shell_quote(binary)} --bind-addr 0.0.0.0:{_CS_PORT} --auth none {_shell_quote(serve_root)} \
-            > {_shell_quote(install_root + '/code-server.log')} 2>&1 &
-          for i in 1 2 3 4 5 6 7 8 9 10; do
-            ss -tlnp | grep -q ':{_CS_PORT} ' && break
-            sleep 0.5
-          done
-        fi
-        PID=$(ss -tlnp | grep ':{_CS_PORT} ' | grep -o 'pid=[0-9]*' | head -1 | cut -d= -f2)
-        test -n "$PID"
-        echo "READY PID=$PID"
-        """)
-    return script
-
-
-
-_CS_ENSURE_SCRIPT = _build_code_server_ensure_script()
-
-
-async def _ensure_volume(valves, volume_name: str, client: httpx.AsyncClient) -> str:
-    """Get or create a Daytona volume by name. Polls until ready. Returns the volume ID."""
-    encoded_name = urllib.parse.quote(volume_name, safe="")
-    get_url = _api(valves, f"/volumes/by-name/{encoded_name}")
-
-    # Try to fetch existing volume (treat deleting volumes as absent)
-    resp = await client.get(get_url, headers=_headers(valves), timeout=30.0)
-    need_create = (
-        resp.status_code != 200
-        or resp.json().get("state") in ("pending_delete", "deleting")
-    )
-    if need_create:
-        # Create the volume.  Retry loop handles the race where a
-        # recently-deleted volume name hasn't fully freed up yet.
-        for attempt in range(30):
-            resp = await client.post(
-                _api(valves, "/volumes"),
-                headers=_headers(valves),
-                json={"name": volume_name},
-                timeout=30.0,
-            )
-            if resp.status_code == 400 and "already exists" in resp.text:
-                # Deletion still propagating — wait and retry.
-                await asyncio.sleep(2)
-                resp = await client.get(get_url, headers=_headers(valves), timeout=30.0)
-                if resp.status_code == 200:
-                    state = resp.json().get("state")
-                    if state not in ("pending_delete", "deleting"):
-                        break
-                continue
-            resp.raise_for_status()
-            break
-        else:
-            raise RuntimeError(
-                f"Could not create volume '{volume_name}' — "
-                f"name still reserved by a deleting volume after 60s of retries"
-            )
-
-    vol = resp.json()
-    vol_id = vol["id"]
-
-    # Poll until the volume is ready (creation involves S3 provisioning).
-    # Tolerate transient 404s — the by-name index may lag behind creation.
-    if vol.get("state") == "ready":
-        return vol_id
-
-    deadline = time.time() + 60
-    poll_interval = 1.0
-    while time.time() < deadline:
-        await asyncio.sleep(poll_interval)
-        resp = await client.get(get_url, headers=_headers(valves), timeout=30.0)
-        if resp.status_code == 404:
-            poll_interval = min(poll_interval * 1.2, 5.0)
-            continue
-        resp.raise_for_status()
-        vol = resp.json()
-        if vol.get("state") == "ready":
-            return vol_id
-        poll_interval = min(poll_interval * 1.2, 5.0)
-
-    raise RuntimeError(f"Volume '{volume_name}' did not reach ready state within 60s (state: {vol.get('state')})")
-
-
 async def _wait_for_toolbox(valves, sandbox_id: str, client: httpx.AsyncClient, emitter=None, *, wait: bool = True):
     """Ensure the workspace exists, retrying toolbox startup only during lifecycle work."""
     attempts = 30 if wait else 1
@@ -3366,8 +2493,8 @@ async def _ensure_sandbox(valves, email: str, client: httpx.AsyncClient, emitter
             )
 
         # 2. Build the create request. Admin overrides layer over lathe's
-        # tunable defaults (language, autoStop/Archive/Delete); the
-        # structural keys (name/labels/volumes) are forced last so a
+        # tunable defaults (language, autoStop/Archive/Delete).
+        # Identity keys are forced last; volume overrides are forbidden so a
         # misconfigured override can never break the per-user lookup
         # invariant. _parse_create_overrides already rejects those keys,
         # but forcing them here is belt-and-suspenders.
@@ -3381,14 +2508,7 @@ async def _ensure_sandbox(valves, email: str, client: httpx.AsyncClient, emitter
             "name": sandbox_name,
             "labels": {label_key: email},
         }
-        if valves.persistent_volume:
-            volume_name = f"{label_key}/{email}"
-            volume_id = await _ensure_volume(valves, volume_name, client)
-            create_json["volumes"] = [
-                {"volumeId": volume_id, "mountPath": VOLUME_MOUNT_PATH}
-            ]
-
-        # 3. Create new sandbox (with or without volume)
+        # 3. Create new sandbox (workspace persists across stop/archive)
         await _emit(emitter, "Preparing sandbox...")
         resp = await client.post(
             _api(valves, "/sandbox"),
@@ -3573,10 +2693,6 @@ class Tools:
             -1,
             description="Minutes after archive before sandbox is permanently deleted (-1 = never). Example: 129600 = 90 days.",
         )
-        persistent_volume: bool = Field(
-            True,
-            description="Mount a persistent S3/FUSE volume at /home/daytona/volume. Disable for deployments with limited data retention.",
-        )
         auto_create_sandbox: bool = Field(
             True,
             description=(
@@ -3601,7 +2717,7 @@ class Tools:
                 "create request, e.g. "
                 '{"cpu":2,"memory":4,"disk":20,"snapshot":"my-snapshot","target":"us"}. '
                 "Resource fields (cpu/memory/disk) are integers in cores/GB. "
-                "Cannot override name, labels, or volumes (managed by lathe)."
+                "Cannot override name or labels, or attach volumes."
             ),
         )
         foreground_timeout_seconds: int = Field(
@@ -3635,7 +2751,7 @@ class Tools:
 
     # Manpage strings are interpolated via plain str.replace() in the
     # lathe() method, NOT str.format().  Known placeholders today:
-    # {tool_catalog}, {volume_note}, {destroy_volume_note}, {preview_access_note}. Unknown
+    # {tool_catalog}, {recipe_revision}, {preview_access_note}. Unknown
     # placeholders pass through unchanged (no KeyError), and literal
     # braces in shell/JSON/regex snippets (${VAR}, {pid,log,exit},
     # {"key":"value"}, {n,m}) are always safe.  If you add a new dynamic
@@ -3664,8 +2780,9 @@ class Tools:
 
             **Common — user downloads and uploads via dufs:**
             Ask the user to download the file on their own machine, then
-            upload it to the sandbox through the dufs file browser. Call
-            expose(target="dufs", access="private") to get the URL. Choose public
+            upload it to the sandbox through the dufs file browser. Run
+            the dufs recipe from the services manual, then
+            expose(target="http:5000", access="private") to get the URL. Choose public
             only if the user explicitly requests public/world access; missing
             private wrapping is not permission to downgrade. This handles any
             file type and host, subject to the deployment's upload limits.
@@ -3815,58 +2932,37 @@ class Tools:
             - No stdin interaction. The code runs non-interactively.
             - Default timeout is 120 seconds. Pass timeout=0 for no limit,
               or a custom value in seconds.
-            - Output is the raw stdout/stderr stream from the REPL. Large
-              outputs are not truncated (unlike bash), so be mindful of
-              printing huge data structures.
+            - stdout/stderr previews are bounded to 50 KiB. Save large results
+              to files and inspect selected ranges instead of printing them.
 
-            ## Sub-agent access
-
-            Delegates (sub-agents) share the same interpreter context as the
-            outer conversation. A delegate can define a variable that the
-            outer model later reads, or vice versa. This is useful for
-            shared computations. Context creation is serialized, but Python
-            executions are not: avoid concurrent mutation of shared variables.
             """),
         "services": textwrap.dedent("""\
             # Lathe — Service Details
 
-            Use the expose() tool description for
-            normal one-step operation. This page is for implementation details,
-            recovery, and configurations outside the named fast paths.
+            Start applications with bash(), then expose(target="http:<port>",
+            access="private"). expose never installs or starts applications.
+            Shells and IDEs provide arbitrary execution: always keep them private.
 
-            ## Lifecycle and state
+            ## On-demand repository recipes
 
-            Named targets install and start themselves when called. Call the same
-            expose() target again after sandbox sleep or a failed process; there is
-            no separate install command. Binaries and logs under /tmp/lathe survive
-            stop/restart but not destroy(). A preview registration neither keeps the
-            sandbox awake nor restarts its process.
-
-            - dufs[:/absolute/path]: port 5000; binary /tmp/lathe/dufs; log /tmp/lathe/dufs.log.
-            - ttyd: port 7681; binary /tmp/lathe/ttyd; log /tmp/lathe/ttyd.log.
-            - code-server[:/absolute/path]: port 8080; install /tmp/lathe/code-server; log
-              /tmp/lathe/code-server.log.
-            - site:/absolute/path: stable path-derived port in 20000–59999; state
-              and logs under /tmp/lathe/site/<port>/.
-
-            Multiple site: paths can run simultaneously. The same path reuses its
-            server. A path-hash collision or unrelated listener on an assigned port
-            fails rather than replacing or exposing the wrong process.
-            All named directory roots must exist inside /home/daytona/workspace,
-            including after symlink resolution. Bare dufs and code-server use the
-            workspace itself. Each uses one fixed port: a different root cannot
-            replace a running instance. code-server's root is its initial folder,
-            not filesystem confinement: its terminal can access the whole sandbox.
-            Managed dufs permits upload, delete, search, folder ZIP downloads, and
-            file hashes; it refuses symlinks pointing outside the served root. An
-            older running dufs process with broader permissions must be stopped
-            before expose() will return a URL. Static sites use Python's HTTP
-            server, which can follow symlinks inside the served directory.
-
-            Managed dufs, ttyd, and code-server artifacts are resolved from one
-            saved GitHub release document and verified before atomic installation.
-            dufs and code-server use GitHub's immutable release-asset SHA-256 digest;
-            ttyd uses that release's upstream SHA256SUMS asset.
+            Recipe revision: {recipe_revision}
+            Use the cached snapshot when present. Otherwise bootstrap the pinned
+            revision (never main or a moving tag):
+            ```sh
+            test -f "$HOME/.cache/lathe/recipes/{recipe_revision}/app.py" || {
+              curl -fsSL https://raw.githubusercontent.com/rndmcnlly/lathe/{recipe_revision}/recipes/bootstrap.sh -o /tmp/lathe-recipes-bootstrap.sh && sh /tmp/lathe-recipes-bootstrap.sh {recipe_revision}
+            }
+            ```
+            Then run with bash(), choosing an absolute existing workspace root:
+            ```sh
+            python3 ~/.cache/lathe/recipes/{recipe_revision}/app.py dufs --root /home/daytona/workspace --port 5000
+            ```
+            Read the JSON READY metadata, then expose http:5000 privately.
+            Other recipes: ttyd (7681), code-server (8080), site (8000).
+            Recipes own installation, process identity checks, startup and logs.
+            After sandbox sleep, rerun the same recipe before renewing exposure.
+            The ordinary sandbox filesystem survives stop/archive, not destroy.
+            Preview registration neither keeps a sandbox awake nor restarts a process.
 
             {preview_access_note}
 
@@ -3893,158 +2989,6 @@ class Tools:
             rules and direct/upstream bypass routes. Exposure does not secure
             alternate paths into the sandbox application.
 
-            ## Manual configurations
-
-            Named targets intentionally cover common configurations. For a custom
-            service, start it with bash() and expose its port with http:<port>.
-            This includes custom dufs roots or permissions, ttyd options, and
-            code-server flags. The generic route does not inherit named-target
-            policy: the caller remains responsible for process lifecycle and the
-            explicit public/private access choice.
-
-            Example custom code-server process:
-            ```
-            nohup /tmp/lathe/code-server/bin/code-server --bind-addr 0.0.0.0:8080 --auth none /home/daytona/workspace &
-            ```
-            Then expose target="http:8080" with private access.
-
-            If a named target fails, report its returned setup error rather than
-            silently substituting another service or weaker access mode. Use bash()
-            to inspect the corresponding log only when diagnosis is needed.
-            """),
-        "delegate": textwrap.dedent("""\
-            # Lathe — Delegate
-
-            ## What delegate() does
-
-            delegate(task, context_files, max_steps, foreground_seconds)
-            spawns an autonomous sub-agent that runs the same model against
-            the same sandbox. The sub-agent has access to: bash, read,
-            write, edit, glob, grep. It does NOT have: lathe, onboard,
-            expose, destroy, or delegate (no recursion).
-
-            max_steps caps inference calls (default 10, max 30), including
-            the final response. Reserve time for a summary; a wrap-up nudge
-            near the limit does not guarantee completion.
-
-            A one-step delegation is context-only: the sub-agent receives the task
-            and any context_files, but no tools. Use max_steps=1 for single-shot
-            analysis of supplied material. Tasks requiring sandbox inspection or
-            changes need max_steps>=2 so one request can call tools and another can
-            produce the final response.
-
-            ## Foreground vs. background execution
-
-            Like bash(), delegate() has a foreground window controlled by
-            foreground_seconds (default 30, max 300). If the sub-agent
-            finishes within this window, its result is returned inline
-            (same as before). If the window expires, the delegation is
-            auto-backgrounded: you get a descriptor with sidecar paths,
-            and the sub-agent continues running asynchronously.
-
-            ### Sidecar files
-
-            Where DELEGATE=/dev/shm/lathe/delegate/<id>:
-
-              DELEGATE/task    — the original task description
-              DELEGATE/log     — timestamped progress entries (live)
-              DELEGATE/result  — final sub-agent output (on success)
-              DELEGATE/error   — error message (on failure)
-              DELEGATE/usage   — JSON: steps, tool_calls, tokens
-
-            DELEGATE/result or DELEGATE/error appears when the sub-agent
-            finishes. Absence of both means it's still running.
-            Sidecars remain available until the sandbox stops or restarts.
-
-            Read the returned result/error paths to collect completion, log
-            for progress, and usage for cost. Tell the user background work
-            is running; poll only when asked or when completion is expected.
-
-            ## Scope and parallel work
-
-            Delegate bounded investigation, changes, or batch work, not a
-            single tool operation or work requiring user interaction/expose.
-            Include the goal, constraints, errors, and completion criteria
-            in task: the sub-agent cannot ask clarifying questions.
-
-            For independent tasks, use foreground_seconds=0 and collect each
-            result. All delegates share the filesystem: assign disjoint edit
-            scopes or coordinate explicitly to avoid overwriting each other.
-
-            ## The context_files parameter
-
-            Pass a list of absolute sandbox paths (e.g. AGENTS.md, SKILL.md,
-            config files) whose contents should be injected into the
-            sub-agent's prompt. The files are fetched once at delegation
-            time and appear as a "Reference Files" section — the sub-agent
-            sees their full contents without spending steps reading them.
-            References have an aggregate 50 KiB budget including headings.
-            Oversized files fail before inference; they are never silently clipped.
-            Prepare smaller references, or have the sub-agent use read() previews.
-
-            Pass relevant AGENTS.md/SKILL.md paths discovered via onboard()
-            rather than duplicating their contents in task.
-
-            All paths must be absolute. Delegation fails immediately if
-            any path does not exist on the sandbox.
-
-            ## Step budget and handoff behavior
-
-            With 2 steps remaining, Lathe nudges for a handoff: accomplished,
-            unresolved, and critical absolute file paths. A delegate can still
-            exhaust its budget without useful output. Simplify the task or
-            increase max_steps; use reported files as follow-up context_files.
-
-            ## Cost model
-
-            Each step is a full inference call billed to the same provider.
-            Token cost varies with context and output; max_steps caps calls,
-            not tokens or dollars. Inspect the returned usage summary.
-            """),
-        "handoff": textwrap.dedent("""\
-            # Lathe — Handoff
-
-            ## What handoff() does
-
-            handoff() returns instructions for writing a handoff document.
-            You write the document as your reply to the user — streamed
-            text, not a tool call. The user then starts a new conversation
-            and pastes the handoff as their opening message.
-
-            ## When to use it
-
-            - The user asks to "hand off", "compact", or "save context".
-            - You notice the conversation is getting long and suggest it.
-            - You can suggest the capability on your own, but don't
-              initiate the handoff unless the user agrees.
-
-            ## How it works
-
-            1. You call handoff(). No parameters needed.
-            2. The tool returns formatting instructions.
-            3. You write the handoff document as reply text, following
-               those instructions exactly.
-            4. End that response. Later user requests can continue here.
-
-            The handoff has a short preamble in the user's language
-            telling them what to do, a horizontal rule, then the
-            structured handoff body (Goal, Accomplished, Unresolved,
-            Key files, What didn't work).
-
-            ## Why reply text, not a file?
-
-            Reply text streams to the user in real time. Tool call
-            arguments don't appear until the agent finishes writing them
-            (long delay for big writes). The user should see the handoff
-            forming so they can judge its quality.
-
-            ## The sandbox persists
-
-            The sandbox filesystem survives across conversations. Files
-            you wrote in this session will be there when the user starts
-            a new conversation. The handoff document can reference sandbox
-            paths, and the next agent can read them or use them as
-            context_files in delegate() calls.
             """),
         "overview": textwrap.dedent("""\
             # Lathe Toolkit — Overview
@@ -4052,7 +2996,6 @@ class Tools:
             Work in a per-user Linux sandbox, shared across conversations.
             Tools create/start/recover it automatically. Default working directory:
             /home/daytona/workspace. Use absolute sandbox paths for file tools.
-            {volume_note}\
             Files survive stop/archive; running processes and interpreter state do
             not. Idle stop defaults to 15 minutes. Previews do not keep it awake.
 
@@ -4068,24 +3011,22 @@ class Tools:
 
             - Shell commands are non-interactive; use -y flags as needed.
               Parallelize with separate bash calls, not shell-level & + wait.
-            - bash and delegate auto-background after their foreground window.
+            - bash auto-backgrounds after its foreground window.
               Use the returned sidecar paths to inspect progress/results. Bash
               logs and exit status remain readable for 24 hours after completion;
               later bash calls reap expired results. Sandbox stop/restart clears them.
             - {preview_access_note}
-            - Named expose targets manage service startup/recovery; http:<port>
-              requires an already-running service. ttyd/code-server are private-only.
-            - destroy is irreversible and requires user confirmation.{destroy_volume_note}
+            - Start services with bash or repository recipes, then expose http:<port>.
+              Never expose shells or IDEs publicly.
+            - destroy is irreversible and requires user confirmation.
 
             ## Read details only when needed
 
             Call lathe(manpage="...") with:
             - "interpret": persistent Python state and limitations (vs. one-shot bash).
-            - "delegate": bounded autonomous work, context files, background results, costs.
             - "background": shell-job sidecars and peek/poll/kill recipes.
             - "services": browser file transfer, sites, terminals, IDEs, headers, recovery.
             - "egress": network allowlist and user-assisted workarounds for blocked hosts.
-            - "handoff": user-approved context transfer to a new conversation.
             - "version": installed toolkit version.
 
             ## Available tools
@@ -4101,8 +3042,6 @@ class Tools:
     _MANPAGE_INDEX: dict[str, str] = {
         "overview": "Big-picture orientation: sandbox model, tool catalog, key workflows, gotchas.",
         "interpret": "Persistent Python REPL: state model, when to use vs bash, limitations.",
-        "delegate": "Sub-agent delegation: foreground/background, sidecar files, agent teams, cost model.",
-        "handoff": "Context handoff: writing a handoff document for continuing work in a new conversation.",
         "services": "Advanced service details: lifecycle, ports, logs, manual configuration, and recovery.",
         "background": "Background job sidecar files, and peek/poll/kill recipes.",
         "egress": "Egress restrictions, workarounds (dufs upload, browser-side fetch), Tier 3.",
@@ -4117,7 +3056,7 @@ class Tools:
     ) -> str:
         """
         Read operational orientation or a task-specific manual page.
-        :param manpage: "overview" for safeguards and page index; "interpret", "delegate", "background", "services", "egress", "handoff" for details; "version" for installed version.
+        :param manpage: "overview" for safeguards and page index; "interpret", "background", "services", "egress" for details; "version" for installed version.
         """
         type_err = _check_tool_params({"manpage": manpage}, type(self).lathe)
         if type_err:
@@ -4134,21 +3073,12 @@ class Tools:
 
         if manpage in self._MANPAGES:
             content = self._MANPAGES[manpage]
-            volume_note = (
-                "- /home/daytona/volume is S3/FUSE-backed persistent storage that\n"
-                "              survives sandbox destruction.\n            "
-                if self.valves.persistent_volume else ""
-            )
-            destroy_volume_note = (
-                " The volume is preserved." if self.valves.persistent_volume else ""
-            )
             # Use .replace() rather than .format() so manpages with literal
             # braces (e.g. shell snippets like ${VAR}, regex {n,m}) don't blow
             # up with KeyError, and so missing placeholders are silently
             # tolerated rather than fatal.
             content = content.replace("{tool_catalog}", tool_catalog)
-            content = content.replace("{volume_note}", volume_note)
-            content = content.replace("{destroy_volume_note}", destroy_volume_note)
+            content = content.replace("{recipe_revision}", _RECIPE_REVISION)
             preview_note = (
                 "HTTP expose requires an explicit public/private access choice. Public requests try the wrapper, "
                 "then fall back to a direct signed bearer URL if wrapping is unavailable or refused (unless upstream_headers are requested). "
@@ -4176,17 +3106,6 @@ class Tools:
             f"Call lathe(manpage=\"overview\") for big-picture orientation."
         )
 
-    async def handoff(
-        self,
-        __user__: dict = {},
-        __event_emitter__=None,
-    ) -> str:
-        """
-        Get formatting instructions for a user-approved handoff to a fresh chat. Write it as reply text, then end this response; later user requests may continue here.
-        """
-        await _emit(__event_emitter__, "Handoff", done=True)
-        return _HANDOFF_INSTRUCTIONS
-
     async def destroy(
         self,
         __user__: dict = {},
@@ -4196,16 +3115,10 @@ class Tools:
         """
         Permanently destroy the sandbox VM. Irreversible.
         Prompts the user for confirmation before proceeding.
-        If a persistent volume is attached, its data is preserved and will reappear in the next sandbox.
         """
         # Gate on real human consent via OWUI's confirmation dialog.
-        has_volume = self.valves.persistent_volume
         if __event_call__:
             message = (
-                "This will permanently destroy the sandbox VM and "
-                "all its contents. Persistent volume data is preserved. "
-                "This action cannot be undone."
-                if has_volume else
                 "This will permanently destroy the sandbox VM and "
                 "all its contents. This action cannot be undone."
             )
@@ -4295,13 +3208,6 @@ class Tools:
 
                 await _emit(__event_emitter__, "Sandbox destroyed", done=True)
                 ids = sid[:12]
-                if has_volume:
-                    return (
-                        f"Destroyed 1 sandbox(es) ({ids})."
-                        f" Your persistent files in {VOLUME_MOUNT_PATH} are intact"
-                        f" and will reappear in your next sandbox."
-                        f" A fresh sandbox will be created on the next tool call."
-                    )
                 return (
                     f"Destroyed 1 sandbox(es) ({ids})."
                     f" A fresh sandbox will be created on the next tool call."
@@ -4417,9 +3323,8 @@ class Tools:
                 user_pairs = _parse_env_vars(raw_env)
 
             # Negative (default) falls back to the valve setting.
-            # 0 means immediate background (fire-and-forget), matching
-            # delegate() semantics.  Positive values are the foreground
-            # window in seconds.
+            # 0 means immediate background (fire-and-forget).
+            # Positive values are the foreground window in seconds.
             if foreground_seconds < 0:
                 fg_seconds = self.valves.foreground_timeout_seconds
             else:
@@ -4510,8 +3415,8 @@ class Tools:
         # Capability gate: refuse cleanly when the current model cannot
         # accept image input.  Checked BEFORE _ensure_sandbox so a refusal
         # never spins up a VM.  __metadata__["model"] reflects the user's
-        # actual selection more reliably than __model__ (same dispatch
-        # quirk noted in delegate()).
+        # actual selection more reliably than __model__ in multi-model
+        # chats and some tool-invocation paths.
         model = __metadata__.get("model") if isinstance(__metadata__, dict) else None
         if not isinstance(model, dict) or not model:
             model = __model__ if isinstance(__model__, dict) else {}
@@ -4545,427 +3450,6 @@ class Tools:
         return await _tool_context(__event_emitter__, _run, harness)
     view.__doc__ = inspect.getdoc(_core_view)
 
-    async def delegate(
-        self,
-        task: str,
-        context_files: list[str] = [],
-        max_steps: int = 10,
-        foreground_seconds: int = -1,
-        __user__: dict = {},
-        __chat_id__: str = "",
-        __metadata__: dict = {},
-        __model__: dict = {},
-        __request__=None,
-        __event_emitter__=None,
-    ) -> str:
-        """
-        Run bounded autonomous work with the same model and shared sandbox.
-        Has bash/read/write/edit/glob/grep, not user interaction or expose.
-        Returns a summary or background sidecar paths; see lathe(manpage="delegate").
-        :param task: Specific goal, constraints, and findings; the sub-agent cannot ask questions.
-        :param context_files: Absolute sandbox reference files; missing or aggregate >50 KiB (including headings/separators) fails before inference, never silently clips.
-        :param max_steps: Inference-call budget, 1–30 (default 10). At 1, no tools: supplied-context analysis only. Use >=2 for sandbox work.
-        :param foreground_seconds: Wait before auto-backgrounding, 0–300 seconds; 0 backgrounds immediately, -1 uses default 30.
-        """
-        type_err = _check_tool_params(
-            {"task": task, "context_files": context_files, "max_steps": max_steps,
-             "foreground_seconds": foreground_seconds},
-            type(self).delegate,
-        )
-        if type_err:
-            return type_err
-
-        harness = _HarnessDelivery(self._chat_state, __chat_id__)
-
-        async def _run(client):
-            email = _get_email(__user__)
-            sandbox_id, harness.warning = await _ensure_sandbox(self.valves, email, client, __event_emitter__)
-            await _ensure_chat_init(
-                self.valves, sandbox_id, client,
-                self._chat_state, __chat_id__, __user__, __event_emitter__,
-            )
-
-            await _emit(__event_emitter__, "Preparing delegate...")
-
-            # ── Resolve model and build ASGI transport ───────────────
-            if __request__ is None:
-                return "Error: delegate() requires the OWUI request context (__request__). This tool only works inside Open WebUI."
-
-            # OWUI dispatch quirk: __model__["id"] is not always the
-            # user-selected model. In multi-model chats and certain tool-
-            # invocation paths, __model__ has been observed to carry a
-            # different model than the one the user picked, while
-            # __metadata__["model"]["id"] reliably reflects the actual
-            # selection. Prefer metadata; fall back to __model__.
-            metadata_model = __metadata__.get("model") if isinstance(__metadata__, dict) else None
-            metadata_model_id = metadata_model.get("id") if isinstance(metadata_model, dict) else None
-            model_id = metadata_model_id or __model__.get("id", "")
-            if not model_id:
-                return "Error: delegate() could not determine the current model ID."
-
-            # Extract JWT for authenticating against OWUI's own API
-            token = ""
-            try:
-                token = __request__.state.token.credentials
-            except AttributeError:
-                return "Error: delegate() could not extract authentication token from request."
-
-            # Fetch and validate context before allocating the clients owned by
-            # the delegate. The outer tool client remains owned by _tool_context.
-            file_sections: list[str] = []
-            if context_files:
-                for fpath in context_files:
-                    err = _require_abs_path(fpath, "context_files entry")
-                    if err:
-                        return err
-                remaining = _MAX_BYTES - len("## Reference Files\n\n".encode("utf-8"))
-                for fpath in context_files:
-                    heading = f"### {fpath}\n\n"
-                    remaining -= len(heading.encode("utf-8")) + (2 if file_sections else 0)
-                    if remaining < 0:
-                        raise _ToolFailure("context_files exceed the aggregate 50 KiB limit including headings and separators.")
-                    content = await _download_file(
-                        self.valves, sandbox_id, client, fpath, max_bytes=remaining,
-                    )
-                    if content is None:
-                        return (
-                            f"Error: context_files entry not found on sandbox: {fpath}\n"
-                            f"Verify the path exists before delegating."
-                        )
-                    section = heading + content
-                    remaining -= len(content.encode("utf-8"))
-                    if remaining < 0:
-                        raise _ToolFailure("context_files exceed the aggregate 50 KiB limit including headings. Prepare smaller reference files; nothing was silently truncated.")
-                    file_sections.append(section)
-
-            # ASGI transport — in-process call to OWUI's FastAPI app.
-            # Uses /api/chat/completions which handles all model types:
-            # direct connection models, workspace models, AND pipe/manifold
-            # models (which have custom routing like Anthropic caching).
-            # The /openai/chat/completions endpoint only knows about raw
-            # connection models and cannot route pipe models.
-            #
-            # These clients belong to setup until the agent task is launched.
-            # AsyncExitStack closes every client if any setup stage raises;
-            # after launch, _run_agent owns the stack until completion.
-            agent_clients = contextlib.AsyncExitStack()
-            try:
-                app = __request__.app
-                transport = httpx.ASGITransport(app=app)
-                inner_client = await agent_clients.enter_async_context(
-                    httpx.AsyncClient(transport=transport, base_url="http://localhost")
-                )
-
-                from pydantic_ai import Agent, UsageLimits
-                from pydantic_ai.models.openai import OpenAIChatModel
-                from pydantic_ai.providers.openai import OpenAIProvider
-
-                provider = OpenAIProvider(
-                    base_url="http://localhost/api",
-                    api_key=token,
-                    http_client=inner_client,
-                )
-                model = OpenAIChatModel(model_id, provider=provider)
-
-                # ── Collect user env vars for sub-agent bash ─────────
-                user_valves = __user__.get("valves")
-                user_pairs: list[tuple[str, str]] = []
-                if user_valves:
-                    raw_env = getattr(user_valves, "env_vars", "") or ""
-                    user_pairs = _parse_env_vars(raw_env)
-
-                # _tool_context closes `client` when _run() returns, so tools
-                # and sidecars use a client retained by the delegate task.
-                bg_client = await agent_clients.enter_async_context(httpx.AsyncClient())
-                user_message = _build_delegate_prompt(task, file_sections)
-                clamped_steps = max(1, min(30, max_steps))
-                tools = (
-                    _build_delegate_tools(
-                        self.valves, sandbox_id, bg_client, user_pairs,
-                        chat_state=self._chat_state, chat_id=__chat_id__,
-                        interpreter_state=self._interpreter_state,
-                    )
-                    if clamped_steps > 1 else []
-                )
-                agent = Agent(
-                    model,
-                    system_prompt=_build_delegate_system_prompt(
-                        clamped_steps, has_volume=self.valves.persistent_volume,
-                    ),
-                    tools=tools,
-                    output_type=str,
-                )
-
-                delegate_id = str(uuid.uuid4())
-                delegate_dir = _delegate_sidecar_dir(delegate_id)
-                log_path = f"{delegate_dir}/log"
-                result_path = f"{delegate_dir}/result"
-                error_path = f"{delegate_dir}/error"
-                usage_path = f"{delegate_dir}/usage"
-                task_path = f"{delegate_dir}/task"
-
-                _checked_result(await _core_write(
-                    self.valves, sandbox_id, client,
-                    path=task_path, content=task,
-                ))
-                _checked_result(await _core_write(
-                    self.valves, sandbox_id, client,
-                    path=log_path, content="",
-                ))
-                await _emit(__event_emitter__, "Sub-agent starting...")
-            except BaseException:
-                await agent_clients.aclose()
-                raise
-
-            # ── Foreground timeout ───────────────────────────────────
-            # The signature default is -1 (meaning "use the module default").
-            # Explicit 0 means immediate background (fire-and-forget).
-            # Any positive value is the actual foreground window.
-            if foreground_seconds < 0:
-                fg_seconds = _DELEGATE_FOREGROUND_SECONDS
-            else:
-                fg_seconds = min(300, foreground_seconds)
-
-            # Log lines accumulated during execution (for sidecar and
-            # for the background descriptor preview).
-            log_lines: list[str] = []
-
-            async def _append_log(line: str):
-                """Append a timestamped line to the in-memory log and sandbox file."""
-                ts = time.strftime("%H:%M:%S")
-                hint = line.encode("utf-8")[:1024].decode("utf-8", errors="ignore")
-                entry = f"[{ts}] {hint}"
-                log_lines.append(entry)
-                _checked_result(await _core_write(
-                    self.valves, sandbox_id, bg_client,
-                    path=log_path, content="\n".join(log_lines) + "\n",
-                ))
-
-            # ── The actual sub-agent execution coroutine ─────────────
-            # This is separated so it can either run inline (foreground)
-            # or be detached as a background task.
-
-            agent_done = asyncio.Event()
-            agent_result: dict = {}  # populated by _run_agent
-            # Outer scope sets these when backgrounding; _run_agent reads
-            # them via closure (Python closures capture the variable, not
-            # the value, so outer rebinds are visible to the inner function).
-            emit_to_owui = True
-            was_backgrounded = False
-            bg_start_time = time.time()
-
-            async def _run_agent():
-                """Run the sub-agent to completion, writing sidecar files."""
-                step_count = 0
-                nudge_injected = False
-
-                try:
-                    async with agent.iter(
-                        user_message,
-                        usage_limits=UsageLimits(request_limit=clamped_steps),
-                    ) as agent_run:
-                        async for node in agent_run:
-                            if Agent.is_model_request_node(node):
-                                step_count += 1
-                                remaining = clamped_steps - step_count
-                                status = f"Sub-agent thinking... ({step_count}/{clamped_steps})"
-                                await _append_log(status)
-                                if emit_to_owui:
-                                    await _emit(__event_emitter__, status)
-                                # Inject wrap-up nudge when approaching the limit
-                                if (
-                                    remaining <= _DELEGATE_NUDGE_REMAINING
-                                    and remaining > 0
-                                    and not nudge_injected
-                                ):
-                                    agent_run.enqueue(
-                                        f"[SYSTEM: You have {remaining} step(s) remaining out of "
-                                        f"{clamped_steps}. Do not make any more tool calls. Use "
-                                        f"your final step to hand off your work. Write:\n"
-                                        f"1. What you accomplished.\n"
-                                        f"2. What remains unresolved — specific next steps.\n"
-                                        f"3. Absolute paths to critical sandbox files the calling "
-                                        f"agent or a follow-up sub-agent needs to continue "
-                                        f"(modified sources, failing tests, relevant logs).]"
-                                    )
-                                    nudge_injected = True
-
-                            elif Agent.is_call_tools_node(node):
-                                # Extract tool names and args summary
-                                calls = []
-                                for p in node.model_response.parts:
-                                    if hasattr(p, "tool_name"):
-                                        name = p.tool_name
-                                        # Build a short args hint
-                                        try:
-                                            args = p.args_as_dict()
-                                            if name == "bash" and "command" in args:
-                                                cmd = args["command"]
-                                                hint = cmd[:60] + ("..." if len(cmd) > 60 else "")
-                                                calls.append(f"bash({hint!r})")
-                                            elif name in ("read", "write", "edit") and "path" in args:
-                                                path = args["path"]
-                                                short = path.rsplit("/", 1)[-1]
-                                                calls.append(f"{name}({short})")
-                                            elif name in ("glob", "grep") and "pattern" in args:
-                                                calls.append(f"{name}({args['pattern']!r})")
-                                            else:
-                                                calls.append(name)
-                                        except Exception:
-                                            calls.append(name)
-                                if calls:
-                                    tool_status = f"Sub-agent → {', '.join(calls)}"
-                                    await _append_log(tool_status)
-                                    if emit_to_owui:
-                                        await _emit(__event_emitter__, tool_status)
-
-                        usage = agent_run.usage
-                        result_output = agent_run.result.output if agent_run.result else "(no output)"
-
-                    # ── Write sidecar result files ────────────────────
-                    _checked_result(await _core_write(
-                        self.valves, sandbox_id, bg_client,
-                        path=result_path, content=result_output,
-                    ))
-                    usage_data = {
-                        "steps": step_count,
-                        "tool_calls": usage.tool_calls,
-                        "input_tokens": usage.input_tokens,
-                        "output_tokens": usage.output_tokens,
-                    }
-                    _checked_result(await _core_write(
-                        self.valves, sandbox_id, bg_client,
-                        path=usage_path, content=json.dumps(usage_data),
-                    ))
-                    await _append_log(
-                        f"Completed: {step_count} steps, {usage.tool_calls} tool calls"
-                    )
-
-                    agent_result.update({
-                        "ok": True,
-                        "output": result_output,
-                        "step_count": step_count,
-                        "usage": usage,
-                    })
-
-                except Exception as e:
-                    error_type = type(e).__name__
-                    error_detail = str(e)
-                    # Detect provider-level failures (malformed upstream responses)
-                    # and surface a concise, actionable message instead of raw
-                    # pydantic validation noise.
-                    if "UnexpectedModelBehavior" in error_type or (
-                        "validation error" in error_detail.lower()
-                        and "ChatCompletion" in error_detail
-                    ):
-                        error_msg = (
-                            f"Delegation failed after {step_count} step(s): "
-                            f"the inference provider returned a malformed response "
-                            f"(not a valid ChatCompletion). This is usually a transient "
-                            f"upstream issue — retry the delegation."
-                        )
-                    else:
-                        error_msg = f"Delegation failed after {step_count} step(s): {error_type}: {error_detail}"
-                    agent_result.update({
-                        "ok": False,
-                        "error": error_msg,
-                        "step_count": step_count,
-                    })
-                    try:
-                        _checked_result(await _core_write(
-                            self.valves, sandbox_id, bg_client,
-                            path=error_path, content=error_msg,
-                        ))
-                        await _append_log(f"Error: {error_msg}")
-                    except Exception as e2:
-                        agent_result["error"] += f"; failure evidence could not be persisted: {e2}"
-                        logger.debug("delegate: sidecar error write failed: %s", e2)
-
-                finally:
-                    agent_done.set()
-                    # Push a completion notice if the delegate was backgrounded.
-                    if was_backgrounded:
-                        elapsed = int(time.time() - bg_start_time)
-                        notice = _format_bg_delegate_notice(
-                            delegate_id, elapsed,
-                            step_count=agent_result.get("step_count", step_count),
-                            tool_calls=(agent_result.get("usage").tool_calls
-                                        if agent_result.get("usage") else 0),
-                            result_preview=agent_result.get("output", ""),
-                            error=agent_result.get("error"),
-                        )
-                        _push_bg_notice(self._chat_state, __chat_id__, notice)
-                    await agent_clients.aclose()
-
-            # ── Launch and wait with foreground timeout ───────────────
-            # We run _run_agent as a background task. During the foreground
-            # window, we poll agent_done. If it finishes in time, we return
-            # inline. Otherwise, we return a background descriptor and the
-            # task continues.
-
-            try:
-                bg_task = asyncio.ensure_future(_run_agent())
-            except BaseException:
-                await agent_clients.aclose()
-                raise
-
-            # Wait for completion or timeout
-            try:
-                await asyncio.wait_for(
-                    asyncio.shield(agent_done.wait()),
-                    timeout=fg_seconds if fg_seconds > 0 else 0.01,
-                )
-            except asyncio.TimeoutError:
-                pass  # foreground window expired, proceed to background
-
-            if agent_done.is_set():
-                # ── Finished in foreground ───────────────────────────
-                await bg_task
-
-                if agent_result.get("ok"):
-                    result_output, clipped, _ = _truncate_tail(agent_result["output"])
-                    if clipped:
-                        result_output += f"\n[Bounded text preview; full delegate result: {result_path}]"
-                    usage = agent_result["usage"]
-                    step_count = agent_result["step_count"]
-                    parts = [f"{step_count} step(s)", f"{usage.tool_calls} tool call(s)"]
-                    if usage.input_tokens:
-                        parts.append(f"{usage.input_tokens:,} prompt + {usage.output_tokens:,} completion tokens")
-                    usage_note = f"\n\n[Delegate completed: {', '.join(parts)}]"
-                    await _emit(
-                        __event_emitter__,
-                        f"Delegation complete ({step_count} steps, {usage.tool_calls} tool calls)",
-                        done=True,
-                    )
-                    return result_output + usage_note
-                else:
-                    error_msg = agent_result.get("error", "Unknown error")
-                    await _emit(__event_emitter__, "Delegation failed", done=True)
-                    return error_msg
-
-            else:
-                # ── Backgrounded — return descriptor ─────────────────
-                # Kill the emitter BEFORE returning so the still-running
-                # _run_agent coroutine never tries to call it.  The OWUI
-                # response stream will be closed once we return, and
-                # awaiting the emitter after that can hang or raise,
-                # stalling the background task entirely.
-                emit_to_owui = False
-                was_backgrounded = True
-                bg_start_time = time.time()
-
-                elapsed = fg_seconds
-                # Grab recent log lines for the preview
-                preview = "\n".join(log_lines[-10:]) if log_lines else ""
-                await _emit(
-                    __event_emitter__,
-                    f"Delegation backgrounded after {elapsed}s",
-                    done=True,
-                )
-                return _format_delegate_background(delegate_id, elapsed, preview)
-
-        return await _tool_context(__event_emitter__, _run, harness)
-
     async def expose(
         self,
         target: str,
@@ -4976,230 +3460,53 @@ class Tools:
         __chat_id__: str = "",
         __event_emitter__=None,
     ) -> str:
-        """
-        Expose a sandbox service. Named targets manage startup and recovery;
-        http:<port> requires an already-running service. ttyd and code-server are private-only.
-        :param target: "dufs" or "dufs:/absolute/path" for file transfer, "site:/absolute/path" for static files, "ttyd" for a shell, "code-server" or "code-server:/absolute/path" for an IDE, or "http:<port>" for an existing service (port 3000–9999). Named directory roots must be within /home/daytona/workspace; bare names use the workspace. An IDE root is not filesystem confinement.
-        :param access: Required policy: "private" authenticates the owner and fails closed; "public" allows anyone with the URL and may fall back to a direct bearer URL. Choose private unless the user explicitly requests public/world access.
-        :param tag: Optional untrusted hostname hint, such as "vscode" or "files": lowercase letters, digits, and internal hyphens, max 32 characters. The deployment may ignore it. Hostname text never proves identity or purpose.
-        :param upstream_headers: Optional fixed application headers for HTTP and WebSocket forwarding, independent of public/private access. Replaces browser values case-insensitively; supports Authorization. Requires a compatible wrapper, with no direct fallback. Max 16 headers, 64-byte names, printable ASCII values up to 4096 bytes, 8192 bytes total. Routing/transport headers are forbidden. Values remain in tool arguments; see lathe(manpage="services") for trust boundaries.
+        """Expose an already-running HTTP/WebSocket service. Does not install or start applications.
+        :param target: "http:<port>" for a service listening on port 1024–65535. Start it with bash first. See lathe(manpage="services") for recipes.
+        :param access: Required policy: "private" authenticates the owner and fails closed; "public" allows anyone with the URL and may fall back to a direct bearer URL. Choose private unless the user explicitly requests public/world access. Shells and IDEs should always be private.
+        :param tag: Optional untrusted hostname hint: lowercase letters, digits, internal hyphens, max 32 characters. Hostname text never proves identity or purpose.
+        :param upstream_headers: Fixed application headers for HTTP/WebSocket forwarding, independent of access. Replaces browser values case-insensitively; supports Authorization. Requires a compatible wrapper, never direct fallback. Max 16 headers, 64-byte names, printable ASCII values up to 4096 bytes, 8192 bytes total. Routing/transport headers forbidden. Values remain in tool arguments; see services manual for trust boundaries.
         """
         type_err = _check_tool_params(
             {"target": target, "access": access, "tag": tag,
-             "upstream_headers": upstream_headers},
-            type(self).expose,
+             "upstream_headers": upstream_headers}, type(self).expose,
         )
         if type_err:
             return type_err
-
         header_error = _validate_upstream_headers(upstream_headers)
         if header_error:
             return header_error
-
-        target_value = target.strip()
-        target_stripped = target_value.lower()
-        access_stripped = access.strip().lower()
-        site_root = None
-        dufs_root = _DUFS_ROOT if target_stripped == "dufs" else None
-        cs_root = _CS_ROOT if target_stripped == "code-server" else None
-
-        for prefix in ("site:", "dufs:", "code-server:"):
-            if not target_stripped.startswith(prefix):
-                continue
-            root = target_value[len(prefix):].rstrip("/") or "/"
-            path_error = _require_abs_path(root, f"{prefix[:-1]} path")
-            if path_error:
-                return path_error
-            if prefix == "site:":
-                site_root = root
-            elif prefix == "dufs:":
-                dufs_root = root
-            else:
-                cs_root = root
-            break
-
-        for root in (site_root, dufs_root, cs_root):
-            if root is None:
-                continue
-            # Check lexical containment before sandbox I/O; the ensure scripts
-            # also resolve symlinks on the sandbox before startup/signing.
-            if (not root.startswith("/home/daytona/workspace/")
-                    and root != "/home/daytona/workspace") or ".." in root.split("/"):
-                return "Error: service root must be within /home/daytona/workspace."
-
-        if (target_stripped == "ttyd" or cs_root is not None) and access_stripped != "private":
-            service = "ttyd" if target_stripped == "ttyd" else "code-server"
-            return (
-                f"Error: {service} is private-only because it provides arbitrary command "
-                "execution and access to the sandbox environment. Use access=\"private\"."
-            )
-
+        access = access.strip().lower()
+        if access not in ("public", "private"):
+            return 'Error: access must be "public" or "private".'
+        tag = tag.strip().lower()
+        if tag and not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])?", tag):
+            return "Error: tag must be a lowercase DNS label (max 32 characters)."
+        match = re.fullmatch(r"http:([0-9]{1,5})", target.strip().lower())
+        if not match:
+            return 'Error: target must be "http:<port>". Start applications using bash and the services recipes.'
+        port = int(match[1])
+        if not 1024 <= port <= 65535:
+            return "Error: port must be between 1024 and 65535."
         harness = _HarnessDelivery(self._chat_state, __chat_id__)
 
         async def _run(client):
-
-            if access_stripped not in ("public", "private"):
-                return (
-                    f"Error: access must be \"public\" or \"private\". Got: \"{access}\""
-                )
-
-            tag_stripped = tag.strip().lower()
-            if tag_stripped and not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])?", tag_stripped):
-                return (
-                    "Error: tag must be empty or a lowercase DNS label using letters, "
-                    f"digits, and internal hyphens (max 32 characters). Got: \"{tag}\""
-                )
-
-            if (target_stripped != "ttyd" and dufs_root is None and cs_root is None
-                    and site_root is None and not target_stripped.startswith("http:")):
-                return (
-                    f"Error: target must be \"dufs[:/absolute/path]\", \"site:/absolute/path\", \"ttyd\", \"code-server[:/absolute/path]\", or \"http:<port>\" "
-                    f"(e.g. \"http:5000\"). Got: \"{target}\""
-                )
-
             email = _get_email(__user__)
             sandbox_id, harness.warning = await _ensure_sandbox(self.valves, email, client, __event_emitter__)
             await _ensure_chat_init(
                 self.valves, sandbox_id, client,
                 self._chat_state, __chat_id__, __user__, __event_emitter__,
             )
-
-            # ── Shared helper: ensure service + sign URL ────────────
-            async def _ensure_and_sign(ensure_script, script_timeout_ms,
-                                       http_timeout, svc_port, svc_name,
-                                       ready_status, fail_status, result_msg):
-                """Run ensure-script if provided, then sign a preview URL."""
-                pid = "?"
-                if ensure_script:
-                    await _emit(__event_emitter__, f"Preparing {svc_name}...")
-                    resp = await client.post(
-                        _toolbox(self.valves, sandbox_id, "/process/execute"),
-                        headers=_headers(self.valves),
-                        json={"command": ensure_script, "timeout": script_timeout_ms},
-                        timeout=http_timeout,
-                    )
-                    resp.raise_for_status()
-                    data = resp.json()
-                    result = data.get("result", "")
-                    if data.get("exitCode", -1) != 0 or "READY" not in result:
-                        await _emit(__event_emitter__, fail_status, done=True)
-                        return (
-                            f"Error: {svc_name} setup failed (exit {data.get('exitCode')}).\n"
-                            f"{result[:500]}\n\n"
-                            f"This usually means the sandbox cannot reach the install host "
-                            f"(egress filtering). See lathe(manpage=\"egress\") for workarounds, or "
-                            f"install {svc_name} manually and use expose(target=\"http:{svc_port}\", access=\"{access_stripped}\")."
-                        )
-                    pid = _extract_pid(result)
-                else:
-                    await _emit(__event_emitter__, f"Generating URL for port {svc_port}...")
-
-                await _emit(__event_emitter__, "Generating URL...")
-                url, access_note = await _http_preview(
-                    self.valves, sandbox_id, svc_port, __user__, access_stripped,
-                    tag_stripped, client, upstream_headers=upstream_headers,
-                )
-
-                await _emit(__event_emitter__, ready_status, done=True)
-                return result_msg(url, pid) + "\n\n" + access_note
-
-            if dufs_root is not None:
-                return await _ensure_and_sign(
-                    ensure_script=_build_dufs_ensure_script(serve_root=dufs_root),
-                    script_timeout_ms=60000, http_timeout=90.0,
-                    svc_port=_DUFS_PORT, svc_name="dufs",
-                    ready_status="File browser ready",
-                    fail_status="dufs setup failed",
-                    result_msg=lambda url, pid: (
-                        f"File browser URL: {url}\n\n"
-                        f"Give this URL to the user. In their browser they can:\n"
-                        f"- **Upload**: drag and drop files onto the page\n"
-                        f"- **Download**: click any file\n"
-                        f"- **Browse**: navigate folders\n\n"
-                        f"dufs is serving {dufs_root} on port {_DUFS_PORT} (PID {pid})."
-                    ),
-                )
-
-            if site_root is not None:
-                site_port = _site_port(site_root)
-                return await _ensure_and_sign(
-                    ensure_script=_build_site_ensure_script(site_root, site_port),
-                    script_timeout_ms=15000, http_timeout=30.0,
-                    svc_port=site_port, svc_name="static site",
-                    ready_status="Static site ready",
-                    fail_status="Static site setup failed",
-                    result_msg=lambda url, pid: (
-                        f"Static site URL: {url}\n\n"
-                        f"Give this URL to the user. Python is serving {site_root} "
-                        f"on port {site_port} (PID {pid}). The sandbox auto-stops "
-                        f"after ~{self.valves.auto_stop_minutes} min of inactivity, "
-                        f"which ends the server; call expose again to restart it."
-                    ),
-                )
-
-            if target_stripped == "ttyd":
-                return await _ensure_and_sign(
-                    ensure_script=_TTYD_ENSURE_SCRIPT,
-                    script_timeout_ms=60000, http_timeout=90.0,
-                    svc_port=_TTYD_PORT, svc_name="ttyd",
-                    ready_status="Terminal ready",
-                    fail_status="ttyd setup failed",
-                    result_msg=lambda url, pid: (
-                        f"Terminal URL: {url}\n\n"
-                        f"Give this private URL to the user. It provides a full writable "
-                        f"shell with access to the sandbox environment and files.\n\n"
-                        f"ttyd is serving {_TTYD_ROOT} on port {_TTYD_PORT} (PID {pid}). "
-                        f"The sandbox auto-stops after ~{self.valves.auto_stop_minutes} min "
-                        f"of inactivity, which ends the terminal process; call expose again "
-                        f"to restart it."
-                    ),
-                )
-
-            if cs_root is not None:
-                return await _ensure_and_sign(
-                    ensure_script=_build_code_server_ensure_script(serve_root=cs_root),
-                    script_timeout_ms=240000, http_timeout=270.0,
-                    svc_port=_CS_PORT, svc_name="code-server",
-                    ready_status="IDE ready",
-                    fail_status="code-server setup failed",
-                    result_msg=lambda url, pid: (
-                        f"IDE URL: {url}\n\n"
-                        f"Give this URL to the user. They get VS Code in the browser with:\n"
-                        f"- Full terminal access\n"
-                        f"- File editing and navigation\n"
-                        f"- Extension support\n\n"
-                        f"code-server is opening {cs_root} on port {_CS_PORT} (PID {pid}). "
-                        "The terminal can access files outside this folder."
-                    ),
-                )
-
-            port_str = target_stripped.removeprefix("http:")
-            try:
-                port = int(port_str)
-            except (ValueError, TypeError):
-                return (
-                    f"Error: port in \"http:<port>\" must be a number. "
-                    f"Got: \"{target}\""
-                )
-            if port < 3000 or port > 9999:
-                return (
-                    f"Error: port must be between 3000 and 9999. Got: {port}"
-                )
-
-            return await _ensure_and_sign(
-                ensure_script=None,
-                script_timeout_ms=0, http_timeout=0,
-                svc_port=port, svc_name="service",
-                ready_status=f"URL ready (port {port})",
-                fail_status="",
-                result_msg=lambda url, pid: (
-                    f"Service URL: {url}\n\n"
-                    f"The user can open this in a new browser tab. "
-                    f"\n\n"
-                    f"Note: the sandbox auto-stops after ~{self.valves.auto_stop_minutes} min of inactivity regardless of "
-                    f"running background processes, killing the server. If the user reports "
-                    f"the URL stopped working, restart the server and call expose() again."
-                ),
+            await _emit(__event_emitter__, f"Generating URL for port {port}...")
+            url, access_note = await _http_preview(
+                self.valves, sandbox_id, port, __user__, access, tag, client,
+                upstream_headers=upstream_headers,
+            )
+            await _emit(__event_emitter__, f"URL ready (port {port})", done=True)
+            return (
+                f"Service URL: {url}\n\n{access_note}\n\n"
+                f"The sandbox auto-stops after ~{self.valves.auto_stop_minutes} min of inactivity, "
+                "even with background processes. Restart the service with bash after sleep, "
+                "then call expose again. Registration does not keep the service alive."
             )
 
         return await _tool_context(__event_emitter__, _run, harness)

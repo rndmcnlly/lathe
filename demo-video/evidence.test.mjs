@@ -1,16 +1,22 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { normalizedToolEvents, matchesToolExpectation, managedTargetRoot } from "./evidence.mjs";
+import { normalizedToolEvents, matchesToolExpectation, recipeReadyRoot } from "./evidence.mjs";
 
-test("checkout paths come from rooted IDE exposure, not an assumed clone destination", () => {
+test("checkout paths come from ready recipe results, not an assumed clone destination", () => {
+  const recipeReady = { service: "code-server", port: 8080 };
   for (const root of ["/home/daytona/workspace/lathe", "/home/daytona/workspace/projects/lathe"] ) {
-    const event = { tool: "expose", arguments: { target: `code-server:${root}`, access: "private" }, output: "Ready" };
-    assert.equal(managedTargetRoot(event, "code-server"), root);
-    assert.equal(matchesToolExpectation(event, { tools: ["expose"], managedTarget: "code-server", bindCheckout: true }), true);
+    const result = { service: "code-server", root, port: 8080, expose: "http:8080", status: "started" };
+    const event = { tool: "bash", arguments: { command: `python3 ~/.cache/lathe/recipes/${"a".repeat(40)}/app.py code-server --root ${root} --port 8080` }, output: JSON.stringify(result) };
+    assert.equal(recipeReadyRoot(event, recipeReady), root);
+    assert.equal(matchesToolExpectation(event, { tools: ["bash"], recipeReady, bindCheckout: true }), true);
+    for (const fault of [{ root: "relative" }, { service: "site" }, { port: 9000 },
+      { expose: "http:9000" }, { status: "failed" }]) {
+      assert.equal(recipeReadyRoot({ ...event, output: JSON.stringify({ ...result, ...fault }) }, recipeReady), null);
+    }
+    assert.equal(recipeReadyRoot({ ...event, output: `Assistant says ${root} is ready` }, recipeReady), null);
+    assert.equal(recipeReadyRoot({ ...event, tool: "expose" }, recipeReady), null);
   }
-  assert.equal(managedTargetRoot({ arguments: { target: "code-server" } }, "code-server"), null);
-  assert.equal(managedTargetRoot({ arguments: { target: "http:8080" } }, "code-server"), null);
 });
 
 test("read-back rejects trailing text left by a wrapped-row edit", () => {
@@ -45,10 +51,10 @@ test("normalizes OpenAI tool calls and paired results", () => {
 });
 
 test("normalizes embedded Open WebUI tool observations", () => {
-  const payload = { tool_name: "delegate", args: { foreground_seconds: 0 }, result: "Backgrounded" };
+  const payload = { tool_name: "bash", args: { foreground_seconds: 0 }, result: "Backgrounded" };
   assert.deepEqual(normalizedToolEvents(payload), [{
     id: null,
-    tool: "delegate",
+    tool: "bash",
     arguments: { foreground_seconds: 0 },
     output: "Backgrounded",
   }]);

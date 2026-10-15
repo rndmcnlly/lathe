@@ -9,7 +9,7 @@ import { fileURLToPath } from "node:url";
 import { chromium } from "playwright";
 import { strFromU8, strToU8, unzipSync, zipSync } from "fflate";
 
-import { normalizedToolEvents, matchesToolExpectation, managedTargetRoot } from "./evidence.mjs";
+import { normalizedToolEvents, matchesToolExpectation, recipeReadyRoot } from "./evidence.mjs";
 import { runScenario } from "./interpreter.mjs";
 import { replaceEditorLine } from "./editor.mjs";
 import { openOwuiChat } from "./owui.mjs";
@@ -593,7 +593,7 @@ const adapter = {
   "chat.await-tool-result": async (expected) => {
     const event = await awaitToolResult(state, expected);
     if (expected.bindCheckout) {
-      state.variables.checkout = managedTargetRoot(event, expected.managedTarget);
+      state.variables.checkout = recipeReadyRoot(event, expected.recipeReady);
     }
     return { observations: [`chat.tool=${event.tool}`, "chat.tool.status=completed"] };
   },

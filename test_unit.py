@@ -10,6 +10,7 @@ import base64
 from contextlib import asynccontextmanager
 import hashlib
 import inspect
+import io
 import json
 import os
 from pathlib import Path
@@ -29,7 +30,7 @@ import httpx
 import pytest
 
 import lathe
-from testing_support import EXPECTED_SCHEMA, normalize_schema
+from testing_support import EXPECTED_SCHEMA
 
 USER = {"email": "owner@example.test", "id": "trusted-user"}
 PNG = b"\x89PNG\r\n\x1a\n" + b"\0" * 8
@@ -81,30 +82,12 @@ def tools():
 def http(monkeypatch, transport):
     """Install a strict HTTP boundary, retaining real httpx response semantics."""
     constructor = httpx.AsyncClient
-    clients = []
-
-    class TrackedAsyncClient(constructor):
-        def __init__(self, *args, **kwargs):
-            super().__init__(*args, **kwargs)
-            self.close_calls = 0
-
-        async def aclose(self):
-            self.close_calls += 1
-            await super().aclose()
-
-        async def __aexit__(self, exc_type, exc_value, traceback):
-            self.close_calls += 1
-            await super().__aexit__(exc_type, exc_value, traceback)
 
     def install(handler):
         def create(*args, **kwargs):
-            # Delegate's in-process model transport must remain real.
-            kwargs.setdefault("transport", transport(handler))
-            client = TrackedAsyncClient(*args, **kwargs)
-            clients.append(client)
-            return client
+            kwargs["transport"] = transport(handler)
+            return constructor(*args, **kwargs)
         monkeypatch.setattr(lathe, "httpx", SimpleNamespace(**{**vars(httpx), "AsyncClient": create}))
-        return clients
 
     return install
 
@@ -165,33 +148,9 @@ def test_tools_interface(module):
         assert actual == expected, name
         assert inspect.getdoc(method), name
         assert "__user__" in params and "__event_emitter__" in params
-        if name not in {"lathe", "handoff", "destroy"}:
+        if name not in {"lathe", "destroy"}:
             assert "__chat_id__" in params, name
     assert "__event_call__" in inspect.signature(methods["destroy"]).parameters
-    assert {"__model__", "__metadata__", "__request__"} <= set(
-        inspect.signature(methods["delegate"]).parameters)
-
-
-def test_delegate_interface(module):
-    t = module.Tools()
-    t._chat_state["chat"] = {"init": True, "pending": []}
-    for with_chat in (False, True):
-        tools = module._build_delegate_tools(
-            t.valves, "sb", None, [],
-            chat_state=t._chat_state if with_chat else None, chat_id="chat",
-            interpreter_state=t._interpreter_state if with_chat else None)
-        expected_names = {"bash", "read", "write", "edit", "glob", "grep"}
-        if with_chat:
-            expected_names.add("interpret")
-        assert {tool.name for tool in tools} == expected_names
-        for tool in tools:
-            expected = dict(EXPECTED_SCHEMA[tool.name])
-            if tool.name == "bash":
-                expected["foreground_seconds"] = ("integer", False, 15)
-            assert normalize_schema(tool.tool_def.parameters_json_schema) == expected
-            assert tool.description
-            assert all(p.get("description") for p in
-                       tool.tool_def.parameters_json_schema["properties"].values())
 
 
 @pytest.mark.parametrize("name,kwargs,location,expected,actual", [
@@ -217,17 +176,12 @@ def test_delegate_interface(module):
     ("interpret", {"code": 7}, "code", "str", "int"),
     ("interpret", {"code": "1", "timeout": True}, "timeout", "int", "bool"),
     ("view", {"path": 7}, "path", "str", "int"),
-    ("delegate", {"task": 7}, "task", "str", "int"),
-    ("delegate", {"task": "x", "context_files": "/x"}, "context_files", "list[str]", "str"),
-    ("delegate", {"task": "x", "context_files": [7]}, "context_files[0]", "str", "int"),
-    ("delegate", {"task": "x", "max_steps": True}, "max_steps", "int", "bool"),
-    ("delegate", {"task": "x", "foreground_seconds": True}, "foreground_seconds", "int", "bool"),
     ("expose", {"target": 7, "access": "private"}, "target", "str", "int"),
-    ("expose", {"target": "dufs", "access": 7}, "access", "str", "int"),
-    ("expose", {"target": "dufs", "access": "private", "tag": 7}, "tag", "str", "int"),
-    ("expose", {"target": "dufs", "access": "public", "upstream_headers": []}, "upstream_headers", "dict[str, str]", "list"),
-    ("expose", {"target": "dufs", "access": "public", "upstream_headers": {7: "x"}}, "upstream_headers.key[0]", "str", "int"),
-    ("expose", {"target": "dufs", "access": "public", "upstream_headers": {"Authorization": 7}}, "upstream_headers.value[0]", "str", "int"),
+    ("expose", {"target": "http:5000", "access": 7}, "access", "str", "int"),
+    ("expose", {"target": "http:5000", "access": "private", "tag": 7}, "tag", "str", "int"),
+    ("expose", {"target": "http:5000", "access": "public", "upstream_headers": []}, "upstream_headers", "dict[str, str]", "list"),
+    ("expose", {"target": "http:5000", "access": "public", "upstream_headers": {7: "x"}}, "upstream_headers.key[0]", "str", "int"),
+    ("expose", {"target": "http:5000", "access": "public", "upstream_headers": {"Authorization": 7}}, "upstream_headers.value[0]", "str", "int"),
 ])
 async def test_bad_types_rejected_before_io(
     module, monkeypatch, name, kwargs, location, expected, actual,
@@ -246,9 +200,7 @@ async def test_bad_types_rejected_before_io(
     ("read", {"path": "/x", "start": 1, "stop": 0}),
     ("edit", {"path": "/x", "old_string": "a", "new_string": "b", "replace_all": False}),
     ("view", {"path": "/image"}),
-    ("delegate", {"task": "x", "context_files": ["/x"], "max_steps": 1,
-                  "foreground_seconds": 0}),
-    ("expose", {"target": "dufs", "access": "private", "tag": "files"}),
+    ("expose", {"target": "http:5000", "access": "private", "tag": "files"}),
 ])
 async def test_valid_types_pass_wrapper_boundary(module, monkeypatch, name, kwargs):
     context = AsyncMock(return_value="accepted")
@@ -371,186 +323,93 @@ def tree(tmp_path):
 
 
 @pytest.mark.parametrize("kind", ["GLOB", "GREP"])
-def test_search_scope_and_absolute_paths(tree, tmp_path_factory, kind):
-    def search(pattern):
-        args = (str(tree), pattern, 100) if kind == "GLOB" else (str(tree), "needle", pattern, 100)
-        return script_call(kind, kind.lower() + "_hierarchy", *args)
-    relative = search("**/*.py,!**/deep/**")
-    absolute = search(f"{tree}/**/*.py,!{tree}/**/deep/**")
-    assert relative.splitlines()[1:] == absolute.splitlines()[1:]
-    assert "deep/" not in "\n".join(relative.splitlines()[1:])
-    assert str(tree / "a.py") in relative
-    assert "b.txt" not in relative
-    assert search("!**/deep/**,**/*.py").splitlines()[1:] == relative.splitlines()[1:]
-    assert "b.txt" in search("**/*.py,**/*.txt")
-    assert search("!**/*.py").startswith("Error:")
-    outside = tmp_path_factory.mktemp("outside").resolve()
-    (outside / "other.py").write_text("needle\n")
-    assert str(outside / "other.py") in search(f"{outside}/*.py")
-
-
-@pytest.mark.parametrize("kind", ["GLOB", "GREP"])
-def test_wildcard_free_directories_are_recursive_and_files_remain_exact(tmp_path, kind):
-    root = tmp_path.resolve()
-    files = {
-        "src/top.py": "needle top\n",
-        "src/nested/deep.py": "needle deep\n",
-        "src/nested/other.txt": "needle other\n",
-        "outside.py": "needle outside\n",
-    }
-    for name, content in files.items():
-        path = root / name
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(content)
-
-    def search(pattern):
-        args = (str(root), pattern, 100) if kind == "GLOB" else (
-            str(root), "needle", pattern, 100)
-        return script_call(kind, kind.lower() + "_hierarchy", *args)
-
-    for directory_pattern in ("src", str(root / "src")):
-        result = search(directory_pattern)
-        assert str(root / "src/top.py") in result
-        assert str(root / "src/nested/deep.py") in result
-        assert str(root / "src/nested/other.txt") in result
-        assert str(root / "outside.py") not in result
-
-    for file_pattern in ("src/top.py", str(root / "src/top.py")):
-        result = search(file_pattern)
-        assert str(root / "src/top.py") in result
-        assert str(root / "src/nested/deep.py") not in result
-
-    for exclusion in ("!src", f"!{root / 'src'}"):
-        result = search(f"**/*,{exclusion}")
-        assert str(root / "outside.py") in result
-        assert str(root / "src/top.py") not in result
-        assert str(root / "src/nested/deep.py") not in result
-
-
-@pytest.mark.parametrize("kind,total", [("GLOB", 13), ("GREP", 22)])
-@pytest.mark.parametrize("budget", [1, 4, 8, 100])
-def test_search_budget_keeps_concrete_evidence(tree, kind, total, budget):
-    args = (str(tree), "**/*", budget) if kind == "GLOB" else (str(tree), "needle", "**/*", budget)
-    result = script_call(kind, kind.lower() + "_hierarchy", *args)
+@pytest.mark.parametrize("budget", [1, 4, 100])
+def test_rg_search_bounds_and_concrete_evidence(tree, kind, budget):
+    result = script_call(kind, "search", str(tree), None if kind == "GLOB" else "needle", "**/*.{py,txt}", budget)
     header, *body = result.splitlines()
-    assert int(header.split()[0]) == total
-    assert len(body) == min(total, budget)
+    assert len(body) <= budget
+    assert body
+    assert ("limit reached" in header) == (budget < (13 if kind == "GLOB" else 22))
     for line in body:
         if kind == "GLOB":
             assert Path(line).is_file()
         else:
             path, number, text = line.rsplit(":", 2)
-            assert Path(path).read_text().splitlines()[int(number) - 1] == text.strip()
+            assert text == Path(path).read_text().splitlines()[int(number) - 1]
             assert "needle" in text
-    if total > budget:
-        assert f"showing {budget}, {total - budget} omitted" in header
-    else:
-        assert "omitted" not in header
 
 
 @pytest.mark.parametrize("kind", ["GLOB", "GREP"])
-@pytest.mark.parametrize("count", [0, 1, 99, 100, 101, 2000])
-def test_search_thresholds_do_not_collapse_to_counts(tmp_path, kind, count):
+def test_rg_globs_use_standard_braces_and_relative_scope(tree, kind):
+    def search(scope):
+        return script_call(kind, "search", str(tree), None if kind == "GLOB" else "needle", scope, 100)
+    assert str(tree / "a.py") in search("**/*.{py,txt}")
+    assert str(tree / "b.txt") in search("**/*.{py,txt}")
+    assert str(tree / "b.txt") not in search("**/*.py")
+    assert search(str(tree / "*.py")).startswith("Error:")
+    assert search("**/*.py,**/*.txt").startswith("0 results")
+
+
+def test_rg_regex_errors_binary_and_large_output(tmp_path):
     root = tmp_path.resolve()
-    for i in range(count):
-        path = root / f"group-{i % 5}" / f"hit-{i}.txt"
-        path.parent.mkdir(exist_ok=True)
-        path.write_text(f"miss\nneedle {i}\n")
-    # Overlapping includes must neither duplicate evidence nor inflate totals.
-    scope = "**/*.txt,group-0/*.txt"
-    args = (str(root), scope, 100) if kind == "GLOB" else (
-        str(root), "needle", scope, 100)
-    header, *body = script_call(kind, kind.lower() + "_hierarchy", *args).splitlines()
-    assert int(header.split()[0]) == count
-    assert len(body) == min(count, 100)
-    assert len(set(body)) == len(body)
-    for line in body:
-        if kind == "GLOB":
-            assert Path(line).is_file()
-        else:
-            path, number, text = line.rsplit(":", 2)
-            assert number == "2"
-            assert text.strip() == Path(path).read_text().splitlines()[1]
-    if count > 100:
-        assert f"showing 100, {count - 100} omitted" in header
+    (root / "binary").write_bytes(b"needle\0" * 1000)
+    path = root / "large.txt"
+    path.write_text("needle\n" * 50000 + "late marker\n")
+    assert script_call("GREP", "search", str(root), "[", "**/*", 5).startswith("Error:")
+    assert script_call("GREP", "search", str(root), "absent", "**/*", 5).startswith("0 results")
+    result = script_call("GREP", "search", str(root), "needle", "**/*.txt", 5)
+    assert len(result.splitlines()) == 6 and "limit reached" in result
+    assert script_call("GREP", "search", str(root), "late marker", "**/*", 5).endswith(f"{path}:50001:late marker")
+    path.write_text("needle" + "x" * 100000 + "\n")
+    result = script_call("GREP", "search", str(root), "needle", "**/*", 5)
+    assert len(result) < 1000 and "needle" in result
+
+
+@pytest.mark.parametrize("fault", [None, "digest", "url", "member"])
+def test_rg_blank_sandbox_acquisition_is_verified_and_cached(tmp_path, monkeypatch, fault):
+    # Execute the production bootstrap with an in-memory HTTPS fixture and a
+    # real tar archive. No dependency on rg being installed in the test process.
+    namespace = {}
+    exec(lathe._SEARCH_SCRIPT, namespace)
+    root = tmp_path / "lathe"
+    original_path = namespace["Path"]
+    namespace["Path"] = lambda value: root if value == "/tmp/lathe" else original_path(value)
+    monkeypatch.setattr(namespace["shutil"], "which", lambda name: None)
+    name = "ripgrep-99.1.2-x86_64-unknown-linux-musl"
+    archive = io.BytesIO()
+    with tarfile.open(fileobj=archive, mode="w:gz") as tar:
+        payload = b"#!/bin/sh\necho rg-fixture\n"
+        member = tarfile.TarInfo(name + "/rg")
+        member.size = len(payload)
+        if fault == "member":
+            member.type = tarfile.SYMTYPE
+            member.linkname = "/outside"
+            member.size = 0
+        tar.addfile(member, io.BytesIO(payload))
+    data = archive.getvalue()
+    url = f"https://github.com/BurntSushi/ripgrep/releases/download/99.1.2/{name}.tar.gz"
+    release = {"tag_name": "99.1.2", "assets": [{
+        "name": name + ".tar.gz", "browser_download_url": url if fault != "url" else "https://invalid.test/rg",
+        "digest": "sha256:" + (hashlib.sha256(data).hexdigest() if fault != "digest" else "0" * 64),
+    }]}
+    calls = []
+    def fetch(requested, timeout):
+        calls.append(requested)
+        assert timeout == 20
+        if requested == "https://api.github.com/repos/BurntSushi/ripgrep/releases/latest":
+            return io.BytesIO(json.dumps(release).encode())
+        assert requested == url
+        return io.BytesIO(data)
+    monkeypatch.setattr(namespace["urllib"].request, "urlopen", fetch)
+    if fault:
+        with pytest.raises(ValueError):
+            namespace["_ripgrep"]()
+        assert not (root / "rg").exists()
     else:
-        assert "omitted" not in header
-
-
-def test_grep_invalid_regex_and_no_hits(tree):
-    assert script_call("GREP", "grep_hierarchy", str(tree), "[", "**/*", 10).startswith("Error:")
-    assert script_call("GREP", "grep_hierarchy", str(tree), "absent", "**/*", 10).startswith("0 matches")
-
-
-@pytest.mark.parametrize("kind", ["GLOB", "GREP"])
-def test_search_rejects_brace_expansion_and_accepts_comma_alternatives(tree, kind):
-    function = kind.lower() + "_hierarchy"
-    prefix = (str(tree),) if kind == "GLOB" else (str(tree), "needle")
-    result = script_call(kind, function, *prefix, "**/*.{py,txt}", 100)
-    assert result.startswith("Error:")
-    assert "brace expansion is not supported" in result
-    alternative = script_call(kind, function, *prefix, "**/*.py,**/*.txt", 100)
-    assert str(tree / "a.py") in alternative
-    assert str(tree / "b.txt") in alternative
-
-
-def test_grep_skips_binary_and_bounds_large_file_matches(tmp_path):
-    binary = tmp_path / "binary.dat"
-    binary.write_bytes(b"needle\0" + b"x" * 1_000_000)
-    large = tmp_path / "large.txt"
-    large.write_text("needle\n" * 50_000 + "late marker\n")
-
-    dense = script_call("GREP", "grep_hierarchy", str(tmp_path), "needle", "**/*", 5)
-    assert dense.splitlines()[0].startswith("50000 matches across 1 files")
-    assert dense.splitlines()[1:] == [f"{large}:{i}: needle" for i in range(1, 6)]
-    assert "showing 5, 49995 omitted" in dense.splitlines()[0]
-    assert "1 binary or unreadable files skipped" in dense.splitlines()[0]
-    assert str(binary) not in dense
-
-    late = script_call("GREP", "grep_hierarchy", str(tmp_path), "late marker", "**/*", 5)
-    assert f"{large}:50001: late marker" in late
-    assert str(binary) not in late
-
-
-def test_grep_clips_concrete_long_hits(tmp_path):
-    path = tmp_path / "wide.txt"
-    path.write_text("needle" + "x" * 100_000 + "\n")
-    result = script_call("GREP", "grep_hierarchy", str(tmp_path), "needle", "**/*", 1)
-    assert result.splitlines()[1:] == [f"{path}:1: " + "needle" + "x" * 194 + "..."]
-
-
-def test_empty_grep_reports_readable_scope(tree):
-    result = script_call("GREP", "grep_hierarchy", str(tree), "absent", "**/*.py", 1)
-    assert "0 matches across 0 files" in result
-    assert "searched 12 readable files" in result
-    assert "**/*.py" in result and str(tree) in result
-
-
-def test_grep_discards_hits_from_failed_file_reads(tmp_path):
-    path = tmp_path / "partial.txt"
-    path.write_text("needle\nneedle\n")
-    source = lathe._GREP_SCRIPT + f'''
-import builtins
-_real_open = builtins.open
-class InterruptedFile:
-    def __init__(self, file): self.file = file
-    def __enter__(self): return self
-    def __exit__(self, *args): return self.file.__exit__(*args)
-    def __iter__(self):
-        yield next(iter(self.file))
-        raise OSError("injected read interruption")
-def interrupted_open(path, mode="r", **kwargs):
-    file = _real_open(path, mode, **kwargs)
-    return file if mode == "rb" else InterruptedFile(file)
-builtins.open = interrupted_open
-print(grep_hierarchy({str(tmp_path)!r}, "needle", "**/*.txt", 1))
-'''
-    result = run_script(source)
-    assert result.startswith("0 matches across 0 files")
-    assert "searched 0 readable files" in result
-    assert "1 binary or unreadable files skipped" in result
-    assert len(result.splitlines()) == 1
-
+        binary = namespace["_ripgrep"]()
+        assert subprocess.check_output([binary], text=True).strip() == "rg-fixture"
+        assert namespace["_ripgrep"]() == binary
+        assert len(calls) == 2
 
 @pytest.mark.parametrize("name,kwargs", [
     ("read", {}), ("write", {"content": "x"}),
@@ -559,6 +418,22 @@ print(grep_hierarchy({str(tmp_path)!r}, "needle", "**/*.txt", 1))
 async def test_relative_file_path_never_reaches_http(tools, name, kwargs):
     result = await getattr(lathe, "_core_" + name)(tools.valves, "sb", None, path="relative", **kwargs)
     assert "absolute path" in result
+
+
+@pytest.mark.parametrize("kind", ["glob", "grep"])
+@pytest.mark.parametrize("budget,expected", [(0, 1), (999, 500)])
+async def test_search_core_executes_quoted_arguments_and_clamps(tools, tmp_path, transport, kind, budget, expected):
+    (tmp_path / "a'quoted.txt").write_text("needle's marker\n" * 600)
+    def handler(request):
+        assert (request.method, request.url.path) == ("POST", "/sb/process/execute")
+        command = json.loads(request.content)["command"]
+        source = shlex.split(command)[2].replace("/home/daytona/workspace", str(tmp_path))
+        return httpx.Response(200, json={"exitCode": 0, "result": run_script(source)})
+    async with httpx.AsyncClient(transport=transport(handler)) as client:
+        kwargs = {"pattern": "**/*.txt"} if kind == "glob" else {"pattern": "needle's marker", "files": "**/*.txt"}
+        result = await getattr(lathe, "_core_" + kind)(tools.valves, "sb", client, max_lines=budget, **kwargs)
+    assert len(result.splitlines()[1:]) == (1 if kind == "glob" else expected)
+    assert str(tmp_path / "a'quoted.txt") in result
 
 
 async def test_file_core_http_roundtrip(tools, tmp_path, transport):
@@ -808,12 +683,9 @@ async def test_bash_large_log_survives_unrelated_chat(tools, sandbox, http, monk
     assert emissions[-1]["data"]["description"] == "Command complete"
     subsequent = await tools.bash("printf next", workdir=str(tmp_path), __user__=USER, __chat_id__="a")
     assert subsequent == "next"
-    async with lathe.httpx.AsyncClient() as client:
-        delegate_bash = lathe._build_delegate_tools(tools.valves, "sb", client, [])[0]
-        literal = await delegate_bash.function(command="printf 'Error: expected output'", workdir=str(tmp_path))
-        assert literal == "Error: expected output"
-        delegate_failure = await delegate_bash.function(command="echo failed; false", workdir=str(tmp_path))
-        assert delegate_failure == "Exit code: 1\nfailed\n"
+    literal = await tools.bash("printf 'Error: expected output'", workdir=str(tmp_path),
+                               __user__=USER, __chat_id__="a")
+    assert literal == "Error: expected output"
 
 
 @pytest.mark.parametrize("start,stop", [(1, 0), (-1, 0), (1, -1)])
@@ -995,17 +867,15 @@ def test_auto_init_scans_default_workspace_skills(tmp_path):
     assert "Scanning project skills via /home/daytona/workspace/.agents/skills/<skill-name>/SKILL.md" in result
 
 
-@pytest.mark.parametrize("volume,wrapped", [(False, False), (True, False), (True, True)])
-async def test_rendered_manual(tools, volume, wrapped):
-    tools.valves.persistent_volume = volume
+@pytest.mark.parametrize("wrapped", [False, True])
+async def test_rendered_manual(tools, wrapped):
     tools.valves.preview_wrapper_url = "https://wrapper.test" if wrapped else ""
     for page in tools._MANPAGES:
         result = await tools.lathe(page)
         assert len(result) > 500 and not result.startswith("Error:")
         assert not re.search(r"\{(?:tool_catalog|volume_note|destroy_volume_note|preview_access_note)\}", result)
     overview = await tools.lathe()
-    assert ("/home/daytona/volume" in overview) == volume
-    assert "bash(" in overview and "delegate(" in overview
+    assert "bash(" in overview
     assert ("try the wrapper" in overview) == wrapped
     assert "overview" in await tools.lathe("nonexistent")
 
@@ -1154,7 +1024,7 @@ async def test_interpreter_sandbox_replacement_and_failed_creation(tools, transp
         assert await lathe._ensure_interpreter_context(tools.valves, "new-sb", client, tools._interpreter_state, "a") == ("new", True)
 
 
-async def test_interpreter_parent_delegate_share_identity(tools, sandbox, http, monkeypatch):
+async def test_interpreter_calls_reuse_identity(tools, sandbox, http, monkeypatch):
     import httpx_ws
     executions = []
     posts = []
@@ -1176,13 +1046,7 @@ async def test_interpreter_parent_delegate_share_identity(tools, sandbox, http, 
         yield Socket()
     monkeypatch.setattr(httpx_ws, "aconnect_ws", connect)
     assert await tools.interpret("x = 1", __chat_id__="a", __user__=USER) == "(no output)"
-    tools._chat_state.clear()  # Delegate availability does not depend on notices.
-    async with lathe.httpx.AsyncClient() as client:
-        delegates = lathe._build_delegate_tools(
-            tools.valves, "sb", client, [], chat_state=tools._chat_state,
-            chat_id="a", interpreter_state=tools._interpreter_state)
-        interpret = next(tool for tool in delegates if tool.name == "interpret")
-        assert await interpret.function(code="x += 1") == "(no output)"
+    assert await tools.interpret("x += 1", __chat_id__="a", __user__=USER) == "(no output)"
     assert [call["contextId"] for call in executions] == ["shared", "shared"]
     assert len(posts) == 1
 
@@ -1284,7 +1148,6 @@ async def test_started_tool_request_budget(tools, http):
 async def test_startup_readiness_retries_and_creates_workspace(
     tools, transport, clock, tmp_path, initial, failure,
 ):
-    tools.valves.persistent_volume = False
     observations = iter([initial, "started"])
     workspace = tmp_path / "workspace with spaces"
     attempts = []
@@ -1295,6 +1158,7 @@ async def test_startup_readiness_retries_and_creates_workspace(
                 "id": "sb", "state": "started", "labels": {"test": USER["email"]},
             }])
         if request.url.path == "/sandbox" and request.method == "POST":
+            assert "volumes" not in json.loads(request.content)
             if initial == "conflicted":
                 return httpx.Response(409)
             return httpx.Response(200, json={"id": "sb", "state": "started"})
@@ -1360,7 +1224,6 @@ async def test_started_workspace_failure_never_runs_tool(tools, http, clock, fai
 
 
 async def test_startup_workspace_failure_is_bounded(tools, transport, clock):
-    tools.valves.persistent_volume = False
     attempts = []
 
     def handler(request):
@@ -1400,7 +1263,6 @@ async def test_stale_discovery_never_resurrects_sandbox(tools, transport, state,
 
 
 async def test_concurrent_first_calls_converge_by_unique_name(tools, transport):
-    tools.valves.persistent_volume = False
     label_lookups = 0
     create_calls = 0
     both_looked_up = asyncio.Event()
@@ -1450,7 +1312,6 @@ async def test_concurrent_first_calls_converge_by_unique_name(tools, transport):
 
 
 async def test_create_conflict_without_authoritative_winner_is_retryable(tools, transport):
-    tools.valves.persistent_volume = False
     calls = []
 
     def handler(request):
@@ -1791,7 +1652,7 @@ def preview(tools, sandbox, http):
             if request.url.path.endswith("/signed-preview-url"):
                 assert request.method == "GET" and request.url.host == "api.test"
                 port = int(request.url.path.split("/")[-2])
-                assert port in (5000, 7681, 8080) or 20000 <= port < 60000
+                assert 1024 <= port <= 65535
                 assert request.url.params["expiresInSeconds"] == "86400"
                 return httpx.Response(200, json={"url": upstream})
             assert request.url.host == "proxy.test"
@@ -1806,7 +1667,7 @@ def preview(tools, sandbox, http):
     return SimpleNamespace(invoke=invoke, upstream=upstream, protected=protected, secret=secret, good=good)
 
 
-@pytest.mark.parametrize("target", ["http:5000", "dufs", "dufs:/home/daytona/workspace/Files", "site:/home/daytona/workspace/My Site", "ttyd", "code-server", "code-server:/home/daytona/workspace/Project"])
+@pytest.mark.parametrize("target", ["http:1024", "http:5000", "http:65535"])
 async def test_preview_uses_trusted_identity_and_hides_credentials(preview, target):
     result, calls, events = await preview.invoke(target=target)
     assert preview.protected in result and "Owner-authenticated" in result
@@ -1819,329 +1680,11 @@ async def test_preview_uses_trusted_identity_and_hides_credentials(preview, targ
     assert registrations[0].headers["Authorization"] == "Bearer " + preview.secret
 
 
-async def test_ttyd_is_private_only_before_io(tools, monkeypatch):
-    context = AsyncMock(side_effect=AssertionError("public ttyd reached I/O"))
+@pytest.mark.parametrize("target", ["dufs", "ttyd", "code-server", "site:/absolute", "http:1023", "http:65536", "http:no"])
+async def test_removed_or_invalid_expose_targets_fail_before_io(tools, monkeypatch, target):
+    context = AsyncMock(side_effect=AssertionError("invalid target reached I/O"))
     monkeypatch.setattr(lathe, "_tool_context", context)
-    result = await tools.expose("ttyd", "public", __user__=USER)
-    assert result.startswith("Error: ttyd is private-only")
-    context.assert_not_called()
-
-
-@pytest.mark.parametrize("target", ["code-server", "code-server:/home/daytona/workspace/project"])
-async def test_code_server_is_private_only_before_io(tools, monkeypatch, target):
-    context = AsyncMock(side_effect=AssertionError("public IDE reached I/O"))
-    monkeypatch.setattr(lathe, "_tool_context", context)
-    result = await tools.expose(target, "public", __user__=USER)
-    assert result.startswith("Error: code-server is private-only")
-    context.assert_not_called()
-
-
-async def test_ttyd_uses_verified_idempotent_fast_path(preview):
-    result, calls, _ = await preview.invoke(target="ttyd", tag="terminal")
-    assert "Terminal URL" in result and "full writable shell" in result
-    setup = next(r for r in calls if r.url.host == "proxy.test")
-    request = json.loads(setup.content)
-    script = request["command"]
-    assert request["timeout"] == 60000
-    assert "ttyd/releases/latest" in script
-    assert 'a["name"] == "ttyd.x86_64"' in script
-    assert 'a["name"] == "SHA256SUMS"' in script
-    assert 'test "$ACTUAL" = "$EXPECTED"' in script
-    assert "Port 7681 is occupied by a non-ttyd process" in script
-    assert script.count("nohup /tmp/lathe/ttyd") == 1
-    registration = next(r for r in calls if r.url.host == "wrapper.test")
-    assert json.loads(registration.content)["access"] == "private"
-
-
-async def test_ttyd_setup_failure_stops_before_preview(preview):
-    result, calls, _ = await preview.invoke(target="ttyd", setup_failure=True)
-    assert result.startswith("Error: ttyd setup failed")
-    assert "checksum mismatch" in result
-    assert not any(r.url.host == "wrapper.test" for r in calls)
-
-
-@pytest.mark.parametrize("service", ["dufs", "code-server"])
-@pytest.mark.parametrize("fault", [None, "stale", "release", "digest"])
-@pytest.mark.parametrize("existing_listener", [False, True])
-def test_managed_archive_install_is_release_consistent_verified_and_atomic(
-    tmp_path, service, fault, existing_listener,
-):
-    install_root = tmp_path / "lathe"
-    install_root.mkdir()
-    fixtures = tmp_path / "fixtures"
-    fixtures.mkdir()
-    fake_bin = tmp_path / "bin"
-    fake_bin.mkdir()
-
-    if service == "dufs":
-        repo, tag = "sigoden/dufs", "v9.8.7"
-        asset_name = f"dufs-{tag}-x86_64-unknown-linux-musl.tar.gz"
-        staged = fixtures / "dufs"
-        staged.write_text("#!/bin/sh\nexit 0\n")
-        staged.chmod(0o755)
-        archive_members = [(staged, "dufs")]
-        script = lathe._build_dufs_ensure_script(str(install_root), str(tmp_path))
-        installed = install_root / "dufs"
-        port = 5000
-    else:
-        repo, tag = "coder/code-server", "v9.8.7"
-        asset_name = "code-server-9.8.7-linux-amd64.tar.gz"
-        staged = fixtures / "code-server"
-        staged.write_text("#!/bin/sh\nexit 0\n")
-        staged.chmod(0o755)
-        archive_members = [(staged, "code-server-9.8.7-linux-amd64/bin/code-server")]
-        script = lathe._build_code_server_ensure_script(str(install_root), str(tmp_path))
-        installed = install_root / "code-server/bin/code-server"
-        port = 8080
-
-    script = script.replace("/home/daytona/workspace", str(tmp_path))
-
-    if fault == "stale":
-        if service == "dufs":
-            installed.write_text("incomplete")
-        else:
-            installed.parent.mkdir(parents=True)
-            (installed.parent.parent / "partial-download").write_text("incomplete")
-
-    archive = fixtures / "asset.tar.gz"
-    with tarfile.open(archive, "w:gz") as bundle:
-        for source, arcname in archive_members:
-            bundle.add(source, arcname=arcname)
-    digest = hashlib.sha256(archive.read_bytes()).hexdigest()
-    asset_url = f"https://github.com/{repo}/releases/download/{tag}/{asset_name}"
-    release = {
-        "url": f"https://api.github.com/repos/{repo}/releases/12345",
-        "tag_name": tag,
-        "assets": [
-            {"name": "decoy.tar.gz", "browser_download_url": "https://invalid.test/decoy", "digest": "sha256:" + "0" * 64},
-            {"name": asset_name, "browser_download_url": asset_url, "digest": f"sha256:{digest}"},
-        ],
-    }
-    if fault == "release":
-        release["assets"][1]["browser_download_url"] = asset_url.replace(f"/{tag}/", "/v0.0.0/")
-    elif fault == "digest":
-        release["assets"][1]["digest"] = "sha256:" + "0" * 64
-    release_path = fixtures / "release.json"
-    release_path.write_text(json.dumps(release))
-
-    curl_log = tmp_path / "curl.log"
-    fake_curl = fake_bin / "curl"
-    fake_curl.write_text(textwrap.dedent(f"""\
-        #!/bin/sh
-        set -e
-        printf '%s\\n' "$*" >> {shlex.quote(str(curl_log))}
-        URL=""
-        OUT=""
-        while test "$#" -gt 0; do
-          case "$1" in
-            -o) OUT=$2; shift 2 ;;
-            -*) shift ;;
-            *) URL=$1; shift ;;
-          esac
-        done
-        case "$URL" in
-          https://api.github.com/repos/*/releases/latest) sleep 0.2; cp {shlex.quote(str(release_path))} "$OUT" ;;
-          {shlex.quote(asset_url)}) cp {shlex.quote(str(archive))} "$OUT" ;;
-          *) exit 90 ;;
-        esac
-        """))
-    fake_curl.chmod(0o755)
-    # The fake listener's PID must have a coherent command identity. Never read
-    # the host's unrelated /proc/123, which may be missing or a different process.
-    proc_root = fixtures / "proc"
-    process = proc_root / "123"
-    process.mkdir(parents=True)
-    options = "\0--allow-upload\0--allow-delete\0--allow-search\0--allow-archive\0--allow-hash" if service == "dufs" else ""
-    process.joinpath("cmdline").write_bytes(f"{installed}\0{tmp_path}{options}\0".encode())
-    script = script.replace("/proc/", str(proc_root) + "/")
-    if existing_listener:
-        # Force the reuse path deterministically, instead of relying on which
-        # concurrent installer reaches the listener check first.
-        (install_root / (service + ".root")).write_text(str(tmp_path))
-    fake_ss = fake_bin / "ss"
-    fake_ss.write_text(
-        f"#!/bin/sh\n"
-        f"test -f {shlex.quote(str(install_root / (service + '.root')))} || exit 0\n"
-        f"printf '%s\\n' 'LISTEN 0 128 0.0.0.0:{port} users:((\"{service}\",pid=123,fd=3))'\n"
-    )
-    fake_ss.chmod(0o755)
-
-    env = {**os.environ, "PATH": f"{fake_bin}:{os.environ['PATH']}"}
-    if fault == "stale" and service == "code-server":
-        processes = [
-            subprocess.Popen(
-                ["bash", "-c", script], text=True,
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env,
-            )
-            for _ in range(2)
-        ]
-        completed = [
-            subprocess.CompletedProcess(process.args, process.wait(timeout=20), *process.communicate())
-            for process in processes
-        ]
-        assert all(result.returncode == 0 for result in completed), completed
-        result = completed[0]
-    else:
-        result = subprocess.run(
-            ["bash", "-c", script], text=True, capture_output=True, env=env, timeout=20,
-        )
-    calls = curl_log.read_text().splitlines()
-    assert "/releases/latest" in calls[0]
-    if fault in (None, "stale"):
-        assert result.returncode == 0, result.stderr
-        assert installed.read_text() == "#!/bin/sh\nexit 0\n"
-        assert os.access(installed, os.X_OK)
-        expected_calls = 4 if fault == "stale" and service == "code-server" else 2
-        assert len(calls) == expected_calls and all(
-            asset_url in call for call in calls if "/releases/latest" not in call
-        )
-    else:
-        assert result.returncode != 0
-        assert not installed.exists()
-        assert not any(path.name.startswith(".install.") for path in install_root.iterdir())
-        assert len(calls) == (1 if fault == "release" else 2)
-
-
-@pytest.mark.parametrize("identity,error", [
-    ("matching", None), ("wrong-binary", "occupied by another process"),
-    ("wrong-root", "serving a different root"),
-])
-def test_code_server_fake_listener_preserves_identity_guards(tmp_path, identity, error):
-    root = tmp_path / "lathe"
-    project = tmp_path / "project"
-    project.mkdir()
-    binary = root / "code-server/bin/code-server"
-    binary.parent.mkdir(parents=True)
-    binary.write_text("#!/bin/sh\nexit 0\n")
-    binary.chmod(0o755)
-    (root / "code-server.root").write_text(str(project))
-    proc = tmp_path / "proc"
-    (proc / "123").mkdir(parents=True)
-    command = str(binary) if identity != "wrong-binary" else "/unrelated-service"
-    serve_root = str(project) if identity != "wrong-root" else "/wrong-project"
-    (proc / "123/cmdline").write_bytes(f"{command}\0{serve_root}\0".encode())
-    fake = tmp_path / "fake-bin"
-    fake.mkdir()
-    ss = fake / "ss"
-    ss.write_text('#!/bin/sh\necho \'LISTEN 0 128 0.0.0.0:8080 users:(("code-server",pid=123,fd=3))\'\n')
-    ss.chmod(0o755)
-    script = lathe._build_code_server_ensure_script(str(root), str(project))
-    script = script.replace("/home/daytona/workspace", str(tmp_path)).replace("/proc/", str(proc) + "/")
-    result = subprocess.run(["bash", "-c", script], capture_output=True, text=True,
-                            env={**os.environ, "PATH": f"{fake}:{os.environ['PATH']}"}, timeout=10)
-    if error:
-        assert result.returncode != 0 and error in result.stderr
-    else:
-        assert result.returncode == 0 and "READY PID=123" in result.stdout
-
-
-def test_dufs_launch_keeps_file_operations_without_outside_symlinks(tmp_path):
-    install_root = tmp_path / "lathe"
-    install_root.mkdir()
-    binary = install_root / "dufs"
-    args_path = tmp_path / "args"
-    binary.write_text(f"#!/bin/sh\nprintf '%s\\n' \"$@\" > {shlex.quote(str(args_path))}\n")
-    binary.chmod(0o755)
-    fake_bin = tmp_path / "bin"
-    fake_bin.mkdir()
-    ss = fake_bin / "ss"
-    ss.write_text(
-        f"#!/bin/sh\n"
-        f"test -f {shlex.quote(str(args_path))} || exit 0\n"
-        "printf '%s\\n' 'LISTEN 0 128 0.0.0.0:5000 users:((\"dufs\",pid=123,fd=3))'\n"
-    )
-    ss.chmod(0o755)
-    script = lathe._build_dufs_ensure_script(str(install_root), str(tmp_path))
-    script = script.replace("/home/daytona/workspace", str(tmp_path))
-    result = subprocess.run(
-        ["bash", "-c", script], capture_output=True, text=True, timeout=5,
-        env={**os.environ, "PATH": f"{fake_bin}:{os.environ['PATH']}"},
-    )
-    assert result.returncode == 0, result.stderr
-    assert args_path.read_text().splitlines() == [
-        str(tmp_path), "--allow-upload", "--allow-delete", "--allow-search",
-        "--allow-archive", "--allow-hash",
-    ]
-
-
-async def test_site_fast_path_preserves_path_and_manages_only_its_server(preview):
-    root = "/home/daytona/workspace/My Site"
-    port = lathe._site_port(root)
-    result, calls, _ = await preview.invoke(
-        target=f"site:{root}", tag="demo",
-    )
-    assert "Static site URL" in result
-    assert root in result
-    setup = next(r for r in calls if r.url.host == "proxy.test")
-    request = json.loads(setup.content)
-    script = request["command"]
-    assert request["timeout"] == 15000
-    assert f"SITE_ROOT='{root}'" in script
-    assert f"python3 -m http.server {port}" in script
-    assert f"Assigned site port {port} is occupied by another process" in script
-    assert "hash collision" in script
-    registration = next(r for r in calls if r.url.host == "wrapper.test")
-    assert json.loads(registration.content)["access"] == "private"
-
-
-@pytest.mark.parametrize("target,root,command", [
-    ("dufs", "/home/daytona/workspace/Files", "dufs"),
-    ("code-server", "/home/daytona/workspace/Project", "code-server"),
-])
-async def test_managed_root_is_passed_to_service_and_reported(preview, target, root, command):
-    result, calls, _ = await preview.invoke(target=f"{target}:{root}")
-    assert root in result
-    script = json.loads(next(r for r in calls if r.url.host == "proxy.test").content)["command"]
-    assert f"'{root}'" in script
-    assert "already serving a different root" in script
-    assert "os.path.realpath" in script
-    assert f"{command}.root" in script
-
-
-@pytest.mark.parametrize("target", ["site", "dufs", "code-server"])
-@pytest.mark.parametrize("root", ["/home/daytona", "/home/daytona/workspace/../volume", "/home/daytona/workspace-other"])
-async def test_root_outside_workspace_refused_before_io(tools, monkeypatch, target, root):
-    context = AsyncMock(side_effect=AssertionError("outside root reached I/O"))
-    monkeypatch.setattr(lathe, "_tool_context", context)
-    result = await tools.expose(f"{target}:{root}", "private", __user__=USER)
-    assert result.startswith("Error: service root must be within")
-    context.assert_not_called()
-
-
-@pytest.mark.parametrize("target", ["site", "dufs", "code-server"])
-def test_named_service_rejects_symlink_escape_before_launch(tmp_path, target):
-    workspace = tmp_path / "workspace"
-    workspace.mkdir()
-    outside = tmp_path / "outside"
-    outside.mkdir()
-    (workspace / "escape").symlink_to(outside, target_is_directory=True)
-    root = str(workspace / "escape")
-    install = tmp_path / "install"
-    if target == "site":
-        script = lathe._build_site_ensure_script(root, 30123)
-    elif target == "dufs":
-        script = lathe._build_dufs_ensure_script(str(install), root)
-    else:
-        script = lathe._build_code_server_ensure_script(str(install), root)
-    script = script.replace("/home/daytona/workspace", str(workspace))
-    result = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=5)
-    assert result.returncode != 0
-    assert "Service root must be an existing directory" in result.stderr
-    assert not install.exists()
-
-
-def test_site_ports_are_stable_and_allow_parallel_sites():
-    first = lathe._site_port("/workspace/redesign-a")
-    assert first == lathe._site_port("/workspace/redesign-a")
-    assert first != lathe._site_port("/workspace/redesign-b")
-    assert 20000 <= first < 60000
-
-
-async def test_site_requires_absolute_path_before_io(tools, monkeypatch):
-    context = AsyncMock(side_effect=AssertionError("relative site reached I/O"))
-    monkeypatch.setattr(lathe, "_tool_context", context)
-    result = await tools.expose("site:relative/path", "private", __user__=USER)
-    assert result.startswith("Error: site path must be an absolute path")
+    assert (await tools.expose(target, "private", __user__=USER)).startswith("Error:")
     context.assert_not_called()
 
 
@@ -2165,7 +1708,7 @@ async def test_public_preview_accepts_public_wrapper_result(preview):
 
 
 @pytest.mark.parametrize("access", ["public", "private"])
-@pytest.mark.parametrize("target", ["http:5000", "dufs", "site:/home/daytona/workspace/site"])
+@pytest.mark.parametrize("target", ["http:5000", "http:8000"])
 async def test_preview_headers_are_registration_scoped_and_not_echoed(preview, access, target):
     headers = {"Authorization": "Basic YXBwOnNlY3JldA==", "X-App-Mode": "demo"}
     result, calls, events = await preview.invoke(
@@ -2291,173 +1834,6 @@ async def test_preview_configuration_and_direct_mode(preview, tools):
     assert result.startswith("Error:") and not calls
 
 
-def delegate_request(app=lambda scope, receive, send: None):
-    return SimpleNamespace(
-        app=app,
-        state=SimpleNamespace(token=SimpleNamespace(credentials="user-token")),
-    )
-
-
-@pytest.mark.parametrize("context_files,missing", [(["relative"], False), (["/missing"], True)])
-async def test_delegate_context_rejection_closes_every_created_client(
-    tools, sandbox, http, context_files, missing,
-):
-    def respond(request):
-        assert missing and request.url.path == "/sb/files/download"
-        return httpx.Response(404)
-
-    clients = http(respond)
-    result = await tools.delegate(
-        "task", context_files=context_files, __user__=USER,
-        __request__=delegate_request(), __model__={"id": "model"},
-    )
-    assert result.startswith("Error:")
-    assert len(clients) == 1
-    assert [client.close_calls for client in clients] == [1]
-
-
-@pytest.mark.parametrize("stage", ["provider", "tool", "prompt", "agent", "sidecar"])
-async def test_delegate_setup_exception_closes_every_owned_client(
-    tools, sandbox, http, monkeypatch, stage,
-):
-    clients = http(lambda request: pytest.fail(f"unexpected request: {request.url}"))
-
-    def fail(*args, **kwargs):
-        raise RuntimeError(f"{stage} setup failed")
-
-    if stage == "provider":
-        import pydantic_ai.providers.openai
-        monkeypatch.setattr(pydantic_ai.providers.openai, "OpenAIProvider", fail)
-    elif stage == "tool":
-        monkeypatch.setattr(lathe, "_build_delegate_tools", fail)
-    elif stage == "prompt":
-        monkeypatch.setattr(lathe, "_build_delegate_prompt", fail)
-    elif stage == "agent":
-        monkeypatch.setattr(sys.modules["pydantic_ai"], "Agent", fail)
-    else:
-        monkeypatch.setattr(lathe, "_core_write", AsyncMock(side_effect=RuntimeError("sidecar setup failed")))
-
-    result = await tools.delegate(
-        "task", __user__=USER, __request__=delegate_request(),
-        __model__={"id": "model"},
-    )
-    assert result == f"Error: {stage} setup failed"
-    assert len(clients) == (2 if stage == "provider" else 3)
-    assert [client.close_calls for client in clients] == [1] * len(clients)
-
-
-@pytest.mark.parametrize("boundary", [False, True])
-async def test_one_step_delegate_answers_from_context_without_tools(
-    tools, sandbox, http, monkeypatch, tmp_path, boundary,
-):
-    source = tmp_path / "large-context.txt"
-    evidence = "decisive evidence\n"
-    if boundary:
-        overhead = len(f"## Reference Files\n\n### {source}\n\n".encode())
-        evidence += "x" * (50 * 1024 - overhead - len(evidence.encode()))
-    source.write_text(evidence)
-    root = tmp_path / "sidecars"
-    monkeypatch.setattr(lathe, "_EPHEMERAL_ROOT", str(root))
-    tools._chat_state["chat"] = {"init": True, "pending": []}
-
-    def execute(request):
-        if request.method == "GET" and request.url.path == "/sb/files/download":
-            assert request.url.params["path"] == str(source)
-            return httpx.Response(200, text=source.read_text())
-        assert (request.method, request.url.path) == ("POST", "/sb/process/execute")
-        command = shlex.split(json.loads(request.content)["command"])
-        return httpx.Response(200, json={"exitCode": 0, "result": run_script(command[2])})
-
-    clients = http(execute)
-    requests = []
-
-    async def app(scope, receive, send):
-        body = b""
-        while True:
-            message = await receive()
-            body += message.get("body", b"")
-            if not message.get("more_body"):
-                break
-        payload = json.loads(body)
-        requests.append(payload)
-        assert not payload.get("tools")
-        messages = json.dumps(payload["messages"])
-        assert "decisive evidence" in messages
-        assert "With a one-step budget" in messages
-        response = {
-            "id": "completion", "object": "chat.completion", "created": 0,
-            "model": "selected-model", "choices": [{
-                "index": 0,
-                "message": {"role": "assistant", "content": "context-only answer"},
-                "finish_reason": "stop",
-            }],
-            "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
-        }
-        await send({"type": "http.response.start", "status": 200,
-                    "headers": [(b"content-type", b"application/json")]})
-        await send({"type": "http.response.body", "body": json.dumps(response).encode()})
-
-    result = await tools.delegate(
-        "Analyze the supplied file", context_files=[str(source)], max_steps=1,
-        foreground_seconds=5, __user__=USER, __chat_id__="chat",
-        __model__={"id": "selected-model"}, __request__=delegate_request(app),
-    )
-
-    assert "context-only answer" in result
-    assert "1 step(s), 0 tool call(s)" in result
-    assert len(requests) == 1
-    sidecars = next((root / "delegate").iterdir())
-    assert (sidecars / "result").read_text() == "context-only answer"
-    assert json.loads((sidecars / "usage").read_text())["tool_calls"] == 0
-    assert [client.close_calls for client in clients[:3]] == [1, 1, 1]
-
-
-@pytest.mark.parametrize("count", [1, 2])
-async def test_reference_budget_includes_outer_heading_and_separators(tools, sandbox, http, count):
-    tools._chat_state["chat"] = {"init": True, "pending": []}
-    paths = [f"/reference/{i}" for i in range(count)]
-    # Sections alone fit exactly. The complete block must be rejected.
-    available = 50 * 1024 - sum(len(f"### {p}\n\n".encode()) for p in paths)
-    sizes = [available // count] * count
-    sizes[-1] += available % count
-    def handler(request):
-        assert request.method == "GET" and request.url.path == "/sb/files/download"
-        return httpx.Response(200, content=b"x" * sizes[paths.index(request.url.params["path"])])
-    http(handler)
-    async def app(scope, receive, send):
-        pytest.fail("reference block exceeding budget reached inference")
-    result = await tools.delegate("Analyze", context_files=paths, max_steps=1,
-        __user__=USER, __chat_id__="chat", __model__={"id": "model"}, __request__=delegate_request(app))
-    assert result.startswith("Error:") and "byte text limit" in result
-
-
-@pytest.mark.parametrize("sizes", [(1000000,), (30000, 30000)])
-async def test_delegate_rejects_oversized_reference_before_inference(tools, sandbox, http, sizes):
-    tools._chat_state["chat"] = {"init": True, "pending": []}
-    chunks_received = 0
-    class ReferenceStream(httpx.AsyncByteStream):
-        async def __aiter__(self):
-            nonlocal chunks_received
-            for _ in range(125):
-                chunks_received += 1
-                yield b"x" * 8192
-    def handler(request):
-        assert request.method == "GET" and request.url.path == "/sb/files/download"
-        size = sizes[int(request.url.params["path"].rsplit("/", 1)[1])]
-        if size == 1000000:
-            return httpx.Response(200, stream=ReferenceStream())
-        return httpx.Response(200, content=b"x" * size)
-    http(handler)
-    async def app(scope, receive, send):
-        pytest.fail("oversized reference reached inference")
-    result = await tools.delegate("Analyze references", context_files=[f"/reference/{i}" for i in range(len(sizes))],
-        max_steps=1, __user__=USER, __chat_id__="chat", __model__={"id": "model"},
-        __request__=delegate_request(app))
-    assert result.startswith("Error:") and "byte text limit" in result
-    if sizes == (1000000,):
-        assert chunks_received <= 7, "reference must be rejected before full acquisition"
-
-
 @pytest.mark.parametrize("oversized", [False, True])
 async def test_interpret_bounds_oversized_and_many_frames(tools, sandbox, http, monkeypatch, oversized):
     import contextlib
@@ -2492,136 +1868,6 @@ async def test_interpret_bounds_oversized_and_many_frames(tools, sandbox, http, 
         assert "Text preview truncated" in result and "discarded" in result
     else:
         assert result == "Error: expected output", "literal stdout is not the internal error protocol"
-
-
-@pytest.mark.parametrize("background,fail,persist_failure", [
-    (False, False, False), (True, False, False), (True, True, False),
-    (False, False, True), (True, False, True),
-])
-async def test_real_delegate_execution_and_completion(tools, sandbox, http, monkeypatch, tmp_path, background, fail, persist_failure):
-    """Real Agent, tool cores and files; observe completion as the caller does."""
-    release = asyncio.Event()
-    if not background:
-        release.set()
-    requests, emissions = [], []
-    source = tmp_path / "input.txt"
-    source.write_text("secret discovered by tool\n")
-    root = tmp_path / "sidecars"
-    monkeypatch.setattr(lathe, "_EPHEMERAL_ROOT", str(root))
-    for chat in ("chat", "other"):
-        tools._chat_state[chat] = {"init": True, "pending": []}
-
-    def execute(request):
-        assert (request.method, request.url.path) == ("POST", "/sb/process/execute")
-        assert request.headers["authorization"] == "Bearer test-key"
-        command = shlex.split(json.loads(request.content)["command"])
-        assert command[:2] == ["python3", "-c"]
-        if persist_failure and "/result'" in command[2]:
-            # Execute the real shipped write path against a filesystem failure.
-            next((root / "delegate").iterdir()).joinpath("result").mkdir(exist_ok=True)
-        return httpx.Response(200, json={"exitCode": 0, "result": run_script(command[2])})
-    clients = http(execute)
-
-    async def app(scope, receive, send):
-        body = b""
-        while True:
-            message = await receive()
-            body += message.get("body", b"")
-            if not message.get("more_body"):
-                break
-        requests.append((scope, json.loads(body)))
-        await release.wait()
-        if fail:
-            response = {"error": {"message": "synthetic model failure", "type": "invalid_request_error"}}
-            status = 400
-        else:
-            if len(requests) == 1:
-                message = {"role": "assistant", "content": None, "tool_calls": [{
-                    "id": "read-1", "type": "function", "function": {
-                        "name": "read", "arguments": json.dumps({"path": str(source)})}}]}
-                finish = "tool_calls"
-            else:
-                message = {"role": "assistant", "content": "verified result"}
-                finish = "stop"
-            response = {"id": "completion", "object": "chat.completion", "created": 0,
-                        "model": "selected-model", "choices": [{"index": 0, "message": message, "finish_reason": finish}],
-                        "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}}
-            status = 200
-        await send({"type": "http.response.start", "status": status, "headers": [(b"content-type", b"application/json")]})
-        await send({"type": "http.response.body", "body": json.dumps(response).encode()})
-
-    async def emit(event):
-        emissions.append(event)
-
-    async def read_in(chat):
-        return await tools.read(str(source), __user__=USER, __chat_id__=chat)
-
-    request = SimpleNamespace(app=app, state=SimpleNamespace(token=SimpleNamespace(credentials="user-token")))
-    task_description = f"Read {source} and report"
-    # Capture newly spawned tasks only for failure cleanup, never as an oracle.
-    existing_tasks = asyncio.all_tasks()
-    try:
-        result = await tools.delegate(task_description, max_steps=3,
-            foreground_seconds=0 if background else 5, __user__=USER, __chat_id__="chat",
-            __model__={"id": "wrong-model"}, __metadata__={"model": {"id": "selected-model"}},
-            __request__=request, __event_emitter__=emit)
-        delegate_clients = clients[:3]
-        assert len(delegate_clients) == 3
-        directories = list((root / "delegate").iterdir())
-        assert len(directories) == 1, result
-        sidecars = directories[0]
-        assert (sidecars / "task").read_text() == task_description
-        emission_count = len(emissions)
-        notice = "Background delegation failed" if fail or persist_failure else "Background delegation completed"
-        if background:
-            descriptor = re.search(r"^DELEGATE=(.+)$", result, re.MULTILINE)
-            assert descriptor and sidecars.name == descriptor[1], result
-            assert not (sidecars / "result").exists() and not (sidecars / "error").exists()
-            assert [client.close_calls for client in delegate_clients] == [1, 0, 0]
-            assert notice not in await read_in("chat")
-        else:
-            if persist_failure:
-                assert "Delegation failed" in result and "Cannot write" in result
-                assert not any(e["data"]["description"].startswith("Delegation complete") for e in emissions)
-            else:
-                assert "verified result" in result and "1 tool call(s)" in result
-        release.set()
-        async with asyncio.timeout(5):
-            if background:
-                while notice not in (delivered := await read_in("chat")):
-                    await asyncio.sleep(0)
-                assert delivered.count(notice) == 1
-            while not all(client.is_closed for client in delegate_clients):
-                await asyncio.sleep(0)
-        assert [client.close_calls for client in delegate_clients] == [1, 1, 1]
-        if background:
-            assert len(emissions) == emission_count, "delegate emitted to a closed foreground stream"
-        assert notice not in await read_in("chat")
-        assert notice not in await read_in("other")
-        if fail or persist_failure:
-            assert ("Cannot write" if persist_failure else "synthetic model failure") in (sidecars / "error").read_text()
-            assert not (sidecars / "result").is_file()
-        else:
-            assert (sidecars / "result").read_text() == "verified result"
-            assert json.loads((sidecars / "usage").read_text())["tool_calls"] == 1
-            assert len(requests) == 2
-            assert any(m.get("role") == "tool" and "1: secret discovered by tool" in m["content"]
-                       for m in requests[1][1]["messages"])
-        # Check the recorded model protocol outside production's exception handlers.
-        assert requests
-        for scope, body in requests:
-            assert scope["path"] == "/api/chat/completions"
-            assert dict(scope["headers"])[b"authorization"] == b"Bearer user-token"
-            assert body["model"] == "selected-model" and "chat_id" not in body
-    finally:
-        release.set()
-        tasks = asyncio.all_tasks() - existing_tasks
-        for task in tasks:
-            task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
-        for client in clients:
-            if not client.is_closed:
-                await client.aclose()
 
 
 if __name__ == "__main__":

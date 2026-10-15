@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <link rel="stylesheet" href="style.css">
     <title>Lathe: sandbox tools for Open WebUI</title>
-    <meta name="description" content="Lathe connects models in Open WebUI to per-user Daytona sandboxes for code execution, file work, delegation, and exposed services.">
+    <meta name="description" content="Lathe connects models in Open WebUI to per-user Daytona sandboxes for code execution, file work, and exposed services.">
     <meta property="og:title" content="Lathe">
     <meta property="og:type" content="website">
     <meta property="og:description" content="A sandbox toolkit for models in Open WebUI.">
@@ -37,7 +37,7 @@
 <div class="callout">
     <strong>Lathe connects a model in Open WebUI to a Linux sandbox.</strong>
     The model can run commands, edit files, use a persistent Python session,
-    delegate longer jobs, and give the user browser access. An admin
+    run background shell jobs, and give the user browser access. An admin
     installs one Python tool; Lathe provisions and reconnects one Daytona
     sandbox per user.
 </div>
@@ -81,8 +81,7 @@
         </video>
         <p class="video-caption">
             A live conversation on a deployed Open WebUI instance: enable Lathe,
-            inspect a repository, open its sandbox in VS Code, stop the service,
-            and delegate a focused code review.
+            inspect a repository, open its sandbox in VS Code, and stop the service.
             <a href="https://github.com/rndmcnlly/lathe/tree/main/demo-video">Capture source</a>
         </p>
     </div>
@@ -104,9 +103,9 @@
         these intervals.
     </p>
     <p>
-        Conversation context is separate from sandbox state. <code>handoff()</code>
-        prepares a compact record for a new conversation; it does not copy or preserve
-        model context automatically.
+        Conversation context is separate from sandbox state. Open WebUI handles
+        conversation continuation and compaction; save important project context in
+        workspace files so a new conversation can discover it.
     </p>
 </section>
 
@@ -125,7 +124,7 @@
         </div>
         <div class="tool-card">
             <h3>glob · grep</h3>
-            <p>Find files and search text contents with comma-separated globs, <code>!</code> exclusions, and <code>**</code> path-component recursion. Brace expansion is not supported.</p>
+            <p>Find files and search text with ripgrep: one workspace-relative glob, native braces and <code>!</code> exclusions, and normal ignore and hidden-file rules.</p>
         </div>
         <div class="tool-card">
             <h3>view</h3>
@@ -136,20 +135,16 @@
             <p>Run Python in a chat-scoped REPL whose variables survive between calls.</p>
         </div>
         <div class="tool-card">
-            <h3>delegate</h3>
-            <p>Give a bounded, multi-step task to a sub-agent working in the same sandbox.</p>
-        </div>
-        <div class="tool-card">
             <h3>expose</h3>
-            <p>Create temporary browser access to a static site, web service, file browser, private lightweight terminal, or browser IDE.</p>
+            <p>Publish a running HTTP service with explicit private or public access. Start apps through shell commands or optional recipes first.</p>
         </div>
         <div class="tool-card">
             <h3>onboard · lathe</h3>
             <p>Load project instructions and consult the model-facing manual.</p>
         </div>
         <div class="tool-card">
-            <h3>handoff · destroy</h3>
-            <p>Prepare a fresh-chat handoff or, with confirmation, remove the sandbox VM.</p>
+            <h3>destroy</h3>
+            <p>With confirmation, permanently remove the sandbox and its workspace.</p>
         </div>
     </div>
 </section>
@@ -178,7 +173,7 @@
         </li>
         <li>
             <span class="recipe-label">Continue elsewhere</span>
-            <span class="recipe-desc">“Prepare a handoff for a fresh conversation.”</span>
+            <span class="recipe-desc">“Save a project summary in the workspace for our next conversation.”</span>
         </li>
     </ul>
 </section>
@@ -188,10 +183,10 @@
     <div class="section-label">Trust and retention</div>
     <h2 class="section-title">Know where the work goes</h2>
     <ul class="limit-list trust-list">
-        <li><strong>Sandbox data lives in Daytona.</strong> Lathe labels each sandbox with the Open WebUI user's email. When persistent volumes are enabled, <code>/home/daytona/volume</code> is backed by Daytona's S3/FUSE storage.</li>
+        <li><strong>Sandbox data lives in Daytona.</strong> Lathe labels each sandbox with the Open WebUI user's email. Files survive normal stops and archives without an additional persistent volume.</li>
         <li><strong>User environment variables are credentials entrusted to the agent.</strong> Lathe injects them into model-directed shell commands. The model can print them, inspect process environments, or read generated command wrappers. Use scoped, revocable credentials.</li>
         <li><strong>Choose the preview's access mode.</strong> Every HTTP exposure is explicitly public or private. Public requests may fall back to a direct signed bearer URL if wrapping is unavailable; private requests require owner authentication and never downgrade to public. Upstream access defaults to 24 hours; the tool reports wrapper expiry separately.</li>
-        <li><strong>Auto-delete and volume retention are separate.</strong> By default, neither the sandbox nor its persistent volume is automatically deleted. An admin can set sandbox deletion intervals, but a separately managed persistent volume survives sandbox destruction.</li>
+        <li><strong>Deletion destroys the workspace.</strong> Automatic sandbox deletion is disabled by default, but an admin can change that policy. Export important results or commit them to a remote repository before sandbox destruction.</li>
         <li><strong>Updates are manual.</strong> Open WebUI stores the uploaded copy of <code>lathe.py</code>. An installed deployment does not receive fixes merely because the GitHub repository changed, and Lathe has no built-in update or notification mechanism.</li>
     </ul>
 </section>

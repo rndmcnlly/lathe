@@ -6,7 +6,7 @@ must not silently update its own oracle. Tuple: JSON type, required, default.
 
 EXPECTED_SCHEMA = {
     "lathe": {"manpage": ("string", False, "overview")},
-    "handoff": {}, "destroy": {},
+    "destroy": {},
     "onboard": {"path": ("string", True, None)},
     "bash": {"command": ("string", True, None), "workdir": ("string", False, "/home/daytona/workspace"),
              "foreground_seconds": ("integer", False, -1)},
@@ -19,8 +19,6 @@ EXPECTED_SCHEMA = {
              "max_lines": ("integer", False, 100)},
     "interpret": {"code": ("string", True, None), "timeout": ("integer", False, 120)},
     "view": {"path": ("string", True, None)},
-    "delegate": {"task": ("string", True, None), "context_files": ("array", False, []),
-                 "max_steps": ("integer", False, 10), "foreground_seconds": ("integer", False, -1)},
     "expose": {"target": ("string", True, None), "access": ("string", True, None),
                "tag": ("string", False, ""), "upstream_headers": ("object", False, {})},
 }

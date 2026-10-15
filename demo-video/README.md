@@ -46,10 +46,10 @@ The first recorded question asks Lathe for its installed version. The capture
 requires a matching `lathe(manpage="version")` result and saves a version frame,
 so the video identifies the deployed toolkit rather than the checkout version.
 Conversational prompts keep test instructions out of the visible dialogue.
-The overview precedes the relay-writing turn, and the editor's rooted expose
-call supplies the actual checkout path rather than a hardcoded clone destination.
-Cold IDE setup gets a six-minute turn budget, covering Lathe's four-minute
-installation window and the model's reply.
+The overview precedes the relay-writing turn. The pinned recipe's ready result
+supplies the actual checkout path rather than a hardcoded clone destination;
+the later private `http:8080` exposure only registers access to that service.
+Cold IDE setup gets a six-minute turn budget for installation and the model's reply.
 
 The relay edit targets the file editor by URI, selects text with cursor movement,
 and verifies the rendered document before saving with the platform's shortcut.
@@ -63,10 +63,12 @@ all VS Code AI features are disabled and the secondary Chat sidebar starts hidde
 
 ## Capture policy and automation
 
-Local and hosted authentication use the same unmodified scenario. Managed
-code-server must be private: the oracle requires an actual `expose` call with
-private access and its owner-only result, not an assistant promise or a public
-HTTP-port substitute. The local identity fixture auto-approves its one fixed
+Local and hosted authentication use the same unmodified scenario. Recipe-launched
+code-server must be private: the oracle requires a ready recipe result and an
+actual `expose(target="http:8080", access="private")` call with its owner-only
+result, not an assistant promise or public substitute. The services manual owns
+the pinned acquisition command; unpublished local trials must preseed that exact
+revision's recipe cache rather than fetch mutable source. The local identity fixture auto-approves its one fixed
 synthetic user without a visible sign-in page, while
 the real Worker performs PKCE exchange, owner-email authorization, and host-only
 session creation. It does not qualify Pocket ID or real passkey authentication.

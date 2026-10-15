@@ -3,8 +3,8 @@
 
 By default this suite temporarily deploys the exact local ``lathe.py`` as
 ``lathe_test``. It never updates or invokes the production ``lathe`` toolkit.
-The staging toolkit uses a distinct Daytona deployment label and persistent
-volumes are disabled, so its sandboxes are also isolated and disposable. The
+The staging toolkit uses a distinct Daytona deployment label and provisions no
+extra volumes, so its sandboxes are also isolated and disposable. The
 staging toolkit and sandboxes are deleted when the suite exits, including after
 failures and ``--no-deploy`` runs.
 
@@ -57,15 +57,6 @@ PREVIEW_REVOKE_URL = os.environ.get("LATHE_PREVIEW_REVOKE_URL", "")
 PREVIEW_ACCESS = os.environ.get("LATHE_PREVIEW_ACCESS", "private")
 
 
-def staged_source():
-    source = SOURCE_PATH.read_text()
-    if "--preview-only" in sys.argv:
-        # expose has no pydantic-ai dependency. Avoid changing the shared OWUI
-        # environment while qualifying only this path beside an older toolkit.
-        # All executable source remains identical; only install metadata differs.
-        source = re.sub(r'^requirements:.*\n', '', source, count=1, flags=re.MULTILINE)
-    return source
-
 # 1x1 transparent PNG, used to exercise view() end-to-end.
 PNG_B64 = (
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk"
@@ -104,7 +95,7 @@ class Results:
 
 
 async def deploy_staging_tool(*, display_name="Lathe Test"):
-    source = staged_source()
+    source = SOURCE_PATH.read_text()
     payload = {
         "id": TOOL_ID,
         "name": display_name,
@@ -142,7 +133,6 @@ async def deploy_staging_tool(*, display_name="Lathe Test"):
             "auto_stop_minutes": 5,
             "auto_archive_minutes": 5,
             "auto_delete_minutes": 0,
-            "persistent_volume": False,
             "auto_create_sandbox": True,
             "sandbox_missing_message": "",
             "sandbox_create_overrides": '{"ttlMinutes":30}',
@@ -365,28 +355,8 @@ def tool_outputs(output):
     return results
 
 
-def require_single_dispatch(output, expected):
-    """Require one target tool, allowing Lathe's advised first-use overview."""
-    calls = tool_calls(output)
-    names = [call.get("name") for call in calls]
-    lathe_calls = [call for call in calls if call.get("name") == "lathe"]
-    overview_only = True
-    if lathe_calls:
-        args = lathe_calls[0].get("arguments") or "{}"
-        args = json.loads(args) if isinstance(args, str) else args
-        overview_only = args.get("manpage", "overview") == "overview"
-    require(
-        names.count(expected) == 1
-        and names.count("lathe") <= 1
-        and names[-1:] == [expected]
-        and set(names) <= {"lathe", expected}
-        and overview_only,
-        output,
-    )
-
-
 def verify_journey(output, destination, marker):
-    """Require observed discovery, delegation, and a subsequent inspection.
+    """Require observed discovery, direct copying, and a separate read.
 
     Filesystem effects are checked separately through Daytona. In particular,
     assistant prose is never evidence that the overview or file was inspected.
@@ -396,7 +366,7 @@ def verify_journey(output, destination, marker):
     results = {item.get("call_id"): item for item in output
                if item.get("type") == "function_call_output"}
     overview_seen = False
-    delegated = False
+    copied = False
     inspected = False
     for call in calls:
         args = call.get("arguments") or "{}"
@@ -405,14 +375,14 @@ def verify_journey(output, destination, marker):
         if call.get("name") == "lathe" and args.get("manpage", "overview") == "overview":
             overview_seen = any(value.strip() and not value.startswith(("Error:", "Unknown manpage"))
                                 for value in values)
-        if call.get("name") == "delegate":
-            require(overview_seen, "Delegation happened before overview discovery")
-            delegated = True
-        if delegated and call.get("name") in ("read", "bash", "interpret"):
-            inspected |= destination in json.dumps(args) and any(marker in value for value in values)
+        if call.get("name") in ("write", "bash", "interpret") and destination in json.dumps(args):
+            require(overview_seen, "Copying happened before overview discovery")
+            copied |= any(value.strip() and not value.startswith(("Error:", "Exit code:")) for value in values)
+        if copied and call.get("name") == "read":
+            inspected |= args.get("path") == destination and any(marker in value for value in values)
     require(overview_seen, "Agent did not consult the overview")
-    require(delegated, "Agent did not use delegation")
-    require(inspected, "Agent did not inspect the copied result after delegation")
+    require(copied, "Agent did not directly copy the file")
+    require(inspected, "Agent did not separately read the destination after copying")
 
 
 async def main():
@@ -451,7 +421,7 @@ async def main():
 
     async def exact_source_and_schema():
         remote = await fetch_staging_tool()
-        local_source = staged_source()
+        local_source = SOURCE_PATH.read_text()
         remote_source = remote.get("content", "")
         require(
             remote_source == local_source,
@@ -510,21 +480,6 @@ async def main():
         require(not any(PNG_B64[:40] in v for v in values),
                 f"raw base64 leaked into text channel: {values[0][:120]}")
 
-    async def delegate_dispatch():
-        # The value is in the sandbox, not in the delegate's task. Verify a
-        # disk effect separately so repeating the instructions cannot pass.
-        destination = path + ".copy"
-        output = await client.send(
-            "Call delegate exactly once with max_steps=5 and foreground_seconds=120. "
-            f"The delegated task is: read {path} and write an exact copy of its contents to {destination}. "
-            "Do not do the task yourself or call any other tool.",
-            timeout=240,
-        )
-        require_single_dispatch(output, "delegate")
-        output = await client.send(f"Call read exactly once for {destination}.")
-        require_single_dispatch(output, "read")
-        require(any(canary in value for value in tool_outputs(output)), output)
-
     async def protected_preview_dispatch():
         nonlocal preview_url
         output = await client.send(
@@ -553,8 +508,8 @@ async def main():
             "You are using this coding environment for the first time. Consult its built-in "
             "overview before starting. "
             f"Create {source} containing exactly {marker} with no extra whitespace. "
-            f"Ask a subagent to make an exact copy at {destination}, then inspect the copied "
-            "contents yourself to verify the result. Wait for the work to finish. "
+            f"Make an exact copy at {destination}, then use a separate read tool call on "
+            "the copied file to verify its contents. "
             "Use at most 12 tool calls and finish within 4 minutes.",
             timeout=240, max_calls=12,
         )
@@ -596,7 +551,6 @@ async def main():
                 ("write and read dispatch", write_and_read_dispatch),
                 ("interpreter dispatch", interpreter_dispatch),
                 ("view dispatch", view_dispatch),
-                ("delegate dispatch", delegate_dispatch),
             ])
         if preview_enabled:
             scenarios.append((f"model to OWUI to {PREVIEW_ACCESS} wrapped expose", protected_preview_dispatch))
