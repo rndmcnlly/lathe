@@ -2945,6 +2945,12 @@ class Tools:
 
             ## On-demand repository recipes
 
+            Choose a recipe by the user's task:
+            - dufs: browser file upload/download for the user (port 5000).
+            - ttyd: interactive browser shell (7681, private only).
+            - code-server: browser VS Code IDE (8080, private only).
+            - site: static website preview (8000).
+
             Recipe revision: {recipe_revision}
             Use the cached snapshot when present. Otherwise bootstrap the pinned
             revision (never main or a moving tag):
@@ -2953,12 +2959,17 @@ class Tools:
               curl -fsSL https://raw.githubusercontent.com/rndmcnlly/lathe/{recipe_revision}/recipes/bootstrap.sh -o /tmp/lathe-recipes-bootstrap.sh && sh /tmp/lathe-recipes-bootstrap.sh {recipe_revision}
             }
             ```
+            Before launching, use read() on the shared guide:
+            /home/daytona/.cache/lathe/recipes/{recipe_revision}/README.md
+            and the selected app's instructions:
+            /home/daytona/.cache/lathe/recipes/{recipe_revision}/<app>/SKILL.md
+            Replace <app> with dufs, ttyd, code-server, or site. These contain
+            app-specific capabilities, safeguards, startup and recovery guidance.
             Then run with bash(), choosing an absolute existing workspace root:
             ```sh
             python3 ~/.cache/lathe/recipes/{recipe_revision}/app.py dufs --root /home/daytona/workspace --port 5000
             ```
             Read the JSON READY metadata, then expose http:5000 privately.
-            Other recipes: ttyd (7681), code-server (8080), site (8000).
             Recipes own installation, process identity checks, startup and logs.
             After sandbox sleep, rerun the same recipe before renewing exposure.
             The ordinary sandbox filesystem survives stop/archive, not destroy.
@@ -3461,6 +3472,9 @@ class Tools:
         __event_emitter__=None,
     ) -> str:
         """Expose an already-running HTTP/WebSocket service. Does not install or start applications.
+        For user file upload/download, interactive shells, browser VS Code IDEs,
+        or static websites, first read lathe(manpage="services") for recipe choices
+        and their app-specific instructions, then launch with bash.
         :param target: "http:<port>" for a service listening on port 1024–65535. Start it with bash first. See lathe(manpage="services") for recipes.
         :param access: Required policy: "private" authenticates the owner and fails closed; "public" allows anyone with the URL and may fall back to a direct bearer URL. Choose private unless the user explicitly requests public/world access. Shells and IDEs should always be private.
         :param tag: Optional untrusted hostname hint: lowercase letters, digits, internal hyphens, max 32 characters. Hostname text never proves identity or purpose.

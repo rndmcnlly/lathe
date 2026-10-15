@@ -46,6 +46,11 @@ clear home. It is not counted as eliminating those scripts from the whole
 system. Local trials may preseed the exact pinned source before its commit is
 published.
 
+Extraction must preserve discovery: tool descriptions and the services manual
+name the user-facing capabilities and route to the pinned recipes' shared guide
+and per-app skills before launch. Application expertise stays available just in
+time without duplicating it in the runtime.
+
 ## State
 
 Files in an ordinary sandbox survive stop/archive. Destroying the sandbox
