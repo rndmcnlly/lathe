@@ -19,14 +19,9 @@ import traceback
 import uuid
 
 import httpx
-from httpx_ws import aconnect_ws
 from dotenv import load_dotenv
 
-from lathe import (
-    Tools, _api, _extract_sandbox_list, _headers, _site_port, _toolbox,
-    _CS_BIN, _CS_ENSURE_SCRIPT, _DUFS_BIN, _DUFS_ENSURE_SCRIPT,
-    _TTYD_ENSURE_SCRIPT, _TTYD_PORT,
-)
+from lathe import Tools, _api, _extract_sandbox_list, _headers, _toolbox
 
 
 load_dotenv()
@@ -34,9 +29,7 @@ load_dotenv()
 API_KEY = os.environ.get("DAYTONA_API_KEY", "")
 DEPLOYMENT_LABEL = "lathe-integration-test"
 TEST_EMAIL = "runner@lathe-integration.test"
-VOLUME_NAME = f"{DEPLOYMENT_LABEL}/{TEST_EMAIL}"
 WORKSPACE = "/home/daytona/workspace"
-VOLUME = "/home/daytona/volume"
 
 # 1x1 transparent PNG, used to exercise view().
 PNG_B64 = (
@@ -136,7 +129,6 @@ async def main():
     tools = Tools()
     tools.valves.daytona_api_key = API_KEY
     tools.valves.deployment_label = DEPLOYMENT_LABEL
-    tools.valves.persistent_volume = True
     tools.valves.auto_stop_minutes = 15
     tools.valves.auto_archive_minutes = 60
     tools.valves.auto_delete_minutes = -1
@@ -150,7 +142,6 @@ async def main():
     }
     canary = f"LATHE_{uuid.uuid4().hex}"
     test_file = f"{WORKSPACE}/contract-{uuid.uuid4().hex}.txt"
-    volume_file = f"{VOLUME}/contract-volume-canary.txt"
     results = Results()
     started = time.monotonic()
     cleanup_failed = False
@@ -169,8 +160,8 @@ async def main():
         require("Replaced 1" in output, output)
 
         glob_output, grep_output = await asyncio.gather(
-            tools.glob(f"{WORKSPACE}/contract-*.txt", **ctx),
-            tools.grep(canary, files=f"{WORKSPACE}/contract-*.txt", **ctx),
+            tools.glob("contract-*.txt", **ctx),
+            tools.grep(canary, files="contract-*.txt", **ctx),
         )
         require(test_file in glob_output, glob_output)
         require(canary in grep_output and test_file in grep_output, grep_output)
@@ -358,7 +349,8 @@ async def main():
         except Exception:
             raise AssertionError("Direct signed-preview reachability failed") from None
 
-    async def ttyd_terminal_roundtrip():
+    async def workspace_survives_stop():
+        # No extra volume: restart the same VM and independently read its file.
         async with httpx.AsyncClient() as client:
             response = await client.get(
                 _api(tools.valves, "/sandbox"),
@@ -366,135 +358,24 @@ async def main():
                 headers=_headers(tools.valves), timeout=30,
             )
             response.raise_for_status()
-            sandbox = next(
-                item for item in _extract_sandbox_list(response.json())
-                if item.get("labels", {}).get(DEPLOYMENT_LABEL) == TEST_EMAIL
-            )
-            # Named expose runs its ensure script through /process/execute.
-            # bash() uses a short-lived command session, whose teardown sends
-            # SIGTERM to ttyd even after the script reports a listening PID.
-            response = await client.post(
-                _toolbox(tools.valves, sandbox["id"], "/process/execute"),
-                headers=_headers(tools.valves),
-                json={"command": _TTYD_ENSURE_SCRIPT, "timeout": 60000}, timeout=90,
-            )
+            sandbox, = [s for s in _extract_sandbox_list(response.json())
+                        if s.get("labels", {}).get(DEPLOYMENT_LABEL) == TEST_EMAIL]
+            require(not sandbox.get("volumes"), "Test sandbox unexpectedly has an extra volume")
+            sid = sandbox["id"]
+            response = await client.post(_api(tools.valves, f"/sandbox/{sid}/stop"),
+                                         headers=_headers(tools.valves), timeout=30)
             response.raise_for_status()
-            data = response.json()
-            require(data.get("exitCode") == 0 and "READY PID=" in data.get("result", ""), data)
-            response = await client.get(
-                _api(tools.valves, f"/sandbox/{sandbox['id']}/ports/{_TTYD_PORT}/signed-preview-url"),
-                params={"expiresInSeconds": 300}, headers=_headers(tools.valves), timeout=30,
-            )
-            response.raise_for_status()
-            preview = response.json()["url"]
-
-            page = await client.get(
-                preview, headers={"X-Daytona-Skip-Preview-Warning": "true"}, timeout=20,
-            )
-            require(page.status_code == 200 and "ttyd" in page.text.lower(),
-                    f"ttyd page did not load through the signed preview: HTTP {page.status_code}, "
-                    f"content-type {page.headers.get('content-type', 'unknown')}")
-
-            parsed = httpx.URL(preview)
-            ws_url = parsed.copy_with(
-                scheme="wss", path="/ws",
-            )
-            canary_command = f"printf '{canary}\\n'\n"
-            async with aconnect_ws(
-                str(ws_url), client, subprotocols=["tty"],
-                headers={"X-Daytona-Skip-Preview-Warning": "true"},
-            ) as ws:
-                await ws.send_text('{"columns":80,"rows":24}')
-                await ws.send_bytes(b"0" + canary_command.encode())
-                deadline = time.monotonic() + 15
-                received = b""
-                while time.monotonic() < deadline and canary.encode() not in received:
-                    received += await asyncio.wait_for(ws.receive_bytes(), timeout=5)
-                require(canary.encode() in received, received[-500:])
-
-    async def verified_service_bootstrap():
-        for name, script, binary, timeout in [
-            ("dufs", _DUFS_ENSURE_SCRIPT, _DUFS_BIN, 90),
-            ("code-server", _CS_ENSURE_SCRIPT, _CS_BIN, 300),
-        ]:
-            output = await tools.bash(script, foreground_seconds=timeout, **ctx)
-            require("READY PID=" in output, output)
-            output = await tools.bash(f"test -x {binary} && {binary} --version", **ctx)
-            require("Exit code:" not in output, f"{name} bootstrap did not install a working executable: {output}")
-
-    async def dufs_rooted_browser_policy():
-        token = uuid.uuid4().hex
-        inside = f"dufs-inside-{token}.txt"
-        outside = f"dufs-outside-{token}.txt"
-        link = f"dufs-escape-{token}"
-        await tools.write(f"{WORKSPACE}/{inside}", canary, **ctx)
-        await tools.write(f"{VOLUME}/{outside}", canary, **ctx)
-        try:
-            result = await tools.bash(f"ln -s {VOLUME} {WORKSPACE}/{link}", **ctx)
-            require("Exit code:" not in result, result)
-            output = await tools.expose("dufs", "public", **ctx)
-            require("File browser URL:" in output, output)
-            import re
-            match = re.search(r"https://\S+", output)
-            require(match is not None, output)
-            base = httpx.URL(match.group())
-            headers = {"X-Daytona-Skip-Preview-Warning": "true"}
-            async with httpx.AsyncClient() as client:
-                inside_page = await client.get(base.copy_with(path=f"/{inside}"), headers=headers, timeout=20)
-                require(inside_page.status_code == 200 and inside_page.text == canary,
-                        f"dufs normal file: HTTP {inside_page.status_code}: {inside_page.text[:200]}")
-                escaped = await client.get(base.copy_with(path=f"/{link}/{outside}"), headers=headers, timeout=20)
-                require(escaped.status_code == 404,
-                        f"dufs followed a symlink outside root: HTTP {escaped.status_code}")
-                deleted = await client.delete(base.copy_with(path=f"/{inside}"), headers=headers, timeout=20)
-                require(deleted.is_success, f"dufs delete returned HTTP {deleted.status_code}")
-                check = await tools.read(f"{WORKSPACE}/{inside}", **ctx)
-                require("Error: File not found" in check, check)
-        finally:
-            await tools.bash(f"rm -f {WORKSPACE}/{link} {WORKSPACE}/{inside} {VOLUME}/{outside}", **ctx)
-
-    async def parallel_static_sites():
-        import re
-
-        roots = [f"{WORKSPACE}/site-a", f"{WORKSPACE}/site-b"]
-        markers = [f"SITE_A_{canary}", f"SITE_B_{canary}"]
-        for root, marker in zip(roots, markers):
-            await tools.write(f"{root}/index.html", marker, **ctx)
-
-        outputs = await asyncio.gather(*(
-            tools.expose(f"site:{root}", "public", **ctx) for root in roots
-        ))
-        urls = []
-        for output, root in zip(outputs, roots):
-            require(f"port {_site_port(root)}" in output, output)
-            match = re.search(r"https://\S+", output)
-            require(match is not None, output)
-            urls.append(match.group())
-
-        async with httpx.AsyncClient() as client:
-            pages = await asyncio.gather(*(
-                client.get(url, headers={"X-Daytona-Skip-Preview-Warning": "true"}, timeout=20)
-                for url in urls
-            ))
-        for page, marker in zip(pages, markers):
-            require(page.status_code == 200 and marker in page.text, page.text[:200])
-
-        repeated = await tools.expose(f"site:{roots[0]}", "public", **ctx)
-        require(f"port {_site_port(roots[0])}" in repeated, repeated)
-
-    async def volume_survives_recreation():
-        await tools.write(volume_file, canary + "\n", **ctx)
-        output = await tools.destroy(
-            __user__=user,
-            __event_emitter__=emitter,
-            __event_call__=confirmed,
-        )
-        require("Destroyed 1 sandbox" in output, output)
-
-        # The next call creates a fresh VM and remounts the same named volume.
-        output = await tools.read(volume_file, **ctx)
-        require(canary in output, output)
-        await tools.bash(f"rm -f {volume_file}", **ctx)
+            for _ in range(60):
+                response = await client.get(_api(tools.valves, f"/sandbox/{sid}"),
+                                            headers=_headers(tools.valves), timeout=30)
+                response.raise_for_status()
+                if response.json().get("state") == "stopped":
+                    break
+                await asyncio.sleep(1)
+            else:
+                raise AssertionError("Test sandbox did not stop")
+        output = await tools.read(test_file, **ctx)
+        require(canary in output and "OMEGA" in output, output)
 
     async def disabled_auto_create_is_respected():
         output = await tools.destroy(
@@ -522,19 +403,13 @@ async def main():
             ("bounded command retention", bounded_command_retention),
             ("background completion notice", background_completion_notice),
             ("signed preview URL", expose_contract),
-            ("parallel static sites", parallel_static_sites),
-            ("verified dufs and code-server cold-start bootstrap", verified_service_bootstrap),
-            ("dufs rooted browser symlink and delete policy", dufs_rooted_browser_policy),
-            ("ttyd page and websocket command", ttyd_terminal_roundtrip),
-            ("persistent volume survives VM recreation", volume_survives_recreation),
+            ("ordinary workspace survives sandbox stop", workspace_survives_stop),
             ("disabled auto-create policy", disabled_auto_create_is_respected),
         ]:
             if not await results.run(name, scenario):
                 break
     finally:
-        # Cleanup runs even when an HTTP exception aborts a scenario. The named
-        # volume is intentionally retained and reused, so runs do not leak one
-        # Daytona volume per invocation.
+        # Cleanup deletes only isolated test sandboxes, never existing volumes.
         try:
             await _delete_test_sandboxes(tools)
         except Exception as exc:

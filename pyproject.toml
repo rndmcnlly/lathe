@@ -1,12 +1,12 @@
 [project]
 name = "lathe"
-version = "0.32.0"
+version = "1.0.0"
 requires-python = ">=3.11"
 dependencies = [
     "httpx",
     "httpx-ws",
-    "pydantic",
-    "pydantic-ai-slim[openai]~=2.5",
+    "pydantic>=2",
+    "PyYAML",
     "python-dotenv",
     "python-socketio[asyncio_client]>=5.16.2",
     "aiohttp>=3.14.1",
@@ -14,7 +14,7 @@ dependencies = [
 ]
 
 [dependency-groups]
-dev = ["pytest>=8", "pytest-asyncio>=1"]
+dev = ["pytest>=8", "pytest-asyncio>=1", "ripgrep>=15"]
 
 [tool.pytest.ini_options]
 testpaths = ["test_unit.py", "test_monitor.py", "test_demo_local.py"]

@@ -85,8 +85,8 @@ class Trace:
 class RecordingRelay:
     """Loopback-only forwarder, with no synthetic model responses or body edits.
 
-    The workspace selects the model and any router plugin for parent AND
-    delegate requests. Reject changed policy at the actual upstream boundary
+    The workspace selects the model and any router plugin for inference
+    requests. Reject changed policy at the actual upstream boundary
     rather than silently inheriting an account tier or a Pareto-only plugin.
     """
 

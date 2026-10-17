@@ -1,8 +1,7 @@
 # Interpreter identity lifecycle
 
 `interpret()` keeps one Daytona context per non-empty OWUI conversation ID in
-one loaded `Tools` instance. Parent calls and delegates receive the same
-registry. A per-conversation asyncio lock serializes identity lookup, probing,
+one loaded `Tools` instance. A per-conversation asyncio lock serializes identity lookup, probing,
 and creation, not Python execution. Concurrent code can still race on variables.
 
 The registry is separate from the bounded chat-notice LRU. Evicting or

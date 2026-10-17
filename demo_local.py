@@ -1,15 +1,18 @@
 #!/usr/bin/env python3
-"""Record the shared-editor demo using disposable local OWUI and Wrangler.
+"""Record everyday data visualization using disposable local OWUI and Wrangler.
 
 Run: uv run python demo_local.py
 Needs Docker, OpenSSL, Node/npm, and the monitor's two provider environment keys.
-Port 443 must be free. No cloud deployment or production OWUI configuration.
+Uses loopback TLS port 443 by default (DEMO_TLS_PORT overrides the host mapping).
+No cloud deployment or production OWUI configuration.
 """
 
 import argparse
 import asyncio
 import base64
+import csv
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -35,6 +38,119 @@ WORKER = "lathe-local-worker"
 TLS = "lathe-local-tls"
 ISSUER = f"http://{monitor.CONTAINER}:9100/demo-idp"
 DEMO_MODEL = "z-ai/glm-5.3-flash"
+PROVIDER_POLICY = {"data_collection": "deny", "zdr": True,
+                   "max_price": {"prompt": .20, "completion": 1.00}}
+MAX_OUTPUT_TOKENS = 16384
+
+
+class DemoRelay(monitor.RecordingRelay):
+    """Keep privacy and a conservative $4.50 reservation at the upstream boundary."""
+    def __init__(self, trace, key):
+        super().__init__(trace, key)
+        self.reserved = 0.0
+
+    async def handle(self, request):
+        from aiohttp import web
+        payload = await request.json()
+        if any(payload.get("provider", {}).get(k) != v for k, v in PROVIDER_POLICY.items()):
+            self.evidence_errors.append("privacy or price policy missing")
+            raise web.HTTPBadRequest(text="Demo requires ZDR/deny/price policy")
+        cap = payload.get("max_tokens", payload.get("max_completion_tokens", 0))
+        request_bytes = len(await request.read())
+        prices = PROVIDER_POLICY["max_price"]
+        bound = ((request_bytes + 10000) * prices["prompt"] + cap * prices["completion"]) / 1_000_000
+        if not 0 < cap <= MAX_OUTPUT_TOKENS or self.reserved + bound > 4.50 or self.requests >= 40:
+            self.trace("demo_budget_rejected", max_tokens=cap, request_bytes=request_bytes,
+                       reserved_usd=self.reserved, next_bound_usd=bound)
+            self.evidence_errors.append("demo inference budget")
+            raise web.HTTPBadRequest(text="Demo inference budget exhausted")
+        self.reserved += bound
+        self.trace("demo_policy", zdr=True, data_collection="deny", reserved_usd=self.reserved)
+        return await super().handle(request)
+
+
+def tls_port():
+    port = int(os.environ.get("DEMO_TLS_PORT", "443"))
+    if not 1 <= port <= 65535:
+        raise ValueError("DEMO_TLS_PORT must be between 1 and 65535")
+    return port
+
+
+def relay_app(relay):
+    """Allow ordinary screenshot-bearing requests, still subject to the budget."""
+    from aiohttp import web
+    app = web.Application(client_max_size=32 * 1024 * 1024)
+    app.router.add_post("/v1/chat/completions", relay.handle)
+    return app
+
+
+async def configure_demo(api):
+    """Use Lathe without native agents and block sandbox outbound traffic.
+
+    Preserve bootstrap's provider policy and all staging lifecycle valves.
+    Refresh OWUI's effective model cache after changing builtin capabilities.
+    """
+    response = await api.get("/api/models")
+    response.raise_for_status()
+    effective = next(m for m in response.json()["data"] if m["id"] == monitor.workspace_model())
+    model = {k: effective["info"][k] for k in ("id", "base_model_id", "name", "params", "meta")}
+    model["params"].setdefault("custom_params", {}).setdefault("provider", {}).update(PROVIDER_POLICY)
+    # OWUI can omit the ordinary model max_tokens parameter on a UI-native turn.
+    # An explicit upstream override keeps the actual request bounded as well.
+    model["params"]["max_tokens"] = MAX_OUTPUT_TOKENS
+    model["params"]["custom_params"]["max_tokens"] = MAX_OUTPUT_TOKENS
+    model["params"]["system"] = "The sandbox has no outbound Internet access. Use available local tools and self-contained assets."
+    model["meta"]["capabilities"]["builtin_tools"] = False
+    response = await api.post("/api/v1/models/model/update",
+                              params={"id": monitor.workspace_model()}, json=model)
+    response.raise_for_status()
+    response = await api.get("/api/models", params={"refresh": "true"})
+    response.raise_for_status()
+    effective = next(m for m in response.json()["data"] if m["id"] == monitor.workspace_model())
+    if effective["info"]["meta"]["capabilities"]["builtin_tools"]:
+        raise RuntimeError("OWUI's effective model unexpectedly enables builtin tools")
+    path = "/api/v1/tools/id/lathe_test/valves"
+    response = await api.get(path)
+    response.raise_for_status()
+    valves = response.json()
+    overrides = json.loads(valves["sandbox_create_overrides"])
+    overrides["networkBlockAll"] = True
+    valves["sandbox_create_overrides"] = json.dumps(overrides)
+    response = await api.post(path + "/update", json=valves)
+    response.raise_for_status()
+
+
+async def verify_demo_files(http, directory):
+    """Read actual sandbox policy and artifacts without the model or toolkit."""
+    response = await http.get("https://app.daytona.io/api/sandbox", params={
+        "labels": json.dumps({os.environ["LATHE_TEST_DEPLOYMENT_LABEL"]: "monitor@lathe.invalid"})})
+    response.raise_for_status()
+    data = response.json()
+    matches = [s for s in (data if isinstance(data, list) else data.get("items", []))
+               if s.get("labels", {}).get(os.environ["LATHE_TEST_DEPLOYMENT_LABEL"]) == "monitor@lathe.invalid"]
+    if len(matches) != 1 or matches[0].get("networkBlockAll") is not True or matches[0].get("volumes"):
+        raise RuntimeError("Expected one egress-blocked, volume-free demo sandbox")
+    sandbox = matches[0]
+    artifact = json.loads((ROOT / "demo-video/out/artifact.json").read_text())
+    path = artifact["path"]
+    if not path.startswith("/") or not path.lower().endswith(".html"):
+        raise RuntimeError("Expected an absolute HTML artifact path")
+    response = await http.get(f"https://proxy.app.daytona.io/toolbox/{sandbox['id']}/files/download", params={"path": path})
+    response.raise_for_status()
+    html = response.text
+    rows = list(csv.DictReader(io.StringIO((ROOT / "demo-video/repair-log.csv").read_text())))
+    summary = {"items": len(rows), "repaired": sum(row["outcome"] == "repaired" for row in rows),
+               "minutes": sum(int(row["minutes"]) for row in rows)}
+    text = re.sub(r"<(style|script)\b[^>]*>.*?</\1>", "", html, flags=re.I | re.S)
+    text = re.sub(r"<[^>]+>", " ", text)
+    if (len(html) < 500 or "repair" not in text.lower()
+            or any(not re.search(rf"\b{summary[key]}\b", text) for key in ("items", "repaired"))
+            or re.search(r"(?:src|href)\s*=\s*['\"]\s*(?:https?:)?//", html, re.I)
+            or re.search(r"(?:@import|url\()\s*['\"]?(?:https?:)?//", html, re.I)):
+        raise RuntimeError("Independent infographic read lacks basic results or uses external assets")
+    (directory / "independent-files.json").write_text(json.dumps({
+        "verified": True, "networkBlockAll": True, "sandbox_id": sandbox["id"],
+        "reference_summary": summary, "files": {path: html}}, indent=2))
 
 
 def demo_identity_app(client_secret, *, clock=time.monotonic):
@@ -109,9 +225,8 @@ async def serve():
     from aiohttp import web
     directory = Path("/artifacts")
     trace = monitor.Trace(directory)
-    relay = monitor.RecordingRelay(trace, os.environ["OPENROUTER_API_KEY"])
-    app = web.Application()
-    app.router.add_post("/v1/chat/completions", relay.handle)
+    relay = DemoRelay(trace, os.environ["OPENROUTER_API_KEY"])
+    app = relay_app(relay)
     runner = web.AppRunner(app, access_log=None)
     await runner.setup()
     await web.TCPSite(runner, "127.0.0.1", 9099).start()
@@ -126,10 +241,22 @@ async def serve():
         import test_deployment as suite
         suite.TRACE = trace
         await suite.deploy_staging_tool(display_name="Lathe")
+        deployed = await suite.fetch_staging_tool()
+        actual_sha = hashlib.sha256(deployed["content"].encode()).hexdigest()
+        expected_sha = hashlib.sha256((ROOT / "lathe.py").read_bytes()).hexdigest()
+        if actual_sha != expected_sha:
+            raise RuntimeError("Deployed Lathe source differs from the checkout")
+        (directory / "source-qualification.json").write_text(json.dumps({
+            "deployed_sha256": actual_sha, "checkout_sha256": expected_sha, "matched": True}, indent=2))
+        async with httpx.AsyncClient(base_url="http://127.0.0.1:8080",
+                headers={"Authorization": f"Bearer {token}"}, timeout=30) as api:
+            await configure_demo(api)
         # Private pipe to the parent, never written to an artifact or console.
         print(json.dumps({"ready": True, "token": token}), flush=True)
         await asyncio.to_thread(sys.stdin.readline)
         relay.verify_evidence()
+        async with httpx.AsyncClient(headers={"Authorization": f"Bearer {os.environ['DAYTONA_API_KEY']}"}, timeout=30) as http:
+            await verify_demo_files(http, directory)
     finally:
         try:
             if suite:
@@ -141,6 +268,7 @@ async def serve():
                 "requested_model": relay.model,
                 "serving_models": sorted(trace.models), "requests": relay.requests,
                 "evidence_errors": relay.evidence_errors,
+                "upper_bound_reserved_usd": relay.reserved,
             }, indent=2))
 
 
@@ -210,14 +338,14 @@ http {{
         "npx --yes wrangler@4.136.1 dev --local --ip 0.0.0.0 --port 8787 "
         "--config wrangler.json --persist-to /tmp/wrangler-state")
     monitor.docker("run", "-d", "--name", TLS, "--network", NETWORK,
-        "--network-alias", ZONE, "-p", "127.0.0.1:443:443",
+        "--network-alias", ZONE, "-p", f"127.0.0.1:{tls_port()}:443",
         "--mount", f"type=bind,src={path},dst=/local-demo,readonly",
         "nginx:1.28-alpine", "nginx", "-g", "daemon off;", "-c", "/local-demo/nginx.conf")
     deadline = time.monotonic() + 240
     while time.monotonic() < deadline:
         try:
             # Browser-style request through loopback, preserving the Worker host.
-            response = httpx.get("https://127.0.0.1/", headers={"Host": ZONE}, verify=False, timeout=3)
+            response = httpx.get(f"https://127.0.0.1:{tls_port()}/", headers={"Host": ZONE}, verify=False, timeout=3)
             if response.status_code == 200 and "preview wrapper" in response.text:
                 return token
         except httpx.TransportError:
@@ -233,10 +361,8 @@ def capture_environment(token, port):
     env = {k: v for k, v in os.environ.items()
            if not k.startswith(("DEMO_", "OWUI_")) and k not in server_keys}
     env.update(DEMO_LOCAL_TOKEN=token, DEMO_OWUI_URL=f"http://127.0.0.1:{port}",
-               DEMO_MODEL=monitor.workspace_model(), DEMO_PROXY_DOMAINS=ZONE)
-    # This opt-in affects prewarm only, never authentication or preview policy.
-    if os.environ.get("DEMO_SKIP_PREWARM") == "1":
-        env["DEMO_SKIP_PREWARM"] = "1"
+               DEMO_MODEL=monitor.workspace_model(), DEMO_PROXY_DOMAINS=ZONE,
+               DEMO_TLS_PORT=str(tls_port()))
     return env
 
 
@@ -283,10 +409,12 @@ def qualify(directory):
     routing = json.loads((directory / "demo-routing.json").read_text())
     cleanup = json.loads((directory / "demo-cleanup.json").read_text())
     capture = json.loads((ROOT / "demo-video/out/capture-report.json").read_text())
+    files = json.loads((directory / "independent-files.json").read_text())
     if (capture["status"] != "accepted" or not cleanup["success"]
             or routing["requested_model"] != environment["requested_model"]
             or not routing["serving_models"] or not routing["requests"]
-            or routing["evidence_errors"]):
+            or routing["evidence_errors"] or files.get("verified") is not True
+            or files.get("networkBlockAll") is not True):
         raise RuntimeError("Demo qualification failed: capture, routing, or cleanup evidence")
     result = {"accepted": True, "git_sha": environment["git_sha"],
               "requested_model": routing["requested_model"], "serving_models": routing["serving_models"],

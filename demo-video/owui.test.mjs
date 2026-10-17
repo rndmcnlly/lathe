@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { chromium } from "playwright";
-import { openOwuiChat } from "./owui.mjs";
+import { openOwuiChat, typeMessage } from "./owui.mjs";
 
 test("chat readiness dismisses release notes despite ongoing network activity and survives a fresh recording context", { timeout: 10000 }, async () => {
   const browser = await chromium.launch({ headless: true });
@@ -47,11 +47,24 @@ test("chat readiness dismisses release notes despite ongoing network activity an
     const recordedPage = await setup(recording);
     await openOwuiChat(recordedPage, "http://owui.test/");
     assert.equal(await recordedPage.getByRole("dialog").count(), 0);
-    // Returning from the editor also needs UI readiness, not network silence.
+    // A later chat navigation also needs UI readiness, not network silence.
     await openOwuiChat(recordedPage, "http://owui.test/c/chat");
     assert.equal(await recordedPage.locator("#chat-input").isVisible(), true);
     assert.equal(ongoingRequests, 3);
   } finally {
     await browser.close();
   }
+});
+
+test("multiline prompts use real editor input and preserve CSV hard breaks", { timeout: 10000 }, async () => {
+  const browser = await chromium.launch({ headless: true });
+  try {
+    const page = await browser.newPage();
+    await page.setContent('<div id="chat-input" contenteditable="true"><p>Old draft</p></div>');
+    const csv = "day,repaired\nMonday,8\nTuesday,12";
+    await typeMessage(page, csv);
+    assert.equal(await page.locator("#chat-input").innerText(), csv);
+    await typeMessage(page, "A replacement");
+    assert.equal(await page.locator("#chat-input").innerText(), "A replacement");
+  } finally { await browser.close(); }
 });

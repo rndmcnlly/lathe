@@ -1,22 +1,24 @@
-export function managedTargetRoot(event, target) {
-  const value = event.arguments?.target;
-  return typeof value === "string" && value.startsWith(`${target}:/`)
-    ? value.slice(target.length + 1) : null;
-}
-
 export function matchesToolExpectation(event, expected) {
-  const contains = (value, text) => !text || JSON.stringify(value).toLowerCase().includes(text.toLowerCase());
+  const contains = (value, text) => !text || (typeof value === "string" ? value : JSON.stringify(value))
+    .toLowerCase().includes(text.toLowerCase());
   return expected.tools.includes(event.tool)
     && Object.entries(expected.argumentsEqual || {}).every(([key, value]) =>
       event.arguments?.[key] === value)
-    && (!expected.managedTarget || event.arguments?.target === expected.managedTarget
-      || (typeof event.arguments?.target === "string"
-        && event.arguments.target.startsWith(`${expected.managedTarget}:/`)))
-    && (!expected.bindCheckout || Boolean(managedTargetRoot(event, expected.managedTarget)))
     && contains(event.arguments, expected.argumentContains)
     && contains(event.output, expected.outputContains)
     && (!expected.outputLineEquals || event.output.split(/\r?\n/).some((line) =>
       line.replace(/^\d+: /, "") === expected.outputLineEquals));
+}
+
+export function privatePreviewUrl(event, domains) {
+  if (event.tool !== "expose" || event.arguments?.access !== "private") throw new Error("Expected private exposure evidence");
+  const match = event.output.match(/^Service URL:\s+(https:\/\/\S+)/m);
+  const url = new URL(match?.[1] || "invalid");
+  if (url.protocol !== "https:" || url.username || url.password
+      || !domains.some((domain) => url.hostname === domain || url.hostname.endsWith(`.${domain}`))) {
+    throw new Error("Untrusted private preview URL");
+  }
+  return url.href;
 }
 
 export function normalizedToolEvents(payload) {
