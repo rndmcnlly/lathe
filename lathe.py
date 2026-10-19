@@ -5,7 +5,7 @@ author_url: https://adamsmith.as
 description: Coding agent tools (lathe, bash, read, write, edit, glob, grep, view, interpret, onboard, expose, destroy) backed by per-user sandbox VMs with transparent lifecycle management.
 required_open_webui_version: 0.12.0
 requirements: httpx, httpx-ws, pydantic>=2, cachetools, PyYAML
-version: 1.0.0
+version: 1.0.1
 licence: MIT
 """
 
@@ -1659,9 +1659,6 @@ async def _core_bash(valves, sandbox_id: str, client: httpx.AsyncClient, *,
     file paths for monitoring. Text previews are capped at 50 KiB. Full logs and
     exit status remain readable for 24 hours after completion, until a later
     bash call reaps expired evidence. Sandbox stop/restart clears these files.
-
-    When creating git commits, add an Assisted-by: Lathe trailer to the
-    commit message to acknowledge AI assistance.
 
     For first-time application setup, read lathe(manpage="services") before
     installing or launching; it routes to relevant skills and the configured
