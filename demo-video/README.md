@@ -79,8 +79,16 @@ Local captures and source edits never replace the existing public video.
 
 ## Current qualification status
 
-On 2026-10-20, [the v1 live capture passed](https://github.com/rndmcnlly/lathe/actions/runs/39452639788),
-including private preview, independent artifact checks, and cleanup. Editorial
-review caught an unsupported seasonal claim in the generated infographic, so
-scenario 11 adds explicit grounding guidance. A reviewed take of that revision
-is required before replacing the public video.
+On 2026-10-20, [scenario 11 passed live qualification](https://github.com/rndmcnlly/lathe/actions/runs/39455361278)
+at checkout `fac12e5229fd1bc5567135693a3b479686c0a43a`, including private preview,
+independent artifact/source checks, serving-model evidence, and cleanup. The
+reviewed take was promoted to `demo-video-latest` and is embedded at lathe.tools.
+Its qualification and capture reports are attached to that release.
+
+This publication promoted the exact downloaded, reviewed CI artifact with the
+same default-branch SHA, model, source, acceptance, and cleanup checks as the
+workflow. It did not generate another unreviewed take. Scenario 11 adds explicit
+claim-grounding guidance; the browser also handles a service-root directory
+listing by following the evidenced artifact's same-origin link. Earlier rejected
+takes remain in their Actions runs. Generated editorial conclusions still need
+human review.
