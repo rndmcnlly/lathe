@@ -87,23 +87,25 @@ Local captures and source edits never replace the existing public video.
 
 ## Current qualification status
 
-Scenario 14 asks for quick analytics before the infographic and rejects
-persisted turn errors, including tool-call exhaustion. Its live qualification is pending;
-the public video remains the scenario 11 take below until a replacement is reviewed.
-After natural analytics and Python-specific requests chose no tools and shell
-Python respectively, demo-only system guidance now prefers the persistent
-interpreter for data analysis. Those rejected takes are retained in Actions.
+On 2026-10-20, [scenario 14 passed live qualification](https://github.com/rndmcnlly/lathe/actions/runs/39460102515)
+at checkout `c5577a420874f400e018ee51264c9b6990f64eb0`. The reviewed analytics-first
+take is published at `demo-video-latest` and embedded at lathe.tools, with its
+qualification and capture reports attached to the release.
 
-On 2026-10-20, [scenario 11 passed live qualification](https://github.com/rndmcnlly/lathe/actions/runs/39455361278)
-at checkout `fac12e5229fd1bc5567135693a3b479686c0a43a`, including private preview,
-independent artifact/source checks, serving-model evidence, and cleanup. The
-reviewed take was promoted to `demo-video-latest` and is embedded at lathe.tools.
-Its qualification and capture reports are attached to that release.
+The first answer arrives about 40 seconds into the take, with an actual `interpret`
+result and a reading pause before the infographic request. All three turns
+completed without persisted errors; private preview, independent artifact/source
+checks, serving-model evidence, and cleanup passed. The exact downloaded artifact
+was promoted after default-branch SHA and qualification checks, not regenerated
+as an unreviewed take.
 
-This publication promoted the exact downloaded, reviewed CI artifact with the
-same default-branch SHA, model, source, acceptance, and cleanup checks as the
-workflow. It did not generate another unreviewed take. Scenario 11 adds explicit
-claim-grounding guidance; the browser also handles a service-root directory
-listing by following the evidenced artifact's same-origin link. Earlier rejected
-takes remain in their Actions runs. Generated editorial conclusions still need
-human review.
+The previously published scenario 11 had exhausted the monitor's inherited
+12-iteration limit despite producing a usable artifact. The demo now uses 24
+iterations per turn and rejects persisted OWUI errors. Natural analytics and
+Python-specific requests subsequently chose no tools and shell Python respectively;
+demo-only system guidance now prefers `interpret` for analysis. These earlier
+takes remain in their Actions runs.
+
+Generated conclusions still need human review. In particular, the analytics
+answer's projected 90%+ repair rate is speculation, not a measured finding from
+the supplied log. The infographic labels its suggestions and small-sample caveat.
