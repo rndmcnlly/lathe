@@ -6,7 +6,9 @@ short requests, not a scripted coding-agent capabilities showcase.
 1. Enable Lathe visibly through **Integrations → Tools → Lathe**.
 2. “Here's our repair-café log. Make an HTML infographic showing the volunteers
    what we accomplished and where we could improve.” The message includes
-   `repair-log.csv` as a pasted CSV block of individual repair records.
+   `repair-log.csv` as a pasted CSV block of individual repair records. It asks
+   for evidence-grounded claims, repairs distinguished from advice, and suggestions
+   labeled as suggestions.
 3. “Serve it up, private.” Open the resulting private preview and scroll through
    the infographic.
 
@@ -74,7 +76,8 @@ Local captures and source edits never replace the existing public video.
 
 ## Current qualification status
 
-As of 2026-10-15, the everyday-use storyboard has no accepted live capture.
-Iteration was paused after capture/relay fixes and provider rate limiting;
-trial cleanup succeeded. Offline checks pass, but a future accepted end-to-end
-take is still required before publishing a replacement video.
+On 2026-10-20, [the v1 live capture passed](https://github.com/rndmcnlly/lathe/actions/runs/39452639788),
+including private preview, independent artifact checks, and cleanup. Editorial
+review caught an unsupported seasonal claim in the generated infographic, so
+scenario 11 adds explicit grounding guidance. A reviewed take of that revision
+is required before replacing the public video.

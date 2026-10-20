@@ -1,6 +1,6 @@
 {
   "id": "lathe-everyday-infographic",
-  "version": 10,
+  "version": 11,
   "steps": [
     { "id": "auth.owui", "do": "auth.ensure-owui", "failureDomain": "authentication" },
     { "id": "capture.start", "do": "capture.start" },
@@ -9,7 +9,7 @@
     {
       "id": "infographic.request", "do": "chat.send", "failureDomain": "model_behavior",
       "with": {
-        "prompt": "Here's our repair-café log. Make an HTML infographic showing the volunteers what we accomplished and where we could improve.",
+        "prompt": "Here's our repair-café log. Make an HTML infographic showing the volunteers what we accomplished and where we could improve. Ground factual claims in these records, distinguish repairs from advice, and label suggestions as suggestions.",
         "dataFile": "repair-log.csv", "timeoutMs": 420000
       }
     },
