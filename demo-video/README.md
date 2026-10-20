@@ -49,6 +49,9 @@ request/output-token limits. See [CI-MONITOR.md](../CI-MONITOR.md).
 `scenario.json` is a linear take. The adapter preserves real multiline editor
 input and waits for visible chat readiness instead of `networkidle`. Failures
 reject the take, without narrative retries or alternate routes.
+If the private service opens a directory listing, the browser follows only its
+exact same-origin HTML link matching the artifact identified in tool records.
+It never guesses a URL or substitutes a different artifact.
 
 Persisted tool records identify the model's HTML path and prove an actual private
 `expose` result, not an assistant promise. The runner independently downloads that

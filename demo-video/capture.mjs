@@ -12,6 +12,7 @@ import { strFromU8, strToU8, unzipSync, zipSync } from "fflate";
 import { normalizedToolEvents, matchesToolExpectation, privatePreviewUrl } from "./evidence.mjs";
 import { runScenario } from "./interpreter.mjs";
 import { openOwuiChat, typeMessage } from "./owui.mjs";
+import { followDirectoryArtifact } from "./preview.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const OUT_DIR = resolve(__dirname, "out");
@@ -277,9 +278,10 @@ async function failUnknownAuth(page, flow) {
   throw new Error(`${flow} authentication reached an unknown state at ${page.url()}: ${snapshot.title}\n${snapshot.text}`);
 }
 
-async function ensurePreviewAuth(page, previewOrigin) {
+async function ensurePreviewAuth(page, previewOrigin, artifactPath) {
   const deadline = Date.now() + 90000;
   while (Date.now() < deadline) {
+    if (await followDirectoryArtifact(page, artifactPath)) continue;
     if (await page.getByRole("heading", { name: /repair|café|cafe/i }).first().isVisible().catch(() => false)) return;
     const url = new URL(page.url());
     const action = await visibleButton(page, /sign in|continue|authorize|allow|approve/i);
@@ -333,7 +335,7 @@ async function openPreview(state) {
   if (!url) throw new Error("No trusted HTTPS preview URL found in the response");
   state.previewUrl = url;
   await state.page.goto(url);
-  await ensurePreviewAuth(state.page, new URL(url).origin);
+  await ensurePreviewAuth(state.page, new URL(url).origin, state.artifactPath);
   state.previewReady = true;
 }
 
@@ -508,6 +510,7 @@ const adapter = {
       && typeof event.arguments?.path === "string" && event.arguments.path.startsWith("/")
       && event.arguments.path.toLowerCase().endsWith(".html"));
     if (!event) throw new Error("No HTML artifact path found in completed file-tool records");
+    state.artifactPath = event.arguments.path;
     await writeFile(resolve(OUT_DIR, "artifact.json"), `${JSON.stringify({ path: event.arguments.path, tool: event.tool })}\n`);
     await scrollChatToBottom(state.page);
     return { observations: [`artifact.path=${event.arguments.path}`] };
