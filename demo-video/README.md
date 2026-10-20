@@ -4,8 +4,8 @@ A real GLM 5.3 Flash conversation in Open WebUI: raw repair-café data and three
 short requests, not a scripted coding-agent capabilities showcase.
 
 1. Enable Lathe visibly through **Integrations → Tools → Lathe**.
-2. Ask for a short summary: repairs, volunteer time, and what blocked unsuccessful
-   repairs. Include `repair-log.csv` as pasted individual records, keeping advice
+2. Ask for a quick Python analysis: repairs, volunteer time, and average item time
+   by session, plus what blocked unsuccessful repairs. Include `repair-log.csv` as pasted individual records, keeping advice
    separate from repairs. The take must show a real `interpret` result without
    naming that tool in the user's prompt. Hold the short answer for reading.
 3. Ask for a phone-readable HTML infographic based on those findings, with
@@ -84,8 +84,8 @@ Local captures and source edits never replace the existing public video.
 
 ## Current qualification status
 
-Scenario 12 adds quick analytics before the infographic and rejects persisted
-turn errors, including tool-call exhaustion. Its live qualification is pending;
+Scenario 13 asks for a quick Python analysis before the infographic and rejects
+persisted turn errors, including tool-call exhaustion. Its live qualification is pending;
 the public video remains the scenario 11 take below until a replacement is reviewed.
 
 On 2026-10-20, [scenario 11 passed live qualification](https://github.com/rndmcnlly/lathe/actions/runs/39455361278)

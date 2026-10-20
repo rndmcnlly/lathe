@@ -228,7 +228,8 @@ keeps temporary-directory removal host-owned, including `.wrangler/tmp`.
 The staging sandbox has `networkBlockAll=true`: no clone, installer, external
 asset, or ripgrep bootstrap is needed. OWUI still reaches OpenRouter and the
 Daytona control plane. The user gives raw individual repair records and first asks
-for quick analytics: repairs, time logged, and blockers. A real `interpret` result
+for quick Python analytics: repairs, time logged, average item time by session,
+and blockers. A real `interpret` result
 is required, without naming the tool in the prompt. After a reading pause, the
 user asks for an HTML infographic based on those findings, then says “Serve it
 up, private.” The model chooses calculations, implementation, paths
