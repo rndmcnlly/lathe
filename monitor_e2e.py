@@ -295,7 +295,7 @@ def cleanup(directory):
     return failed
 
 
-def launch(directory, *, docker_args=()):
+def launch(directory, *, docker_args=(), tool_call_iterations=12):
     """Pull moving OWUI slim, record its digest, then launch loopback-only."""
     image = "ghcr.io/open-webui/open-webui:slim"
     print(f"Pulling {image}", flush=True)
@@ -308,7 +308,8 @@ def launch(directory, *, docker_args=()):
                 "git_sha": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip(),
                 "router": requested_model(), "requested_model": requested_model(),
                 "plugins": model_plugins(requested_model()),
-                "deployment_label": os.environ["LATHE_TEST_DEPLOYMENT_LABEL"]}
+                "deployment_label": os.environ["LATHE_TEST_DEPLOYMENT_LABEL"],
+                "tool_call_iterations": tool_call_iterations}
     (directory / "environment.json").write_text(json.dumps(metadata, indent=2) + "\n")
     docker("run", "--detach", "--name", CONTAINER,
            "--publish", "127.0.0.1:0:8080", "--mount", f"type=bind,src={ROOT},dst=/monitor,readonly",
@@ -319,7 +320,7 @@ def launch(directory, *, docker_args=()):
            "--env", "LATHE_ISOLATED_CI=1", "--env", "ENABLE_OLLAMA_API=false",
            "--env", "ENABLE_SIGNUP=true", "--env", "WEBUI_AUTH=true",
            "--env", "SCARF_NO_ANALYTICS=true", "--env", "DO_NOT_TRACK=true",
-           "--env", "CHAT_RESPONSE_MAX_TOOL_CALL_ITERATIONS=12",
+           "--env", f"CHAT_RESPONSE_MAX_TOOL_CALL_ITERATIONS={tool_call_iterations}",
            "--env", "HF_HUB_OFFLINE=1", *docker_args, image)
     return metadata
 

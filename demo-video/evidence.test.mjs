@@ -1,6 +1,27 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { normalizedToolEvents, matchesToolExpectation, privatePreviewUrl } from "./evidence.mjs";
+import { normalizedToolEvents, matchesToolExpectation, privatePreviewUrl, assertSuccessfulTurn } from "./evidence.mjs";
+
+test("persisted turn errors reject otherwise useful output, including exhausted tool iterations", () => {
+  const payload = (message) => ({ chat: { history: { currentId: "current", messages: {
+    old: { role: "assistant", done: true, error: { content: "old error" } }, current: message,
+  } } } });
+  const completed = { role: "assistant", done: true, content: "Your infographic is ready." };
+  assert.doesNotThrow(() => assertSuccessfulTurn(payload(completed)));
+  for (const content of ["Tool-call limit reached (12 iterations).", "Provider unavailable"]) {
+    assert.throws(() => assertSuccessfulTurn(payload({ ...completed, error: { content } })), /turn error/);
+  }
+  for (const message of [null, { ...completed, done: false }, { ...completed, role: "user" }]) {
+    assert.throws(() => assertSuccessfulTurn(payload(message)), /missing/);
+  }
+});
+
+test("analytics evidence requires an interpreter result, not just a call or prose", () => {
+  const expected = { tools: ["interpret"] };
+  assert.equal(matchesToolExpectation({ tool: "interpret", output: "12 items, 7 repaired" }, expected), true);
+  assert.equal(matchesToolExpectation({ tool: "interpret", output: "" }, expected), false);
+  assert.equal(matchesToolExpectation({ tool: "bash", output: "12 items, 7 repaired" }, expected), false);
+});
 
 test("pairs persisted tool calls with their actual results and deduplicates history copies", () => {
   const output = [

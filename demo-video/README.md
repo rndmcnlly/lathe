@@ -1,15 +1,16 @@
 # Everyday visualization demo
 
-A real GLM 5.3 Flash conversation in Open WebUI: raw repair-café data and two
+A real GLM 5.3 Flash conversation in Open WebUI: raw repair-café data and three
 short requests, not a scripted coding-agent capabilities showcase.
 
 1. Enable Lathe visibly through **Integrations → Tools → Lathe**.
-2. “Here's our repair-café log. Make an HTML infographic showing the volunteers
-   what we accomplished and where we could improve.” The message includes
-   `repair-log.csv` as a pasted CSV block of individual repair records. It asks
-   for evidence-grounded claims, repairs distinguished from advice, and suggestions
-   labeled as suggestions.
-3. “Serve it up, private.” Open the resulting private preview and scroll through
+2. Ask for a short summary: repairs, volunteer time, and what blocked unsuccessful
+   repairs. Include `repair-log.csv` as pasted individual records, keeping advice
+   separate from repairs. The take must show a real `interpret` result without
+   naming that tool in the user's prompt. Hold the short answer for reading.
+3. Ask for a phone-readable HTML infographic based on those findings, with
+   evidence-grounded claims and suggestions labeled as suggestions.
+4. “Serve it up, private.” Open the resulting private preview and scroll through
    the infographic.
 
 The model chooses its calculations, conclusions, implementation, file paths and
@@ -43,6 +44,8 @@ the model provider and Daytona control plane; the sandbox has actual
 hosted login, or `.env` is imported by the runner. The upstream relay enforces ZDR,
 data-collection denial, price ceilings, a conservative $4.50 reservation cap, and
 request/output-token limits. See [CI-MONITOR.md](../CI-MONITOR.md).
+The demo permits 24 tool iterations per user turn, independently of the shorter
+monitor's 12. The existing whole-run inference, time, and cost budgets still apply.
 
 ## Evidence and checks
 
@@ -52,6 +55,8 @@ reject the take, without narrative retries or alternate routes.
 If the private service opens a directory listing, the browser follows only its
 exact same-origin HTML link matching the artifact identified in tool records.
 It never guesses a URL or substitutes a different artifact.
+Each completed turn is checked for OWUI's persisted errors. Tool-call exhaustion
+rejects the take even if it produced an otherwise usable artifact and preview.
 
 Persisted tool records identify the model's HTML path and prove an actual private
 `expose` result, not an assistant promise. The runner independently downloads that
@@ -78,6 +83,10 @@ after capture, model/source and cleanup gates may update `demo-video-latest`.
 Local captures and source edits never replace the existing public video.
 
 ## Current qualification status
+
+Scenario 12 adds quick analytics before the infographic and rejects persisted
+turn errors, including tool-call exhaustion. Its live qualification is pending;
+the public video remains the scenario 11 take below until a replacement is reviewed.
 
 On 2026-10-20, [scenario 11 passed live qualification](https://github.com/rndmcnlly/lathe/actions/runs/39455361278)
 at checkout `fac12e5229fd1bc5567135693a3b479686c0a43a`, including private preview,

@@ -470,7 +470,7 @@ def main():
             path = Path(temporary)
             registration_key = prepare_infrastructure(path)
             os.environ["LATHE_PREVIEW_WRAPPER_KEY"] = registration_key
-            monitor.launch(directory, docker_args=(
+            monitor.launch(directory, tool_call_iterations=24, docker_args=(
                 "--network", NETWORK,
                 "--env", "DEFAULT_PROMPT_SUGGESTIONS=[]",
                 "--env", "ENABLE_CODE_INTERPRETER=false",

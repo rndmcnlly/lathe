@@ -227,11 +227,17 @@ keeps temporary-directory removal host-owned, including `.wrangler/tmp`.
 
 The staging sandbox has `networkBlockAll=true`: no clone, installer, external
 asset, or ripgrep bootstrap is needed. OWUI still reaches OpenRouter and the
-Daytona control plane. The user gives raw individual repair records and asks for
-an HTML infographic about accomplishments and improvements. Their only follow-up
-is “Serve it up, private.” The model chooses calculations, implementation, paths
+Daytona control plane. The user gives raw individual repair records and first asks
+for quick analytics: repairs, time logged, and blockers. A real `interpret` result
+is required, without naming the tool in the prompt. After a reading pause, the
+user asks for an HTML infographic based on those findings, then says “Serve it
+up, private.” The model chooses calculations, implementation, paths
 and service port. No subagents or built-in interpreter are enabled: this is an
-everyday productivity task, not an orchestration demonstration.
+everyday productivity task, not an orchestration demonstration. The demo permits
+24 tool iterations per turn; the regular monitor retains 12. The existing 40-request,
+output-token, wall-time, and $4.50 reservation caps remain in force. A persisted
+OWUI turn error, including tool-call exhaustion, rejects the take even if an
+artifact or preview was produced.
 
 The browser checks the private preview and scrolls through the infographic.
 Persisted tool records identify the saved HTML path and actual private exposure;

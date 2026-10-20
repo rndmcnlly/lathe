@@ -1,16 +1,28 @@
 {
   "id": "lathe-everyday-infographic",
-  "version": 11,
+  "version": 12,
   "steps": [
     { "id": "auth.owui", "do": "auth.ensure-owui", "failureDomain": "authentication" },
     { "id": "capture.start", "do": "capture.start" },
     { "id": "chat.open", "do": "chat.open", "screenshot": "fresh-chat", "failureDomain": "ui_drift" },
     { "id": "lathe.enable", "do": "owui.enable-tool", "screenshot": "lathe-enabled", "failureDomain": "ui_drift" },
     {
+      "id": "analytics.request", "do": "chat.send", "failureDomain": "model_behavior",
+      "with": {
+        "prompt": "Here's our repair-café log. How many items did we repair, how much volunteer time did we log, and what blocked the unsuccessful repairs? Give me a short summary first; don't build anything yet. Keep advice-only visits separate from repairs.",
+        "dataFile": "repair-log.csv", "timeoutMs": 180000
+      }
+    },
+    {
+      "id": "analytics.prove", "do": "chat.await-tool-result", "screenshot": "quick-analytics", "failureDomain": "model_behavior",
+      "with": { "tools": ["interpret"] }
+    },
+    { "id": "analytics.hold", "do": "camera.hold", "with": { "milliseconds": 8000 } },
+    {
       "id": "infographic.request", "do": "chat.send", "failureDomain": "model_behavior",
       "with": {
-        "prompt": "Here's our repair-café log. Make an HTML infographic showing the volunteers what we accomplished and where we could improve. Ground factual claims in these records, distinguish repairs from advice, and label suggestions as suggestions.",
-        "dataFile": "repair-log.csv", "timeoutMs": 420000
+        "prompt": "Now turn those findings into an HTML infographic for the volunteers: what we accomplished and where we could improve. Keep it readable on a phone, ground factual claims in the log, distinguish repairs from advice, and label suggestions as suggestions.",
+        "timeoutMs": 420000
       }
     },
     {

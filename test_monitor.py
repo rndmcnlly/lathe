@@ -284,7 +284,8 @@ def test_journey_oracle_rejects_plausible_false_success(suite, copy_tool, copy_a
 
 
 @pytest.mark.parametrize("selected", [None, "z-ai/glm-5.3-flash"])
-def test_launcher_tracks_moving_slim_and_exposes_only_loopback(tmp_path, monkeypatch, selected):
+@pytest.mark.parametrize("iterations", [None, 24])
+def test_launcher_tracks_moving_slim_and_exposes_only_loopback(tmp_path, monkeypatch, selected, iterations):
     import subprocess
     commands = []
     if selected:
@@ -298,7 +299,7 @@ def test_launcher_tracks_moving_slim_and_exposes_only_loopback(tmp_path, monkeyp
                             "Id": "sha256:abc", "Architecture": "amd64"}]) if args[0] == "image" else ""
         return subprocess.CompletedProcess(args, 0, data, "")
     monkeypatch.setattr(monitor, "docker", docker)
-    metadata = monitor.launch(tmp_path)
+    metadata = monitor.launch(tmp_path, **({"tool_call_iterations": iterations} if iterations else {}))
     run = commands[-1]
     image = "ghcr.io/open-webui/open-webui:slim"
     assert commands[0] == ("pull", image)
@@ -311,6 +312,8 @@ def test_launcher_tracks_moving_slim_and_exposes_only_loopback(tmp_path, monkeyp
     assert f"LATHE_MONITOR_MODEL={selected or 'openrouter/pareto-code'}" in run
     assert metadata["requested_model"] == (selected or "openrouter/pareto-code")
     assert metadata["plugins"] == ([] if selected else monitor.PLUGINS)
+    assert f"CHAT_RESPONSE_MAX_TOOL_CALL_ITERATIONS={iterations or 12}" in run
+    assert metadata["tool_call_iterations"] == (iterations or 12)
     assert not any("chat.adamsmith.as" in arg for arg in run)
     assert not any("type=volume" in arg for arg in run)
 

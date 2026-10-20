@@ -1,7 +1,16 @@
+export function assertSuccessfulTurn(payload) {
+  const history = payload?.chat?.history;
+  const message = history?.messages?.[history.currentId];
+  if (!message || message.role !== "assistant" || message.done !== true) {
+    throw new Error("Completed assistant turn is missing from persisted chat evidence");
+  }
+  if (message.error) throw new Error("Open WebUI recorded an assistant turn error (including possible tool-call exhaustion)");
+}
+
 export function matchesToolExpectation(event, expected) {
   const contains = (value, text) => !text || (typeof value === "string" ? value : JSON.stringify(value))
     .toLowerCase().includes(text.toLowerCase());
-  return expected.tools.includes(event.tool)
+  return Boolean(event.output?.trim()) && expected.tools.includes(event.tool)
     && Object.entries(expected.argumentsEqual || {}).every(([key, value]) =>
       event.arguments?.[key] === value)
     && contains(event.arguments, expected.argumentContains)

@@ -9,7 +9,7 @@ import { fileURLToPath } from "node:url";
 import { chromium } from "playwright";
 import { strFromU8, strToU8, unzipSync, zipSync } from "fflate";
 
-import { normalizedToolEvents, matchesToolExpectation, privatePreviewUrl } from "./evidence.mjs";
+import { normalizedToolEvents, matchesToolExpectation, privatePreviewUrl, assertSuccessfulTurn } from "./evidence.mjs";
 import { runScenario } from "./interpreter.mjs";
 import { openOwuiChat, typeMessage } from "./owui.mjs";
 import { followDirectoryArtifact } from "./preview.mjs";
@@ -495,6 +495,7 @@ const adapter = {
     await sendMessage(state.page);
     await waitForResponse(state.page, timeoutMs);
     state.chatUrl = state.page.url();
+    assertSuccessfulTurn(await fetchChat(state));
     return { observations: ["chat.state=idle"] };
   },
 

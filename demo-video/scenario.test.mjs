@@ -22,3 +22,16 @@ test("missing artifact evidence stops the storyboard before the private preview"
   await assert.rejects(runScenario(scenario, adapter), (error) => error.report.failed_step === "infographic.prove");
   assert.equal(previewed, false);
 });
+
+test("analytics must demonstrate interpretation before commissioning the infographic", async () => {
+  let infographic = false;
+  const adapter = Object.fromEntries(scenario.steps.map((step) => [step.do, async () => ({})]));
+  adapter["chat.send"] = async ({ dataFile }) => { if (!dataFile) infographic = true; };
+  adapter["chat.await-tool-result"] = async (expected) => {
+    if (!matchesToolExpectation({ tool: "bash", output: "7 repairs" }, expected)) {
+      throw new Error("no interpreter result");
+    }
+  };
+  await assert.rejects(runScenario(scenario, adapter), (error) => error.report.failed_step === "analytics.prove");
+  assert.equal(infographic, false);
+});
