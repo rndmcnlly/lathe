@@ -99,7 +99,11 @@ async def configure_demo(api):
     # An explicit upstream override keeps the actual request bounded as well.
     model["params"]["max_tokens"] = MAX_OUTPUT_TOKENS
     model["params"]["custom_params"]["max_tokens"] = MAX_OUTPUT_TOKENS
-    model["params"]["system"] = "The sandbox has no outbound Internet access. Use available local tools and self-contained assets."
+    model["params"]["system"] = (
+        "The sandbox has no outbound Internet access. Use available local tools and self-contained assets. "
+        "For Python data analysis, prefer Lathe's persistent interpret tool over launching Python through bash: "
+        "keep data and computed results available for follow-up turns. Use bash for shell commands and service processes."
+    )
     model["meta"]["capabilities"]["builtin_tools"] = False
     response = await api.post("/api/v1/models/model/update",
                               params={"id": monitor.workspace_model()}, json=model)

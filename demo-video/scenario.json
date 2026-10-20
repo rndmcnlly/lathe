@@ -1,6 +1,6 @@
 {
   "id": "lathe-everyday-infographic",
-  "version": 13,
+  "version": 14,
   "steps": [
     { "id": "auth.owui", "do": "auth.ensure-owui", "failureDomain": "authentication" },
     { "id": "capture.start", "do": "capture.start" },
@@ -9,7 +9,7 @@
     {
       "id": "analytics.request", "do": "chat.send", "failureDomain": "model_behavior",
       "with": {
-        "prompt": "Here's our repair-café log. Start with a quick Python analysis we can build on: repairs, volunteer time, and average minutes per item for each session, plus what blocked unsuccessful repairs. Keep the answer to a small table and two takeaways. Keep advice-only visits separate from repairs. No webpage yet.",
+        "prompt": "Here's our repair-café log. Start with a quick analysis we can build on: repairs, volunteer time, and average minutes per item for each session, plus what blocked unsuccessful repairs. Keep the answer to a small table and two takeaways. Keep advice-only visits separate from repairs. No webpage yet.",
         "dataFile": "repair-log.csv", "timeoutMs": 180000
       }
     },

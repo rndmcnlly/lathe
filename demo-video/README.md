@@ -4,7 +4,7 @@ A real GLM 5.3 Flash conversation in Open WebUI: raw repair-café data and three
 short requests, not a scripted coding-agent capabilities showcase.
 
 1. Enable Lathe visibly through **Integrations → Tools → Lathe**.
-2. Ask for a quick Python analysis: repairs, volunteer time, and average item time
+2. Ask for a quick analysis: repairs, volunteer time, and average item time
    by session, plus what blocked unsuccessful repairs. Include `repair-log.csv` as pasted individual records, keeping advice
    separate from repairs. The take must show a real `interpret` result without
    naming that tool in the user's prompt. Hold the short answer for reading.
@@ -16,8 +16,11 @@ short requests, not a scripted coding-agent capabilities showcase.
 The model chooses its calculations, conclusions, implementation, file paths and
 service port. There are no subagents, version question, exact-answer phrases,
 prescribed tool sequence, output schema, installer recipes or editor choreography.
-The model gets only an ordinary deployment fact as additional system context:
-sandbox Internet access is blocked, so use available tools and self-contained assets.
+The demo system context states that sandbox Internet access is blocked and
+instructs the model to prefer `interpret` for Python data analysis, keeping state
+for follow-up turns, while using `bash` for shell work and service processes.
+This is demo-only tool-selection guidance, not a change to Lathe's shipped tools
+or a prescribed analysis implementation.
 
 ## Run
 
@@ -84,9 +87,12 @@ Local captures and source edits never replace the existing public video.
 
 ## Current qualification status
 
-Scenario 13 asks for a quick Python analysis before the infographic and rejects
+Scenario 14 asks for quick analytics before the infographic and rejects
 persisted turn errors, including tool-call exhaustion. Its live qualification is pending;
 the public video remains the scenario 11 take below until a replacement is reviewed.
+After natural analytics and Python-specific requests chose no tools and shell
+Python respectively, demo-only system guidance now prefers the persistent
+interpreter for data analysis. Those rejected takes are retained in Actions.
 
 On 2026-10-20, [scenario 11 passed live qualification](https://github.com/rndmcnlly/lathe/actions/runs/39455361278)
 at checkout `fac12e5229fd1bc5567135693a3b479686c0a43a`, including private preview,
