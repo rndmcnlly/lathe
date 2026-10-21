@@ -456,8 +456,10 @@ async def main():
         require(any(canary in value for value in tool_outputs(output)), output)
 
     async def interpreter_dispatch():
+        # The prompt must not contain the expected output: a model can echo a
+        # literal canary as text without calling the tool.
         output = await client.send(
-            f"Call interpret exactly once with Python code print('{canary}')."
+            f"Call interpret exactly once with Python code print('{canary[::-1]}'[::-1])."
         )
         require(any(call.get("name") == "interpret" for call in tool_calls(output)), output)
         require(any(canary in value for value in tool_outputs(output)), output)
