@@ -60,7 +60,8 @@ not custom runners or handwritten HTTP response classes.
   policy matrices belong offline.
 - OWUI (`test_deployment.py`): actual loader/schema/middleware and real-model
   dispatch. Verify created files by a separate read, not an echoed
-  canary. This is a nondeterministic smoke test, not a model simulation or a
+  canary. Dispatch prompts must not contain the expected tool output (models
+  may answer it as text instead of calling the tool). This is a nondeterministic smoke test, not a model simulation or a
   minimum-version matrix: it qualifies local source against `OWUI_URL`.
 
 `testing_support.py` specifies the public schema contract independently of Lathe,
