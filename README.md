@@ -278,7 +278,7 @@ not the public deployment's handbook. See the development-handbook playbook in
 `CI-MONITOR.md`. A plain Markdown HTTP response suffices; GitHub need not be mocked.
 
 ```bash
-uv run pytest                               # offline, no credentials (~2s)
+uv run pytest                               # offline, no credentials
 uv run python test_integration.py            # needs DAYTONA_API_KEY in .env
 uv run python test_deployment.py [--verbose] # also needs OWUI_URL, OWUI_TOKEN, OWUI_MODEL
 ```

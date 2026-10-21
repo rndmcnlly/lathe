@@ -1172,132 +1172,6 @@ async def test_first_failure_delivers_context_once(tools, monkeypatch, http, tmp
     assert not any(s in subsequent for s in ["sandbox recreated", "workspace snapshot", "GITHUB_TOKEN"])
 
 
-@pytest.mark.parametrize("prior,live,expected,lost", [
-    (None, [], "new", False), ("old", [{"id": "old"}], "old", False),
-    ("old", [], "new", True),
-])
-async def test_interpreter_context_recovery(tools, transport, prior, live, expected, lost):
-    tools._chat_state["a"] = {"init": True, "pending": []}
-    if prior:
-        tools._interpreter_state["a"] = {"id": prior, "sandbox_id": "sb", "lock": asyncio.Lock()}
-    calls = []
-    def handler(request):
-        calls.append(request.method)
-        assert request.url.path == "/sb/process/interpreter/context"
-        assert request.method in {"GET", "POST"}
-        return httpx.Response(200, json={"contexts": live} if request.method == "GET" else {"id": "new"})
-    async with httpx.AsyncClient(transport=transport(handler)) as client:
-        assert await lathe._ensure_interpreter_context(tools.valves, "sb", client, tools._interpreter_state, "a") == (expected, lost)
-    assert tools._interpreter_state["a"]["id"] == expected
-    assert calls.count("POST") == (expected == "new")
-
-
-@pytest.mark.parametrize("failure", [503, 404, "transport", "missing-list", "bad-entry"])
-async def test_interpreter_probe_failure_preserves_identity(tools, transport, failure):
-    tools._interpreter_state["a"] = {"id": "healthy", "sandbox_id": "sb", "lock": asyncio.Lock()}
-    failed = True
-    def handler(request):
-        assert request.method == "GET"  # Never create on an ambiguous probe.
-        if not failed:
-            return httpx.Response(200, json={"contexts": [{"id": "healthy"}]})
-        if failure == "transport":
-            raise httpx.ConnectError("temporarily unavailable", request=request)
-        if isinstance(failure, int):
-            return httpx.Response(failure)
-        return httpx.Response(200, json={} if failure == "missing-list" else {"contexts": [{}]})
-    async with httpx.AsyncClient(transport=transport(handler)) as client:
-        with pytest.raises((httpx.HTTPError, RuntimeError)):
-            await lathe._ensure_interpreter_context(tools.valves, "sb", client, tools._interpreter_state, "a")
-        assert tools._interpreter_state["a"]["id"] == "healthy"
-        failed = False
-        assert await lathe._ensure_interpreter_context(tools.valves, "sb", client, tools._interpreter_state, "a") == ("healthy", False)
-
-
-async def test_interpreter_concurrent_creation_and_notice_reconstruction(tools, transport):
-    entered, release = asyncio.Event(), asyncio.Event()
-    posts = []
-    async def handler(request):
-        if request.method == "POST":
-            posts.append(request)
-            entered.set()
-            await release.wait()
-            return httpx.Response(200, json={"id": "shared"})
-        assert request.method == "GET"
-        return httpx.Response(200, json={"contexts": [{"id": "shared"}]})
-    async with httpx.AsyncClient(transport=transport(handler)) as client:
-        async def resolve():
-            return await lathe._ensure_interpreter_context(tools.valves, "sb", client, tools._interpreter_state, "a")
-        first = asyncio.create_task(resolve())
-        await entered.wait()
-        second = asyncio.create_task(resolve())
-        await asyncio.sleep(0)
-        release.set()
-        assert await asyncio.gather(first, second) == [("shared", False)] * 2
-        tools._chat_state["a"] = {"init": True, "pending": []}
-        for index in range(tools._chat_state.maxsize):
-            tools._chat_state[str(index)] = {"init": True, "pending": []}
-        assert "a" not in tools._chat_state
-        tools._chat_state["a"] = {"init": True, "pending": []}
-        assert await resolve() == ("shared", False)
-    assert len(posts) == 1
-
-
-async def test_interpreter_sandbox_replacement_and_failed_creation(tools, transport):
-    tools._interpreter_state["a"] = {"id": "old", "sandbox_id": "old-sb", "lock": asyncio.Lock()}
-    fail = True
-    def handler(request):
-        assert (request.method, request.url.path) == ("POST", "/new-sb/process/interpreter/context")
-        return httpx.Response(503) if fail else httpx.Response(200, json={"id": "new"})
-    async with httpx.AsyncClient(transport=transport(handler)) as client:
-        with pytest.raises(httpx.HTTPStatusError):
-            await lathe._ensure_interpreter_context(tools.valves, "new-sb", client, tools._interpreter_state, "a")
-        assert tools._interpreter_state["a"]["id"] == "old"
-        fail = False
-        assert await lathe._ensure_interpreter_context(tools.valves, "new-sb", client, tools._interpreter_state, "a") == ("new", True)
-
-
-async def test_interpreter_calls_reuse_identity(tools, sandbox, http, monkeypatch):
-    import httpx_ws
-    executions = []
-    posts = []
-    def handler(request):
-        assert request.url.path == "/sb/process/interpreter/context"
-        if request.method == "POST":
-            posts.append(request)
-            return httpx.Response(200, json={"id": "shared"})
-        assert request.method == "GET"
-        return httpx.Response(200, json={"contexts": [{"id": "shared"}]})
-    http(handler)
-    class Socket:
-        async def send_json(self, message):
-            executions.append(message)
-        async def receive_json(self):
-            raise httpx_ws.WebSocketDisconnect(1000)
-    @asynccontextmanager
-    async def connect(*args, **kwargs):
-        yield Socket()
-    monkeypatch.setattr(httpx_ws, "aconnect_ws", connect)
-    assert await tools.interpret("x = 1", __chat_id__="a", __user__=USER) == "(no output)"
-    assert await tools.interpret("x += 1", __chat_id__="a", __user__=USER) == "(no output)"
-    assert [call["contextId"] for call in executions] == ["shared", "shared"]
-    assert len(posts) == 1
-
-
-async def test_interpreter_conversations_are_isolated_and_require_identity(tools, transport):
-    created = []
-    def handler(request):
-        assert request.method == "POST"
-        context_id = f"context-{len(created)}"
-        created.append(context_id)
-        return httpx.Response(200, json={"id": context_id})
-    async with httpx.AsyncClient(transport=transport(handler)) as client:
-        with pytest.raises(ValueError, match="conversation ID"):
-            await lathe._ensure_interpreter_context(tools.valves, "sb", client, tools._interpreter_state, "")
-        for chat_id, expected in [("a", "context-0"), ("b", "context-1")]:
-            assert await lathe._ensure_interpreter_context(tools.valves, "sb", client, tools._interpreter_state, chat_id) == (expected, False)
-    assert created == ["context-0", "context-1"]
-
-
 @pytest.mark.parametrize("prefix", ["", "earlier output\n" * 10000], ids=["short", "large"])
 async def test_background_bash_poll_delivers_once(tools, sandbox, http, clock, tmp_path, monkeypatch, prefix):
     monkeypatch.setattr(lathe, "_EPHEMERAL_ROOT", str(tmp_path))
@@ -2066,41 +1940,34 @@ async def test_preview_configuration_and_direct_mode(preview, tools):
     assert result.startswith("Error:") and not calls
 
 
-@pytest.mark.parametrize("oversized", [False, True])
-async def test_interpret_bounds_oversized_and_many_frames(tools, sandbox, http, monkeypatch, oversized):
-    import contextlib
-    import httpx_ws
-    tools._chat_state["chat"] = {"init": True, "pending": []}
-    monkeypatch.setattr(lathe, "_ensure_interpreter_context", AsyncMock(return_value=("ctx", False)))
-    frames = iter(([{"type": "stdout", "text": "é" * 500000}] +
-                   [{"type": "stderr", "text": "discarded"}] * 1000) if oversized else
-                  [{"type": "stdout", "text": "Error: expected output"}])
-    received = 0
-    class WS:
-        async def send_json(self, message):
-            assert message["code"] == "print('large')"
-        async def receive_json(self):
-            nonlocal received
-            try:
-                frame = next(frames)
-            except StopIteration:
-                raise httpx_ws.WebSocketDisconnect(1000)
-            received += 1
-            return frame
-    @contextlib.asynccontextmanager
-    async def connect(*args, **kwargs):
-        assert kwargs["queue_size"] == 1
-        yield WS()
-    monkeypatch.setattr(httpx_ws, "aconnect_ws", connect)
-    http(lambda request: pytest.fail("unexpected HTTP"))
-    result = await tools.interpret("print('large')", __user__=USER, __chat_id__="chat")
-    assert received == (1001 if oversized else 1), "must drain execution even after preview fills"
-    assert len(result.encode()) < 53 * 1024
-    if oversized:
-        assert "Text preview truncated" in result and "discarded" in result
-    else:
-        assert result == "Error: expected output", "literal stdout is not the internal error protocol"
+@pytest.mark.parametrize("failure", [503, "transport", "json", "shape"])
+async def test_interpret_ambiguous_response_never_replays(tools, sandbox, http, failure):
+    calls = []
+    def handler(request):
+        calls.append(request)
+        assert request.url.path == "/sb/process/execute"
+        if failure == "transport":
+            raise httpx.ReadError("lost response", request=request)
+        if failure == 503:
+            return httpx.Response(503)
+        return httpx.Response(200, json={"exitCode": 0, "result": "not json" if failure == "json" else "{}"})
+    http(handler)
+    result = await tools.interpret("x = 1", __user__=USER, __chat_id__="chat")
+    assert "outcome may be unknown" in result and "Do not automatically replay" in result
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("kwargs,chat,detail", [
+    ({"code": " "}, "chat", "empty code"),
+    ({"code": "x = 1", "timeout": -1}, "chat", "zero or positive"),
+    ({"code": "x = 1"}, "", "conversation ID"),
+    ({"code": "#" + "x" * 100000}, "chat", "command budget"),
+])
+async def test_interpret_rejects_invalid_submissions_without_rpc(tools, sandbox, http, kwargs, chat, detail):
+    http(lambda request: pytest.fail("invalid submission must not issue interpreter RPC"))
+    result = await tools.interpret(**kwargs, __user__=USER, __chat_id__=chat)
+    assert detail in result
 
 
 if __name__ == "__main__":
-    raise SystemExit(pytest.main([__file__, *sys.argv[1:]]))
+    raise SystemExit(pytest.main(sys.argv[1:]))

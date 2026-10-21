@@ -4,8 +4,8 @@ author: Adam Smith
 author_url: https://adamsmith.as
 description: Coding agent tools (lathe, bash, read, write, edit, glob, grep, view, interpret, onboard, expose, destroy) backed by per-user sandbox VMs with transparent lifecycle management.
 required_open_webui_version: 0.12.0
-requirements: httpx, httpx-ws, pydantic>=2, cachetools, PyYAML
-version: 1.0.1
+requirements: httpx, pydantic>=2, cachetools, PyYAML
+version: 1.1.0
 licence: MIT
 """
 
@@ -981,7 +981,7 @@ def _check_tool_params(kwargs: dict, annotated_fn) -> str | None:
 # method signature.
 _CORE_INFRA_PARAMS = frozenset({
     "valves", "sandbox_id", "client", "emit", "user_pairs",
-    "on_background", "chat_state", "chat_id", "interpreter_state",
+    "on_background", "chat_state", "chat_id", "user_identity",
 })
 
 
@@ -1008,7 +1008,7 @@ def _standard_tool(core_fn, *, emit_start: str, emit_done: str,
         emit_done: Status message emitted after the core returns.
         extra_core_kwargs: Optional callable(self, sandbox_id, __chat_id__)
             returning a dict of extra kwargs to pass to the core function
-            (e.g. interpreter_state and chat_id for interpret).
+            (e.g. chat_id for interpret).
     """
     # ── Extract tool-visible parameters from the core function ───────
     core_sig = inspect.signature(core_fn)
@@ -1096,6 +1096,8 @@ def _standard_tool(core_fn, *, emit_start: str, emit_done: str,
                 call_kwargs.update(
                     extra_core_kwargs(self, sandbox_id, __chat_id__)
                 )
+            if "user_identity" in core_sig.parameters:
+                call_kwargs["user_identity"] = email
 
             result = await core_fn(
                 self.valves, sandbox_id, client, **call_kwargs,
@@ -1878,70 +1880,328 @@ async def _poll_bg_bash(valves, sandbox_id: str, session_id: str,
 
 # ── Code interpreter ─────────────────────────────────────────────────
 #
-# The Daytona toolbox exposes a persistent Python REPL via a WebSocket
-# endpoint.  Variables, imports, and definitions survive across calls
-# within the same "context". Interpreter identity lives separately from
-# disposable chat notices, for the lifetime of one loaded Tools instance.
-# If the sandbox restarts (killing the interpreter process), we detect the stale
-# context, create a fresh one, and warn the model that state was lost.
-#
-# The WS protocol:
-#   1. Connect to /process/interpreter/execute (HTTP upgrade)
-#   2. Send one JSON frame: {code, contextId, timeout}
-#   3. Receive N JSON frames: {type: "stdout"|"stderr"|"error", text, ...}
-#   4. Server sends WS close: code 1000 = normal, 4008 = timeout
-#
-# httpx-ws (aconnect_ws) handles the upgrade using the same
-# httpx.AsyncClient we already have, keeping the HTTP stack cohesive.
+# OWUI workers are disposable clients of a sandbox-owned session supervisor.
+# The embedded program is stdlib-only and runs as the sandbox user, not as a
+# protected authority against that user. Lifetime flock excludes competing
+# supervisors; short RPCs never carry platform credentials into the sandbox.
 
-_INTERPRET_DEFAULT_TIMEOUT = 120  # seconds; server default is 600
+_INTERPRET_DEFAULT_TIMEOUT = 120
+
+_INTERPRETER_SCRIPT = r'''
+import contextlib
+import fcntl
+import hashlib
+import io
+import json
+import os
+from pathlib import Path
+import signal
+import socket
+import socketserver
+import subprocess
+import sys
+import threading
+import time
+import traceback
+import uuid
+
+LIMIT = 50 * 1024
+VERSION = 1
+
+def atomic(path, value):
+    staged = path.with_name(path.name + "." + uuid.uuid4().hex)
+    try:
+        with staged.open("x") as f:
+            json.dump(value, f, ensure_ascii=True)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(staged, path)
+    finally:
+        staged.unlink(missing_ok=True)
+
+def read_json(path):
+    with path.open() as f:
+        return json.load(f)
+
+def kernel(fd):
+    channel = socket.socket(fileno=fd).makefile("rwb")
+    namespace = {"__name__": "__main__", "__builtins__": __builtins__}
+    channel.write(b'{"ready":true}\n')
+    channel.flush()
+    for line in channel:
+        request = json.loads(line)
+        remaining = [LIMIT]
+        clipped = [False]
+        class Capture(io.TextIOBase):
+            def __init__(self):
+                self.parts = []
+            @property
+            def encoding(self):
+                return "utf-8"
+            def write(self, text):
+                raw = text.encode("utf-8", errors="replace")
+                part = raw[:remaining[0]].decode("utf-8", errors="ignore")
+                if part:
+                    self.parts.append(part)
+                clipped[0] |= len(raw) > remaining[0]
+                remaining[0] -= len(part.encode("utf-8"))
+                return len(text)
+            def flush(self):
+                pass
+        stdout, stderr = Capture(), Capture()
+        failed = False
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            try:
+                exec(compile(request["code"], "<lathe>", "exec"), namespace)
+            except BaseException:
+                failed = True
+                stderr.write(traceback.format_exc())
+        result = {"status": "error" if failed else "complete",
+                  "stdout": "".join(stdout.parts), "stderr": "".join(stderr.parts),
+                  "clipped": clipped[0]}
+        channel.write(json.dumps(result).encode() + b"\n")
+        channel.flush()
+
+def serve(source, durable, runtime, workspace):
+    # Never unlink a live supervisor's socket or write its journal.
+    owner = (runtime / "owner.lock").open("a")
+    try:
+        fcntl.flock(owner, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return
+    atomic(runtime / "process.json", {"supervisor": os.getpid(), "kernel": None})
+    state_path = durable / "state.json"
+    runs = durable / "runs"
+    runs.mkdir(exist_ok=True)
+    mutex = threading.Lock()
+    child = None
+    channel = None
+    reset = False
+    problem = None
+    state = {"version": VERSION, "generation": None, "active": None}
+    try:
+        if state_path.exists():
+            state = read_json(state_path)
+            if (not isinstance(state, dict) or state.get("version") != VERSION
+                    or not {"generation", "active"} <= state.keys()
+                    or any(state[k] is not None and not isinstance(state[k], str)
+                           for k in ("generation", "active"))):
+                raise ValueError("invalid session journal")
+            if state["active"]:
+                previous = read_json(runs / (state["active"] + ".json"))
+                if previous.get("status") not in ("complete", "error", "timeout"):
+                    raise ValueError("prior execution outcome is unknown; inspect the run before manual recovery")
+                state["active"] = None
+                atomic(state_path, state)
+        for path in runs.glob("*.json"):
+            if read_json(path).get("status") == "running":
+                raise ValueError("prior execution outcome is unknown; inspect the run before manual recovery")
+    except Exception as exc:
+        problem = "Session recovery blocked: " + str(exc)
+
+    def stop_child():
+        nonlocal child, channel
+        if child is not None:
+            if child.poll() is None:
+                child.kill()
+            child.wait()
+            child = None
+        if channel is not None:
+            channel.close()
+            channel = None
+
+    def ensure_child():
+        nonlocal child, channel, reset
+        if child is not None and child.poll() is None:
+            return
+        stop_child()
+        parent, peer = socket.socketpair()
+        try:
+            child = subprocess.Popen(
+                [sys.executable, "-c", source + "\nkernel(int(sys.argv[1]))", str(peer.fileno())],
+                pass_fds=(peer.fileno(),), stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                cwd=workspace,
+            )
+        finally:
+            peer.close()
+        parent.settimeout(10)
+        channel = parent.makefile("rwb")
+        if json.loads(channel.readline()) != {"ready": True}:
+            raise RuntimeError("Python worker did not become ready")
+        parent.settimeout(None)
+        parent.close()
+        atomic(runtime / "process.json", {"supervisor": os.getpid(), "kernel": child.pid})
+        reset = state["generation"] is not None
+        state["generation"] = uuid.uuid4().hex
+        atomic(state_path, state)
+
+    def execute(request, record):
+        nonlocal problem, reset
+        try:
+            # A separate result channel keeps user stdout out of the protocol.
+            channel.write(json.dumps({"code": request["code"]}).encode() + b"\n")
+            channel.flush()
+            # The sandbox owns the deadline, independently of OWUI clients.
+            watchdog = None
+            expired = threading.Event()
+            if request["timeout"]:
+                def expire():
+                    expired.set()
+                    if child is not None and child.poll() is None:
+                        child.kill()
+                watchdog = threading.Timer(request["timeout"], expire)
+                watchdog.start()
+            try:
+                line = channel.readline()
+            finally:
+                if watchdog is not None:
+                    watchdog.cancel()
+                    watchdog.join()
+            if expired.is_set():
+                stop_child()
+                result = {"status": "timeout", "stdout": "", "stderr": "Execution timed out; Python memory was discarded. Partial effects may remain. Do not automatically replay this code.", "clipped": False}
+            elif not line:
+                stop_child()
+                result = {"status": "error", "stdout": "", "stderr": "Python worker exited before returning a result. Partial effects may remain. Do not automatically replay this code.", "clipped": False}
+            else:
+                result = json.loads(line)
+            with mutex:
+                record.update(result)
+                atomic(runs / (record["id"] + ".json"), record)
+                state["active"] = None
+                atomic(state_path, state)
+                reset = False
+        except BaseException:
+            # Keep the durable active claim. A lost result is not absence.
+            with mutex:
+                problem = "Execution outcome is unknown; inspect the run before manual recovery"
+
+    class Handler(socketserver.StreamRequestHandler):
+        def handle(self):
+            nonlocal problem
+            try:
+                request = json.loads(self.rfile.readline(2 * 1024 * 1024))
+                run_id = request["id"]
+                if len(run_id) != 32 or any(c not in "0123456789abcdef" for c in run_id):
+                    raise ValueError("invalid execution ID")
+                path = runs / (run_id + ".json")
+                with mutex:
+                    if path.exists():
+                        response = read_json(path)
+                        if request["op"] == "submit" and response["fingerprint"] != hashlib.sha256(json.dumps([request["code"], request["timeout"]]).encode()).hexdigest():
+                            raise ValueError("execution ID already belongs to a different submission")
+                        if problem and response["status"] == "running":
+                            response = {"status": "blocked", "detail": problem}
+                    elif request["op"] == "status":
+                        response = {"status": "missing", "detail": "No execution record; outcome is unknown. Do not automatically replay."}
+                    elif problem:
+                        response = {"status": "blocked", "detail": problem}
+                    elif state["active"]:
+                        response = {"status": "busy", "detail": "Session is executing run " + state["active"] + "; wait before submitting more Python."}
+                    else:
+                        if request["op"] != "submit" or type(request["timeout"]) is not int or request["timeout"] < 0 or not isinstance(request["code"], str):
+                            raise ValueError("invalid submission")
+                        ensure_child()
+                        response = {"id": run_id, "status": "running", "generation": state["generation"], "lost_state": reset,
+                                    "fingerprint": hashlib.sha256(json.dumps([request["code"], request["timeout"]]).encode()).hexdigest()}
+                        # Publish the unresolved claim before dispatching Python.
+                        problem = "Submission publication was interrupted; inspect the run before manual recovery"
+                        atomic(path, response)
+                        state["active"] = run_id
+                        atomic(state_path, state)
+                        threading.Thread(target=execute, args=(request, dict(response)), daemon=True).start()
+                        problem = None
+                        # Results are bounded; retain completed run evidence for 24h.
+                        for old in runs.glob("*.json"):
+                            try:
+                                if old != path and time.time() - old.stat().st_mtime > 86400:
+                                    old.unlink()
+                            except OSError:
+                                pass  # Retention cleanup must not fail an admitted run.
+                self.wfile.write(json.dumps(response).encode() + b"\n")
+            except Exception as exc:
+                self.wfile.write(json.dumps({"status": "blocked", "detail": str(exc)}).encode() + b"\n")
+
+    class Server(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
+        daemon_threads = True
+    address = runtime / "rpc.sock"
+    address.unlink(missing_ok=True)
+    server = Server(str(address), Handler)
+    def shutdown(*_):
+        stop_child()
+        raise SystemExit(0)
+    signal.signal(signal.SIGTERM, shutdown)
+    try:
+        server.serve_forever()
+    finally:
+        stop_child()
+        server.server_close()
+        address.unlink(missing_ok=True)
+
+def rpc(source, durable, runtime, request, workspace):
+    durable, runtime = Path(durable), Path(runtime)
+    durable.mkdir(parents=True, exist_ok=True)
+    runtime.mkdir(parents=True, exist_ok=True)
+    address = str(runtime / "rpc.sock")
+    def connect():
+        sock = socket.socket(socket.AF_UNIX)
+        sock.settimeout(5)
+        try:
+            sock.connect(address)
+            return sock
+        except OSError:
+            sock.close()
+            return None
+    sock = connect()
+    if sock is None:
+        deadline = time.monotonic() + 12
+        launched = False
+        with (runtime / "launch.lock").open("a") as launch:
+            while sock is None:
+                if time.monotonic() >= deadline:
+                    raise RuntimeError("Interpreter supervisor unavailable; no Python submitted. Inspect " + str(runtime / "service.log"))
+                try:
+                    fcntl.flock(launch, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    time.sleep(0.05)
+                    sock = connect()
+                    continue
+                sock = connect()
+                if sock is None and not launched:
+                    with (runtime / "service.log").open("ab") as log:
+                        subprocess.Popen([sys.executable, "-c", source + "\nserve(" + repr(source) + ", Path(" + repr(str(durable)) + "), Path(" + repr(str(runtime)) + "), " + repr(workspace) + ")"],
+                                         stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True)
+                    launched = True
+                time.sleep(0.05)
+                sock = sock or connect()
+    with sock, sock.makefile("rwb") as stream:
+        stream.write(json.dumps(request).encode() + b"\n")
+        stream.flush()
+        response = stream.readline(2 * 1024 * 1024)
+        if not response:
+            raise RuntimeError("Interpreter RPC disconnected; execution outcome may be unknown")
+        return json.loads(response)
+'''
 
 
-async def _ensure_interpreter_context(
-    valves, sandbox_id: str, client: httpx.AsyncClient,
-    interpreter_state: dict, chat_id: str,
-) -> tuple[str, bool]:
-    """Resolve identity under a per-chat lock; only a valid list proves absence.
-
-    Records are intentionally non-evicting, scoped to one Tools instance.
-    A failed/ambiguous probe must never replace a healthy interpreter.
-    The lock covers identity resolution, not execution of user Python code.
-    """
+def _interpreter_paths(valves, sandbox_id: str, user_identity: str, chat_id: str):
+    import hashlib
     if not chat_id:
         raise ValueError("interpret() requires a conversation ID")
-    state = interpreter_state.setdefault(chat_id, {"lock": asyncio.Lock()})
-    async with state["lock"]:
-        ctx_id = state.get("id")
-        if ctx_id and state["sandbox_id"] == sandbox_id:
-            resp = await client.get(
-                _toolbox(valves, sandbox_id, "/process/interpreter/context"),
-                headers=_headers(valves),
-                timeout=15.0,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            contexts = data.get("contexts") if isinstance(data, dict) else None
-            if not isinstance(contexts, list) or any(
-                not isinstance(c, dict) or not isinstance(c.get("id"), str)
-                or not c["id"] for c in contexts
-            ):
-                raise RuntimeError("Daytona returned an invalid interpreter context list")
-            if any(c["id"] == ctx_id for c in contexts):
-                return ctx_id, False
+    if not user_identity or not valves.deployment_label:
+        raise ValueError("interpret() requires user and deployment identities")
+    identity = json.dumps([valves.deployment_label, user_identity, chat_id, sandbox_id], ensure_ascii=True)
+    key = hashlib.sha256(identity.encode()).hexdigest()
+    return (f"/home/daytona/.local/share/lathe/python/{key}",
+            f"{_EPHEMERAL_ROOT}/python/{key}")
 
-        # Authoritative absence, a different sandbox, or first use.
-        resp = await client.post(
-            _toolbox(valves, sandbox_id, "/process/interpreter/context"),
-            headers=_headers(valves),
-            json={"language": "python", "cwd": "/home/daytona/workspace"},
-            timeout=30.0,
-        )
-        resp.raise_for_status()
-        new_id = resp.json().get("id")
-        if not isinstance(new_id, str) or not new_id:
-            raise RuntimeError("Daytona returned an interpreter context with no ID")
-        state.update(id=new_id, sandbox_id=sandbox_id)
-        return new_id, ctx_id is not None
+
+def _build_interpreter_rpc_script(durable: str, runtime: str, request: dict, *,
+                                  workspace: str = "/home/daytona/workspace") -> str:
+    return (_INTERPRETER_SCRIPT + "\nprint(json.dumps(rpc("
+            + repr(_INTERPRETER_SCRIPT) + ", " + repr(durable) + ", "
+            + repr(runtime) + ", " + repr(request) + ", " + repr(workspace) + ")))\n")
 
 
 def _format_interpret_result(stdout: str, stderr: str,
@@ -1951,7 +2211,7 @@ def _format_interpret_result(stdout: str, stderr: str,
 
     if lost_state:
         parts.append(
-            "[Warning: the interpreter session was reset (sandbox restarted). "
+            "[Warning: the interpreter session was reset (Python process was replaced). "
             "All previously defined variables, imports, and state are gone. "
             "Re-run any necessary setup.]"
         )
@@ -1979,97 +2239,68 @@ def _format_interpret_result(stdout: str, stderr: str,
 
 
 async def _core_interpret(valves, sandbox_id: str, client: httpx.AsyncClient,
-                          interpreter_state: dict, chat_id: str, *,
+                          chat_id: str, user_identity: str, *,
                           code: str, timeout: int = _INTERPRET_DEFAULT_TIMEOUT) -> str:
     """Run Python code in a persistent REPL session. Variables, imports, and
-    definitions survive across calls within the same conversation.
-    Use this for iterative data exploration, incremental computation, or
-    any workflow where you need state to persist between executions.
-    For one-shot shell commands or non-Python work, prefer bash() instead.
-    Stream output is a 50 KiB preview; excess output is discarded explicitly.
-    Write large results to a sandbox file for full access via read() or expose().
+    definitions survive across calls within the same conversation, across OWUI
+    workers and toolkit reloads. Use this for iterative data exploration and
+    incremental computation. For one-shot scripts, prefer bash().
+    One execution per conversation at a time; overlapping calls return busy.
+    Execution and its bounded result survive an OWUI worker exiting. Completed
+    run records remain in the sandbox for 24 hours, until a later submission.
+    Output is a 50 KiB preview; excess output is discarded explicitly.
+    Write large results to a sandbox file for read() or expose().
 
     :param code: Python code to execute. Top-level await is not supported.
-    :param timeout: Max execution time in seconds (default: 120). Use 0 for no limit.
+    :param timeout: Max execution time in seconds (default: 120). Use 0 for no limit. A timeout discards Python memory; partial effects may remain.
     """
-    from httpx_ws import aconnect_ws, WebSocketDisconnect
-
     if not code.strip():
         raise _ToolFailure("empty code. Provide Python code to execute.")
-
-    context_id, lost_state = await _ensure_interpreter_context(
-        valves, sandbox_id, client, interpreter_state, chat_id,
-    )
-
-    # Build the WS URL from the proxy base (same host, /process/interpreter/execute).
-    ws_url = _toolbox(valves, sandbox_id, "/process/interpreter/execute")
-
-    stdout_parts: list[str] = []
-    stderr_parts: list[str] = []
-    errors: list[dict] = []
-    timed_out = False
-    preview_bytes = 0
-    preview_clipped = False
-    execution_failed = False
-
+    if timeout < 0:
+        raise _ToolFailure("timeout must be zero or positive")
+    if len(code.encode()) > 1024 * 1024:
+        raise _ToolFailure("Python submission exceeds 1 MiB; put large inputs in a file")
+    durable, runtime = _interpreter_paths(valves, sandbox_id, user_identity, chat_id)
+    run_id = uuid.uuid4().hex
+    record_path = f"{durable}/runs/{run_id}.json"
+    request = {"op": "submit", "id": run_id, "code": code, "timeout": timeout}
+    submission_script = _build_interpreter_rpc_script(durable, runtime, request)
+    if len(_shell_quote(submission_script).encode()) > 96 * 1024:
+        raise _ToolFailure("Python submission exceeds the sandbox command budget; put code in a file and execute it from a short snippet")
     try:
-        async with aconnect_ws(
-            ws_url, client,
-            keepalive_ping_interval_seconds=20,
-            queue_size=1,
-            headers=_headers(valves),
-        ) as ws:
-            # Send the execute request.
-            await ws.send_json({
-                "code": code,
-                "contextId": context_id,
-                "timeout": timeout if timeout > 0 else 0,
-            })
-
-            # Receive output frames until the server closes the connection.
-            while True:
-                try:
-                    msg = await ws.receive_json()
-                except WebSocketDisconnect as exc:
-                    if exc.code == 4008:
-                        timed_out = True
-                    break
-
-                msg_type = msg.get("type", "")
-                if msg_type not in ("stdout", "stderr", "error"):
-                    continue
-                if msg_type == "error":
-                    execution_failed = True
-                    text = msg.get("traceback") or f"{msg.get('name', 'Error')}: {msg.get('value', '')}"
-                else:
-                    text = msg.get("text", "")
-                raw = text.encode("utf-8")
-                room = _MAX_BYTES - preview_bytes
-                clipped = raw[:room].decode("utf-8", errors="ignore")
-                preview_bytes += len(clipped.encode("utf-8"))
-                preview_clipped = preview_clipped or len(raw) > room
-                if clipped:
-                    if msg_type == "stdout":
-                        stdout_parts.append(clipped)
-                    elif msg_type == "stderr":
-                        stderr_parts.append(clipped)
-                    else:
-                        errors.append({"traceback": clipped})
-
-    except Exception as e:
-        raise _ToolFailure(f"Error connecting to interpreter: {e}") from e
-
-    stdout = "".join(stdout_parts)
-    stderr = "".join(stderr_parts)
-
-    result = _format_interpret_result(stdout, stderr, errors, lost_state)
-    if timed_out:
+        while True:
+            raw = await _run_sandbox_script(
+                valves, sandbox_id, client,
+                submission_script if request["op"] == "submit" else _build_interpreter_rpc_script(durable, runtime, request),
+                error_prefix="interpreter RPC failed",
+            )
+            data = json.loads(raw)
+            if not isinstance(data, dict) or data.get("status") not in {
+                "running", "complete", "error", "timeout", "busy", "blocked", "missing",
+            }:
+                raise ValueError("invalid interpreter response")
+            if data["status"] != "running":
+                break
+            request = {"op": "status", "id": run_id}
+            await asyncio.sleep(0.5)
+    except Exception as exc:
+        raise _ToolFailure(
+            f"Interpreter submission/observation failed; execution outcome may be unknown. "
+            f"Do not automatically replay Python. Inspect {record_path}. {exc}"
+        ) from exc
+    if data["status"] in {"busy", "blocked", "missing"}:
+        caution = "" if data["status"] == "busy" else "\nDo not automatically replay Python."
+        raise _ToolFailure(f"{data.get('detail', data['status'])}{caution}\nExecution record: {record_path}")
+    if (not isinstance(data.get("stdout"), str) or not isinstance(data.get("stderr"), str)
+            or type(data.get("lost_state")) is not bool or type(data.get("clipped")) is not bool):
+        raise _ToolFailure(f"Invalid interpreter result; do not replay Python. Inspect {record_path}")
+    result = _format_interpret_result(data["stdout"], data["stderr"], [], data["lost_state"])
+    if data["status"] == "timeout":
         result = f"[Execution timed out after {timeout}s]\n\n{result}"
-    if preview_clipped:
+    if data["clipped"]:
         result += "\n[Text preview truncated at 50 KiB; excess stream output was discarded. For full output, write to a sandbox file in your Python code and use read() or expose().]"
-    if timed_out or execution_failed:
-        raise _ToolFailure(result)
-
+    if data["status"] != "complete":
+        raise _ToolFailure(f"{result}\nExecution record: {record_path}")
     return result
 
 
@@ -2297,7 +2528,7 @@ async def _chat_auto_init(
     tool call.  Also fetches sandbox resource metadata from the Daytona
     API (cpu, memory, disk, region) without an extra sandbox-side command.
     """
-    parts: list[str] = ["[Auto-init: first tool call in this conversation]"]
+    parts: list[str] = ["[Sandbox orientation (may repeat across workers)]"]
     parts.append(
         'For first-time application setup, read lathe(manpage="services") '
         "before installing or launching."
@@ -2741,7 +2972,6 @@ class Tools:
         # Chat-scoped auto-init and background notices, drained into text results.
         # LRU eviction drops pending messages; a later call re-runs auto-init.
         self._chat_state: LRUCache = LRUCache(maxsize=1024)
-        self._interpreter_state: dict = {}
 
     # ── agent-facing manual ──────────────────────────────────────────
     #
@@ -2886,25 +3116,37 @@ class Tools:
         "interpret": textwrap.dedent("""\
             # Lathe — Persistent Python Interpreter
 
-            interpret() runs Python code in a persistent REPL backed by the
-            Daytona code interpreter. Variables, imports, and definitions
+            interpret() runs Python code in a sandbox-owned persistent REPL.
+            Variables, imports, and definitions
             survive across calls within the same conversation.
 
             ## State model
 
-            - One interpreter context per conversation (chat), created lazily
+            - One Python session per deployment, user, conversation, and sandbox,
+              created lazily
               on the first interpret() call.
             - State persists across calls: define a function in one call, use
               it in the next. Import a module once, use it everywhere.
-            - Identity survives eviction/reconstruction of chat notices, but
-              only within one loaded toolkit instance. OWUI restart, toolkit
-              reload, or another worker does not reconnect to the old context.
-              Save important results to files; this is not durable storage.
-            - Transient context-list failures fail the call without replacing
-              state. Retry once the service recovers.
+            - Identity survives OWUI worker changes, restarts, and toolkit
+              reloads. Save important results to files; Python memory is not
+              durable storage. Upgrading from the Daytona-backed interpreter
+              starts new sessions; old Python variables are not migrated.
+            - One call per session may execute at a time. Overlapping calls
+              return busy without executing their code. Other chats can run
+              independently. This is organizational separation, not isolation
+              against agents with shell access to the same sandbox.
             - State is lost when the sandbox stops or restarts (idle timeout,
               destroy, etc.). The tool detects this and warns you to re-run
-              setup code.
+               setup code.
+            - A timeout kills the Python process and discards its memory.
+              Partial filesystem/network effects may remain. Never automatically
+              replay Python after a timeout or ambiguous submission.
+            - Execution continues if the requesting OWUI worker dies. Bounded
+              results are recorded under ~/.local/share/lathe/python/*/runs/;
+              completed records are retained for 24 hours, until a later call.
+              If the supervisor dies mid-run, recovery blocks rather than
+              guessing. Inspect the reported record and running processes before
+              user-approved manual recovery. See INTERPRETER-STATE.md for details.
 
             ## When to use interpret() vs bash()
 
@@ -3480,7 +3722,6 @@ class Tools:
         emit_start="Running Python...",
         emit_done="Execution complete",
         extra_core_kwargs=lambda self, sandbox_id, chat_id: {
-            "interpreter_state": self._interpreter_state,
             "chat_id": chat_id,
         },
     )

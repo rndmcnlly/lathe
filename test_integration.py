@@ -206,6 +206,59 @@ async def main():
         output = await tools.interpret("print(contract_value + 2)", **ctx)
         require("42" in output, output)
 
+    async def multiworker_interpreter():
+        # Fresh OS processes load the actual toolkit, with no shared Python
+        # registry. Secrets travel over stdin, never command-line arguments.
+        worker_source = """
+import asyncio, json, sys
+from lathe import Tools
+options = json.load(sys.stdin)
+tools = Tools()
+tools.valves = tools.Valves(**options['valves'])
+async def main():
+    result = await tools.interpret(options['code'], __user__=options['user'], __chat_id__=options['chat'])
+    print(json.dumps(result))
+asyncio.run(main())
+"""
+        async def worker(code, chat=chat_id):
+            process = await asyncio.create_subprocess_exec(
+                sys.executable, "-c", worker_source,
+                stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            options = {"valves": tools.valves.model_dump(), "user": user, "chat": chat, "code": code}
+            try:
+                stdout, _stderr = await asyncio.wait_for(
+                    process.communicate(json.dumps(options).encode()), timeout=180)
+            except BaseException:
+                if process.returncode is None:
+                    process.kill()
+                await process.wait()
+                raise
+            require(process.returncode == 0, "Independent toolkit process failed")
+            return json.loads(stdout)
+
+        output = await worker("crossworker_value = 35")
+        require(not output.startswith("Error:"), output)
+        output = await worker("crossworker_value += 1; print(crossworker_value)")
+        require(output.rstrip().endswith("36"), output)
+        output = await tools.interpret("print(crossworker_value)", **ctx)
+        require(output.rstrip().endswith("36"), output)
+
+        fresh_chat = f"race-{uuid.uuid4()}"
+        outputs = await asyncio.gather(*[
+            worker("race_value = globals().get('race_value', 0) + 1; print(race_value)", fresh_chat)
+            for _ in range(2)
+        ])
+        # Orientation may precede either success or an Error result on each
+        # fresh worker. Classify the actual numeric output, not its prefix.
+        admitted = [o for o in outputs if o.rstrip().splitlines()[-1] in {"1", "2"}]
+        require(bool(admitted), outputs)
+        require(all(o in admitted or "Session is executing run" in o for o in outputs), outputs)
+        output = await worker("print(race_value)", fresh_chat)
+        require(output.rstrip().endswith(str(len(admitted))), output)
+        print("  independent processes: continuity, reload, simultaneous first-use admission")
+
     async def background_completion_notice():
         output = await tools.bash(
             "sleep 2; printf 'background-finished'",
@@ -376,6 +429,11 @@ async def main():
                 raise AssertionError("Test sandbox did not stop")
         output = await tools.read(test_file, **ctx)
         require(canary in output and "OMEGA" in output, output)
+        # Files and durable session history survive, but Python memory does not.
+        reloaded = Tools()
+        reloaded.valves = tools.Valves(**tools.valves.model_dump())
+        output = await reloaded.interpret("print('contract_value' in globals())", **ctx)
+        require("session was reset" in output and output.rstrip().endswith("False"), output)
 
     async def disabled_auto_create_is_respected():
         output = await tools.destroy(
@@ -400,6 +458,7 @@ async def main():
             ("core tool roundtrip", core_tool_roundtrip),
             ("view tool roundtrip", view_tool_roundtrip),
             ("onboarding and persistent interpreter", onboarding_and_interpreter),
+            ("independent toolkit workers share interpreter identity", multiworker_interpreter),
             ("bounded command retention", bounded_command_retention),
             ("background completion notice", background_completion_notice),
             ("signed preview URL", expose_contract),

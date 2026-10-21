@@ -1,10 +1,9 @@
 [project]
 name = "lathe"
-version = "1.0.1"
+version = "1.1.0"
 requires-python = ">=3.11"
 dependencies = [
     "httpx",
-    "httpx-ws",
     "pydantic>=2",
     "PyYAML",
     "python-dotenv",
@@ -17,6 +16,6 @@ dependencies = [
 dev = ["pytest>=8", "pytest-asyncio>=1", "ripgrep>=15"]
 
 [tool.pytest.ini_options]
-testpaths = ["test_unit.py", "test_monitor.py", "test_demo_local.py"]
+testpaths = ["test_unit.py", "test_interpreter.py", "test_monitor.py", "test_demo_local.py"]
 asyncio_mode = "auto"
 addopts = "-q"

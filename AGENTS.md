@@ -47,7 +47,7 @@ constants, prompt wording, or implementation choices. Execute the production pat
 under test, never a copied implementation. Use pytest fixtures/parametrization,
 not custom runners or handwritten HTTP response classes.
 
-- Offline (`test_unit.py`): real temporary files and shipped scripts; loading
+- Offline (`test_unit.py`, `test_interpreter.py`): real temporary files and shipped scripts; loading
   with/without future annotations; wrapper schemas, HTTP failures,
   lifecycle/message delivery, preview credentials, and byte-exact images.
   Block real HTTP; record unexpected requests/responder assertions and
@@ -92,6 +92,20 @@ edits need offline tests, not paid model qualification solely for wording.
 
 ## Design and compatibility invariants
 
+- **Multi-worker compatibility**: maintain compatibility with multiple OWUI
+  workers/replicas. The sandbox and authoritative Daytona metadata own
+  sandbox-associated identity and execution state; worker-local caches must be
+  disposable and must not select independent interpreter identities. Orientation
+  may repeat per worker, and advisory notices/background completion delivery may
+  remain best-effort. Do not introduce Redis or another OWUI-level synchronization
+  layer for Lathe state; this does not replace OWUI's own scaling requirements.
+  The sandbox is user-controlled: conversation namespaces provide organizational
+  separation, not a security boundary against the owner or their agents. Keep
+  platform credentials, caller ownership, destruction authorization, and preview
+  access policy outside sandbox-controlled authority. Existing interpreter
+  behavior and remaining qualification limits are documented in
+  `INTERPRETER-STATE.md` and tracked in #110. Synthetic tests alone do not
+  establish live multi-worker OWUI qualification.
 - **Poka-yoke over convenience**: reject plausible misuse that silently produces
   wrong results. File tools require absolute paths (Daytona and bash resolve
   relative paths differently); documented exceptions such as onboard("") are explicit.
