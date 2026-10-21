@@ -437,8 +437,9 @@ async def main():
             require(actual == expected_params, f"{name}: expected {expected_params}, got {actual}")
 
     async def bash_dispatch():
+        # As in interpreter_dispatch, keep the expected output out of the prompt.
         output = await client.send(
-            f"Call bash exactly once with command printf {canary}. Do not use another tool."
+            f"Call bash exactly once with command printf {canary[::-1]} | rev. Do not use another tool."
         )
         calls = tool_calls(output)
         require(calls and calls[0].get("name") == "bash", calls)
