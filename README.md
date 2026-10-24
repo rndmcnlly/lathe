@@ -1,6 +1,6 @@
 # Lathe
 
-A single-file Open WebUI toolkit that gives any model a coding agent's tool surface: `bash`, `read`, `write`, `edit`, `glob`, `grep`, `view`, `onboard`, `expose`, `destroy`, executing against per-user cloud sandboxes via [Daytona](https://www.daytona.io/).
+A single-file Open WebUI toolkit that gives any model a coding agent's tool surface: `bash`, `read`, `write`, `edit`, `glob`, `grep`, `view`, `peek`, `poke`, `onboard`, `expose`, `destroy`, executing against per-user cloud sandboxes via [Daytona](https://www.daytona.io/).
 
 **For users**: See [lathe.tools](https://lathe.tools) for what Lathe can do, how to use it, and example workflows.
 
@@ -8,7 +8,7 @@ A single-file Open WebUI toolkit that gives any model a coding agent's tool surf
 
 ## What it does to your instance
 
-Lathe registers twelve tools that models can call in [Native function calling mode](https://docs.openwebui.com/features/extensibility/plugin/tools/). When a user's model calls a tool, Lathe creates, starts, or resumes a cloud sandbox VM via the Daytona control plane and toolbox APIs. All sandbox operations go outbound from your OWUI server.
+Lathe registers fourteen tools that models can call in [Native function calling mode](https://docs.openwebui.com/features/extensibility/plugin/tools/). When a user's model calls a tool, Lathe creates, starts, or resumes a cloud sandbox VM via the Daytona control plane and toolbox APIs. All sandbox operations go outbound from your OWUI server.
 
 Lathe does not import `open_webui.*`, use OWUI file storage, or change stored model, prompt, user, or instance configuration. Its tool descriptions and results include operational instructions, project context, and background notices that influence the calling model.
 
@@ -24,7 +24,7 @@ Lathe does not import `open_webui.*`, use OWUI file storage, or change stored mo
 
 1. **Daytona account** with an API key ([daytona.io](https://www.daytona.io/))
 2. **Open WebUI ≥ 0.12.0** with Native function calling mode enabled
-3. Models that support tool/function calling (`view()` additionally needs a vision-capable model)
+3. Models that support tool/function calling (`view()` and `peek` screenshots additionally need a vision-capable model)
 
 The toolkit requires Open WebUI 0.12.0 or newer, including its native conversation orchestration and image-history support for `view()`.
 
@@ -133,8 +133,9 @@ otherwise low-risk services. Configure `preview_wrapper_url` and
 when the wrapper supports it, browser authentication. Wrapping applies to
 running HTTP services before a URL reaches the model or user. Start the service
 through `bash`, then call `expose(target="http:8080", access="private")` (substitute
-its port). Only `http:<port>` targets on ports 1024–65535 are accepted; Lathe does
-not install applications through `expose` or provide SSH access.
+its port). `expose(target="vnc", access=...)` opens the shared desktop
+described in [Shared desktop](#shared-desktop-computer-use). Lathe does not
+install applications through `expose` or provide SSH access.
 
 The optional [agent handbook](handbook/README.md) describes static sites, dufs
 file browsers, ttyd terminals, and code-server editors. These are reference
@@ -230,6 +231,58 @@ visible in the recording; collaborator access depends on the wrapper's policy,
 not possession of the URL. Opening a wrapped URL may require a separate login
 even when the owner is already signed into Open WebUI.
 
+### Shared desktop (computer use)
+
+Daytona sandboxes include an Xfce desktop on a virtual display, with a noVNC
+viewer on port 6080. Lathe gives the model and the user two ways into that one
+screen:
+
+- The model calls `peek` to read it (screenshots, window lists, pointer position,
+  accessibility tree, process status) and `poke` to change it (start/stop the
+  desktop, mouse and keyboard input, accessibility actions). Each tool takes a
+  `command` name and an `args` object. Lathe checks both against a fixed command
+  list before contacting the sandbox, so `peek` cannot send input and neither
+  tool is a general proxy to Daytona's API.
+- The user opens the desktop in a browser tab after the model calls
+  `expose(target="vnc", access="private")`. Lathe picks the port and returns the
+  noVNC page URL. `expose` does not start the desktop; the model starts it with
+  `poke(command="start")` first.
+
+The intended use is a browser task that needs a human login partway through.
+The model starts the desktop and browser, navigates to the login page, sends
+the user the private desktop link, and stops sending input or taking
+screenshots. The user signs in, then replies in chat; the model takes a fresh
+screenshot and continues. The password never needs to enter the chat.
+
+What administrators should know:
+
+- **No new valves or wrapper changes.** Upgrading from 1.1 adds `peek` and
+  `poke` to the existing toolkit. Desktop links use the same preview wrapper
+  and `preview_wrapper_*` valves as other `expose` targets.
+- **Private is advice, not enforcement.** As for shells and editors, the model is
+  told to use private access, but `access="public"` still works, including the
+  direct Daytona bearer URL fallback for deployments without the wrapper. A
+  public desktop URL lets anyone who has it control the desktop and every
+  account logged in there. Failed private requests never fall back to public.
+- **A login is shared with the agent.** Keeping the password out of chat does
+  not keep the session out of reach: anything running in the sandbox, including
+  the model's `bash` commands, can use an account the user logs into there.
+- **Screenshots are stored in chat history.** `peek` screenshots are returned as
+  images to the model, so OWUI keeps them with the conversation. They require a
+  vision-capable model; text-only models can still use the other commands.
+- **Handoff is a convention, not a lock.** Nothing stops the model, another chat,
+  or a subagent from sending input while the user is working. Lathe also does
+  not retry input, and a successful `poke` means the input was delivered, not
+  that the application did what was intended.
+- **Snapshots and resources.** Daytona's default snapshot provides the desktop
+  packages; a custom `sandbox_create_overrides` snapshot must include them.
+  BayLeaf measured the desktop stack idling near 450 MB of memory, so very
+  small sandboxes may struggle. Browsers are ordinary sandbox software the
+  model installs or launches with `bash`.
+
+The model-facing command reference is `lathe(manpage="computer")`.
+[COMPUTER-USE.md](COMPUTER-USE.md) records the design and live qualification.
+
 ### Externally provisioned sandboxes (`auto_create_sandbox`)
 
 If another system shapes and provisions sandboxes (e.g. giving different users
@@ -257,8 +310,10 @@ flow, e.g. *"Visit https://example.com/setup to create your sandbox first."*
 | `glob(pattern, max_lines)` | List workspace files using one native ripgrep glob |
 | `grep(pattern, files, max_lines)` | Search workspace text using ripgrep regex and one native file glob |
 | `view(path)` | Load an image into the model's visual context (PNG/JPEG/GIF/WebP, ≤ 4 MB, content-sniffed) |
+| `peek(command, args)` | Observe Daytona's shared desktop: screenshots, display, accessibility and diagnostics |
+| `poke(command, args)` | Send desktop input or change its lifecycle; coordinate human login explicitly |
 | `interpret(code, timeout)` | Run Python in a conversation-scoped persistent interpreter |
-| `expose(target, access)` | Publish a running `http:<port>` service with explicit `public` or `private` access |
+| `expose(target, access)` | Publish a running `http:<port>` service or the `vnc` desktop with explicit `public` or `private` access |
 | `destroy()` | Permanently delete the sandbox after interactive confirmation |
 
 Search scopes are workspace-relative, with ripgrep's brace, `!`, ignore, and

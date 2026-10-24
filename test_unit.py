@@ -1734,6 +1734,193 @@ async def test_text_model_view_refused_before_io(tools, monkeypatch, model):
     context.assert_not_called()
 
 
+@pytest.mark.parametrize("tool,command,args,method,path,payload", [
+    ("peek", "status", {}, "GET", "status", {}),
+    ("peek", "process.logs", {"process": "novnc"}, "GET", "process/novnc/logs", {}),
+    ("peek", "display.info", {}, "GET", "display/info", {}),
+    ("peek", "display.windows", {}, "GET", "display/windows", {}),
+    ("peek", "mouse.position", {}, "GET", "mouse/position", {}),
+    ("peek", "accessibility.tree", {"scope": "pid", "pid": 123}, "GET", "a11y/tree",
+     {"scope": "pid", "pid": "123", "maxDepth": "2"}),
+    ("peek", "accessibility.find", {"name": "Submit", "states": ["visible"]}, "POST", "a11y/find",
+     {"scope": "focused", "name": "Submit", "states": ["visible"], "nameMatch": "substring", "limit": 20}),
+    ("poke", "start", {}, "POST", "start", {}),
+    ("poke", "stop", {}, "POST", "stop", {}),
+    ("poke", "process.restart", {"process": "xfce4"}, "POST", "process/xfce4/restart", {}),
+    ("poke", "mouse.move", {"x": 5, "y": 6}, "POST", "mouse/move", {"x": 5, "y": 6}),
+    ("poke", "mouse.click", {"x": 5, "y": 6}, "POST", "mouse/click",
+     {"x": 5, "y": 6, "button": "left", "double": False}),
+    ("poke", "mouse.drag", {"startX": 1, "startY": 2, "endX": 3, "endY": 4}, "POST", "mouse/drag",
+     {"startX": 1, "startY": 2, "endX": 3, "endY": 4, "button": "left"}),
+    ("poke", "mouse.scroll", {"x": 5, "y": 6, "direction": "up"}, "POST", "mouse/scroll",
+     {"x": 5, "y": 6, "direction": "up", "amount": 1}),
+    ("poke", "mouse.down", {}, "POST", "mouse/down", {"button": "left"}),
+    ("poke", "mouse.up", {"x": 7, "y": 8}, "POST", "mouse/up", {"x": 7, "y": 8, "button": "left"}),
+    ("poke", "keyboard.type", {"text": "α\nHello"}, "POST", "keyboard/type", {"text": "α\nHello", "delay": 0}),
+    ("poke", "keyboard.press", {"key": "c", "modifiers": ["ctrl"]}, "POST", "keyboard/key",
+     {"key": "c", "modifiers": ["ctrl"]}),
+    ("poke", "keyboard.hotkey", {"keys": "ctrl+l"}, "POST", "keyboard/hotkey", {"keys": "ctrl+l"}),
+    ("poke", "keyboard.down", {"key": "shift"}, "POST", "keyboard/down", {"key": "shift"}),
+    ("poke", "keyboard.up", {"key": "shift"}, "POST", "keyboard/up", {"key": "shift"}),
+    ("poke", "accessibility.focus", {"id": "node"}, "POST", "a11y/node/focus", {"id": "node"}),
+    ("poke", "accessibility.invoke", {"id": "node"}, "POST", "a11y/node/invoke", {"id": "node"}),
+    ("poke", "accessibility.set_value", {"id": "node", "value": "abc"}, "POST", "a11y/node/value",
+     {"id": "node", "value": "abc"}),
+])
+async def test_computer_dispatch(tools, sandbox, http, tool, command, args, method, path, payload):
+    calls = []
+    def handler(request):
+        calls.append(request)
+        assert (request.method, request.url.path) == (method, "/sb/computeruse/" + path)
+        assert request.headers["Authorization"] == "Bearer test-key"
+        assert (dict(request.url.params) if method == "GET" else json.loads(request.content)) == payload
+        return httpx.Response(200, json={"status": "active", "canary": "observed-state"})
+    http(handler)
+    result = await getattr(tools, tool)(command, args, __user__=USER)
+    assert "Error:" not in result
+    assert len(calls) == 1
+    if tool == "peek":
+        assert "observed-state" in result
+
+
+@pytest.mark.parametrize("tool,command,args", [
+    ("peek", "start", {}), ("peek", "mouse.click", {"x": 1, "y": 2}),
+    ("poke", "screenshot", {}), ("poke", "display.info", {}),
+    ("peek", "../process/execute", {}), ("poke", "unknown", {}),
+    ("poke", "start", {"command": "secret-input"}),
+    ("poke", "keyboard.type", {"text": 7}),
+    ("poke", "keyboard.press", {"key": "c", "modifiers": [7]}),
+    ("poke", "mouse.click", {"x": True, "y": 2}),
+    ("poke", "mouse.click", {"x": "1", "y": 2}),
+    ("poke", "mouse.click", {"x": -1, "y": 2}),
+    ("poke", "mouse.click", {"x": 1, "y": 2, "double": "false"}),
+    ("poke", "mouse.down", {"x": 1}),
+    ("poke", "keyboard.type", {"text": "x" * 16385}),
+    ("peek", "screenshot", {"region": {"x": 0, "y": 0, "width": False, "height": 20}}),
+    ("peek", "screenshot.compressed", {"scale": float("nan")}),
+    ("peek", "screenshot.compressed", {"scale": True}),
+    ("peek", "accessibility.tree", {"scope": "pid"}),
+    ("peek", "accessibility.tree", {"pid": 10}),
+    ("peek", "accessibility.find", {"states": [1]}),
+    ("poke", "process.restart", {"process": "../../execute"}),
+    ("peek", 12, {}), ("poke", "start", []),
+])
+async def test_computer_rejects_misuse_before_io(tools, monkeypatch, tool, command, args):
+    ensure = AsyncMock(side_effect=AssertionError("invalid command reached provisioning"))
+    monkeypatch.setattr(lathe, "_ensure_sandbox", ensure)
+    result = await getattr(tools, tool)(command, args, __user__=USER)
+    assert result.startswith("Error:") and "secret-input" not in result
+    ensure.assert_not_called()
+
+
+@pytest.mark.parametrize("encoding", ["raw", "json", "pascal"])
+@pytest.mark.parametrize("compressed,region", [(False, False), (False, True), (True, False), (True, True)])
+async def test_computer_screenshot_byte_exact(tools, sandbox, http, encoding, compressed, region):
+    args = {"showCursor": True}
+    if compressed:
+        args.update(format="png", quality=90, scale=0.5)
+    if region:
+        args["region"] = {"x": 10, "y": 20, "width": 30, "height": 40}
+    def handler(request):
+        suffix = "screenshot" + ("/region" if region else "") + ("/compressed" if compressed else "")
+        assert request.method == "GET" and request.url.path == "/sb/computeruse/" + suffix
+        expected = {"showCursor": "true"}
+        if compressed:
+            expected.update(format="png", quality="90", scale="0.5")
+        if region:
+            expected.update(x="10", y="20", width="30", height="40")
+        assert dict(request.url.params) == expected
+        if encoding == "raw":
+            return httpx.Response(200, content=PNG)
+        return httpx.Response(200, json={"Screenshot" if encoding == "pascal" else "screenshot": base64.b64encode(PNG).decode()})
+    http(handler)
+    tools._chat_state["screen"] = {"init": True, "pending": ["deferred notice"]}
+    result = await tools.peek("screenshot.compressed" if compressed else "screenshot", args,
+                              __user__=USER, __chat_id__="screen")
+    assert result == "data:image/png;base64," + base64.b64encode(PNG).decode()
+    http(lambda r: httpx.Response(200, json={"status": "active"}))
+    text = await tools.peek("status", __user__=USER, __chat_id__="screen")
+    assert "deferred notice" in text
+
+
+async def test_computer_vision_gate_is_image_only(tools, sandbox, http, monkeypatch):
+    context = AsyncMock(side_effect=AssertionError("nonvision image reached I/O"))
+    with monkeypatch.context() as m:
+        m.setattr(lathe, "_tool_context", context)
+        result = await tools.peek("screenshot", __metadata__={"model": {"architecture": {"input_modalities": ["text"]}}},
+                                  __model__={"architecture": {"input_modalities": ["image"]}})
+        assert "vision-capable" in result
+        context.assert_not_called()
+    http(lambda r: httpx.Response(200, json={"status": "active"}))
+    result = await tools.peek("status", __model__={"info": {"meta": {"capabilities": {"vision": False}}}}, __user__=USER)
+    assert "active" in result
+
+
+@pytest.mark.parametrize("failure", ["http", "timeout", "redirect", "bad-image", "oversize", "bad-json"])
+async def test_computer_failures_are_bounded_redacted_and_not_retried(tools, sandbox, http, failure):
+    calls = []
+    def handler(request):
+        calls.append(request)
+        if failure == "timeout":
+            raise httpx.ReadTimeout("secret-input")
+        if failure == "http":
+            return httpx.Response(500, text="secret-input")
+        if failure == "redirect":
+            return httpx.Response(302, headers={"Location": "https://leak.test/secret-input"})
+        if failure == "oversize":
+            return httpx.Response(200, content=b"x" * (6 * 1024 * 1024))
+        if failure == "bad-image":
+            return httpx.Response(200, json={"screenshot": base64.b64encode(b"secret-input").decode()})
+        return httpx.Response(200, text="secret-input")
+    http(handler)
+    screenshot = failure in {"bad-image", "oversize", "bad-json"}
+    result = await (tools.peek("screenshot", __user__=USER) if screenshot else
+                    tools.poke("keyboard.type", {"text": "secret-input"}, __user__=USER))
+    assert result.startswith("Error:") and "secret-input" not in result
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("access,wrapped", [("private", True), ("public", True), ("public", False)])
+async def test_vnc_preview_uses_existing_policy_and_landing_path(tools, sandbox, http, access, wrapped):
+    tools.valves.preview_wrapper_url = "https://wrapper.test/register" if wrapped else ""
+    tools.valves.preview_wrapper_key = "wrapper-secret" if wrapped else ""
+    calls = []
+    def handler(request):
+        calls.append(request)
+        if request.url.path == "/sb/computeruse/status":
+            assert request.method == "GET"
+            return httpx.Response(200, json={"Status": "active"})
+        if request.url.host == "api.test":
+            assert request.url.path == "/sandbox/sb/ports/6080/signed-preview-url"
+            return httpx.Response(200, json={"url": "https://signed.test/?token=secret-token"})
+        assert (request.method, request.url.host, request.url.path) == ("POST", "wrapper.test", "/register")
+        registration = json.loads(request.content)
+        assert registration["access"] == access and registration["owner"]["email"] == USER["email"]
+        return httpx.Response(200, json={"url": "https://protected.test/", "expires_at": "2099-01-01T00:00:00Z"})
+    http(handler)
+    result = await tools.expose("vnc", access, __user__=USER)
+    assert "/vnc.html?" in result and "path=websockify" in result
+    assert "logged-in accounts" in result
+    assert ("secret-token" in result) is not wrapped
+    assert len(calls) == (3 if wrapped else 2)
+
+
+async def test_vnc_does_not_start_desktop_or_downgrade_private(tools, sandbox, http):
+    calls = []
+    def handler(request):
+        calls.append(request)
+        assert (request.method, request.url.path) == ("GET", "/sb/computeruse/status")
+        return httpx.Response(200, json={"status": "inactive"})
+    http(handler)
+    result = await tools.expose("vnc", "private", __user__=USER)
+    assert result.startswith("Error:") and "not active" in result
+    assert len(calls) == 1
+    calls.clear()
+    http(lambda r: httpx.Response(200, json={"status": "active"}))
+    result = await tools.expose("vnc", "private", __user__=USER)
+    assert result.startswith("Error:") and "no direct URL" in result
+
+
 @pytest.fixture
 def preview(tools, sandbox, http):
     upstream, protected, secret = "https://secret.preview.test/", "https://owner.preview.test/", "installation-secret"

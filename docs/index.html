@@ -37,7 +37,8 @@
 <div class="callout">
     <strong>Lathe connects a model in Open WebUI to a Linux sandbox.</strong>
     The model can run commands, edit files, use a persistent Python session,
-    run background shell jobs, and share running services in the browser. An admin
+    run background shell jobs, share running services in the browser, and operate
+    a Linux desktop that you can also open and use yourself. An admin
     installs one Python tool; Lathe provisions and reconnects one Daytona
     sandbox per user.
 </div>
@@ -151,8 +152,12 @@
             <p>Run Python in a chat-scoped REPL whose variables survive between calls.</p>
         </div>
         <div class="tool-card">
+            <h3>peek · poke</h3>
+            <p>Observe and operate a shared Linux desktop. Open it yourself to log in, then tell the agent when to resume. Screenshots need a vision-capable model and become part of the conversation.</p>
+        </div>
+        <div class="tool-card">
             <h3>expose</h3>
-            <p>Share a running HTTP service with explicit private or public access. The agent starts and checks the service first; Lathe does not install it.</p>
+            <p>Open a running service or the shared desktop with explicit private or public access. Prefer private for desktops and logged-in sessions. The agent starts and checks it first.</p>
         </div>
         <div class="tool-card">
             <h3>onboard · lathe</h3>
@@ -163,6 +168,32 @@
             <p>With confirmation, permanently remove the sandbox and its workspace.</p>
         </div>
     </div>
+</section>
+
+<!-- Shared desktop -->
+<section class="section">
+    <div class="section-label">Shared desktop</div>
+    <h2 class="section-title">You log in, the agent does the clicking</h2>
+    <p>
+        Some browser chores are tedious but sit behind a login: downloading a year
+        of statements, filling the same form fifty times, checking a dashboard
+        that has no API. The sandbox has a desktop that both of you can reach.
+        The model sees it through screenshots and sends mouse and keyboard input.
+        You see it in a browser tab and use it like any remote desktop.
+    </p>
+    <ol class="handoff-list">
+        <li>Ask for the task and say you will handle the login.</li>
+        <li>The model starts the desktop and a browser, goes to the login page, and sends you a private desktop link.</li>
+        <li>It stops clicking and taking screenshots. You open the link, confirm your identity if the deployment asks, then sign in to the site.</li>
+        <li>Reply “ready” in chat. The model takes a fresh screenshot and carries on.</li>
+    </ol>
+    <p>
+        Your password stays out of the chat, but the logged-in session does not
+        stay out of the agent's reach: anything running in the sandbox can use it.
+        Log in only to accounts you would let the agent act in, and log out or
+        ask the model to close the browser when you are done. The pause during
+        your login is an agreement, not a lock, so watch for unexpected input.
+    </p>
 </section>
 
 <!-- Workflows -->
@@ -186,6 +217,10 @@
         <li>
             <span class="recipe-label">Learn a working procedure</span>
             <span class="recipe-desc">“Walk me through starting and checking this service. Once we've tested it together, ask before saving a reusable skill.”</span>
+        </li>
+        <li>
+            <span class="recipe-label">Hand off a login</span>
+            <span class="recipe-desc">“Open the library's site on the desktop and send me a private link. Wait while I sign in, then export my loan history.”</span>
         </li>
         <li>
             <span class="recipe-label">Continue elsewhere</span>
@@ -215,6 +250,7 @@
         <li><strong>Sandbox data lives in Daytona.</strong> Lathe labels each sandbox with the Open WebUI user's email. Files survive normal stops and archives without an additional persistent volume.</li>
         <li><strong>User environment variables are credentials entrusted to the agent.</strong> Lathe injects them into model-directed shell commands. The model can print them, inspect process environments, or read generated command wrappers. Use scoped, revocable credentials.</li>
         <li><strong>Choose the preview's access mode.</strong> Every HTTP exposure is explicitly public or private. Private previews require the deployment's authentication wrapper and never downgrade to public. Public previews may use a direct signed bearer URL when wrapping is unavailable, where the request permits it. Upstream access defaults to 24 hours; the tool reports wrapper expiry separately. Sharing access does not keep a stopped service or sandbox running.</li>
+        <li><strong>Desktop screenshots stay in the chat.</strong> Each screenshot the model takes is saved with the conversation in Open WebUI, along with whatever was on screen. A public desktop link lets anyone who has it control the desktop and the accounts logged in there; ask for private.</li>
         <li><strong>Deletion destroys the workspace.</strong> Automatic sandbox deletion is disabled by default, but an admin can change that policy. Export important results or commit them to a remote repository before sandbox destruction.</li>
         <li><strong>Updates are manual.</strong> Open WebUI stores the uploaded copy of <code>lathe.py</code>. An installed deployment does not receive fixes merely because the GitHub repository changed, and Lathe has no built-in update or notification mechanism.</li>
     </ul>

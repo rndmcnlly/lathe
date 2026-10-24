@@ -402,6 +402,89 @@ asyncio.run(main())
         except Exception:
             raise AssertionError("Direct signed-preview reachability failed") from None
 
+    async def computer_roundtrip():
+        import base64
+        import re
+        import shlex
+
+        output = await tools.poke("start", **ctx)
+        require(not output.startswith("Error:"), output)
+        for _ in range(30):
+            output = await tools.peek("status", **ctx)
+            if re.search(r'"status"\s*:\s*"active"', output, re.I):
+                break
+            await asyncio.sleep(1)
+        else:
+            raise AssertionError(f"Desktop did not become active: {output}")
+
+        for command in ("display.info", "display.windows", "mouse.position"):
+            output = await tools.peek(command, **ctx)
+            require(not output.startswith("Error:"), output)
+        for command, args in [
+            ("screenshot", {}),
+            ("screenshot", {"region": {"x": 0, "y": 0, "width": 100, "height": 80}}),
+            ("screenshot.compressed", {"format": "jpeg", "scale": 0.5}),
+            ("screenshot.compressed", {"region": {"x": 0, "y": 0, "width": 100, "height": 80}, "format": "png"}),
+        ]:
+            output = await tools.peek(command, args, **ctx)
+            require(output.startswith("data:image/"), output[:200])
+            require(len(base64.b64decode(output.split(",", 1)[1], validate=True)) > 100, "Empty screenshot")
+
+        # A real terminal consumes keyboard events; verify its file separately,
+        # not the input acknowledgement or a canary echoed in a tool argument.
+        script = f"{WORKSPACE}/desktop-input.py"
+        saved = f"{WORKSPACE}/desktop-input.txt"
+        await tools.write(script, f"from pathlib import Path\nPath({saved!r}).write_text(input())\n", **ctx)
+        child = shlex.quote(f"python3 {script}")
+        output = await tools.bash(
+            f"export DISPLAY=:0; if command -v xfce4-terminal >/dev/null; then "
+            f"exec xfce4-terminal --disable-server --title=LatheInput --command={child}; "
+            f"else exec xterm -title LatheInput -e python3 {script}; fi",
+            foreground_seconds=0, **ctx)
+        require("Error:" not in output, output)
+        for _ in range(20):
+            windows = await tools.peek("display.windows", **ctx)
+            if "LatheInput" in windows:
+                break
+            await asyncio.sleep(0.5)
+        else:
+            raise AssertionError(f"Test terminal did not open: {windows}")
+        output = await tools.poke("keyboard.type", {"text": canary}, **ctx)
+        require("Input delivered" in output, output)
+        output = await tools.poke("keyboard.press", {"key": "enter"}, **ctx)
+        require("Input delivered" in output, output)
+        for _ in range(20):
+            output = await tools.read(saved, **ctx)
+            if canary in output:
+                break
+            await asyncio.sleep(0.5)
+        require(canary in output, output)
+
+        output = await tools.peek("accessibility.tree", {"maxDepth": 1}, **ctx)
+        require(not output.startswith("Error:"), output)
+
+        # Explicitly public only on this disposable test desktop, with no login.
+        output = await tools.expose("vnc", "public", **ctx)
+        match = re.search(r'https://\S+', output)
+        require(match is not None, "VNC preview URL missing")
+        async with httpx.AsyncClient() as client:
+            response = await client.get(match.group(), headers={"X-Daytona-Skip-Preview-Warning": "true"}, timeout=20)
+            require(response.status_code == 200 and "noVNC" in response.text, "VNC landing page unreachable")
+            # A real WebSocket handshake qualifies the signed-preview transport;
+            # cookie authentication for private wrappers needs browser testing.
+            from urllib.parse import urlsplit, urlunsplit
+            parts = urlsplit(match.group())
+            socket_url = urlunsplit(parts._replace(path="/websockify"))
+            async with client.stream("GET", socket_url, headers={
+                "Origin": f"{parts.scheme}://{parts.netloc}",
+                "Connection": "Upgrade", "Upgrade": "websocket",
+                "Sec-WebSocket-Version": "13", "Sec-WebSocket-Key": base64.b64encode(os.urandom(16)).decode(),
+                "Sec-WebSocket-Protocol": "binary", "X-Daytona-Skip-Preview-Warning": "true",
+            }, timeout=20) as response:
+                require(response.status_code == 101, "VNC WebSocket upgrade failed")
+        output = await tools.poke("stop", **ctx)
+        require(not output.startswith("Error:"), output)
+
     async def workspace_survives_stop():
         # No extra volume: restart the same VM and independently read its file.
         async with httpx.AsyncClient() as client:
@@ -462,6 +545,7 @@ asyncio.run(main())
             ("bounded command retention", bounded_command_retention),
             ("background completion notice", background_completion_notice),
             ("signed preview URL", expose_contract),
+            ("desktop input, screenshots and VNC transport", computer_roundtrip),
             ("ordinary workspace survives sandbox stop", workspace_survives_stop),
             ("disabled auto-create policy", disabled_auto_create_is_respected),
         ]:

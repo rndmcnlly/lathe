@@ -19,6 +19,8 @@ EXPECTED_SCHEMA = {
              "max_lines": ("integer", False, 100)},
     "interpret": {"code": ("string", True, None), "timeout": ("integer", False, 120)},
     "view": {"path": ("string", True, None)},
+    "peek": {"command": ("string", True, None), "args": ("object", False, {})},
+    "poke": {"command": ("string", True, None), "args": ("object", False, {})},
     "expose": {"target": ("string", True, None), "access": ("string", True, None),
                "tag": ("string", False, ""), "upstream_headers": ("object", False, {})},
 }

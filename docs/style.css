@@ -198,6 +198,24 @@ code {
     margin-bottom: 0;
 }
 
+/* ── Handoff steps ───────────────────────────────── */
+
+.handoff-list {
+    margin: 0 0 1rem;
+    padding-left: 1.4rem;
+}
+
+.handoff-list li {
+    font-size: 0.85rem;
+    color: var(--fg-soft);
+    padding: 0.25rem 0;
+    line-height: 1.55;
+}
+
+.handoff-list li::marker {
+    color: var(--dim);
+}
+
 /* ── Subsection titles ────────────────────────────── */
 
 .subsection-title {

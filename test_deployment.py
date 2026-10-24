@@ -483,6 +483,23 @@ async def main():
         require(not any(PNG_B64[:40] in v for v in values),
                 f"raw base64 leaked into text channel: {values[0][:120]}")
 
+    async def computer_dispatch():
+        output = await client.send('Call poke exactly once with command "start" and args {}.')
+        require(any(call.get("name") == "poke" for call in tool_calls(output)), "Model did not dispatch poke")
+        for _ in range(15):
+            output = await client.send('Call peek exactly once with command "status" and args {}.')
+            require(any(call.get("name") == "peek" for call in tool_calls(output)), "Model did not dispatch peek")
+            if any(re.search(r'"status"\s*:\s*"active"', v, re.I) for v in tool_outputs(output)):
+                break
+            await asyncio.sleep(1)
+        else:
+            raise AssertionError("Desktop did not become ready through OWUI")
+        output = await client.send('Call peek exactly once with command "screenshot.compressed" and args {"format":"png","scale":0.5}.')
+        require(any(call.get("name") == "peek" for call in tool_calls(output)), "Model did not request screenshot")
+        values = tool_outputs(output)
+        require(any("Image file read successfully" in v for v in values), "OWUI did not lift the desktop image")
+        require(not any("data:image/" in v for v in values), "Desktop image leaked as text")
+
     async def protected_preview_dispatch():
         nonlocal preview_url
         output = await client.send(
@@ -554,6 +571,7 @@ async def main():
                 ("write and read dispatch", write_and_read_dispatch),
                 ("interpreter dispatch", interpreter_dispatch),
                 ("view dispatch", view_dispatch),
+                ("peek/poke dispatch and native desktop image", computer_dispatch),
             ])
         if preview_enabled:
             scenarios.append((f"model to OWUI to {PREVIEW_ACCESS} wrapped expose", protected_preview_dispatch))

@@ -33,6 +33,21 @@ need to know how an editor, terminal, file browser, or website was installed.
 Keeping the access boundary in Lathe is compatible with moving application
 management out of it.
 
+Daytona's built-in desktop is a provider capability, not a Lathe-installed
+application. `peek(command, args)` observes its screen, accessibility state and
+diagnostics; `poke(command, args)` sends input or changes desktop lifecycle.
+Commands are a closed, strictly validated vocabulary, not arbitrary API routes.
+`expose(target="vnc", access=...)` supplies the human's noVNC connection to the
+same screen, through the ordinary preview policy. Private access is strongly
+advised, not enforced by target; explicit public access remains an escape hatch.
+Browser installation and launch remain ordinary sandbox program work.
+
+The desktop is shared across conversations and people. Human login requires an
+explicit conversational handoff: stop input and screenshots until the human
+says ready, then observe afresh. This is coordination, not an enforced control
+lock or credential-isolation boundary. Screenshots delivered to OWUI enter
+conversation history; logging in grants sandbox software access to that session.
+
 ## Optional applications and reference material
 
 File browsers, terminals, IDEs, and static servers are ordinary optional
