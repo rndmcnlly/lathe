@@ -21,6 +21,22 @@ const UPSTREAM_HEADER_BLOCKED = new Set([
   "content-length", "expect", "http2-settings", "proxy-authorization", "proxy-authenticate",
 ]);
 const UPSTREAM_HEADER_PREFIXES = ["x-forwarded-", "sec-", "cf-", "daytona-", "x-daytona-", "x-lathe-"];
+// Browser request headers never forwarded (CONTRACT.md §5.2 step 3, plus
+// Referer, §5.2 step 4). Deliberately narrower than the injection-forbidden set:
+// Origin, Cookie and Sec-* are browser-owned and forwarded or mediated.
+const BROWSER_HEADER_REMOVED = new Set([
+  "host", "forwarded", "x-real-ip", "true-client-ip", "keep-alive", "te", "trailer",
+  "transfer-encoding", "content-length", "expect", "http2-settings", "proxy-authorization",
+  "proxy-authenticate", "accept-encoding", "referer",
+]);
+const BROWSER_HEADER_REMOVED_PREFIXES = ["x-forwarded-", "cf-", "daytona-", "x-daytona-", "x-lathe-"];
+// CONTRACT.md §6: 4xx/5xx bodies pass through unless large or naming the
+// upstream. Daytona appends its signed capability host to X-Forwarded-Host, so
+// applications can echo it in error pages. A body cut short mid-read is
+// replaced too, keeping the application's status.
+const ERROR_BODY_LIMIT = 64 * 1024;
+const MASKED_ERROR_BODY = "Preview application request failed. (The application's response body was " +
+  "replaced by the preview wrapper because it was large, named the upstream, or could not be read.)";
 
 let oidcConfigurationPromise;
 
@@ -106,7 +122,7 @@ export default {
 
 async function handleRegister(request, env) {
   const auth = request.headers.get("authorization") ?? "";
-  if (auth !== `Bearer ${env.REGISTER_TOKEN}`) {
+  if (!(await bearerMatches(auth, env.REGISTER_TOKEN))) {
     return json({ error: "invalid bearer token" }, 401);
   }
 
@@ -239,7 +255,7 @@ async function handleRegister(request, env) {
 
 async function handleRevoke(request, env, rawLabel) {
   const auth = request.headers.get("authorization") ?? "";
-  if (auth !== `Bearer ${env.REGISTER_TOKEN}`) {
+  if (!(await bearerMatches(auth, env.REGISTER_TOKEN))) {
     return json({ error: "invalid bearer token" }, 401);
   }
   const label = decodeURIComponent(rawLabel).trim().toLowerCase();
@@ -579,28 +595,32 @@ async function proxy(request, url, target, publicHost, zone, upstreamHeaders = {
   upstream.pathname = url.pathname;
   upstream.search = url.search;
 
+  // CONTRACT.md §5.2, in order: start from the browser's headers, drop
+  // Connection-nominated and wrapper-controlled ones, mediate cookies, forward
+  // the rest unchanged, set wrapper headers, then inject configured values last.
   const headers = new Headers(request.headers);
-  headers.set("X-Forwarded-Host", publicHost);
-  headers.set("X-Forwarded-Proto", "https");
+  const websocket = headers.get("upgrade")?.toLowerCase() === "websocket";
+  for (const name of (headers.get("connection") ?? "").split(",")) {
+    const token = name.trim().toLowerCase();
+    if (token && /^[!#$%&'*+.^_`|~0-9a-z-]+$/.test(token)
+        && !(websocket && (token === "upgrade" || token.startsWith("sec-websocket-")))) {
+      headers.delete(token);
+    }
+  }
+  if (websocket) headers.set("connection", "Upgrade");
+  else { headers.delete("connection"); headers.delete("upgrade"); }
+  for (const name of [...headers.keys()]) {
+    if (BROWSER_HEADER_REMOVED.has(name)
+        || BROWSER_HEADER_REMOVED_PREFIXES.some((prefix) => name.startsWith(prefix))) {
+      headers.delete(name);
+    }
+  }
   const cookies = stripSessionCookie(headers.get("cookie") ?? "");
   if (cookies) headers.set("cookie", cookies);
   else headers.delete("cookie");
-
-  // Connection-nominated fields must not let a browser mark injected headers
-  // hop-by-hop. Preserve only the WebSocket upgrade control, then inject last.
-  if (Object.keys(upstreamHeaders).length) {
-    const websocket = headers.get("upgrade")?.toLowerCase() === "websocket";
-    for (const name of (headers.get("connection") ?? "").split(",")) {
-      const token = name.trim().toLowerCase();
-      if (token && /^[!#$%&'*+.^_`|~0-9a-z-]+$/.test(token)
-          && !(websocket && (token === "upgrade" || token.startsWith("sec-websocket-")))) {
-        headers.delete(token);
-      }
-    }
-    if (websocket) headers.set("connection", "Upgrade");
-    else headers.delete("connection");
-    for (const [name, value] of Object.entries(upstreamHeaders)) headers.set(name, value);
-  }
+  headers.set("X-Forwarded-Host", publicHost);
+  headers.set("X-Forwarded-Proto", "https");
+  for (const [name, value] of Object.entries(upstreamHeaders)) headers.set(name, value);
 
   let resp;
   try {
@@ -634,12 +654,58 @@ async function proxy(request, url, target, publicHost, zone, upstreamHeaders = {
   const location = out.get("location");
   if (location) out.set("location", unwrapLocation(location, upstream, publicHost));
 
+  if (resp.status >= 400 && resp.status <= 599 && request.method !== "HEAD") {
+    const body = await readBounded(resp.body, ERROR_BODY_LIMIT).catch(() => null);
+    out.delete("content-length");
+    if (!body || namesUpstream(body, upstream.hostname)) {
+      out.delete("content-encoding");
+      out.set("content-type", "text/plain; charset=utf-8");
+      return new Response(MASKED_ERROR_BODY, { status: resp.status, headers: out });
+    }
+    return new Response(body, { status: resp.status, headers: out });
+  }
+
   // workerd supports reconstructing 101 responses when the handle is explicit.
   // Upgrade cookies cross the same authentication boundary as ordinary HTTP.
   return new Response(resp.body, {
     status: resp.status, headers: out,
     ...(resp.status === 101 ? { webSocket: resp.webSocket } : {}),
   });
+}
+
+// Returns the whole body, or null if it exceeds limit bytes.
+async function readBounded(stream, limit) {
+  if (!stream) return new Uint8Array();
+  const reader = stream.getReader();
+  const chunks = [];
+  let size = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    size += value.byteLength;
+    if (size > limit) {
+      await reader.cancel().catch(() => {});
+      return null;
+    }
+    chunks.push(value);
+  }
+  const body = new Uint8Array(size);
+  let offset = 0;
+  for (const chunk of chunks) { body.set(chunk, offset); offset += chunk.byteLength; }
+  return body;
+}
+
+// Hostname, its first label, and that label without a `{port}-` prefix (the
+// Daytona token). IP literals contribute only themselves: their first octet
+// would match ordinary numbers.
+function namesUpstream(body, hostname) {
+  const text = new TextDecoder().decode(body).replace(/[A-Z]/g, (c) => c.toLowerCase());
+  const needles = [hostname];
+  if (!/^[\d.]+$|^\[/.test(hostname)) {
+    const label = hostname.split(".", 1)[0];
+    needles.push(label, label.replace(/^\d+-/, ""));
+  }
+  return needles.some((needle) => needle && text.includes(needle));
 }
 
 function unwrapLocation(location, upstream, publicHost) {
@@ -655,6 +721,16 @@ function unwrapLocation(location, upstream, publicHost) {
   } catch {
     return location;
   }
+}
+
+// Constant-time comparison: hash both sides, then compare fixed-length digests.
+async function bearerMatches(auth, token) {
+  if (typeof token !== "string" || !token) return false;
+  const encode = (v) => crypto.subtle.digest("SHA-256", new TextEncoder().encode(v));
+  const [a, b] = (await Promise.all([encode(auth), encode(`Bearer ${token}`)])).map((d) => new Uint8Array(d));
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) diff |= a[i] ^ b[i];
+  return diff === 0;
 }
 
 const escapeHtml = (s) =>

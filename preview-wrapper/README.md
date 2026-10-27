@@ -70,106 +70,31 @@ Public wrapped previews remain available without OIDC.
 
 ## Registration Contract
 
-This is the authoritative Lathe registration contract for the reference Worker
-and independently deployed wrappers. Worker-specific features are identified
-below.
+The authoritative, normative protocol for Lathe and every wrapper (this Worker,
+BayLeaf's gateway, or an independent implementation) is
+[CONTRACT.md](CONTRACT.md): registration request and reply, `upstream_headers`
+validation and semantics, request-header forwarding, response handling, a
+black-box case table, and the conformance process. Change that file first.
 
-```http
-POST /register
-Authorization: Bearer $REGISTER_TOKEN
-Content-Type: application/json
-
-{"owner":{"subject":"owui-user-id","email":"owner@example.org"},
- "upstream_url":"https://signed-upstream.example/",
- "access":"private","tag":"vscode"}
-```
-
-The optional `tag` is an untrusted model-supplied display hint. The Worker uses
-`HOSTNAME_TEMPLATE` (default: `lathe-{access}`) and always appends a random
-16-hex-character nonce. For example, `{access}-{tag}` produces
-`private-vscode-{nonce}`. Hostname text is never an authorization claim; the
-stored registration remains authoritative. The Worker returns:
-
-```json
-{"url":"https://lathe-private-{nonce}.previews.example.org/",
- "host":"lathe-private-{nonce}.previews.example.org",
- "expires_at":"2026-09-20T01:00:00Z"}
-```
-
-The sensitive upstream URL is never echoed. Early revocation is
-`DELETE /register/{label}` with the same bearer token.
-
-### Lathe client validation
-
-Lathe sends an HTTPS POST to its configured registration endpoint with an
-installation bearer credential, not a sandbox-management credential. Owner
-subject/email come only from OWUI's injected user context; the model controls
-neither identity nor the upstream URL. Access is a requirement, not a preference.
-
-Lathe requires a distinct HTTPS response URL and future timezone-qualified
-`expires_at`. It rejects URLs reflecting the upstream hostname or installation
-credential, follows no registration redirects, and exposes no raw registration
-response/error text. Private requests fail closed on missing identity/configuration,
-failure, or malformed responses. Headerless public requests may fall back to the
-direct Daytona signed bearer URL; nonempty upstream headers prohibit fallback.
-Only `url` and `expires_at` are required in a headerless success response: `host`
-is reference-Worker metadata. Valid JSON alone cannot prove browser authorization.
+This section records only what is specific to the reference Worker.
 
 ### Reference Worker labels
 
-Other trusted producers may register an explicit label:
+Besides Lathe registrations, other trusted producers may register an explicit
+label:
 
 ```json
 {"subdomain":"demo-abc123","target":"https://service.example/","ttl":86400}
 ```
 
-`ttl` is optional and constrained to 60–86400 seconds. Lathe registrations must
-set `access` to exactly `public` or `private`; the Worker either enforces that
-policy or rejects the registration. Generic explicit-label registrations remain
-public-only and cannot use the reserved `lathe-` prefix. Previous request,
-response, and stored-record shapes are not accepted.
+`ttl` is optional and constrained to 60–86400 seconds; Lathe registrations
+default to 86400. Generic explicit-label registrations are public-only, cannot
+use the reserved `lathe-` prefix, and replace any existing registration for the
+same label, including its injected headers. Early revocation is
+`DELETE /register/{label}` with the registration bearer token. Successful
+replies also include `host`, which Lathe ignores.
 
-### Upstream headers
-
-Both Lathe and generic trusted producers may add an optional `upstream_headers`
-dictionary. It configures fixed application headers on one registration, for
-**either public or private access**. The model may propose the values directly;
-owner authentication remains solely the private-access gate. The wrapper does
-not interpret assertion names, map identities, infer roles, or create accounts.
-
-```json
-{"owner":{"subject":"owui-user-id","email":"owner@example.org"},
- "upstream_url":"https://signed-upstream.example/","access":"public",
- "upstream_headers":{"Authorization":"Basic YXBwOnNlY3JldA==","X-App-Mode":"demo"}}
-```
-
-Limits: at most 16 string/string entries; HTTP-token names of 1–64 ASCII bytes;
-printable ASCII values (including empty strings) of at most 4096 bytes each;
-8192 total bytes across names and values. Case-insensitive duplicate names are
-rejected. Invalid inputs return a generic 400 without echoing names or values.
-
-Forbidden names (case-insensitive): `Host`, `Cookie`, `Origin`, `Referer`,
-`Forwarded`, `X-Real-IP`, `True-Client-IP`, `Connection`, `Upgrade`, `Keep-Alive`,
-`TE`, `Trailer`, `Transfer-Encoding`, `Content-Length`, `Expect`, `HTTP2-Settings`,
-`Proxy-Authorization`, and `Proxy-Authenticate`. Forbidden prefixes:
-`X-Forwarded-`, `Sec-`, `CF-`, `Daytona-`, `X-Daytona-`, and `X-Lathe-`.
-`Authorization` (including Basic) is supported as an application credential,
-separate from registration, OIDC, browser-session, and Daytona credentials.
-
-Configured headers replace browser-supplied values case-insensitively, after any
-private-access check, on HTTP requests and WebSocket handshakes. Client
-`Connection` nominations cannot turn injected headers into hop-by-hop fields.
-Unconfigured application headers retain their existing behavior: no assertion
-namespace is reserved. Existing origin information is not replaced; applications
-remain responsible for cross-origin/CSRF policy. Public visitors can exercise
-the configured credential without signing in.
-
-For nonempty headers, success adds `"upstream_headers_applied": true` to the
-ordinary registration reply. No header names or values are returned. Lathe
-requires this exact acknowledgement and refuses direct-URL fallback if injection
-was requested. Omitted or empty headers keep the original reply and behavior.
-
-#### Storage and rotation
+### Upstream header storage and rotation
 
 Header-bearing registrations require `REGISTRATION_ENCRYPTION_KEY`: a base64
 encoded, random 32-byte secret. The complete registration, including destination,
@@ -286,14 +211,8 @@ record counts. No per-preview DNS record is created.
 
 ## Proxy Behavior
 
-- Preserves method, body, path, and query string.
-- Adds `X-Forwarded-Host` and `X-Forwarded-Proto`.
-- Removes `Domain=` from upstream `Set-Cookie`, making cookies host-only.
-- Removes `__Host-lathe_session` before proxying request cookies upstream and
-  discards upstream attempts to set it.
-- Rewrites same-origin absolute redirects to the public wrapper hostname.
-- Preserves the runtime WebSocket handle while applying the same cookie filtering
-  to upgrade responses as ordinary HTTP.
+Request and response handling is specified in [CONTRACT.md](CONTRACT.md)
+(sections 5 and 6). Its section 12 lists where this Worker does not yet conform.
 
 The upstream target must be reachable from Cloudflare's edge. Do not treat the
 wrapper as a private network tunnel.

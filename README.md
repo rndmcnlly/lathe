@@ -195,8 +195,10 @@ cannot choose the hostname template or which trusted identity fields it exposes.
 
 #### Registration contract
 
-The authoritative wire protocol, client validation, identity requirements, and
-header forwarding contract are in [preview-wrapper/README.md](preview-wrapper/README.md#registration-contract).
+The authoritative wire protocol, client validation, and header forwarding
+contract are in [preview-wrapper/CONTRACT.md](preview-wrapper/CONTRACT.md);
+identity requirements for the reference Worker are in
+[preview-wrapper/README.md](preview-wrapper/README.md#identity-compatibility).
 Independent wrappers must implement that contract, using their own deployment
 and storage mechanisms. Valid registration JSON does not prove that a wrapper
 enforces its browser-authentication claims: the configured wrapper is trusted.
@@ -206,7 +208,8 @@ requests, independently of public/private access. They require a compatible
 wrapper and never fall back to a direct URL. Values remain in OWUI tool
 arguments and are entrusted to the application; public visitors can exercise
 them. They neither establish visitor identity nor prevent direct application
-bypass. See the [header contract](preview-wrapper/README.md#upstream-headers)
+bypass. Browser headers already pass through except reserved ones, so injection is
+not needed for forwarding. See the [contract](preview-wrapper/CONTRACT.md#4-upstream_headers-injection)
 for limits, acknowledgement, storage, and rotation requirements.
 
 #### Lifetime and browser behavior
