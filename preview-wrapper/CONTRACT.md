@@ -10,8 +10,10 @@ Key words MUST, MUST NOT, SHOULD, SHOULD NOT and MAY are used as in RFC 2119.
 Anything this file does not constrain is implementation-defined, and Lathe MUST
 NOT depend on it.
 
-- Contract revision: 2 (draft, [Lathe #111](https://github.com/rndmcnlly/lathe/issues/111)).
-  Revision 2 makes browser-header forwarding normative (section 5). Revision 1
+- Contract revision: 3 (draft, [Lathe #111](https://github.com/rndmcnlly/lathe/issues/111)).
+  Revision 3 makes Fetch Metadata forwarding mandatory and adds Daytona
+  provider requirements (section 5.4). Revision 2 made browser-header
+  forwarding normative (section 5). Revision 1
   was the registration and `upstream_headers` contract of [Lathe #98](https://github.com/rndmcnlly/lathe/issues/98).
 - Known implementations: the reference Worker (`src/index.js`); BayLeaf
   (`bayleaf-ucsc/bayleaf`, `api/src/routes/previews.ts`, tracked in
@@ -188,8 +190,8 @@ Status 200, `Content-Type: application/json`, `Cache-Control: no-store`:
   and wrong-owner requests MUST NOT reach the upstream at all.
 - In public mode, every visitor exercises injected credentials. Lathe SHOULD
   require an explicit acknowledgement from the model before sending
-  `upstream_headers` with `access: "public"` (client-side; no wire field in
-  revision 2).
+  `upstream_headers` with `access: "public"` (client-side; no wire field as
+  of revision 3).
 - Purpose: values the browser cannot hold, such as fixed application auth.
   Injection is **not** a forwarding mechanism. Browser headers already pass
   (section 5). Injecting a CSRF marker disables the application's own check
@@ -239,15 +241,23 @@ step wins over an earlier one.
      be capabilities.
    - `origin`: MUST be forwarded unchanged when present. Applications need it
      for their own cross-origin checks.
-   - `sec-fetch-*`: MAY be forwarded. They are browser-set and truthful.
+   - Fetch Metadata: `Sec-Fetch-Site`, `Sec-Fetch-Mode`, `Sec-Fetch-Dest` and
+     `Sec-Fetch-User` MUST be forwarded unchanged on every request, including
+     navigations. They are browser-set and truthful. Go 1.25+ `net/http`
+     `CrossOriginProtection` trusts `Sec-Fetch-Site` and otherwise compares
+     `Origin`'s host with `Host`; Daytona rewrites `Host` to `localhost:<port>`,
+     so without Fetch Metadata the application rejects its own same-origin
+     POSTs (verified live 2026-10-27 behind BayLeaf: 403 "Sec-Fetch-Site is
+     missing, and Origin does not match Host"; 200 once forwarded). Other
+     `sec-*` headers MAY be forwarded.
    - `sec-websocket-*`, `upgrade: websocket`, `connection: Upgrade`: MUST be
      forwarded on WebSocket handshakes.
 5. **Forward everything else unchanged.** Any header not removed or mediated
    above MUST reach the upstream with its browser value. A wrapper MUST NOT
    use an allowlist of application header names.
 6. **Set wrapper headers.** `X-Forwarded-Host: {public host}`,
-   `X-Forwarded-Proto: https`. Provider headers the wrapper itself needs (for
-   example `X-Daytona-Skip-Preview-Warning`) MAY be set here.
+   `X-Forwarded-Proto: https`. Provider headers the wrapper itself needs MAY
+   be set here; section 5.4 makes some of them mandatory for Daytona.
 7. **Apply `upstream_headers`** (section 4.2), overwriting.
 
 A wrapper MAY apply further size or count limits to forwarded headers. It MUST
@@ -283,6 +293,36 @@ forged by injection.
   document the prefix, and requests under it MUST NOT reach the upstream. On
   public hosts the reference Worker currently reserves nothing (section 12).
 
+### 5.4 Daytona upstreams
+
+Applies to wrappers whose upstream is a Daytona preview URL (Lathe's case).
+
+- The wrapper MUST send `X-Daytona-Disable-CORS: true` upstream (section 5.2
+  step 6). Daytona's default CORS layer echoes any `Origin` with
+  `Access-Control-Allow-Credentials: true` and answers preflights itself with
+  204, so the application never sees them (verified live 2026-10-27). Daytona
+  strips the header and leaves CORS to the application.
+- The wrapper SHOULD send `X-Daytona-Skip-Preview-Warning: true`, so browsers
+  reach the application instead of Daytona's interstitial.
+- Browsers cannot influence either header: `x-daytona-` is already
+  wrapper-controlled (section 5.2 step 3) and injection-forbidden (section 4.1).
+- The wrapper SHOULD NOT forward Daytona credentials in `Authorization`:
+  archived proxy source shows a valid Daytona Bearer is consumed by the proxy
+  rather than passed to the application.
+- Observed provider behaviour on signed URLs (2026-10-27): `Host` is rewritten
+  to `localhost:<port>`; a second `X-Forwarded-Host` carrying the signed
+  capability hostname is appended after the wrapper's value (section 6);
+  `X-Daytona-Trust-Forwarded-Host` has no effect; responses set no
+  `daytona-sandbox-auth-*` cookie.
+
+Provenance: Daytona production has been closed source since 2026-06-11
+([announcement](https://www.daytona.io/dotfiles/updates/daytona-is-going-closed-source)).
+The public repository <https://github.com/daytonaio/daytona> is archived at
+v0.190.0 (`01c502bb1f1f`), so findings from source are hypotheses and live
+probes are the evidence. Provider documentation:
+[preview](https://www.daytona.io/docs/en/preview),
+[custom preview proxy](https://www.daytona.io/docs/en/custom-preview-proxy).
+
 ## 6. Responses
 
 - Status MUST pass through unchanged, including 3xx, 4xx and 5xx.
@@ -317,7 +357,7 @@ forged by injection.
   bodies are not scanned by either known implementation; a streaming,
   known-value redactor in the style of GitHub Actions' `SecretMasker`
   (registered encodings, in-place same-length replacement, carry-over across
-  chunks) is a possible future revision, not a requirement.
+  chunks) is not planned (section 12).
 - Response headers MUST NOT disclose the upstream hostname or credentials. A
   wrapper MAY drop or rewrite any header for that reason and MAY add security
   headers (CSP, `X-Frame-Options`, HSTS).
@@ -359,6 +399,7 @@ unless marked otherwise; run in both access modes unless marked.
 | F5 | `Accept`, `Content-Type`, `If-None-Match` | seen unchanged |
 | F6 | `Authorization: Bearer app-token-123` | seen (unless wrapper documents a platform-credential screen that matches it) |
 | F7 | `Authorization: Basic YXBwOnNlY3JldA==` | seen unchanged |
+| F8 | `Sec-Fetch-Site: same-origin`, `Sec-Fetch-Mode: navigate` (plus `Sec-Fetch-Dest`, `Sec-Fetch-User`) on a POST navigation | seen unchanged |
 | R1 | `X-Forwarded-For: 203.0.113.9` | absent, or the wrapper's own value |
 | R2 | `x-FORWARDED-host: evil.example` | value is `{public host}` |
 | R3 | `CF-Connecting-IP: 203.0.113.9` | absent, or the edge's own value |
@@ -367,6 +408,8 @@ unless marked otherwise; run in both access modes unless marked.
 | R6 | `X-Lathe-Anything: x` | absent |
 | R7 | `True-Client-IP`, `X-Real-IP`, `Forwarded` | absent, or wrapper-set |
 | R8 | `Proxy-Authorization: Basic eA==` | absent |
+| D1 | Any request to a Daytona upstream, browser sends no Daytona headers | seen `X-Daytona-Disable-CORS: true` |
+| D2 | Browser sends `X-Daytona-Disable-CORS: false` | seen `true` |
 | C1 | `Connection: X-Pocket` plus `X-Pocket: 1` | `X-Pocket` absent (HTTP only) |
 | C2 | `Connection: X-Injected` with `X-Injected` configured for injection | seen with injected value |
 | C3 | WebSocket handshake with `Connection: Upgrade, X-Foo` and `X-Foo: 1` | handshake succeeds; `X-Foo` absent |
@@ -444,6 +487,9 @@ confirm at least one case fails:
 - applying `Connection` stripping only when injection is configured (fails C1);
 - injecting before forwarding instead of after (fails I1, I2, C2);
 - dropping `Origin` (fails F4);
+- removing browser `sec-fetch-*` headers (fails F8);
+- omitting `X-Daytona-Disable-CORS` (fails D1);
+- setting the Daytona headers only when the browser already sent them (fails D1);
 - resolving the browser path as a relative URL (fails P1);
 - masking all error bodies (fails E1);
 - passing all error bodies (fails E2).
@@ -464,6 +510,9 @@ section 9; add a case.
 
 ## 11. Revision history
 
+- **3** (draft, Lathe #111): Fetch Metadata forwarding becomes MUST; Daytona
+  provider requirements (section 5.4); section 12 decisions recorded. No wire
+  change.
 - **2** (draft, Lathe #111): browser-header forwarding becomes normative
   (section 5.2), with structural removal of routing, provider, transport and
   wrapper headers and mandatory forwarding of everything else. Error bodies
@@ -473,13 +522,16 @@ section 9; add a case.
 - **1** (Lathe #98): registration, `access`, `upstream_headers` validation,
   `upstream_headers_applied`, encrypted storage.
 
-## 12. Known nonconformance and open questions
+## 12. Known nonconformance, decisions and open questions
 
-Reference Worker (`src/index.js`), as of contract revision 2:
+Reference Worker (`src/index.js`), as of contract revision 3:
 
 - Conforms to section 5.2, constant-time bearer comparison and section 6 error
   bodies as of the revision 2 implementation (Lathe #111).
-- Forwards `sec-*` browser headers (allowed by section 5.2 step 4).
+- Forwards all `sec-*` browser headers, including Fetch Metadata (F8).
+- Sends `X-Daytona-Disable-CORS: true` and
+  `X-Daytona-Skip-Preview-Warning: true` on every upstream request,
+  unconditionally (section 5.4; harmless for non-Daytona upstreams).
 - Applies no upstream request timeout.
 - Reserves `/_lathe/auth/callback` only on private hosts; no prefix on public
   hosts.
@@ -487,16 +539,19 @@ Reference Worker (`src/index.js`), as of contract revision 2:
   instead of refused, which can loop.
 - Revocation does not close established WebSockets (section 2.6 SHOULD).
 
-BayLeaf (`api/src/routes/previews.ts`), as of contract revision 2:
+BayLeaf (`api/src/routes/previews.ts`), as of contract revision 3:
 
 - Conforms to sections 5.2 and 6 since bayleaf commit `8abe2d3` (deployed
   2026-10-27, bayleaf#118). Live qualification against production passed the
   F, R, E1, E2 and navigation cases with a public exposure
   (`api/scripts/qualify-preview-passthrough.py`); private mode is covered by
   its synthetic harness.
+- Forwards Fetch Metadata and sends `X-Daytona-Disable-CORS: true` since
+  bayleaf commit `70a4fa9` (deployed `066869e8`, 2026-10-27).
 - Stricter than required, all allowed: forwards script-set headers only on
-  same-origin non-navigation requests; drops `sec-*`; screens every forwarded
-  value for platform credentials; rejects cross-origin non-GET requests.
+  same-origin non-navigation requests; drops `sec-*` other than Fetch
+  Metadata; screens every forwarded value for platform credentials; rejects
+  cross-origin non-GET requests.
 - Nonconforming: drops browser `Authorization` unless it is a single Bearer
   token, so application credentials in other schemes (for example browser
   Basic authentication) never reach the upstream. Section 5.2 step 4 permits
@@ -505,19 +560,31 @@ BayLeaf (`api/src/routes/previews.ts`), as of contract revision 2:
   the Worker runs (R3 is satisfied by refusal).
 - Reply omits `host` (allowed).
 
+Decisions (2026-10-27):
+
+- **Signed vs standard Daytona URLs: stay on signed.** The capability an
+  application can learn (section 6) grants only what the preview already
+  grants: one port, for at most 24 hours. For private previews only the owner
+  sees application pages, so the residual risk is the owner sharing their
+  screen. Standard preview tokens are sandbox-wide (every port, including the
+  terminal and toolbox), cannot be revoked, and would concentrate that
+  authority in the wrapper.
+- **Daytona header audit: done.** Results are in section 5.4: mandatory
+  `X-Daytona-Disable-CORS`, recommended `X-Daytona-Skip-Preview-Warning`, no
+  forwarded Daytona Bearer, and the observed `Host`, `X-Forwarded-Host`,
+  trust-header and cookie behaviour. R4 and R5 continue to cover the
+  `x-daytona-` and `daytona-` namespaces.
+- **Masking injected `upstream_headers` values in error bodies: not planned.**
+  It remains MAY (section 6). The values are the application's own, and
+  platform credentials are refused at registration (section 4.1).
+- **Streaming 2xx redactor: not planned.** Revisit only if the capability's
+  scope or the tenancy model changes. Masking is an accident guard, not a
+  boundary.
+- **Fetch Metadata forwarding: MUST**, adopted in revision 3 (section 5.2
+  step 4).
+
 Open questions:
 
-- Which headers Daytona's preview proxy interprets outside the `x-daytona-`
-  prefix. Until audited, R4 and R5 cover only the documented namespace.
-- Whether to move from signed preview URLs to standard URLs with
-  `X-Daytona-Preview-Token` plus `X-Daytona-Trust-Forwarded-Host`, which would
-  stop the hostname being a credential. Tradeoff: that token covers the whole
-  sandbox (every port), cannot be revoked, and would need the wrapper to
-  enforce a port allowlist itself. Two behaviours to verify first: whether
-  Daytona strips `X-Daytona-Preview-Token` before the app, and whether the
-  trust header then fully replaces the appended value.
 - Whether the public-injection acknowledgement should become a wire field
   (section 4.2). If it does, follow the optional-then-required sequence in
   section 0.
-- Whether `sec-fetch-*` forwarding should become MUST, so applications can
-  rely on it for their own CSRF defence.

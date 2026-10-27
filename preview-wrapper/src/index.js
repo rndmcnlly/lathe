@@ -620,6 +620,10 @@ async function proxy(request, url, target, publicHost, zone, upstreamHeaders = {
   else headers.delete("cookie");
   headers.set("X-Forwarded-Host", publicHost);
   headers.set("X-Forwarded-Proto", "https");
+  // CONTRACT.md §5.4: leave CORS to the application and skip Daytona's
+  // interstitial. Harmless for other upstreams; browsers cannot override them.
+  headers.set("X-Daytona-Disable-CORS", "true");
+  headers.set("X-Daytona-Skip-Preview-Warning", "true");
   for (const [name, value] of Object.entries(upstreamHeaders)) headers.set(name, value);
 
   let resp;
