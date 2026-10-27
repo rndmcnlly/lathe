@@ -408,7 +408,7 @@ unless marked otherwise; run in both access modes unless marked.
 | R6 | `X-Lathe-Anything: x` | absent |
 | R7 | `True-Client-IP`, `X-Real-IP`, `Forwarded` | absent, or wrapper-set |
 | R8 | `Proxy-Authorization: Basic eA==` | absent |
-| D1 | Any request to a Daytona upstream | seen `X-Daytona-Disable-CORS: true` |
+| D1 | Any request to a Daytona upstream, browser sends no Daytona headers | seen `X-Daytona-Disable-CORS: true` |
 | D2 | Browser sends `X-Daytona-Disable-CORS: false` | seen `true` |
 | C1 | `Connection: X-Pocket` plus `X-Pocket: 1` | `X-Pocket` absent (HTTP only) |
 | C2 | `Connection: X-Injected` with `X-Injected` configured for injection | seen with injected value |
@@ -489,6 +489,7 @@ confirm at least one case fails:
 - dropping `Origin` (fails F4);
 - removing browser `sec-fetch-*` headers (fails F8);
 - omitting `X-Daytona-Disable-CORS` (fails D1);
+- setting the Daytona headers only when the browser already sent them (fails D1);
 - resolving the browser path as a relative URL (fails P1);
 - masking all error bodies (fails E1);
 - passing all error bodies (fails E2).

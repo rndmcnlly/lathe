@@ -540,7 +540,13 @@ for (const access of ["public", "private"]) {
     for (const [name, value] of Object.entries(metadata)) assert.equal(upstream.get(name), value, name);
   });
 
-  test(`${access} upstream always receives Daytona provider headers, never browser values (D1, D2)`, async () => {
+  test(`${access} upstream receives Daytona provider headers on ordinary requests (D1)`, async () => {
+    const { upstream } = await proxied(access);
+    assert.equal(upstream.get("x-daytona-disable-cors"), "true");
+    assert.equal(upstream.get("x-daytona-skip-preview-warning"), "true");
+  });
+
+  test(`${access} browser values cannot override Daytona provider headers (D2)`, async () => {
     const { upstream } = await proxied(access, {
       "X-Daytona-Disable-CORS": "false", "x-daytona-skip-preview-warning": "false",
     });
