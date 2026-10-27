@@ -182,6 +182,8 @@ def test_tools_interface(module):
     ("expose", {"target": "http:5000", "access": "public", "upstream_headers": []}, "upstream_headers", "dict[str, str]", "list"),
     ("expose", {"target": "http:5000", "access": "public", "upstream_headers": {7: "x"}}, "upstream_headers", "dict[str, str]", "int"),
     ("expose", {"target": "http:5000", "access": "public", "upstream_headers": {"Authorization": 7}}, "upstream_headers", "dict[str, str]", "int"),
+    ("expose", {"target": "http:5000", "access": "public", "public_headers_acknowledged": 1}, "public_headers_acknowledged", "bool", "int"),
+    ("expose", {"target": "http:5000", "access": "public", "public_headers_acknowledged": "true"}, "public_headers_acknowledged", "bool", "str"),
 ])
 async def test_bad_types_rejected_before_io(
     module, monkeypatch, name, kwargs, location, expected, actual,
@@ -2404,7 +2406,8 @@ def preview(tools, sandbox, http):
     good = {"url": protected, "expires_at": "2099-01-01T00:00:00Z"}
 
     async def invoke(payload=None, status=200, target="http:5000", user=USER,
-                     access="private", tag="", setup_failure=False, upstream_headers=None):
+                     access="private", tag="", setup_failure=False, upstream_headers=None,
+                     acknowledged=False):
         calls, events = [], []
         async def emit(event):
             events.append(event)
@@ -2430,6 +2433,7 @@ def preview(tools, sandbox, http):
             return httpx.Response(200, json={"exitCode": 0, "result": "READY PID=123"})
         http(handler)
         result = await tools.expose(target, access, tag, upstream_headers=upstream_headers or {},
+                                    public_headers_acknowledged=acknowledged,
                                     __user__=user, __event_emitter__=emit)
         return result, calls, json.dumps(events)
     return SimpleNamespace(invoke=invoke, upstream=upstream, protected=protected, secret=secret, good=good)
@@ -2481,7 +2485,7 @@ async def test_preview_headers_are_registration_scoped_and_not_echoed(preview, a
     headers = {"Authorization": "Basic YXBwOnNlY3JldA==", "X-App-Mode": "demo"}
     result, calls, events = await preview.invoke(
         {**preview.good, "upstream_headers_applied": True}, access=access,
-        target=target, upstream_headers=headers)
+        target=target, upstream_headers=headers, acknowledged=access == "public")
     assert preview.protected in result
     assert all(value not in result + events for value in headers.values())
     registration = json.loads(next(r.content for r in calls if r.url.host == "wrapper.test"))
@@ -2500,7 +2504,8 @@ async def test_preview_headers_are_registration_scoped_and_not_echoed(preview, a
 ])
 async def test_upstream_header_bounds_are_inclusive(preview, headers):
     result, calls, _ = await preview.invoke(
-        {**preview.good, "upstream_headers_applied": True}, access="public", upstream_headers=headers)
+        {**preview.good, "upstream_headers_applied": True}, access="public", upstream_headers=headers,
+        acknowledged=True)
     assert preview.protected in result
     request = next(r for r in calls if r.url.host == "wrapper.test")
     assert json.loads(request.content)["upstream_headers"] == headers
@@ -2517,7 +2522,7 @@ async def test_header_requests_cannot_silently_downgrade(preview, access, failur
     elif failure == "refused":
         payload = {"error": "Bearer secret-app-credential"}
     result, calls, events = await preview.invoke(
-        payload, 409 if failure == "refused" else 200, access=access,
+        payload, 409 if failure == "refused" else 200, access=access, acknowledged=access == "public",
         upstream_headers={"Authorization": "Bearer secret-app-credential"})
     assert result.startswith("Error:")
     assert all(value not in result + events for value in (
@@ -2529,9 +2534,35 @@ async def test_header_requests_cannot_silently_downgrade(preview, access, failur
 async def test_header_requests_require_wrapper_before_signing(preview, tools, access):
     tools.valves.preview_wrapper_key = ""
     result, calls, events = await preview.invoke(
-        access=access, upstream_headers={"Authorization": "secret-app-credential"})
+        access=access, acknowledged=access == "public",
+        upstream_headers={"Authorization": "secret-app-credential"})
     assert result.startswith("Error:") and not calls
     assert "secret-app-credential" not in result + events
+
+
+@pytest.mark.parametrize("headers", [{"Authorization": "Bearer credential-canary"}, {"X-Empty": ""}])
+async def test_public_injection_requires_acknowledgement_before_io(module, monkeypatch, headers):
+    context = AsyncMock(side_effect=AssertionError("unacknowledged public injection reached I/O"))
+    monkeypatch.setattr(module, "_tool_context", context)
+    for access in ("public", " PUBLIC "):
+        result = await module.Tools().expose("http:5000", access, upstream_headers=headers)
+        assert result.startswith("Error:") and "public_headers_acknowledged" in result
+        assert "credential-canary" not in result
+    context.assert_not_called()
+
+
+@pytest.mark.parametrize("access,headers,acknowledged", [
+    ("private", {"Authorization": "Bearer app"}, False),
+    ("public", {}, False),
+    ("public", {"Authorization": "Bearer app"}, True),
+])
+async def test_acknowledgement_needed_only_for_public_injection(module, monkeypatch, access, headers, acknowledged):
+    context = AsyncMock(return_value="accepted")
+    monkeypatch.setattr(module, "_tool_context", context)
+    result = await module.Tools().expose("http:5000", access, upstream_headers=headers,
+                                         public_headers_acknowledged=acknowledged)
+    assert result == "accepted"
+    context.assert_awaited_once()
 
 
 @pytest.mark.parametrize("headers", [

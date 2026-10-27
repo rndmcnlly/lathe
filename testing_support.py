@@ -22,7 +22,8 @@ EXPECTED_SCHEMA = {
     "peek": {"command": ("string", True, None), "args": ("object", False, {})},
     "poke": {"command": ("string", True, None), "args": ("object", False, {})},
     "expose": {"target": ("string", True, None), "access": ("string", True, None),
-               "tag": ("string", False, ""), "upstream_headers": ("object", False, {})},
+               "tag": ("string", False, ""), "upstream_headers": ("object", False, {}),
+               "public_headers_acknowledged": ("boolean", False, False)},
 }
 
 

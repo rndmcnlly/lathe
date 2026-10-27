@@ -4497,15 +4497,28 @@ class Tools:
 
             ## Upstream application headers
 
+            Browser headers already reach the application: a conforming wrapper
+            forwards every header the app's own page script sends (CSRF markers,
+            API-version headers, workspace selectors) and removes only routing,
+            transport, provider and wrapper headers. Do not use upstream_headers
+            to make forwarding work. Injecting a CSRF marker disables the app's
+            own CSRF check. If the app works on localhost but fails through the
+            preview, read the error body (wrappers pass app error bodies through)
+            and suspect cookies, origin or base path before headers.
+
+            upstream_headers is for values the browser cannot hold, such as a
+            fixed credential for an app with no login of its own:
             expose(..., upstream_headers={"Authorization": "Bearer app-token"})
             configures fixed headers on this registration's HTTP requests and
             WebSocket handshakes. Public/private access is independent: public
-            visitors also use the injected credential. Headers do not prove
-            visitor identity. The application decides what they mean.
+            visitors also use the injected credential, so access="public" with
+            nonempty upstream_headers additionally requires
+            public_headers_acknowledged=True, set only when the user approved
+            letting anyone with the URL act with those values. Headers do not
+            prove visitor identity. The application decides what they mean.
 
             Configured names replace browser-supplied values case-insensitively.
-            Unconfigured names remain ordinary browser headers; no application
-            assertion namespace is reserved. Authorization (including Basic) is
+            No application assertion namespace is reserved. Authorization (including Basic) is
             supported. Routing, framing, transport, browser security, and provider
             headers are forbidden. Limits: 16 headers, 64-byte names, printable
             ASCII values up to 4096 bytes, 8192 bytes total for names and values.
@@ -5016,6 +5029,7 @@ class Tools:
         access: str,
         tag: str = "",
         upstream_headers: dict[str, str] = {},
+        public_headers_acknowledged: bool = False,
         __user__: dict = {},
         __chat_id__: str = "",
         __event_emitter__=None,
@@ -5027,11 +5041,13 @@ class Tools:
         :param target: "http:<port>" for an already-running HTTP service on port 1024–65535, or "vnc" for Daytona's built-in desktop (start with poke first). See the services/computer manuals for lifecycle and access safeguards.
         :param access: Required policy: "private" authenticates the owner and fails closed; "public" allows anyone with the URL and may fall back to a direct bearer URL. Choose private unless the user explicitly approves public/world access. Shells, IDEs and VNC desktops should stay private: a public desktop grants control of logged-in accounts.
         :param tag: Optional untrusted hostname hint: lowercase letters, digits, internal hyphens, max 32 characters. Hostname text never proves identity or purpose.
-        :param upstream_headers: Fixed application headers for HTTP/WebSocket forwarding, independent of access. Replaces browser values case-insensitively; supports Authorization. Requires a compatible wrapper, never direct fallback. Max 16 headers, 64-byte names, printable ASCII values up to 4096 bytes, 8192 bytes total. Routing/transport headers forbidden. Values remain in tool arguments; see services manual for trust boundaries.
+        :param upstream_headers: Fixed values injected into every HTTP request/WebSocket handshake, for credentials the browser cannot hold (e.g. Authorization for an app with no login). Not needed for forwarding: browser headers the app's own pages send already pass through; never inject a CSRF marker. Replaces browser values case-insensitively. Requires a compatible wrapper, never direct fallback. Max 16 headers, 64-byte names, printable ASCII values up to 4096 bytes, 8192 bytes total. Routing/transport headers forbidden. Values remain in tool arguments; see services manual for trust boundaries.
+        :param public_headers_acknowledged: Required true when access is "public" and upstream_headers is nonempty: every visitor then acts with the injected values. Set only after the user approves that.
         """
         type_err = _check_tool_params(
             {"target": target, "access": access, "tag": tag,
-             "upstream_headers": upstream_headers}, type(self).expose,
+             "upstream_headers": upstream_headers,
+             "public_headers_acknowledged": public_headers_acknowledged}, type(self).expose,
         )
         if type_err:
             return type_err
@@ -5041,6 +5057,10 @@ class Tools:
         access = access.strip().lower()
         if access not in ("public", "private"):
             return 'Error: access must be "public" or "private".'
+        if access == "public" and upstream_headers and not public_headers_acknowledged:
+            return ('Error: upstream_headers with access="public" lets anyone with the URL act with '
+                    "those values. Use access=\"private\", or set public_headers_acknowledged=true only "
+                    "if the user approved that. Browser headers already pass through without injection.")
         tag = tag.strip().lower()
         if tag and not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])?", tag):
             return "Error: tag must be a lowercase DNS label (max 32 characters)."

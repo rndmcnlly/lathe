@@ -490,3 +490,137 @@ test("upstream transport failures cannot disclose target or credentials", async 
   assert.ok(!body.includes(appHeaders.Authorization));
   assert.ok(!body.includes("signed-upstream.test"));
 });
+
+// CONTRACT.md §9 cases the reference Worker can check without a live provider.
+async function proxied(access, headers = {}, extra = {}) {
+  const env = environment();
+  const registration = await register(env, access, "", extra);
+  if (access === "private") {
+    await env.SUBDOMAINS.put("_lathe:session:owner", JSON.stringify({
+      host: registration.host, owner_email: "owner@example.org", expires_at: Math.floor(Date.now() / 1000) + 3600,
+    }));
+  }
+  const seen = [];
+  globalThis.fetch = async (input, init) => {
+    seen.push(new Headers(init.headers));
+    return new Response("ok");
+  };
+  const header = typeof headers === "function" ? headers(registration.host) : headers;
+  const response = await worker.fetch(new Request(`${registration.url}app`, {
+    method: "POST", body: "payload",
+    headers: { ...header, ...(access === "private" ? { cookie: "__Host-lathe_session=owner" } : {}) },
+  }), env);
+  assert.equal(response.status, 200);
+  assert.equal(seen.length, 1);
+  return { upstream: seen[0], host: registration.host };
+}
+
+for (const access of ["public", "private"]) {
+  test(`${access} unknown application headers and Origin are forwarded unchanged (F1, F3, F4)`, async () => {
+    const { upstream, host } = await proxied(access, (publicHost) => ({
+      "X-Pocket": "1", "X-Some-Unknown-Header-Name": "v", Origin: `https://${publicHost}`,
+      "If-None-Match": '"etag"', Authorization: "Bearer app-token-123",
+    }));
+    assert.equal(upstream.get("x-pocket"), "1");
+    assert.equal(upstream.get("x-some-unknown-header-name"), "v");
+    assert.equal(upstream.get("origin"), `https://${host}`);
+    assert.equal(upstream.get("if-none-match"), '"etag"');
+    assert.equal(upstream.get("authorization"), "Bearer app-token-123");
+  });
+
+  test(`${access} wrapper-controlled browser headers never reach upstream (R1-R8)`, async () => {
+    const removed = {
+      "X-Forwarded-For": "203.0.113.9", "x-FORWARDED-proto": "http", "CF-Connecting-IP": "203.0.113.9",
+      "Cf-Ray": "forged", "X-Daytona-Preview-Token": "x", "DAYTONA-Anything": "x", "X-Lathe-Anything": "x",
+      "True-Client-IP": "203.0.113.9", "x-real-ip": "203.0.113.9", Forwarded: "for=203.0.113.9",
+      "Proxy-Authorization": "Basic eA==", "Proxy-Authenticate": "Basic", "HTTP2-Settings": "AAA",
+      "Keep-Alive": "timeout=5", TE: "trailers", Trailer: "X-Pocket", "Accept-Encoding": "gzip",
+      Referer: "https://lathe-private-0123456789abcdef.preview.test/secret",
+    };
+    const { upstream, host } = await proxied(access, { ...removed, "x-FORWARDED-host": "evil.example" });
+    for (const name of Object.keys(removed)) {
+      const value = upstream.get(name);
+      assert.ok(value === null || name.toLowerCase() === "x-forwarded-proto" && value === "https", name);
+    }
+    assert.equal(upstream.get("x-forwarded-host"), host);
+    assert.equal(upstream.get("x-forwarded-proto"), "https");
+  });
+
+  test(`${access} Connection-nominated headers are removed without any injection (C1)`, async () => {
+    const { upstream } = await proxied(access, { Connection: "X-Pocket", "X-Pocket": "1", "X-Other": "2" });
+    assert.equal(upstream.get("x-pocket"), null);
+    assert.equal(upstream.get("connection"), null);
+    assert.equal(upstream.get("x-other"), "2");
+  });
+
+  test(`${access} injection survives a Connection header naming it (C2)`, async () => {
+    const { upstream } = await proxied(access, { Connection: "X-Injected", "x-injected": "forged" },
+      { upstream_headers: { "X-Injected": "configured" } });
+    assert.equal(upstream.get("x-injected"), "configured");
+  });
+}
+
+const daytonaUpstream = "https://3000-sbxtoken42.daytonaproxy01.net/";
+
+async function errorResponse(status, body, { method = "GET", headers = { "content-type": "application/json" } } = {}) {
+  const env = environment();
+  const registration = await register(env, "public", "", { upstream_url: daytonaUpstream });
+  globalThis.fetch = async () => new Response(body, { status, headers });
+  return worker.fetch(new Request(`${registration.url}app`, { method }), env);
+}
+
+for (const [status, body] of [
+  [403, JSON.stringify({ error: "pocket: csrf header missing" })],
+  [500, "x".repeat(64 * 1024)],
+  [200, "served by 3000-sbxtoken42.daytonaproxy01.net"],
+  [302, "moved from sbxtoken42"],
+]) {
+  test(`${status} application body of ${body.length} bytes passes through (E1)`, async () => {
+    const response = await errorResponse(status, body);
+    assert.equal(response.status, status);
+    assert.equal(response.headers.get("content-type"), "application/json");
+    assert.equal(await response.text(), body);
+  });
+}
+
+for (const [status, body] of [
+  [500, "proxy error at 3000-SBXTOKEN42.DaytonaProxy01.net"],
+  [502, "Host: 3000-sbxtoken42 refused"],
+  [403, '{"detail":"invalid preview token SbxToken42"}'],
+  [404, "x".repeat(64 * 1024 + 1)],
+]) {
+  test(`${status} application body naming the upstream or over 64 KiB is replaced (E2) ${body.length}`, async () => {
+    const response = await errorResponse(status, body, { headers: {
+      "content-type": "application/json", "content-length": String(body.length), "x-app": "kept",
+    } });
+    assert.equal(response.status, status);
+    assert.equal(response.headers.get("content-type"), "text/plain; charset=utf-8");
+    assert.equal(response.headers.get("x-app"), "kept");
+    const text = await response.text();
+    assert.match(text, /replaced/);
+    assert.doesNotMatch(text.toLowerCase(), /sbxtoken42/);
+    assert.notEqual(response.headers.get("content-length"), String(body.length));
+  });
+}
+
+test("HEAD error responses keep their status and carry no body", async () => {
+  const response = await errorResponse(500, null, { method: "HEAD" });
+  assert.equal(response.status, 500);
+  assert.equal(await response.text(), "");
+});
+
+for (const token of [undefined, ""]) {
+  test(`registration fails closed when REGISTER_TOKEN is ${JSON.stringify(token)}`, async () => {
+    const env = environment();
+    env.REGISTER_TOKEN = token;
+    for (const bearer of [String(token), "", "undefined"]) {
+      const response = await registrationRequest(env, { subdomain: "demo", target: "https://service.test" }, bearer);
+      assert.equal(response.status, 401);
+    }
+    const revoke = await worker.fetch(new Request("https://preview.test/register/demo", {
+      method: "DELETE", headers: { authorization: "Bearer " },
+    }), env);
+    assert.equal(revoke.status, 401);
+    assert.equal(env.SUBDOMAINS.values.size, 0);
+  });
+}

@@ -15,7 +15,8 @@ story and responsibility boundaries before changing the tool surface.
   never automatically overwrite or regenerate an existing skill.
 - Maintainers: this file for invariants/tests; `CI-MONITOR.md` for live CI;
   `INTERACTIVE-TRIAL.md` for retained Docker design/handbook trials with the user;
-  `preview-wrapper/README.md` for the authoritative wrapper protocol/deployment.
+  `preview-wrapper/CONTRACT.md` for the authoritative wrapper protocol and
+  conformance process; `preview-wrapper/README.md` for deployment.
 
 Keep implementation detail out of the installation README. Runtime orientation
 should be concise, with task-specific manuals for details. Preserve safeguards
@@ -152,8 +153,8 @@ is fallback, unknown allows.
 
 ## Preview security
 
-The complete protocol and private-authentication implementation live in
-`preview-wrapper/README.md`. Preserve these cross-system invariants:
+The complete protocol lives in `preview-wrapper/CONTRACT.md`; the reference
+private-authentication implementation is described in `preview-wrapper/README.md`. Preserve these cross-system invariants:
 
 - Private unless the user explicitly requests public/world access. Public
   headerless requests may fall back to direct Daytona bearer URLs; private and
