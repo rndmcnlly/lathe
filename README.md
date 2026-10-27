@@ -1,6 +1,6 @@
 # Lathe
 
-A single-file Open WebUI toolkit that gives any model a coding agent's tool surface: `bash`, `read`, `write`, `edit`, `glob`, `grep`, `view`, `peek`, `poke`, `onboard`, `expose`, `destroy`, executing against per-user cloud sandboxes via [Daytona](https://www.daytona.io/).
+A single-file Open WebUI toolkit that gives any model a coding agent's tool surface: `bash`, `read`, `write`, `edit`, `glob`, `grep`, `interpret`, `view`, `show`, `peek`, `poke`, `onboard`, `lathe`, `expose`, `destroy`, executing against per-user cloud sandboxes via [Daytona](https://www.daytona.io/).
 
 **For users**: See [lathe.tools](https://lathe.tools) for what Lathe can do, how to use it, and example workflows.
 
@@ -317,6 +317,7 @@ flow, e.g. *"Visit https://example.com/setup to create your sandbox first."*
 | `glob(pattern, max_lines)` | List workspace files using one native ripgrep glob |
 | `grep(pattern, files, max_lines)` | Search workspace text using ripgrep regex and one native file glob |
 | `view(path)` | Load an image into the model's visual context (PNG/JPEG/GIF/WebP, ≤ 4 MB, content-sniffed) |
+| `show(paths)` | Display 1–4 images (≤ 4 MB) or self-contained HTML documents (≤ 8 MB) inline to the user without adding them to model input. Stored with the chat; HTML runs in an isolated frame with no network access, whatever the OWUI iframe settings |
 | `peek(command, args)` | Observe Daytona's shared desktop: screenshots, display, accessibility and diagnostics |
 | `poke(command, args)` | Send desktop input or change its lifecycle; coordinate human login explicitly |
 | `interpret(code, timeout)` | Run Python in a conversation-scoped persistent interpreter |

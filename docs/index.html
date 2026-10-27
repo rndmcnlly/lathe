@@ -37,7 +37,8 @@
 <div class="callout">
     <strong>Lathe connects a model in Open WebUI to a Linux sandbox.</strong>
     The model can run commands, edit files, use a persistent Python session,
-    run background shell jobs, share running services in the browser, and operate
+    run background shell jobs, show you charts and interactive reports right in
+    the chat, share running services in the browser, and operate
     a Linux desktop that you can also open and use yourself. An admin
     installs one Python tool; Lathe provisions and reconnects one Daytona
     sandbox per user.
@@ -62,7 +63,7 @@
         </div>
         <div class="comparison-card">
             <h3>Your model</h3>
-            <p>Plans the work and calls tools. Choose a tool-capable model; inspecting images also requires vision support.</p>
+            <p>Plans the work and calls tools. Choose a tool-capable model; inspecting images also requires vision support, but showing them to you does not.</p>
         </div>
     </div>
     <p>
@@ -148,6 +149,10 @@
             <p>Inspect sandbox images with a vision-capable model: screenshots, charts, and rendered pages.</p>
         </div>
         <div class="tool-card">
+            <h3>show</h3>
+            <p>Put images or interactive HTML reports directly in the chat for you, without sending them through the model's context. Tooltips and filters work; the page cannot reach the network.</p>
+        </div>
+        <div class="tool-card">
             <h3>interpret</h3>
             <p>Run Python in a chat-scoped REPL whose variables survive between calls.</p>
         </div>
@@ -208,7 +213,11 @@
         </li>
         <li>
             <span class="recipe-label">Make a local report</span>
-            <span class="recipe-desc">“Turn this CSV into a self-contained HTML chart using Python's standard library, then show it privately.”</span>
+            <span class="recipe-desc">“Turn this CSV into an interactive chart with hover details and show it to me here.”</span>
+        </li>
+        <li>
+            <span class="recipe-label">Share a service</span>
+            <span class="recipe-desc">“Start the dashboard and send me a private link.”</span>
         </li>
         <li>
             <span class="recipe-label">Check in parallel</span>
@@ -250,6 +259,7 @@
         <li><strong>Sandbox data lives in Daytona.</strong> Lathe labels each sandbox with the Open WebUI user's email. Files survive normal stops and archives without an additional persistent volume.</li>
         <li><strong>User environment variables are credentials entrusted to the agent.</strong> Lathe injects them into model-directed shell commands. The model can print them, inspect process environments, or read generated command wrappers. Use scoped, revocable credentials.</li>
         <li><strong>Choose the preview's access mode.</strong> Every HTTP exposure is explicitly public or private. Private previews require the deployment's authentication wrapper and never downgrade to public. Public previews may use a direct signed bearer URL when wrapping is unavailable, where the request permits it. Upstream access defaults to 24 hours; the tool reports wrapper expiry separately. Sharing access does not keep a stopped service or sandbox running.</li>
+        <li><strong>Shown images and reports stay in the chat.</strong> Open WebUI saves them with the conversation, and an HTML report runs again each time you open it, isolated from your account and the network.</li>
         <li><strong>Desktop screenshots stay in the chat.</strong> Each screenshot the model takes is saved with the conversation in Open WebUI, along with whatever was on screen. A public desktop link lets anyone who has it control the desktop and the accounts logged in there; ask for private.</li>
         <li><strong>Deletion destroys the workspace.</strong> Automatic sandbox deletion is disabled by default, but an admin can change that policy. Export important results or commit them to a remote repository before sandbox destruction.</li>
         <li><strong>Updates are manual.</strong> Open WebUI stores the uploaded copy of <code>lathe.py</code>. An installed deployment does not receive fixes merely because the GitHub repository changed, and Lathe has no built-in update or notification mechanism.</li>

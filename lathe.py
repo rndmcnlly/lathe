@@ -5,12 +5,13 @@ author_url: https://adamsmith.as
 description: Coding agent tools (lathe, bash, read, write, edit, glob, grep, view, peek, poke, interpret, onboard, expose, destroy) backed by per-user sandbox VMs with transparent lifecycle management.
 required_open_webui_version: 0.12.0
 requirements: httpx, pydantic>=2, cachetools, PyYAML
-version: 1.2.0
+version: 1.3.0
 licence: MIT
 """
 
 import asyncio
 import base64
+import html
 import inspect
 import io
 import json
@@ -1361,6 +1362,92 @@ async def _core_view(valves, sandbox_id: str, client: httpx.AsyncClient, *,
             f"the smaller result."
         )
     return f"data:{mime};base64,{base64.b64encode(data).decode('ascii')}"
+
+
+# show() HTML is sandbox-controlled bytes. OWUI's embed iframe may share the
+# OWUI origin (user setting), so it must hold only this inert wrapper: no
+# script, the document escaped into a nested srcdoc. Sandbox flags intersect
+# down the frame tree, so omitting allow-same-origin gives the document an
+# opaque origin regardless of OWUI's flags. The CSP, inserted before any
+# document content, blocks network egress and form submission (phishing).
+_SHOW_CSP = ("default-src 'none'; script-src 'unsafe-inline' 'unsafe-eval' data: blob:; "
+             "style-src 'unsafe-inline' data: blob:; img-src data: blob:; font-src data: blob:; "
+             "media-src data: blob:; connect-src data: blob:; worker-src data: blob:; "
+             "form-action 'none'; base-uri 'none'")
+_DOCTYPE = re.compile(r"\s*<!doctype[^>]*>", re.IGNORECASE)
+
+
+def _isolated_html(doc: str) -> str:
+    """Wrap an untrusted HTML document for OWUI's embed channel."""
+    csp = f'<meta http-equiv="Content-Security-Policy" content="{_SHOW_CSP}">'
+    doctype = _DOCTYPE.match(doc)
+    split = doctype.end() if doctype else 0
+    inner = doc[:split] + csp + doc[split:]
+    return ('<!doctype html><html><head><meta charset="utf-8"><style>'
+            'html,body{margin:0}div{resize:vertical;overflow:hidden;height:600px}'
+            'iframe{display:block;width:100%;height:100%;border:0}</style></head><body><div>'
+            f'<iframe sandbox="allow-scripts" referrerpolicy="no-referrer" '
+            f'srcdoc="{html.escape(inner, quote=True)}"></iframe></div></body></html>')
+
+
+async def _core_show(valves, sandbox_id: str, client: httpx.AsyncClient, *,
+                     paths: list[str], emit) -> str:
+    """Show images or interactive HTML inline to the human, without loading their contents into model context.
+    Use for charts, illustrations, screenshots, and rich interactive reports.
+    Use view(path) separately if you also need to inspect an image yourself.
+    Accepts 1–4 files: PNG/JPEG/GIF/WebP (4 MiB each), or UTF-8 .html/.htm
+    documents (8 MiB each). HTML must be self-contained: inline its scripts,
+    styles, libraries, data, fonts, and images (as data: URIs) using sandbox
+    programs first; Lathe does not resolve local references. HTML runs in an
+    isolated frame: scripts and inline content work, but it has no network
+    access, cannot submit forms, open windows, or reach the user's session.
+    No server or public URL needed. Source files are not modified. A successful
+    call confirms delivery, not browser execution or rendering correctness.
+
+    :param paths: List of absolute image or self-contained HTML paths, even for one file.
+    """
+    if emit is None:
+        return "Error: show requires a conversation event emitter; nothing was displayed."
+    if not 1 <= len(paths) <= 4:
+        return "Error: paths must contain 1–4 absolute file paths."
+    for path in paths:
+        err = _require_abs_path(path)
+        if err:
+            return err
+    # Prepare the complete batch before publishing anything. Artifact contents
+    # go to UI metadata, never the text/tool output sent to the model.
+    files = []
+    embeds = []
+    for path in paths:
+        if path.lower().endswith((".html", ".htm")):
+            limit = 8 * 1024 * 1024
+            data = bytearray()
+            async with client.stream(
+                "GET", _toolbox(valves, sandbox_id, "/files/download"),
+                params={"path": path}, headers=_headers(valves), timeout=60.0,
+            ) as resp:
+                if resp.status_code == 404:
+                    return f"Error: File not found: {path}"
+                resp.raise_for_status()
+                async for chunk in resp.aiter_bytes():
+                    if len(data) + len(chunk) > limit:
+                        return f"Error: {path} exceeds the 8 MiB HTML limit. Nothing was displayed."
+                    data.extend(chunk)
+            try:
+                doc = data.decode("utf-8-sig")
+            except UnicodeDecodeError:
+                return f"Error: {path} must be UTF-8 HTML. Nothing was displayed."
+            if not doc.lstrip().lower().startswith(("<!doctype html", "<html")):
+                return f"Error: {path} must be an HTML document starting with <!doctype html> or <html>. Nothing was displayed."
+            embeds.append(_isolated_html(doc))
+            continue
+        image = _checked_result(await _core_view(valves, sandbox_id, client, path=path))
+        files.append({"type": "image", "url": image, "name": path.rsplit("/", 1)[-1]})
+    if files:
+        await emit({"type": "files", "data": {"files": files}})
+    if embeds:
+        await emit({"type": "embeds", "data": {"embeds": embeds}})
+    return "Sent to the user's conversation (contents not loaded into model context):\n" + "\n".join(paths)
 
 
 # Computer commands are a closed vocabulary, not model-selected URLs. Models
@@ -5003,6 +5090,36 @@ class Tools:
 
         return await _tool_context(__event_emitter__, _run, harness)
     view.__doc__ = inspect.getdoc(_core_view)
+
+    async def show(
+        self, paths: list[str], __user__: dict = {}, __chat_id__: str = "",
+        __event_emitter__=None,
+    ) -> str:
+        type_err = _check_tool_params({"paths": paths}, type(self).show)
+        if type_err:
+            return type_err
+        if __event_emitter__ is None:
+            return "Error: show requires a conversation event emitter; nothing was displayed."
+        harness = _HarnessDelivery(self._chat_state, __chat_id__)
+
+        async def _run(client):
+            email = _get_email(__user__)
+            sandbox_id, harness.warning = await _ensure_sandbox(
+                self.valves, email, client, __event_emitter__,
+            )
+            await _ensure_chat_init(
+                self.valves, sandbox_id, client, self._chat_state,
+                __chat_id__, __user__, __event_emitter__,
+            )
+            await _emit(__event_emitter__, "Displaying artifacts...")
+            result = _checked_result(await _core_show(
+                self.valves, sandbox_id, client, paths=paths, emit=__event_emitter__,
+            ))
+            await _emit(__event_emitter__, "Artifacts sent", done=True)
+            return result
+
+        return await _tool_context(__event_emitter__, _run, harness)
+    show.__doc__ = inspect.getdoc(_core_show)
 
     async def peek(
         self, command: str, args: dict = {},

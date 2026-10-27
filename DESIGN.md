@@ -56,6 +56,22 @@ conversation history; logging in grants sandbox software access to that session.
 
 ## Optional applications and reference material
 
+`view(path)` loads an image into the agent's visual context; `show(paths)`
+displays images or self-contained interactive HTML to the human without adding
+their contents to model input. HTML is sandbox-controlled bytes, so Lathe never
+trusts OWUI's embed iframe (which may share the OWUI origin) with it: the
+document runs in a nested opaque-origin frame under a CSP without network
+egress or form submission. OWUI may still accept chat-input messages from that
+frame when a user enables same-origin embeds; this is a tolerated affordance
+for tinkerers, not a security boundary, and is deliberately undocumented to
+agents. Agents bundle assets with ordinary sandbox programs, not a Lathe asset
+resolver. Delivery is not a rendering check. Shown content is stored in the
+chat record, the bloat that retired `attach()` (#30), so `show` is scoped to
+display-sized artifacts with per-file caps; downloads, large data, and live
+services go through `expose`. Revisit the caps from usage, not speculation.
+Calling both explicitly serves both audiences. Display-only images are assistant
+message attachments, not public previews or OWUI file-storage uploads.
+
 File browsers, terminals, IDEs, and static servers are ordinary optional
 applications. Lathe ships no app installer, pinned support bundle, cache receipts,
 or prepackaged app skills. The agent can use preinstalled programs, reachable

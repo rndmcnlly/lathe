@@ -9,6 +9,7 @@ import asyncio
 import base64
 from contextlib import asynccontextmanager
 import hashlib
+from html.parser import HTMLParser
 import inspect
 import io
 import json
@@ -1707,6 +1708,110 @@ async def test_view_content_detection(tools, transport, payload, mime):
         assert result == f"data:image/{mime};base64,{base64.b64encode(payload).decode()}"
     else:
         assert result.startswith("Error:")
+
+
+async def test_show_delivers_only_to_ui(tools, sandbox, http):
+    payloads = {"/chart.png": PNG, "/photo.webp": b"RIFF0000WEBP"}
+    def handler(request):
+        assert (request.method, request.url.path) == ("GET", "/sb/files/download")
+        return httpx.Response(200, content=payloads[request.url.params["path"]])
+    http(handler)
+    tools._chat_state["show"] = {"init": True, "pending": ["pending notice"]}
+    events = []
+    async def emit(event):
+        events.append(event)
+    result = await tools.show(list(payloads), __user__=USER, __chat_id__="show", __event_emitter__=emit)
+    assert "pending notice" in result and all(path in result for path in payloads)
+    assert "data:image" not in result
+    attachments = [event["data"]["files"] for event in events if event["type"] == "files"]
+    assert len(attachments) == 1
+    for file, (path, data) in zip(attachments[0], payloads.items(), strict=True):
+        assert file["type"] == "image" and file["name"] == path[1:]
+        assert base64.b64decode(file["url"].split(",", 1)[1]) == data
+
+
+@pytest.mark.parametrize("paths", ["/image", [1], None, [True]])
+async def test_show_rejects_invalid_types_before_io(tools, monkeypatch, paths):
+    context = AsyncMock(side_effect=AssertionError("invalid show reached I/O"))
+    monkeypatch.setattr(lathe, "_tool_context", context)
+    result = await tools.show(paths, __event_emitter__=AsyncMock())
+    assert result.startswith("Error:") and "paths" in result
+    context.assert_not_called()
+
+
+class _Tags(HTMLParser):
+    def __init__(self, text):
+        super().__init__()
+        self.tags = []
+        self.feed(text)
+
+    def handle_starttag(self, tag, attrs):
+        self.tags.append((tag, dict(attrs), self.get_starttag_text()))
+
+
+@pytest.mark.parametrize("html", [
+    '<!doctype html><html><body><script>const secretData=[1,2,3];</script></body></html>',
+    # Attempted breakout of the srcdoc attribute into the OWUI-origin frame.
+    '<html><body>\'"></iframe><script>secretData=parent.localStorage</script>&quot;</body></html>',
+])
+async def test_show_html_runs_isolated_outside_model_result(tools, sandbox, http, html):
+    def handler(request):
+        assert (request.method, request.url.path) == ("GET", "/sb/files/download")
+        return httpx.Response(200, content=html.encode())
+    http(handler)
+    tools._chat_state["html"] = {"init": True}
+    emit = AsyncMock()
+    result = await tools.show(["/report.html"], __user__=USER, __chat_id__="html", __event_emitter__=emit)
+    assert "/report.html" in result and "secretData" not in result and "<script>" not in result
+    embeds = [c.args[0] for c in emit.await_args_list if c.args[0]["type"] == "embeds"]
+    assert not any(c.args[0]["type"] == "files" for c in emit.await_args_list)
+    [wrapper] = embeds[0]["data"]["embeds"]
+    # The OWUI-origin frame holds no script; the document is an opaque-origin child.
+    outer = _Tags(wrapper).tags
+    assert not any(tag == "script" for tag, _, _ in outer)
+    [frame] = [attrs for tag, attrs, _ in outer if tag == "iframe"]
+    assert frame["sandbox"] == "allow-scripts"
+    # The CSP precedes all document content, so the document cannot preempt it.
+    inner = frame["srcdoc"]
+    tag, attrs, raw = _Tags(inner).tags[0]
+    assert tag == "meta" and attrs["http-equiv"] == "Content-Security-Policy"
+    assert "connect-src data: blob:" in attrs["content"] and "form-action 'none'" in attrs["content"]
+    assert inner.replace(raw, "", 1) == html
+
+
+@pytest.mark.parametrize("payload,status", [
+    (b"\xff", 200), (b"https://unexpected.test", 200), (b"", 200),
+    (b"<!doctype html>" + b" " * (8 * 1024 * 1024), 200), (b"missing", 404),
+])
+async def test_show_bad_html_does_not_publish_prepared_images(tools, transport, payload, status):
+    def handler(request):
+        if request.url.params["path"] == "/image":
+            return httpx.Response(200, content=PNG)
+        return httpx.Response(status, content=payload)
+    emit = AsyncMock()
+    async with httpx.AsyncClient(transport=transport(handler)) as client:
+        result = await lathe._core_show(tools.valves, "sb", client, paths=["/image", "/report.html"], emit=emit)
+    assert result.startswith("Error:")
+    emit.assert_not_called()
+
+
+async def test_show_requires_delivery_channel(tools):
+    assert "event emitter" in await tools.show(["/image"])
+
+
+@pytest.mark.parametrize("paths", [[], ["/image"] * 5, ["/image", "relative"], ["/image", "/bad"]])
+async def test_show_batch_failure_does_not_publish(tools, transport, paths):
+    events = AsyncMock()
+    def handler(request):
+        return httpx.Response(200, content=PNG if request.url.params["path"] == "/image" else b"not an image")
+    async with httpx.AsyncClient(transport=transport(handler)) as client:
+        try:
+            result = await lathe._core_show(tools.valves, "sb", client, paths=paths, emit=events)
+        except lathe._ToolFailure:
+            pass
+        else:
+            assert result.startswith("Error:")
+    events.assert_not_called()
 
 
 async def test_image_return_defers_notices_until_text_call(tools, sandbox, http):
