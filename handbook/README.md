@@ -11,6 +11,7 @@ installed version and the user's preferences. Do not fetch every page on startup
 - [dufs: browser file transfer](dufs.md)
 - [ttyd: browser terminal](ttyd.md)
 - [Static site preview](static-site.md)
+- [Shared browser: Playwright, PDFs and waiting](browser.md)
 
 These are relative Markdown links. When reading over HTTP, resolve them against
 the URL of this page, not the shell's working directory. For example, an index

@@ -1735,7 +1735,7 @@ async def test_text_model_view_refused_before_io(tools, monkeypatch, model):
 
 
 @pytest.mark.parametrize("tool,command,args,method,path,payload", [
-    ("peek", "status", {}, "GET", "status", {}),
+    ("peek", "process.status", {"process": "atspi"}, "GET", "process/atspi/status", {}),
     ("peek", "process.logs", {"process": "novnc"}, "GET", "process/novnc/logs", {}),
     ("peek", "display.info", {}, "GET", "display/info", {}),
     ("peek", "display.windows", {}, "GET", "display/windows", {}),
@@ -1770,17 +1770,263 @@ async def test_text_model_view_refused_before_io(tools, monkeypatch, model):
 async def test_computer_dispatch(tools, sandbox, http, tool, command, args, method, path, payload):
     calls = []
     def handler(request):
-        calls.append(request)
-        assert (request.method, request.url.path) == (method, "/sb/computeruse/" + path)
         assert request.headers["Authorization"] == "Bearer test-key"
+        if (request.method, request.url.path) != (method, "/sb/computeruse/" + path):
+            # The only other traffic is the running-display check.
+            assert (request.method, request.url.path) == ("GET", "/sb/computeruse/process/xvfb/status")
+            return httpx.Response(200, json={"processName": "xvfb", "running": True})
+        calls.append(request)
         assert (dict(request.url.params) if method == "GET" else json.loads(request.content)) == payload
-        return httpx.Response(200, json={"status": "active", "canary": "observed-state"})
+        return httpx.Response(200, json={"running": True, "canary": "observed-state"})
     http(handler)
     result = await getattr(tools, tool)(command, args, __user__=USER)
     assert "Error:" not in result
     assert len(calls) == 1
     if tool == "peek":
         assert "observed-state" in result
+
+
+def fake_desktop(running, *, page_result=None, polls_down=0):
+    """Toolbox responder for a desktop whose display starts on POST start."""
+    state = {"running": running, "polls_down": polls_down, "log": [], "scripts": []}
+
+    def handler(request):
+        path = request.url.path.removeprefix("/sb")
+        state["log"].append(f"{request.method} {path}")
+        if path == "/process/execute":
+            state["scripts"].append(json.loads(request.content)["command"])
+            return httpx.Response(200, json={"exitCode": 0, "result": json.dumps(page_result) + "\n"})
+        name = re.fullmatch(r"/computeruse/process/(\w+)/status", path)
+        if name:
+            up = state["running"] or name[1] == "atspi"
+            if state["running"] and state["polls_down"]:
+                state["polls_down"] -= 1
+                up = False
+            return httpx.Response(200, json={"processName": name[1], "running": up})
+        if path == "/computeruse/status":
+            return httpx.Response(200, json={"status": "active" if state["running"] else "partial"})
+        if path == "/computeruse/start":
+            state["running"] = True
+            return httpx.Response(200, json={"message": "started"})
+        if path.startswith("/computeruse/screenshot"):
+            return httpx.Response(200, content=PNG)
+        # Input on a down display crashes Daytona's computer-use service.
+        assert state["running"], f"{path} sent to a down desktop"
+        return httpx.Response(200, json={"x": 1, "y": 2})
+
+    state["handler"] = handler
+    return state
+
+
+@pytest.mark.parametrize("command,args", [
+    ("mouse.click", {"x": 1, "y": 2}),
+    ("keyboard.type", {"text": "hello"}),
+    ("page.open", {"url": "https://example.org/"}),
+])
+async def test_poke_starts_down_desktop_before_acting(tools, sandbox, http, clock, command, args):
+    desktop = fake_desktop(False, polls_down=1, page_result={"ok": True, "text": "Opened."})
+    http(desktop["handler"])
+    result = await tools.poke(command, args, __user__=USER)
+    assert "Error:" not in result and "started" in result
+    log = desktop["log"]
+    acted = log.index("POST /process/execute" if command.startswith("page.") else
+                      "POST /computeruse/" + command.replace(".", "/"))
+    assert log.index("POST /computeruse/start") < acted
+    # The action waited for both the display and the session after start.
+    assert "GET /computeruse/process/xfce4/status" in log[log.index("POST /computeruse/start"):acted]
+    if command.startswith("page."):
+        assert '"launch": true' in desktop["scripts"][0]
+
+
+@pytest.mark.parametrize("command,args", [
+    ("mouse.click", {"x": 1, "y": 2}),
+    ("page.eval", {"js": "1 + 1"}),
+])
+async def test_poke_reuses_running_desktop_without_start(tools, sandbox, http, command, args):
+    desktop = fake_desktop(True, page_result={"ok": True, "text": "Result: 2"})
+    http(desktop["handler"])
+    result = await tools.poke(command, args, __user__=USER)
+    assert "Error:" not in result and "started" not in result
+    assert "POST /computeruse/start" not in desktop["log"]
+
+
+@pytest.mark.parametrize("command,args", [
+    ("status", {}), ("screenshot", {}), ("mouse.position", {}), ("display.info", {}),
+    ("accessibility.tree", {}), ("page.list", {}), ("page.text", {"selector": "main"}),
+    ("page.wait", {"gone": "Just a moment", "timeout": 30}),
+])
+async def test_peek_never_starts_or_touches_a_down_display(tools, sandbox, http, command, args):
+    desktop = fake_desktop(False, page_result={"ok": True, "text": "No shared browser is running."})
+    http(desktop["handler"])
+    result = await tools.peek(command, args, __user__=USER)
+    assert not any(entry.startswith("POST /computeruse") for entry in desktop["log"])
+    assert all("/process/" in e or e.endswith("/computeruse/status") for e in desktop["log"])
+    if command.startswith("page."):
+        assert '"launch": false' in desktop["scripts"][0]
+    elif command == "status":
+        # Truthful summary, not Daytona's misleading aggregate "partial".
+        assert "Desktop is down" in result and "poke starts it" in result
+        assert "Running: atspi." in result
+    else:
+        assert result.startswith("Error:") and "desktop is down" in result
+
+
+@pytest.mark.parametrize("tool,command", [
+    (tool, command) for tool, registry in (("peek", lathe._PEEK_COMMANDS), ("poke", lathe._POKE_COMMANDS))
+    for command in registry])
+async def test_argument_errors_teach_the_command_signature(tools, monkeypatch, tool, command):
+    monkeypatch.setattr(lathe, "_ensure_sandbox", AsyncMock(side_effect=AssertionError("reached I/O")))
+    result = await getattr(tools, tool)(command, {"seconds": 5}, __user__=USER)
+    signature = f"{command} args: {lathe._arg_signature(command)}"
+    assert result.startswith("Error:") and signature in result and "\n" not in signature
+    for name in lathe._COMPUTER_MODELS[command].model_fields:
+        assert name in signature
+
+
+@pytest.mark.parametrize("command,args,expected", [
+    ("page.wait", {"seconds": 5, "timeout": 45, "tab": 7},
+     ["seconds", "timeout", "tab", "timeout?: int 1-30 = 10", "exactly one of text/selector/url/gone"]),
+    ("page.wait", {"timeout": 5}, ["page.wait requires exactly one", "page.wait args: {text?: str"]),
+    ("page.eval", {"expr": "1"}, ["expr", "js: Field required", "page.eval args: {js: str"]),
+    ("page.save", {"url": "https://example.org/p.pdf"}, ["path: Field required", "path: absolute path"]),
+    ("page.save", {"path": "/tmp/p.pdf", "url": "https://example.org/p.pdf", "format": "pdf"},
+     ["at most one of url, format"]),
+])
+async def test_argument_errors_report_every_field(tools, monkeypatch, command, args, expected):
+    monkeypatch.setattr(lathe, "_ensure_sandbox", AsyncMock(side_effect=AssertionError("reached I/O")))
+    tool = "peek" if command in lathe._PEEK_COMMANDS else "poke"
+    result = await getattr(tools, tool)(command, args, __user__=USER)
+    assert result.startswith("Error:")
+    for text in expected:
+        assert text in result
+
+
+def test_decision_time_descriptions_carry_browser_signatures():
+    for method, registry in (("peek", lathe._PEEK_COMMANDS), ("poke", lathe._POKE_COMMANDS)):
+        doc = inspect.getdoc(getattr(lathe.Tools, method))
+        for command in registry:
+            if command.startswith("page."):
+                assert f"{command} {lathe._arg_signature(command)}" in doc
+        assert len(doc) < 2000
+
+
+class FakeCDPSession:
+    """Answers the page script's CDP calls; unexpected calls fail the test."""
+    def __init__(self, content_type, served=b"%PDF-1.7 served bytes"):
+        self.content_type, self.served, self.calls = content_type, served, []
+
+    def value(self, expression, timeout=30):
+        self.calls.append(expression[:40])
+        if expression == "document.contentType":
+            return self.content_type
+        if expression == "location.href":
+            return "https://example.org/paper.pdf"
+        if expression == "document.documentElement.outerHTML":
+            return "<html>page</html>"
+        if expression.startswith("(async (u, limit)"):
+            return {"status": 200, "type": "application/pdf", "data": base64.b64encode(self.served).decode()}
+        raise AssertionError(f"unexpected evaluation {expression[:60]}")
+
+    def call(self, method, params=None, timeout=30):
+        self.calls.append(method)
+        if method == "Page.printToPDF":
+            return {"data": base64.b64encode(b"%PDF-printed").decode()}
+        if method == "Page.captureSnapshot":
+            return {"data": "MIME-Version: 1.0"}
+        raise AssertionError(f"unexpected CDP call {method}")
+
+
+@pytest.fixture
+def page_script():
+    namespace = {}
+    exec(compile(lathe._PAGE_SCRIPT, "page_script", "exec"), namespace)
+    return namespace
+
+
+@pytest.mark.parametrize("content_type,name,fmt,written,error", [
+    ("text/html", "page.pdf", None, b"%PDF-printed", None),
+    ("text/html", "page.HTM", None, b"<html>page</html>", None),
+    ("text/html", "page.mht", None, b"MIME-Version: 1.0", None),
+    ("text/html", "page.bin", "html", b"<html>page</html>", None),
+    ("text/html", "page", None, None, "cannot tell the format"),
+    ("application/pdf", "paper.pdf", None, b"%PDF-1.7 served bytes", None),
+    ("application/pdf", "paper", "pdf", b"%PDF-1.7 served bytes", None),
+    ("application/pdf", "paper.html", "html", None, "has no html form"),
+])
+def test_page_save_mode_selection(page_script, tmp_path, content_type, name, fmt, written, error):
+    session = FakeCDPSession(content_type)
+    args = {"path": str(tmp_path / name), **({"format": fmt} if fmt else {})}
+    if error:
+        with pytest.raises(page_script["Fail"], match=error):
+            page_script["page_save"](session, {}, args)
+        assert not (tmp_path / name).exists()
+        return
+    result = page_script["page_save"](session, {}, args)
+    assert (tmp_path / name).read_bytes() == written and str(len(written)) in result
+    # Chromium's PDF viewer must never be printed.
+    assert ("Page.printToPDF" in session.calls) is (content_type == "text/html" and written == b"%PDF-printed")
+
+
+async def test_page_poke_survives_dead_computer_use_service(tools, sandbox, http):
+    # Chromium does not depend on Daytona's crashed plugin; desktop input does.
+    log = []
+    def handler(request):
+        log.append(request.url.path)
+        if request.url.path == "/sb/process/execute":
+            return httpx.Response(200, json={"exitCode": 0, "result": json.dumps({"ok": True, "text": "Opened."})})
+        return httpx.Response(500, json={"message": "internal server error: connection is shut down"})
+    http(handler)
+    result = await tools.poke("page.open", {"url": "https://example.org/"}, __user__=USER)
+    assert "Opened." in result and "connection is shut down" in result
+    assert "/sb/computeruse/start" not in log
+    result = await tools.poke("mouse.click", {"x": 1, "y": 2}, __user__=USER)
+    assert result.startswith("Error:") and "/sb/computeruse/mouse/click" not in log
+
+
+async def test_stop_warns_about_input_after_restart(tools, sandbox, http):
+    http(fake_desktop(True)["handler"])
+    result = await tools.poke("stop", __user__=USER)
+    assert "crashes" in result and "sandbox restarts" in result
+
+
+async def test_status_reports_running_processes(tools, sandbox, http):
+    http(fake_desktop(True)["handler"])
+    result = await tools.peek("status", __user__=USER)
+    assert result.startswith("Desktop is active.") and "xvfb, xfce4, x11vnc, novnc" in result
+
+
+@pytest.mark.parametrize("command,args,message,shown", [
+    ("keyboard.press", {"key": "KP_Enter"}, 'unsupported key "KP_Enter"; see the docs', 'unsupported key "KP_Enter"'),
+    ("keyboard.type", {"text": "secret-input-value"}, "cannot type secret-input-value now", "cannot type [typed text] now"),
+    ("keyboard.type", {"text": "secret-input-value"}, "cannot type 'secret-inp...'", "cannot type '[typed text]...'"),
+    ("accessibility.set_value", {"id": "n", "value": "hunter"}, "bad value hunter", None),
+    ("mouse.click", {"x": 1, "y": 2}, "x" * 2000, "x" * 300 + "..."),
+])
+async def test_computer_errors_pass_provider_message_bounded_and_redacted(tools, sandbox, http, command, args, message, shown):
+    calls = []
+    def handler(request):
+        if request.url.path.endswith("/process/xvfb/status"):
+            return httpx.Response(200, json={"running": True})
+        calls.append(request)
+        return httpx.Response(500, json={"statusCode": 500, "message": message, "source": "DAYTONA_DAEMON"})
+    http(handler)
+    result = await tools.poke(command, args, __user__=USER)
+    assert result.startswith("Error: computer command failed (HTTP 500)") and "bash with DISPLAY=:0" in result
+    for field in ("text", "value"):
+        if field in args:
+            assert args[field][:8] not in result
+    assert (shown in result) if shown else ("hunter" not in result)
+    assert "x" * 301 not in result
+    assert len(calls) == 1
+
+
+async def test_browser_script_errors_are_redacted(tools, sandbox, http):
+    desktop = fake_desktop(True, page_result={
+        "ok": False, "text": "JavaScript error: ReferenceError: secretFunctionName is not defined"})
+    http(desktop["handler"])
+    result = await tools.poke("page.eval", {"js": "secretFunctionName()"}, __user__=USER)
+    assert result.startswith("Error: page.eval failed: JavaScript error: ReferenceError: [typed text]")
+    assert "secretFunction" not in result
 
 
 @pytest.mark.parametrize("tool,command,args", [
@@ -1797,8 +2043,32 @@ async def test_computer_dispatch(tools, sandbox, http, tool, command, args, meth
     ("poke", "mouse.down", {"x": 1}),
     ("poke", "keyboard.type", {"text": "x" * 16385}),
     ("peek", "screenshot", {"region": {"x": 0, "y": 0, "width": False, "height": 20}}),
-    ("peek", "screenshot.compressed", {"scale": float("nan")}),
-    ("peek", "screenshot.compressed", {"scale": True}),
+    ("peek", "screenshot.compressed", {"scale": 0.5}),
+    ("peek", "process.status", {"process": "at-spi"}),
+    ("poke", "page.list", {}), ("peek", "page.open", {"url": "https://example.org/"}),
+    ("poke", "page.open", {"url": "javascript:alert(1)"}),
+    ("poke", "page.open", {"url": "https://example.org/", "tab": "abcd", "newTab": True}),
+    ("poke", "page.open", {"url": "https://example.org/", "tab": "../json/close"}),
+    ("poke", "page.click", {}),
+    ("poke", "page.click", {"text": "Save", "selector": "button"}),
+    ("poke", "page.type", {"text": "secret-input"}),
+    ("poke", "page.type", {"selector": "#q", "text": "secret-input", "submit": "true"}),
+    ("poke", "page.save", {"path": "paper.pdf", "format": "pdf"}),
+    ("poke", "page.save", {"path": "/tmp/paper.pdf", "format": "docx"}),
+    ("poke", "page.save", {"path": "/tmp/paper.pdf", "format": "pdf", "url": "https://example.org/p.pdf"}),
+    ("poke", "page.save", {"path": "/tmp/paper.pdf", "url": "file:///etc/passwd"}),
+    ("poke", "page.save", {"path": "/tmp/paper.png", "format": "png"}),
+    ("poke", "page.eval", {"js": 7}),
+    ("poke", "page.wait", {"text": "ready"}),
+    ("peek", "page.wait", {}),
+    ("peek", "page.wait", {"text": "ready", "gone": "Just a moment"}),
+    ("peek", "page.wait", {"selector": "#q", "url": "/done"}),
+    ("peek", "page.wait", {"text": "ready", "timeout": 31}),
+    ("peek", "page.wait", {"text": "ready", "timeout": 0}),
+    ("peek", "page.wait", {"text": "ready", "timeout": 2.5}),
+    ("peek", "page.wait", {"text": ""}),
+    ("peek", "page.text", {"maxChars": True}),
+    ("peek", "page.text", {"maxChars": 10_000_000}),
     ("peek", "accessibility.tree", {"scope": "pid"}),
     ("peek", "accessibility.tree", {"pid": 10}),
     ("peek", "accessibility.find", {"states": [1]}),
@@ -1818,15 +2088,17 @@ async def test_computer_rejects_misuse_before_io(tools, monkeypatch, tool, comma
 async def test_computer_screenshot_byte_exact(tools, sandbox, http, encoding, compressed, region):
     args = {"showCursor": True}
     if compressed:
-        args.update(format="png", quality=90, scale=0.5)
+        args.update(format="png", quality=90)
     if region:
         args["region"] = {"x": 10, "y": 20, "width": 30, "height": 40}
     def handler(request):
+        if request.url.path.endswith("/process/xvfb/status"):
+            return httpx.Response(200, json={"running": True})
         suffix = "screenshot" + ("/region" if region else "") + ("/compressed" if compressed else "")
         assert request.method == "GET" and request.url.path == "/sb/computeruse/" + suffix
         expected = {"showCursor": "true"}
         if compressed:
-            expected.update(format="png", quality="90", scale="0.5")
+            expected.update(format="png", quality="90")
         if region:
             expected.update(x="10", y="20", width="30", height="40")
         assert dict(request.url.params) == expected
@@ -1838,7 +2110,7 @@ async def test_computer_screenshot_byte_exact(tools, sandbox, http, encoding, co
     result = await tools.peek("screenshot.compressed" if compressed else "screenshot", args,
                               __user__=USER, __chat_id__="screen")
     assert result == "data:image/png;base64," + base64.b64encode(PNG).decode()
-    http(lambda r: httpx.Response(200, json={"status": "active"}))
+    http(fake_desktop(True)["handler"])
     text = await tools.peek("status", __user__=USER, __chat_id__="screen")
     assert "deferred notice" in text
 
@@ -1851,7 +2123,7 @@ async def test_computer_vision_gate_is_image_only(tools, sandbox, http, monkeypa
                                   __model__={"architecture": {"input_modalities": ["image"]}})
         assert "vision-capable" in result
         context.assert_not_called()
-    http(lambda r: httpx.Response(200, json={"status": "active"}))
+    http(fake_desktop(True)["handler"])
     result = await tools.peek("status", __model__={"info": {"meta": {"capabilities": {"vision": False}}}}, __user__=USER)
     assert "active" in result
 
@@ -1860,6 +2132,8 @@ async def test_computer_vision_gate_is_image_only(tools, sandbox, http, monkeypa
 async def test_computer_failures_are_bounded_redacted_and_not_retried(tools, sandbox, http, failure):
     calls = []
     def handler(request):
+        if request.url.path.endswith("/process/xvfb/status"):
+            return httpx.Response(200, json={"running": True})
         calls.append(request)
         if failure == "timeout":
             raise httpx.ReadTimeout("secret-input")

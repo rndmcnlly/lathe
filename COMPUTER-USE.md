@@ -8,11 +8,29 @@ and workflow guidance live in `lathe(manpage="computer")`.
 ## Contract
 
 - `peek(command, args)` observes status, process diagnostics, display/windows,
-  pointer position, screenshots and accessibility state. Accessibility search
-  is a read-only POST, so classification is by effects rather than HTTP method.
+  pointer position, screenshots, accessibility state and the shared browser
+  (`page.list`, `page.text`). Accessibility search is a read-only POST, so
+  classification is by effects rather than HTTP method. peek never starts the
+  desktop or browser, and refuses display queries while the display is down.
 - `poke(command, args)` starts/stops desktop processes, restarts one process,
-  sends mouse/keyboard input or invokes accessibility actions. Recording is not
-  part of the initial surface.
+  sends mouse/keyboard input, invokes accessibility actions or drives the shared
+  browser (`page.open/click/type/save/eval`). Any non-lifecycle poke first starts
+  a down desktop; page pokes also launch Chromium. Recording is not part of the
+  surface.
+- "Down" means the `xvfb` process is not running, read from per-process status.
+  Daytona's aggregate status reports `partial` after sandbox wake even when
+  every display process is down. Live evidence (2026-10-27): mouse/keyboard
+  input or `mouse.position` on a down display kills Daytona's computer-use
+  plugin ("connection is shut down" on every later call) until the sandbox
+  restarts; screenshots merely fail. Hence auto-start before input and the
+  peek guard.
+- Browser commands run one embedded, stateless sandbox script per call (stdlib
+  plus the image's preinstalled `websockets`), talking to Chromium DevTools on
+  sandbox loopback 127.0.0.1:9222. No CDP traffic from OWUI, no preview of 9222.
+  Chromium runs visibly with its sandbox intact and a persistent profile at
+  `~/.config/lathe-browser`. Clicks are real `Input.dispatchMouseEvent` events
+  at the element center. `page.save` with `url` fetches through the page with
+  its cookies, falling back to `Network.loadNetworkResource` for cross-origin.
 - A closed command registry owns transport mapping and strict argument models.
   Unknown commands/fields, invalid types (including bool-for-int), invalid
   container members and bounds fail before sandbox I/O. The argument reference
@@ -25,8 +43,13 @@ and workflow guidance live in `lathe(manpage="computer")`.
   `screenshot`/`Screenshot`, sniff actual content and preserve decoded bytes.
   Images are limited to 4 MiB and returned without prepended harness notices.
   Known non-vision models are refused before I/O for image commands only.
+  Screenshots are never scaled (no `scale` argument): image pixels are input
+  coordinates, except that region images are offset by the region origin.
 - No input is automatically retried. Success acknowledges delivery, not the
-  intended application's outcome. Errors omit response bodies and typed text.
+  intended application's outcome. Errors carry only Daytona's JSON `message`
+  (or the browser script's message), bounded to 300 characters, with any
+  8-character run shared with typed fields (`text`, `value`, `js`, `url`,
+  `name`) masked; short typed values that appear cause omission.
 - `expose(target="vnc", access=...)` requires active desktop status, resolves
   Daytona's built-in port 6080 and returns `/vnc.html` with autoconnect/scaling
   and the `websockify` path. Direct-preview query credentials are preserved.
@@ -45,8 +68,9 @@ interface. Logging in grants sandbox software access to that browser session;
 screenshots sent to OWUI become conversation history. Preview expiry is not
 logout. Stopping the stack does not promise to reap detached session daemons.
 
-Default Daytona snapshots provide desktop dependencies. Browser installation,
-profiles and application startup remain ordinary sandbox program work. Custom
+Default Daytona snapshots provide desktop dependencies, Chromium and Python
+`websockets`. Other browsers, profiles and application startup remain ordinary
+sandbox program work. Custom
 snapshots may require administrator provisioning. There is no embedded OWUI
 desktop or new cross-site iframe authentication protocol.
 
