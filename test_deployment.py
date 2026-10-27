@@ -489,12 +489,12 @@ async def main():
         for _ in range(15):
             output = await client.send('Call peek exactly once with command "status" and args {}.')
             require(any(call.get("name") == "peek" for call in tool_calls(output)), "Model did not dispatch peek")
-            if any(re.search(r'"status"\s*:\s*"active"', v, re.I) for v in tool_outputs(output)):
+            if any("Desktop is active" in v for v in tool_outputs(output)):
                 break
             await asyncio.sleep(1)
         else:
             raise AssertionError("Desktop did not become ready through OWUI")
-        output = await client.send('Call peek exactly once with command "screenshot.compressed" and args {"format":"png","scale":0.5}.')
+        output = await client.send('Call peek exactly once with command "screenshot.compressed" and args {"format":"png","quality":60}.')
         require(any(call.get("name") == "peek" for call in tool_calls(output)), "Model did not request screenshot")
         values = tool_outputs(output)
         require(any("Image file read successfully" in v for v in values), "OWUI did not lift the desktop image")

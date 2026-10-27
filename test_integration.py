@@ -411,7 +411,7 @@ asyncio.run(main())
         require(not output.startswith("Error:"), output)
         for _ in range(30):
             output = await tools.peek("status", **ctx)
-            if re.search(r'"status"\s*:\s*"active"', output, re.I):
+            if "Desktop is active." in output:
                 break
             await asyncio.sleep(1)
         else:
@@ -423,7 +423,7 @@ asyncio.run(main())
         for command, args in [
             ("screenshot", {}),
             ("screenshot", {"region": {"x": 0, "y": 0, "width": 100, "height": 80}}),
-            ("screenshot.compressed", {"format": "jpeg", "scale": 0.5}),
+            ("screenshot.compressed", {"format": "jpeg", "quality": 50}),
             ("screenshot.compressed", {"region": {"x": 0, "y": 0, "width": 100, "height": 80}, "format": "png"}),
         ]:
             output = await tools.peek(command, args, **ctx)
@@ -484,6 +484,110 @@ asyncio.run(main())
                 require(response.status_code == 101, "VNC WebSocket upgrade failed")
         output = await tools.poke("stop", **ctx)
         require(not output.startswith("Error:"), output)
+
+    async def browser_roundtrip():
+        import re
+        from urllib.parse import urlsplit
+
+        # After the sandbox restart above every display process is down (Daytona
+        # still reports "partial"). Input after an in-plugin stop/start cycle
+        # crashes Daytona's computer-use service, so this follows a sandbox wake.
+        # peek must not start the desktop; poke must.
+        output = await tools.peek("status", **ctx)
+        require("Desktop is down:" in output, output)
+        output = await tools.peek("mouse.position", **ctx)
+        require(output.startswith("Error:") and "desktop is down" in output, output)
+        output = await tools.poke("page.open", {"url": "https://example.org/"}, **ctx)
+        require("started" in output and "Example Domain" in output, output)
+        output = await tools.peek("status", **ctx)
+        require("Desktop is active." in output, output)
+        output = await tools.peek("page.text", **ctx)
+        require("untrusted page text" in output and "documentation" in output, output)
+        def hosts(text):
+            return {urlsplit(u).hostname for u in re.findall(r"https?://\S+", text)}
+
+        output = await tools.poke("page.click", {"text": "Learn more"}, **ctx)
+        require(hosts(output) & {"iana.org", "www.iana.org"}, output)
+        output = await tools.peek("page.list", **ctx)
+        require(hosts(output) & {"iana.org", "www.iana.org"}, output)
+
+        # Local pages: the form proves page.type reaches the page as trusted
+        # input; localhost vs 127.0.0.1 makes the fetch cross-origin (no CORS).
+        site = f"{WORKSPACE}/browser-site"
+        await tools.write(f"{site}/form.html", (
+            "<title>Lathe form</title><form><input id=q value=old><input id=ro value=fixed readonly>"
+            "<button>Go</button></form>"
+            "<p id=out></p><script>document.forms[0].onsubmit = e => { e.preventDefault(); "
+            "document.getElementById('out').textContent = 'submitted:' + "
+            "document.getElementById('q').value.length + ':' + e.isTrusted; };</script>"), **ctx)
+        output = await tools.bash(f"cd {site} && nohup python3 -m http.server 8767 >/tmp/lathe-browser-http.log 2>&1 &", **ctx)
+        require("Exit code:" not in output, output)
+        output = await tools.poke("page.open", {"url": "http://127.0.0.1:8767/form.html", "newTab": True}, **ctx)
+        require("Lathe form" in output, output)
+        tab = re.search(r"Tab ([0-9A-F]{8})", output)[1]
+        # A read-only field takes focus but no text: rejected before any input.
+        output = await tools.poke("page.type", {"selector": "#ro", "text": "x", "submit": True, "tab": tab}, **ctx)
+        require(output.startswith("Error:") and "read-only" in output, output)
+        output = await tools.poke("page.eval", {"js": "document.getElementById('out').textContent === ''", "tab": tab}, **ctx)
+        require("true" in output, output)
+        output = await tools.poke("page.type", {"selector": "#q", "text": "typed value", "submit": True, "tab": tab}, **ctx)
+        require("pressed Enter" in output and "typed value" not in output, output)
+        output = await tools.peek("page.text", {"selector": "#out", "tab": tab}, **ctx)
+        require("submitted:11:true" in output, output)
+        output = await tools.poke("page.eval", {"js": "document.querySelectorAll('input').length + 40"}, **ctx)
+        require("42" in output, output)
+
+        rendered = f"{site}/doc.pdf"
+        # No url or format: an HTML page is rendered by the .pdf extension.
+        output = await tools.poke("page.save", {"path": rendered}, **ctx)
+        require("Saved" in output and "application/pdf" in output, output)
+        fetched = f"{WORKSPACE}/fetched.pdf"
+        output = await tools.poke("page.save", {"path": fetched, "url": "http://localhost:8767/doc.pdf"}, **ctx)
+        require("Saved" in output, output)
+        output = await tools.bash(f"head -c 5 {fetched}; echo; cmp {rendered} {fetched} && echo identical", **ctx)
+        require("%PDF-" in output and "identical" in output, output)
+        # Same origin: the streamed in-page fetch, not the cross-origin fallback.
+        same = f"{WORKSPACE}/same-origin.pdf"
+        output = await tools.poke("page.save", {"path": same, "url": "http://127.0.0.1:8767/doc.pdf"}, **ctx)
+        require("Saved" in output, output)
+        output = await tools.bash(f"cmp {rendered} {same} && echo identical", **ctx)
+        require("identical" in output, output)
+        # A tab showing a PDF saves the served bytes, not a print of the viewer.
+        output = await tools.poke("page.open", {"url": "http://127.0.0.1:8767/doc.pdf", "newTab": True}, **ctx)
+        require("Error:" not in output, output)
+        viewed = f"{WORKSPACE}/viewed.pdf"
+        output = await tools.poke("page.save", {"path": viewed}, **ctx)
+        require("original bytes" in output, output)
+        output = await tools.bash(f"cmp {rendered} {viewed} && echo identical", **ctx)
+        require("identical" in output, output)
+
+        # page.wait polls for delayed content and times out as a normal result.
+        # The cross-origin frame's reported SCREEN bounds must hit it via
+        # desktop input; it reports trusted clicks to the parent by message.
+        await tools.write(f"{site}/frame.html", (
+            "<body style='margin:0;background:red'><script>document.body.onclick = e => "
+            "parent.postMessage('frame-clicked:' + e.isTrusted, '*');</script></body>"), **ctx)
+        await tools.write(f"{site}/host.html", (
+            "<title>Frame host</title><body style='margin:0'><p id=out>waiting</p>"
+            "<iframe src='http://localhost:8767/frame.html' style='position:absolute;left:100px;"
+            "top:150px;width:300px;height:65px;border:0'></iframe><script>"
+            "addEventListener('message', e => document.getElementById('out').textContent = e.data);"
+            "setTimeout(() => document.body.insertAdjacentHTML('beforeend', '<p>delayed-ready</p>'), 3000);"
+            "</script></body>"), **ctx)
+        output = await tools.poke("page.open", {"url": "http://127.0.0.1:8767/host.html"}, **ctx)
+        require("Frame host" in output, output)
+        output = await tools.peek("page.wait", {"text": "delayed-ready", "timeout": 15}, **ctx)
+        require("Condition met" in output, output)
+        output = await tools.peek("page.wait", {"selector": "#never", "timeout": 2}, **ctx)
+        require("Timed out after 2 s" in output and not output.startswith("Error:"), output)
+        output = await tools.peek("page.text", **ctx)
+        center = re.search(r"http://localhost:8767 .* center=\((\d+),(\d+)\)", output)
+        require(center is not None, output)
+        output = await tools.poke("mouse.click", {"x": int(center[1]), "y": int(center[2])}, **ctx)
+        require("Input delivered" in output, output)
+        output = await tools.peek("page.wait", {"text": "frame-clicked:true", "timeout": 5}, **ctx)
+        require("Condition met" in output, output)
+        await tools.bash("pkill -f '[h]ttp.server 8767'", **ctx)
 
     async def workspace_survives_stop():
         # No extra volume: restart the same VM and independently read its file.
@@ -547,6 +651,7 @@ asyncio.run(main())
             ("signed preview URL", expose_contract),
             ("desktop input, screenshots and VNC transport", computer_roundtrip),
             ("ordinary workspace survives sandbox stop", workspace_survives_stop),
+            ("browser page commands with desktop auto-start", browser_roundtrip),
             ("disabled auto-create policy", disabled_auto_create_is_respected),
         ]:
             if not await results.run(name, scenario):

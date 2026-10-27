@@ -36,11 +36,17 @@ management out of it.
 Daytona's built-in desktop is a provider capability, not a Lathe-installed
 application. `peek(command, args)` observes its screen, accessibility state and
 diagnostics; `poke(command, args)` sends input or changes desktop lifecycle.
+Most computer use is browser use, so both tools also carry `page.*` verbs for
+one shared, visible Chromium (`page.open`, `page.click`, `page.save`...). The
+verb names the effect in the tool trace, where pixel coordinates would not.
+poke owns startup: it starts a down desktop and launches the browser, while
+peek never starts anything.
 Commands are a closed, strictly validated vocabulary, not arbitrary API routes.
 `expose(target="vnc", access=...)` supplies the human's noVNC connection to the
 same screen, through the ordinary preview policy. Private access is strongly
 advised, not enforced by target; explicit public access remains an escape hatch.
-Browser installation and launch remain ordinary sandbox program work.
+Browser installation, other browsers and Playwright scripting remain ordinary
+sandbox program work.
 
 The desktop is shared across conversations and people. Human login requires an
 explicit conversational handoff: stop input and screenshots until the human
