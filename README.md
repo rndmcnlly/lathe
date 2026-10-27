@@ -98,11 +98,15 @@ is useful for substantial guidance. Neither valve causes automatic fetching.
 create request, letting you control sandbox shape without a valve per field:
 
 ```json
-{"cpu": 2, "memory": 4, "disk": 20, "snapshot": "my-snapshot", "target": "us"}
+{"snapshot": "daytona-medium", "target": "us"}
 ```
 
-Resource fields (`cpu`, `memory`, `disk`, `gpu`) are integers in cores / GB /
-units; `snapshot` selects the base image; `target` picks a region. Any field
+`snapshot` selects the base environment and, for Daytona's default snapshots,
+the size: `daytona-small` (1 vCPU, 1 GiB, 3 GiB disk), `daytona-medium`
+(2, 4, 8) or `daytona-large` (4, 8, 10). The desktop and browser tools want at
+least `daytona-medium`. `target` picks a region. Resource fields (`cpu`,
+`memory`, `disk`, `gpu`) apply only when creating from an `image`; Daytona
+rejects them alongside a snapshot, and Lathe's default create uses one. Any field
 the Daytona [`POST /sandbox`](https://www.daytona.io/docs/en/tools/api/) body
 accepts works here except reserved identity/storage fields. The keys `name`,
 `labels`, and `volumes` are rejected: Lathe owns per-user lookup and does not

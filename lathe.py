@@ -315,7 +315,7 @@ _PROTECTED_CREATE_KEYS = frozenset({"name", "labels", "volumes"})
 def _parse_create_overrides(raw: str) -> dict:
     """Parse the sandbox_create_overrides valve into a dict of create args.
 
-    Expects a JSON object, e.g. '{"cpu":2,"memory":4,"snapshot":"my-snap"}'.
+    Expects a JSON object, e.g. '{"snapshot":"daytona-medium"}'.
     Returns {} on empty input (not an error). Raises ValueError on malformed
     input or on any attempt to override a lathe-managed key, so the caller
     can surface it to the agent.
@@ -329,13 +329,13 @@ def _parse_create_overrides(raw: str) -> dict:
         raise ValueError(
             f"Valves sandbox_create_overrides is not valid JSON: {exc}. "
             f"Fix the sandbox_create_overrides field in Tool settings (it should "
-            f'look like {{"cpu":2,"memory":4}}) and retry.'
+            f'look like {{"snapshot":"daytona-medium"}}) and retry.'
         ) from exc
     if not isinstance(overrides, dict):
         raise ValueError(
             f"Valves sandbox_create_overrides must be a JSON object, got "
             f"{type(overrides).__name__}. Expected something like "
-            f'{{"cpu":2,"memory":4,"snapshot":"my-snapshot"}}.'
+            f'{{"snapshot":"daytona-medium","target":"us"}}.'
         )
     clobbered = _PROTECTED_CREATE_KEYS & overrides.keys()
     if clobbered:
@@ -3968,8 +3968,9 @@ class Tools:
             description=(
                 "JSON object of extra arguments merged into the Daytona sandbox "
                 "create request, e.g. "
-                '{"cpu":2,"memory":4,"disk":20,"snapshot":"my-snapshot","target":"us"}. '
-                "Resource fields (cpu/memory/disk) are integers in cores/GB. "
+                '{"snapshot":"daytona-medium","target":"us"}. '
+                "Size comes from the snapshot (daytona-small/medium/large); "
+                "cpu/memory/disk apply only with an image, not a snapshot. "
                 "Cannot override name or labels, or attach volumes."
             ),
         )
