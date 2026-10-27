@@ -32,10 +32,11 @@ const BROWSER_HEADER_REMOVED = new Set([
 const BROWSER_HEADER_REMOVED_PREFIXES = ["x-forwarded-", "cf-", "daytona-", "x-daytona-", "x-lathe-"];
 // CONTRACT.md §6: 4xx/5xx bodies pass through unless large or naming the
 // upstream. Daytona appends its signed capability host to X-Forwarded-Host, so
-// applications can echo it in error pages.
+// applications can echo it in error pages. A body cut short mid-read is
+// replaced too, keeping the application's status.
 const ERROR_BODY_LIMIT = 64 * 1024;
 const MASKED_ERROR_BODY = "Preview application request failed. (The application's response body was " +
-  "replaced by the preview wrapper because it was large or named the upstream.)";
+  "replaced by the preview wrapper because it was large, named the upstream, or could not be read.)";
 
 let oidcConfigurationPromise;
 
@@ -654,7 +655,7 @@ async function proxy(request, url, target, publicHost, zone, upstreamHeaders = {
   if (location) out.set("location", unwrapLocation(location, upstream, publicHost));
 
   if (resp.status >= 400 && resp.status <= 599 && request.method !== "HEAD") {
-    const body = await readBounded(resp.body, ERROR_BODY_LIMIT);
+    const body = await readBounded(resp.body, ERROR_BODY_LIMIT).catch(() => null);
     out.delete("content-length");
     if (!body || namesUpstream(body, upstream.hostname)) {
       out.delete("content-encoding");

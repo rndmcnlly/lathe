@@ -358,6 +358,7 @@ unless marked otherwise; run in both access modes unless marked.
 | F4 | `Origin: https://{public host}` | seen unchanged |
 | F5 | `Accept`, `Content-Type`, `If-None-Match` | seen unchanged |
 | F6 | `Authorization: Bearer app-token-123` | seen (unless wrapper documents a platform-credential screen that matches it) |
+| F7 | `Authorization: Basic YXBwOnNlY3JldA==` | seen unchanged |
 | R1 | `X-Forwarded-For: 203.0.113.9` | absent, or the wrapper's own value |
 | R2 | `x-FORWARDED-host: evil.example` | value is `{public host}` |
 | R3 | `CF-Connecting-IP: 203.0.113.9` | absent, or the edge's own value |
@@ -494,9 +495,12 @@ BayLeaf (`api/src/routes/previews.ts`), as of contract revision 2:
   (`api/scripts/qualify-preview-passthrough.py`); private mode is covered by
   its synthetic harness.
 - Stricter than required, all allowed: forwards script-set headers only on
-  same-origin non-navigation requests; drops `sec-*`; drops browser
-  `Authorization` unless it is a single Bearer token; screens every forwarded
+  same-origin non-navigation requests; drops `sec-*`; screens every forwarded
   value for platform credentials; rejects cross-origin non-GET requests.
+- Nonconforming: drops browser `Authorization` unless it is a single Bearer
+  token, so application credentials in other schemes (for example browser
+  Basic authentication) never reach the upstream. Section 5.2 step 4 permits
+  dropping only recognized platform credentials; fails F7.
 - Cloudflare's edge rejects client requests carrying `CF-Connecting-IP` before
   the Worker runs (R3 is satisfied by refusal).
 - Reply omits `host` (allowed).

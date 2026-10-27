@@ -516,7 +516,7 @@ async function proxied(access, headers = {}, extra = {}) {
 }
 
 for (const access of ["public", "private"]) {
-  test(`${access} unknown application headers and Origin are forwarded unchanged (F1, F3, F4)`, async () => {
+  test(`${access} unknown application headers and Origin are forwarded unchanged (F1, F3, F4, F6)`, async () => {
     const { upstream, host } = await proxied(access, (publicHost) => ({
       "X-Pocket": "1", "X-Some-Unknown-Header-Name": "v", Origin: `https://${publicHost}`,
       "If-None-Match": '"etag"', Authorization: "Bearer app-token-123",
@@ -526,6 +526,11 @@ for (const access of ["public", "private"]) {
     assert.equal(upstream.get("origin"), `https://${host}`);
     assert.equal(upstream.get("if-none-match"), '"etag"');
     assert.equal(upstream.get("authorization"), "Bearer app-token-123");
+  });
+
+  test(`${access} browser Basic authentication reaches upstream unchanged (F7)`, async () => {
+    const { upstream } = await proxied(access, { Authorization: "Basic YXBwOnNlY3JldA==" });
+    assert.equal(upstream.get("authorization"), "Basic YXBwOnNlY3JldA==");
   });
 
   test(`${access} wrapper-controlled browser headers never reach upstream (R1-R8)`, async () => {
@@ -602,6 +607,18 @@ for (const [status, body] of [
     assert.notEqual(response.headers.get("content-length"), String(body.length));
   });
 }
+
+test("error body cut short mid-read is replaced, keeping the status", async () => {
+  const body = new ReadableStream({
+    start(controller) { controller.enqueue(new TextEncoder().encode("partial 3000-sbxtoken42")); },
+    pull(controller) { controller.error(new Error("connection reset")); },
+  });
+  const response = await errorResponse(502, body);
+  assert.equal(response.status, 502);
+  const text = await response.text();
+  assert.match(text, /replaced/);
+  assert.doesNotMatch(text.toLowerCase(), /sbxtoken42/);
+});
 
 test("HEAD error responses keep their status and carry no body", async () => {
   const response = await errorResponse(500, null, { method: "HEAD" });
