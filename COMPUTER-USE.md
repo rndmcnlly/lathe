@@ -76,6 +76,25 @@ desktop or new cross-site iframe authentication protocol.
 
 ## Qualification
 
+Browser verbs and round-4 AX revisions (2026-10-27, branch `browser-page-verbs`):
+
+- Offline suite: 693 tests passed (the page-script tests run the shipped
+  JavaScript in Node and skip without it).
+- Daytona integration: 11/11 phases passed, including browser `page.*` commands
+  with desktop auto-start.
+- Isolated OWUI deployment (`lathe_test`): 6/6 scenarios passed on the second
+  run. The first run failed bash dispatch because the model answered without
+  calling the tool (nondeterministic smoke test, not a Lathe fault).
+- Local Docker AX trial with GLM-5.3 Flash, four rounds over a fixture archive,
+  parallel subagents and a real Cloudflare-gated ACM paper: all round-4
+  deliverables correct, with fewer calls than round 3 (fixture 27 to 18, ACM 32
+  to 18 with 8 error results down to 0). Cloudflare's current interstitial is
+  detected and the authorized one-click recipe was followed and reported
+  honestly. Residual: agents rarely offer the VNC live view unprompted or ask
+  consent before first browser use; handoffs often omit the idle window.
+
+Earlier shared-desktop release (v1.2.0):
+
 - Offline suite: 581 tests passed, including command segregation and transport,
   pre-I/O validation, image formats/decoding paths, deferred image notices,
   vision gating, bounds, redacted failures/no retries, VNC landing paths,

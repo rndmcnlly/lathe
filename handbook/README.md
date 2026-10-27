@@ -121,6 +121,8 @@ or sandbox awake. Recheck the app after sandbox sleep before renewing exposure.
 
 Once the workflow is actually verified, **offer** to preserve it. Wait for the
 user's approval and ask what they want remembered, automated, shared, or omitted.
+Only an explicit yes that names the skill or its location counts; a generic
+"continue" or "carry on" is not approval.
 Do not copy this handbook into a prepackaged skill or silently overwrite one.
 
 Use `~/.local/share/lathe/skills/<name>/SKILL.md` for Lathe/Open WebUI practices

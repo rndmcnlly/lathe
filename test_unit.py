@@ -1967,6 +1967,74 @@ def test_page_save_mode_selection(page_script, tmp_path, content_type, name, fmt
     assert ("Page.printToPDF" in session.calls) is (content_type == "text/html" and written == b"%PDF-printed")
 
 
+class NodeDOMSession:
+    """Evaluates the page script's real JavaScript in Node against a stub DOM.
+    Each evaluation of a condition advances to the next page state."""
+    def __init__(self, *pages):
+        self.pages, self.evaluations = list(pages), 0
+
+    def value(self, expression, timeout=30):
+        title, body, frames = self.pages[min(self.evaluations, len(self.pages) - 1)]
+        self.evaluations += 1
+        stub = ("globalThis.document = {title: %s, body: {innerText: %s}, "
+                "querySelectorAll: () => %s.map(src => ({src}))};"
+                "globalThis.location = {href: 'https://example.org/'};"
+                % (json.dumps(title), json.dumps(body), json.dumps(list(frames))))
+        out = subprocess.run(["node", "-e", stub + "process.stdout.write(JSON.stringify(eval("
+                              + json.dumps(expression) + ")))"],
+                             capture_output=True, text=True, check=True, timeout=30).stdout
+        return json.loads(out)
+
+    def where(self, target):
+        return "Tab"
+
+
+needs_node = pytest.mark.skipif(not shutil.which("node"), reason="Node evaluates the page JavaScript")
+CLOUDFLARE = ("Just a moment...", "example.org\nPerforming security verification\nRay ID", [])
+
+
+@needs_node
+@pytest.mark.parametrize("pages,kind,want,expected", [
+    # Cloudflare names its interstitial only in the title: it is present, not gone.
+    ([CLOUDFLARE], "gone", "just a moment", "Timed out"),
+    ([CLOUDFLARE], "text", "Just a Moment", "Condition met (text)"),
+    ([("Paper", "Abstract", [])], "gone", "just a moment", "Already absent at the first check"),
+    ([CLOUDFLARE, CLOUDFLARE, ("Paper", "Abstract", [])], "gone", "just a moment", "Condition met (gone)"),
+])
+def test_page_wait_matches_title_and_reports_absent_text(page_script, monkeypatch, pages, kind, want, expected):
+    now = [0.0]
+    monkeypatch.setitem(page_script, "time", SimpleNamespace(
+        monotonic=lambda: now[0], sleep=lambda s: now.__setitem__(0, now[0] + s)))
+    result = page_script["page_wait"](NodeDOMSession(*pages), {}, {kind: want, "timeout": 1})
+    assert expected in result
+    if "Already absent" in expected:
+        assert "Condition met" not in result
+
+
+@needs_node
+@pytest.mark.parametrize("page,challenge", [
+    (CLOUDFLARE, True),
+    (("Just a moment...", "", []), True),
+    (("Sign in", "Please wait", ["https://challenges.cloudflare.com/cdn-cgi/challenge-platform/x"]), True),
+    (("Paper", "Abstract", ["https://www.youtube.com/embed/x"]), False),
+])
+def test_challenge_notice_detects_cloudflare_and_carries_handoff(page_script, page, challenge):
+    note = page_script["challenge_note"](NodeDOMSession(page))
+    assert bool(note) is challenge
+    if challenge:
+        assert 'expose(target="vnc", access="private")' in note and "page.wait" in note
+
+
+@pytest.mark.parametrize("tool,command,right", [
+    ("peek", "page.open", "poke"), ("peek", "page.click", "poke"), ("peek", "mouse.click", "poke"),
+    ("poke", "page.text", "peek"), ("poke", "page.list", "peek"), ("poke", "screenshot", "peek"),
+])
+async def test_wrong_tool_errors_name_the_right_call(tools, monkeypatch, tool, command, right):
+    monkeypatch.setattr(lathe, "_ensure_sandbox", AsyncMock(side_effect=AssertionError("reached I/O")))
+    result = await getattr(tools, tool)(command, {}, __user__=USER)
+    assert result.startswith("Error:") and f'{right}(command="{command}"' in result
+
+
 async def test_page_poke_survives_dead_computer_use_service(tools, sandbox, http):
     # Chromium does not depend on Daytona's crashed plugin; desktop input does.
     log = []
@@ -1981,6 +2049,21 @@ async def test_page_poke_survives_dead_computer_use_service(tools, sandbox, http
     assert "/sb/computeruse/start" not in log
     result = await tools.poke("mouse.click", {"x": 1, "y": 2}, __user__=USER)
     assert result.startswith("Error:") and "/sb/computeruse/mouse/click" not in log
+
+
+async def test_live_view_offer_follows_first_page_poke_once_per_chat(tools, monkeypatch, http):
+    # Real per-chat initialization owns the state the offer is recorded in.
+    monkeypatch.setattr(lathe, "_ensure_sandbox", AsyncMock(return_value=("sb", None)))
+    http(fake_desktop(True, page_result={"ok": True, "text": "Opened."})["handler"])
+    offer = 'expose(target="vnc", access="private")'
+    desktop = await tools.poke("mouse.click", {"x": 1, "y": 2}, __user__=USER, __chat_id__="a")
+    first = await tools.poke("page.open", {"url": "https://example.org/"}, __user__=USER, __chat_id__="a")
+    again = await tools.poke("page.eval", {"js": "1"}, __user__=USER, __chat_id__="a")
+    other = await tools.poke("page.open", {"url": "https://example.org/"}, __user__=USER, __chat_id__="b")
+    assert offer not in desktop and offer not in again
+    assert offer in first and offer in other
+    # Context follows the page's own result so the result still opens with it.
+    assert first.index("Opened.") < first.index(offer)
 
 
 async def test_stop_warns_about_input_after_restart(tools, sandbox, http):

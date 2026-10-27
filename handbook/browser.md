@@ -16,6 +16,12 @@ it over VNC, and it holds their logins.
 DevTools on port 9222 is full control of a logged-in browser. Never `expose`
 it, tunnel it, or bind it beyond loopback. Do not disable Chromium's sandbox.
 
+Subagents and other chats share this browser and its default tab (the most
+recently used). Parallel workers should each `page.open` with `newTab` and pass
+that `tab` to later commands, or work one at a time. Playwright scripts should
+open their own page (`context.new_page()`) rather than drive `context.pages[0]`
+while another agent may be using it.
+
 If no browser answers on 9222, call `poke(command="page.open", ...)` first.
 If a Chromium already uses the Lathe profile without remote debugging (for
 example one launched by hand), ask the user before closing it.
