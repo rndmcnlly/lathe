@@ -30,7 +30,7 @@ Credentials: gitignored `.env`, documented in `.env.example`. Use `uv run`.
 uv run pytest                                  # offline, no credentials
 uv run pytest -k interpreter                    # focused selection
 uv run python test_integration.py               # DAYTONA_API_KEY
-uv run python test_deployment.py [--verbose]     # also OWUI_URL, OWUI_TOKEN, OWUI_MODEL
+uv run python test_deployment.py [--verbose]     # also OWUI credentials/model: .env.example
 ```
 
 Run offline tests before committing any `lathe.py` change. `uv run python
@@ -81,6 +81,9 @@ Neither live suite belongs in default pytest collection.
   label and no extra volumes. It deletes its toolkit/sandboxes on exit, including
   failures and `--no-deploy`. Override with `LATHE_TEST_TOOL_ID`; use `--no-deploy`
   only for intentionally staged source that may be deleted afterward.
+  Existing hosts require separate admin `OWUI_TOKEN` and dedicated ordinary-user
+  `OWUI_TEST_TOKEN`/`OWUI_TEST_EMAIL`; never borrow the operator's completion session.
+  Filter account-wide socket events by chat and message IDs before any retention.
 - `monitor_e2e.py` uses fresh Docker OWUI, real OpenRouter/Daytona, environment
   keys only (ignores `.env`), never an existing OWUI host. Cleanup must match the
   exact run's `lathe-ci-*` label. No volumes; delete on idle stop after five

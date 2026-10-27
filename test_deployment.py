@@ -13,8 +13,9 @@ Usage:
     uv run python test_deployment.py --no-deploy
     uv run python test_deployment.py --verbose
 
-Requires ``OWUI_URL``, ``OWUI_TOKEN``, ``OWUI_MODEL``, and
-``DAYTONA_API_KEY`` in the environment or ``.env``.
+Requires ``OWUI_URL``, admin ``OWUI_TOKEN``, dedicated ``OWUI_TEST_TOKEN`` and
+``OWUI_TEST_EMAIL``, ``OWUI_MODEL``, and ``DAYTONA_API_KEY`` in the environment
+or ``.env``. The test account must be a separate ordinary user, not an admin.
 """
 
 import asyncio
@@ -38,6 +39,8 @@ if os.environ.get("LATHE_ISOLATED_CI") != "1":
 
 OWUI_BASE = os.environ.get("OWUI_URL", "").rstrip("/")
 OWUI_TOKEN = os.environ.get("OWUI_TOKEN", "")
+OWUI_TEST_TOKEN = os.environ.get("OWUI_TEST_TOKEN", "")
+OWUI_TEST_EMAIL = os.environ.get("OWUI_TEST_EMAIL", "")
 MODEL = os.environ.get("OWUI_MODEL", "")
 DAYTONA_API_KEY = os.environ.get("DAYTONA_API_KEY", "")
 TOOL_ID = os.environ.get("LATHE_TEST_TOOL_ID", "lathe_test")
@@ -64,8 +67,9 @@ PNG_B64 = (
 )
 
 
-def auth_headers():
-    return {"Authorization": f"Bearer {OWUI_TOKEN}", "Content-Type": "application/json"}
+def auth_headers(*, completion=False):
+    token = OWUI_TEST_TOKEN if completion else OWUI_TOKEN
+    return {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
 
 
 def require(condition, detail):
@@ -94,13 +98,64 @@ class Results:
             return False
 
 
-async def deploy_staging_tool(*, display_name="Lathe Test"):
+async def session_identity(*, completion=False):
+    async with httpx.AsyncClient() as client:
+        response = await client.get(f"{OWUI_BASE}/api/v1/auths/",
+            headers=auth_headers(completion=completion), timeout=30)
+        response.raise_for_status()
+        return response.json()
+
+
+async def check_test_identity():
+    """Verify both credentials before setup, sockets, model requests or cleanup."""
+    require(OWUI_TEST_TOKEN and OWUI_TEST_EMAIL,
+            "Dedicated OWUI_TEST_TOKEN and OWUI_TEST_EMAIL are required")
+    admin = await session_identity()
+    user = await session_identity(completion=True)
+    require(admin.get("id") and admin.get("role") == "admin",
+            "OWUI_TOKEN must identify the setup administrator")
+    require(user.get("id") and isinstance(user.get("email"), str)
+            and user["email"].strip().lower() == OWUI_TEST_EMAIL.strip().lower(),
+            "OWUI_TEST_TOKEN does not identify OWUI_TEST_EMAIL")
+    require(user.get("role") == "user" and user["id"] != admin["id"],
+            "Completion identity must be a dedicated non-admin user, separate from setup")
+    return admin, user
+
+
+def staging_grants(user):
+    return [{"principal_type": "user", "principal_id": user["id"], "permission": "read"}]
+
+
+async def check_completion_tools(*, staged):
+    """Fail if the synthetic account can reach another local toolkit."""
+    async with httpx.AsyncClient() as client:
+        response = await client.get(f"{OWUI_BASE}/api/v1/tools/",
+            headers=auth_headers(completion=True), timeout=30)
+        response.raise_for_status()
+        ids = {tool["id"] for tool in response.json()}
+    require(ids == {TOOL_ID} if staged else ids <= {TOOL_ID},
+            "Test identity must have access only to the suite-owned staging toolkit")
+
+
+async def check_staging_access(admin, user):
+    remote = await fetch_staging_tool()
+    require(remote.get("user_id") == admin["id"], "Staging toolkit is not owned by setup identity")
+    grants = remote.get("access_grants")
+    expected = staging_grants(user)
+    require(isinstance(grants, list) and len(grants) == 1
+            and all(grants[0].get(k) == v for k, v in expected[0].items()),
+            "Staging toolkit must grant read access only to the test identity")
+    await check_completion_tools(staged=True)
+
+
+async def deploy_staging_tool(admin, user, *, display_name="Lathe Test"):
     source = SOURCE_PATH.read_text()
     payload = {
         "id": TOOL_ID,
         "name": display_name,
         "content": source,
         "meta": {"description": "Ephemeral deployment-test copy of Lathe"},
+        "access_grants": [],
     }
     async with httpx.AsyncClient() as client:
         response = await client.get(
@@ -116,6 +171,12 @@ async def deploy_staging_tool(*, display_name="Lathe Test"):
                 timeout=120,
             )
         else:
+            response.raise_for_status()
+            require(response.json().get("user_id") == admin["id"],
+                    "Refusing to overwrite staging toolkit owned by another account")
+            # Revoke old grants before replacing code or installing credentials.
+            response = await client.post(f"{OWUI_BASE}/api/v1/tools/id/{TOOL_ID}/access/update",
+                headers=auth_headers(), json={"access_grants": []}, timeout=30)
             response.raise_for_status()
             response = await client.post(
                 f"{OWUI_BASE}/api/v1/tools/id/{TOOL_ID}/update",
@@ -149,19 +210,25 @@ async def deploy_staging_tool(*, display_name="Lathe Test"):
         )
         response.raise_for_status()
 
+        response = await client.post(f"{OWUI_BASE}/api/v1/tools/id/{TOOL_ID}/access/update",
+            headers=auth_headers(), json={"access_grants": staging_grants(user)}, timeout=30)
+        response.raise_for_status()
 
-async def fetch_staging_tool():
+
+async def fetch_staging_tool(*, missing_ok=False):
     async with httpx.AsyncClient() as client:
         response = await client.get(
             f"{OWUI_BASE}/api/v1/tools/id/{TOOL_ID}",
             headers=auth_headers(),
             timeout=30,
         )
+        if missing_ok and response.status_code == 404:
+            return None
         response.raise_for_status()
         return response.json()
 
 
-async def delete_staging_tool():
+async def delete_staging_tool(admin):
     """Delete the suite-owned OWUI toolkit if it exists."""
     async with httpx.AsyncClient() as client:
         response = await client.get(
@@ -172,6 +239,8 @@ async def delete_staging_tool():
         if response.status_code == 404:
             return
         response.raise_for_status()
+        require(response.json().get("user_id") == admin["id"],
+                "Refusing to delete staging toolkit owned by another account")
         response = await client.delete(
             f"{OWUI_BASE}/api/v1/tools/id/{TOOL_ID}/delete",
             headers=auth_headers(),
@@ -240,6 +309,7 @@ class OWUIClient:
         self.budget_error = None
         self.last_output = []
         self.traced_results = 0
+        self.active_request = None
 
         @self.sio.event
         async def connect():
@@ -248,13 +318,20 @@ class OWUIClient:
         @self.sio.on("*")
         async def catch_all(event, *args):
             data = args[0] if args else None
+            # OWUI emits to the entire account room, including native child-chat
+            # and resumed-parent events. Filter before retaining or logging data.
+            if (self.active_request is None or event != "events" or not isinstance(data, dict)
+                    or (data.get("chat_id"), data.get("message_id")) != self.active_request):
+                return
+            inner = data.get("data")
+            if not isinstance(inner, dict):
+                return
+            detail = inner.get("data", {})
+            if not isinstance(detail, dict):
+                return
             self.events.append({"event": event, "data": data})
             if VERBOSE:
                 print(f"  socket {event}: {json.dumps(data, default=str)[:300]}")
-            if event != "events" or not isinstance(data, dict):
-                return
-            inner = data.get("data", {})
-            detail = inner.get("data", {})
             if inner.get("type") == "chat:completion" and "output" in detail:
                 self.last_output = detail["output"]
                 completed = [item for item in self.last_output
@@ -277,10 +354,10 @@ class OWUIClient:
             OWUI_BASE,
             socketio_path="/ws/socket.io",
             transports=["websocket"],
-            auth={"token": OWUI_TOKEN},
+            auth={"token": OWUI_TEST_TOKEN},
             wait_timeout=15,
         )
-        await self.sio.emit("user-join", {"auth": {"token": OWUI_TOKEN}})
+        await self.sio.emit("user-join", {"auth": {"token": OWUI_TEST_TOKEN}})
         await asyncio.sleep(0.5)
 
     async def close(self):
@@ -288,6 +365,7 @@ class OWUIClient:
             await self.sio.disconnect()
 
     async def send(self, prompt, *, timeout=180, max_calls=None):
+        require(self.active_request is None, "OWUIClient supports only one active request")
         self.events.clear()
         self.done.clear()
         self.max_calls = max_calls
@@ -304,12 +382,15 @@ class OWUIClient:
             "session_id": self.session_id,
             "tool_ids": [self.tool_id],
         }
+        self.active_request = (payload["chat_id"], payload["id"])
+        started = time.monotonic()
+        acceptance = {}
         try:
             async with asyncio.timeout(timeout):
                 async with httpx.AsyncClient() as client:
                     response = await client.post(
                         f"{OWUI_BASE}/api/chat/completions",
-                        headers=auth_headers(),
+                        headers=auth_headers(completion=True),
                         json=payload,
                         timeout=30,
                     )
@@ -318,25 +399,28 @@ class OWUIClient:
                             f"OWUI completion HTTP {response.status_code}: {response.text[:1000]}"
                         )
                     response.raise_for_status()
+                    acceptance = {"http_status": response.status_code,
+                                  "task_id": response.json().get("task_id")}
+                    TRACE("completion_accepted", **acceptance)
                 await self.done.wait()
                 require(not self.budget_error, self.budget_error)
         finally:
+            self.active_request = None
+            statuses = [e for e in self.events
+                        if e["data"]["data"].get("type") in ("status", "chat:error")]
+            diagnostics = dict(elapsed=round(time.monotonic() - started, 3),
+                               done=self.done.is_set(), **acceptance,
+                               completed_calls=sum(item.get("type") == "function_call_output"
+                                                   and item.get("status") == "completed"
+                                                   for item in self.last_output),
+                               last_status=statuses[-1]["data"]["data"] if statuses else None)
+            TRACE("request_end", **diagnostics)
+            if not self.done.is_set():
+                print(f"  Incomplete OWUI request: {json.dumps(diagnostics, default=str)}")
             TRACE("chat_output", output=self.last_output,
-                  statuses=[e for e in self.events if e.get("event") == "events"
-                            and (e.get("data") or {}).get("data", {}).get("type")
-                            in ("status", "chat:error")])
+                  statuses=statuses)
 
-        output = []
-        for event in self.events:
-            if event["event"] != "events":
-                continue
-            inner = (event.get("data") or {}).get("data", {})
-            if inner.get("type") != "chat:completion":
-                continue
-            data = inner.get("data", {})
-            if "output" in data:
-                output = data["output"]
-        return output
+        return self.last_output
 
 
 def tool_calls(output):
@@ -402,6 +486,8 @@ async def main():
         for name, value in (
             ("OWUI_URL", OWUI_BASE),
             ("OWUI_TOKEN", OWUI_TOKEN),
+            ("OWUI_TEST_TOKEN", OWUI_TEST_TOKEN),
+            ("OWUI_TEST_EMAIL", OWUI_TEST_EMAIL),
             ("OWUI_MODEL", MODEL),
             ("DAYTONA_API_KEY", DAYTONA_API_KEY),
         )
@@ -409,6 +495,15 @@ async def main():
     ]
     if missing:
         print(f"Error: missing {', '.join(missing)}")
+        return 2
+
+    try:
+        admin, user = await check_test_identity()
+        remote = await fetch_staging_tool(missing_ok=True)
+        require(remote is None or remote.get("user_id") == admin["id"],
+                "Refusing to use staging toolkit owned by another account")
+    except Exception as exc:
+        print(f"Deployment-test preflight failed: {type(exc).__name__}: {exc}")
         return 2
 
     started = time.monotonic()
@@ -538,13 +633,13 @@ async def main():
         async with httpx.AsyncClient() as http:
             headers = {"Authorization": f"Bearer {DAYTONA_API_KEY}"}
             response = await http.get("https://app.daytona.io/api/sandbox",
-                params={"labels": json.dumps({DEPLOYMENT_LABEL: "monitor@lathe.invalid"})},
+                params={"labels": json.dumps({DEPLOYMENT_LABEL: user["email"].strip().lower()})},
                 headers=headers, timeout=30)
             response.raise_for_status()
             data = response.json()
             matches = [s for s in (data if isinstance(data, list) else data.get("items", []))
-                       if s.get("labels", {}).get(DEPLOYMENT_LABEL) == "monitor@lathe.invalid"]
-            require(len(matches) == 1, "Expected one monitor sandbox")
+                       if s.get("labels", {}).get(DEPLOYMENT_LABEL) == user["email"].strip().lower()]
+            require(len(matches) == 1, "Expected one test-identity sandbox")
             sandbox = matches[0]
             require(not sandbox.get("volumes"), "Monitor sandbox has persistent volumes")
             for filename in (source, destination):
@@ -556,9 +651,13 @@ async def main():
                 TRACE("independent_read", path=filename, content=response.text, sandbox_id=sandbox["id"])
 
     try:
+        # Identity and ownership authorize cleanup, even when later access
+        # checks reject an intentionally staged --no-deploy installation.
+        await check_completion_tools(staged=False)
         if deploy:
             print(f"Deploying local lathe.py to isolated toolkit {TOOL_ID!r}...")
-            await deploy_staging_tool()
+            await deploy_staging_tool(admin, user)
+        await check_staging_access(admin, user)
         await cleanup_test_sandboxes()
 
         if not await results.run("exact staged source and complete OWUI schema", exact_source_and_schema):
@@ -609,7 +708,7 @@ async def main():
             TRACE("cleanup_error", error=f"Sandbox cleanup: {exc}")
             print(f"Sandbox cleanup warning: {exc}")
         try:
-            await delete_staging_tool()
+            await delete_staging_tool(admin)
         except Exception as exc:
             cleanup_failed = True
             TRACE("cleanup_error", error=f"Toolkit cleanup: {exc}")

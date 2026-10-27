@@ -1,6 +1,7 @@
 """Offline protection for the monitor's isolation and evidence boundaries."""
 
 import importlib.util
+import asyncio
 import json
 from pathlib import Path
 
@@ -176,10 +177,38 @@ def suite(monkeypatch):
     monkeypatch.setattr(dotenv, "load_dotenv", forbidden_dotenv)
     monkeypatch.setenv("LATHE_ISOLATED_CI", "1")
     monkeypatch.setenv("LATHE_TEST_DEPLOYMENT_LABEL", "lathe-ci-this-run")
+    monkeypatch.setenv("OWUI_URL", "http://127.0.0.1:8080")
+    monkeypatch.setenv("OWUI_TOKEN", "setup-token")
+    monkeypatch.setenv("OWUI_TEST_TOKEN", "test-token")
+    monkeypatch.setenv("OWUI_TEST_EMAIL", "test@lathe.invalid")
     spec = importlib.util.spec_from_file_location("monitor_suite_test", Path(__file__).with_name("test_deployment.py"))
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+@pytest.fixture
+def suite_transport(suite, monkeypatch):
+    """Never let a swallowed mock-boundary assertion look like a passing test."""
+    client_type = httpx.AsyncClient
+    failures = []
+
+    def install(responder):
+        async def guarded(request):
+            try:
+                result = responder(request)
+                if hasattr(result, "__await__"):
+                    result = await result
+                return result
+            except BaseException as exc:
+                failures.append(exc)
+                raise
+        monkeypatch.setattr(suite.httpx, "AsyncClient",
+            lambda **kw: client_type(transport=httpx.MockTransport(guarded), **kw))
+
+    install(lambda request: pytest.fail(f"Unexpected HTTP: {request.method} {request.url}"))
+    yield install
+    assert not failures, failures
 
 
 async def test_cleanup_owns_only_exact_run_and_follows_pages(suite, monkeypatch):
@@ -221,7 +250,7 @@ async def test_staging_deployment_accepts_current_valves_and_sets_expiry(suite, 
     suite.OWUI_BASE = "http://127.0.0.1:8080"
     monkeypatch.setattr(suite.httpx, "AsyncClient",
                         lambda **kw: client_type(transport=httpx.MockTransport(owui), **kw))
-    await suite.deploy_staging_tool(display_name=display_name)
+    await suite.deploy_staging_tool({"id": "admin"}, {"id": "test-user"}, display_name=display_name)
     assert seen[0]["content"] == Path("lathe.py").read_text()
     assert seen[0]["id"] == "lathe_test"
     assert seen[0]["name"] == display_name
@@ -234,6 +263,9 @@ async def test_staging_deployment_accepts_current_valves_and_sets_expiry(suite, 
     assert valves["auto_stop_minutes"] == 5
     assert valves["auto_delete_minutes"] == 0
     assert json.loads(valves["sandbox_create_overrides"])["ttlMinutes"] == 30
+    assert seen[0]["access_grants"] == []
+    assert seen[2] == {"access_grants": [
+        {"principal_type": "user", "principal_id": "test-user", "permission": "read"}]}
 
 
 @pytest.mark.parametrize("copy_tool,copy_args", [
@@ -352,7 +384,9 @@ async def test_socket_delivery_preserves_tool_evidence_and_enforces_budget(suite
         output += [{"type": "function_call", "name": "bash", "call_id": "two"}]
 
     async def owui(request):
-        await client.sio.handlers["/"]["*"]("events", {"data": {
+        payload = json.loads(request.content)
+        await client.sio.handlers["/"]["*"]("events", {
+            "chat_id": payload["chat_id"], "message_id": payload["id"], "data": {
             "type": "chat:completion", "data": {"output": output, "done": not over_budget}}})
         return httpx.Response(200, json={"task_id": "task"})
 
@@ -389,3 +423,293 @@ def test_host_stops_tool_execution_before_sandbox_cleanup(tmp_path, monkeypatch,
     assert calls == ["inspect", "stop", "logs", "rm", "sandbox cleanup"]
     assert "https://preview.example/secret" not in (tmp_path / "owui.log").read_text()
     assert json.loads((tmp_path / "cleanup.json").read_text())["success"] is not cleanup_fails
+
+
+def socket_event(payload, kind="chat:completion", detail=None, **overrides):
+    return {"chat_id": payload["chat_id"], "message_id": payload["id"],
+            "data": {"type": kind, "data": detail or {}}, **overrides}
+
+
+@pytest.mark.parametrize("foreign", [
+    {"chat_id": "other-chat"}, {"message_id": "resumed-message"},
+    {"chat_id": "child-chat", "message_id": "child-message"},
+    {"chat_id": None, "message_id": None},
+])
+async def test_socket_filters_before_retaining_printing_tracing_or_completing(
+        suite, suite_transport, capsys, foreign):
+    suite.VERBOSE = True
+    traced = []
+    suite.TRACE = lambda kind, **data: traced.append((kind, data))
+    client = suite.OWUIClient()
+    emit = client.sio.handlers["/"]["*"]
+    output = [{"type": "function_call", "name": "read", "call_id": "one"},
+              {"type": "function_call_output", "call_id": "one", "status": "completed", "output": "OWN"}]
+
+    async def owui(request):
+        assert request.headers["Authorization"] == "Bearer test-token"
+        payload = json.loads(request.content)
+        await emit("events", socket_event(payload, detail={"output": output}))
+        for kind, detail in [
+            ("chat:completion", {"output": [{"type": "function_call", "call_id": str(i),
+                                             "name": "FOREIGN_PRIVATE"} for i in range(3)], "done": True}),
+            ("status", {"description": "FOREIGN_PRIVATE"}),
+            ("chat:error", {"error": "FOREIGN_PRIVATE"}),
+            ("chat:reload", {"description": "FOREIGN_PRIVATE"}),
+        ]:
+            await emit("events", socket_event(payload, kind, detail, **foreign))
+            assert client.last_output == output
+            assert not client.done.is_set()
+            assert client.budget_error is None
+        # Non-envelope events are never request-scoped, even if they mimic IDs.
+        await emit("other-event", socket_event(payload, detail={"output": "FOREIGN_PRIVATE"}))
+        await emit("events", socket_event(payload, "status", {"description": "own status"}))
+        await emit("events", socket_event(payload, detail={"done": True}))
+        return httpx.Response(200, json={"task_id": "owned-task"})
+
+    suite_transport(owui)
+    assert await client.send("inspect", timeout=1, max_calls=1) == output
+    assert client.active_request is None
+    retained = json.dumps([client.events, traced]) + capsys.readouterr().out
+    assert "FOREIGN_PRIVATE" not in retained
+    end = next(data for kind, data in traced if kind == "request_end")
+    assert end["completed_calls"] == 1
+    assert end["http_status"] == 200 and end["task_id"] == "owned-task"
+    assert end["last_status"]["data"]["description"] == "own status"
+
+
+@pytest.mark.parametrize("first_failure", ["timeout", "http", "success", "cancel"])
+async def test_socket_late_events_ignored_between_and_during_requests(
+        suite, suite_transport, capsys, first_failure):
+    suite.VERBOSE = True
+    traced = []
+    suite.TRACE = lambda kind, **data: traced.append((kind, data))
+    client = suite.OWUIClient()
+    emit = client.sio.handlers["/"]["*"]
+    requests = []
+    accepted = asyncio.Event()
+    output = [{"type": "message", "content": "OWN"}]
+
+    async def owui(request):
+        payload = json.loads(request.content)
+        requests.append(payload)
+        if len(requests) == 1:
+            await emit("events", socket_event(payload, "status", {"description": "waiting for tool"}))
+            accepted.set()
+            if first_failure == "http":
+                return httpx.Response(503)
+            if first_failure == "success":
+                await emit("events", socket_event(payload, detail={"done": True}))
+        else:
+            await emit("events", socket_event(requests[0], detail={"output": "LATE_PRIVATE", "done": True}))
+            assert client.last_output == [] and not client.done.is_set()
+            await emit("events", socket_event(payload, detail={"output": output, "done": True}))
+        return httpx.Response(200, json={"task_id": "owned-task"})
+
+    suite_transport(owui)
+    if first_failure == "cancel":
+        task = asyncio.create_task(client.send("first", timeout=1))
+        await asyncio.wait_for(accepted.wait(), timeout=1)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    elif first_failure == "success":
+        await client.send("first", timeout=1)
+    else:
+        with pytest.raises(TimeoutError if first_failure == "timeout" else RuntimeError):
+            await client.send("first", timeout=.02)
+    assert client.active_request is None
+    before = json.dumps([client.events, traced])
+    await emit("events", socket_event(requests[0], detail={"output": "LATE_PRIVATE", "done": True}))
+    assert json.dumps([client.events, traced]) == before
+    assert await client.send("second", timeout=1) == output
+    assert "LATE_PRIVATE" not in json.dumps([client.events, traced]) + capsys.readouterr().out
+    if first_failure == "timeout":
+        end = next(data for kind, data in traced if kind == "request_end")
+        assert not end["done"] and end["elapsed"] >= .01
+        assert end["task_id"] == "owned-task"
+        assert end["last_status"]["data"]["description"] == "waiting for tool"
+
+
+@pytest.mark.parametrize("case", ["valid", "same-user", "test-admin", "pending", "wrong-email", "missing", "monitor"])
+async def test_completion_identity_preflight(suite, suite_transport, case, monkeypatch):
+    admin = {"id": "admin", "role": "admin", "email": "operator@example.com"}
+    user = {"id": "synthetic", "role": "user", "email": "test@lathe.invalid"}
+    if case == "same-user":
+        user["id"] = "admin"
+    if case in ("test-admin", "pending"):
+        user["role"] = "admin" if case == "test-admin" else "pending"
+    if case == "wrong-email":
+        user["email"] = "someone@example.com"
+    if case == "missing":
+        suite.OWUI_TEST_TOKEN = ""
+    if case == "monitor":
+        user = {**admin, "email": "monitor@lathe.invalid"}
+        suite.OWUI_TEST_EMAIL = user["email"]
+    calls = []
+
+    def owui(request):
+        assert request.url.path == "/api/v1/auths/"
+        calls.append(request.headers["Authorization"])
+        return httpx.Response(200, json=admin if calls[-1] == "Bearer setup-token" else user)
+
+    suite_transport(owui)
+    if case == "valid":
+        assert await suite.check_test_identity() == (admin, user)
+    else:
+        with pytest.raises(AssertionError):
+            await suite.check_test_identity()
+    assert calls == ([] if case == "missing" else ["Bearer setup-token", "Bearer test-token"])
+
+
+@pytest.mark.parametrize("grants,tools,valid", [
+    ([{"principal_type": "user", "principal_id": "test", "permission": "read"}], ["lathe_test"], True),
+    ([{"principal_type": "user", "principal_id": "*", "permission": "read"}], ["lathe_test"], False),
+    ([{"principal_type": "group", "principal_id": "test", "permission": "read"}], ["lathe_test"], False),
+    ([{"principal_type": "user", "principal_id": "test", "permission": "write"}], ["lathe_test"], False),
+    ([{"principal_type": "user", "principal_id": "test", "permission": "read"}], ["lathe_test", "production"], False),
+    ([{"principal_type": "user", "principal_id": "test", "permission": "read"}], [], False),
+    (None, ["lathe_test"], False),
+])
+async def test_staging_access_is_private_and_completion_account_is_restricted(
+        suite, suite_transport, grants, tools, valid):
+    def owui(request):
+        if request.url.path == "/api/v1/tools/id/lathe_test":
+            assert request.headers["Authorization"] == "Bearer setup-token"
+            return httpx.Response(200, json={"user_id": "admin", "access_grants": grants})
+        assert request.url.path == "/api/v1/tools/"
+        assert request.headers["Authorization"] == "Bearer test-token"
+        return httpx.Response(200, json=[{"id": tool} for tool in tools])
+
+    suite_transport(owui)
+    if valid:
+        await suite.check_staging_access({"id": "admin"}, {"id": "test"})
+    else:
+        with pytest.raises(AssertionError):
+            await suite.check_staging_access({"id": "admin"}, {"id": "test"})
+
+
+async def test_socket_auth_uses_only_completion_identity(suite, monkeypatch):
+    client = suite.OWUIClient()
+    calls = []
+
+    async def connect(*args, **kwargs):
+        calls.append(kwargs["auth"])
+
+    async def emit(event, data):
+        calls.append(data["auth"])
+
+    async def sleep(seconds):
+        pass
+
+    monkeypatch.setattr(client.sio, "connect", connect)
+    monkeypatch.setattr(client.sio, "emit", emit)
+    # Replace only this suite's connection settle delay, not global asyncio.
+    from types import SimpleNamespace
+    monkeypatch.setattr(suite, "asyncio", SimpleNamespace(sleep=sleep))
+    await client.connect()
+    assert calls == [{"token": "test-token"}, {"token": "test-token"}]
+
+
+async def test_monitor_provisions_non_admin_completion_identity_and_model_access(suite_transport, monkeypatch):
+    calls = []
+
+    def owui(request):
+        calls.append(request.url.path)
+        if request.url.path == "/api/v1/auths/add":
+            assert request.headers["Authorization"] == "Bearer setup-token"
+            body = json.loads(request.content)
+            assert body["role"] == "user" and body["email"] == "completion@lathe.invalid"
+            assert len(body["password"]) >= 32
+            return httpx.Response(200, json={"id": "completion-user", "role": "user",
+                "token": "completion-token", "email": body["email"]})
+        if request.url.path == "/api/v1/models/model/access/update":
+            assert request.headers["Authorization"] == "Bearer setup-token"
+            assert json.loads(request.content) == {"id": (monitor.requested_model() if len(calls) == 2
+                                                        else monitor.workspace_model()), "access_grants": [
+                {"principal_type": "user", "principal_id": "completion-user", "permission": "read"}]}
+            return httpx.Response(200)
+        assert request.url.path == "/api/models"
+        assert request.headers["Authorization"] == "Bearer completion-token"
+        return httpx.Response(200, json={"data": [{"id": monitor.workspace_model()}]})
+
+    suite_transport(owui)
+    account = await monitor.completion_account("http://127.0.0.1:8080", "setup-token")
+    assert account["token"] == "completion-token"
+    assert calls == ["/api/v1/auths/add", "/api/v1/models/model/access/update",
+                     "/api/v1/models/model/access/update", "/api/models"]
+
+
+@pytest.mark.parametrize("owner", ["admin", "someone-else"])
+async def test_staging_update_revokes_access_before_replacing_source_or_valves(suite, suite_transport, owner):
+    calls = []
+
+    def owui(request):
+        assert request.headers["Authorization"] == "Bearer setup-token"
+        calls.append((request.method, request.url.path, json.loads(request.content) if request.content else None))
+        return httpx.Response(200, json={"user_id": owner})
+
+    suite_transport(owui)
+    if owner != "admin":
+        with pytest.raises(AssertionError, match="owned by another"):
+            await suite.deploy_staging_tool({"id": "admin"}, {"id": "test"})
+        with pytest.raises(AssertionError, match="owned by another"):
+            await suite.delete_staging_tool({"id": "admin"})
+        assert all(method == "GET" for method, _, _ in calls)
+    else:
+        await suite.deploy_staging_tool({"id": "admin"}, {"id": "test"})
+        assert [(method, path.rsplit("/", 1)[-1]) for method, path, _ in calls] == [
+            ("GET", "lathe_test"), ("POST", "update"), ("POST", "update"),
+            ("POST", "update"), ("POST", "update")]
+        assert calls[1][1].endswith("/access/update") and calls[1][2] == {"access_grants": []}
+        assert calls[2][2]["content"] == Path("lathe.py").read_text()
+        assert calls[3][1].endswith("/valves/update")
+        assert calls[4][1].endswith("/access/update")
+        assert calls[4][2] == {"access_grants": [
+            {"principal_type": "user", "principal_id": "test", "permission": "read"}]}
+
+
+async def test_main_refuses_missing_completion_credentials_before_http_or_cleanup(suite, suite_transport, monkeypatch, capsys):
+    suite.OWUI_TEST_TOKEN = ""
+    suite.MODEL = "test-model"
+    suite.DAYTONA_API_KEY = "daytona-test"
+    monkeypatch.setattr(suite.sys, "argv", ["test_deployment.py"])
+    assert await suite.main() == 2
+    assert "OWUI_TEST_TOKEN" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("owner", ["admin", "someone-else"])
+async def test_no_deploy_cleans_owned_staging_after_access_failure_but_not_foreign_toolkit(
+        suite, suite_transport, monkeypatch, owner):
+    suite.MODEL = "test-model"
+    suite.DAYTONA_API_KEY = "daytona-test"
+    monkeypatch.setattr(suite.sys, "argv", ["test_deployment.py", "--no-deploy"])
+    deletions = []
+
+    def owui(request):
+        if request.method == "DELETE":
+            deletions.append(request.url.path)
+            return httpx.Response(200, json=True)
+        assert request.method == "GET"
+        if request.url.path == "/api/v1/auths/":
+            admin = request.headers["Authorization"] == "Bearer setup-token"
+            return httpx.Response(200, json={"id": "admin" if admin else "test",
+                "role": "admin" if admin else "user", "email": "test@lathe.invalid"})
+        if request.url.path == "/api/v1/tools/id/lathe_test":
+            return httpx.Response(200, json={"user_id": owner, "access_grants": [
+                {"principal_type": "user", "principal_id": "*", "permission": "read"}]})
+        if request.url.path == "/api/v1/tools/":
+            return httpx.Response(200, json=[{"id": "lathe_test"}])
+        if request.url.path == "/api/sandbox":
+            return httpx.Response(200, json=[{"id": "owned-sandbox",
+                "labels": {suite.DEPLOYMENT_LABEL: "test@lathe.invalid"}}])
+        assert request.url.path == "/api/sandbox/owned-sandbox"
+        return httpx.Response(404)
+
+    suite_transport(owui)
+    if owner == "admin":
+        with pytest.raises(AssertionError, match="grant read access only"):
+            await suite.main()
+        assert deletions == ["/api/sandbox/owned-sandbox", "/api/v1/tools/id/lathe_test/delete"]
+    else:
+        assert await suite.main() == 2
+        assert not deletions

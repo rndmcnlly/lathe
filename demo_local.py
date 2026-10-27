@@ -238,13 +238,17 @@ async def serve():
     await identity.setup()
     await web.TCPSite(identity, "0.0.0.0", 9100).start()
     suite = None
+    admin = None
     try:
         token = await monitor.bootstrap("http://127.0.0.1:8080", relay.key, display_name=relay.model)
         os.environ.update(OWUI_URL="http://127.0.0.1:8080", OWUI_TOKEN=token,
                           OWUI_MODEL=monitor.workspace_model(), LATHE_TEST_TOOL_ID="lathe_test")
         import test_deployment as suite
         suite.TRACE = trace
-        await suite.deploy_staging_tool(display_name="Lathe")
+        # The interactive demo intentionally uses its sole synthetic browser user.
+        # Unlike the deployment suite, it is not a completion-isolation check.
+        admin = await suite.session_identity()
+        await suite.deploy_staging_tool(admin, admin, display_name="Lathe")
         deployed = await suite.fetch_staging_tool()
         actual_sha = hashlib.sha256(deployed["content"].encode()).hexdigest()
         expected_sha = hashlib.sha256((ROOT / "lathe.py").read_bytes()).hexdigest()
@@ -263,8 +267,8 @@ async def serve():
             await verify_demo_files(http, directory)
     finally:
         try:
-            if suite:
-                await suite.delete_staging_tool()
+            if suite and admin:
+                await suite.delete_staging_tool(admin)
         finally:
             await runner.cleanup()
             await identity.cleanup()
