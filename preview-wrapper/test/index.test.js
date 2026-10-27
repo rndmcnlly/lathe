@@ -533,6 +533,21 @@ for (const access of ["public", "private"]) {
     assert.equal(upstream.get("authorization"), "Basic YXBwOnNlY3JldA==");
   });
 
+  test(`${access} Fetch Metadata reaches upstream unchanged on a POST navigation (F8)`, async () => {
+    const metadata = { "Sec-Fetch-Site": "same-origin", "Sec-Fetch-Mode": "navigate",
+      "Sec-Fetch-Dest": "document", "Sec-Fetch-User": "?1" };
+    const { upstream } = await proxied(access, metadata);
+    for (const [name, value] of Object.entries(metadata)) assert.equal(upstream.get(name), value, name);
+  });
+
+  test(`${access} upstream always receives Daytona provider headers, never browser values (D1, D2)`, async () => {
+    const { upstream } = await proxied(access, {
+      "X-Daytona-Disable-CORS": "false", "x-daytona-skip-preview-warning": "false",
+    });
+    assert.equal(upstream.get("x-daytona-disable-cors"), "true");
+    assert.equal(upstream.get("x-daytona-skip-preview-warning"), "true");
+  });
+
   test(`${access} wrapper-controlled browser headers never reach upstream (R1-R8)`, async () => {
     const removed = {
       "X-Forwarded-For": "203.0.113.9", "x-FORWARDED-proto": "http", "CF-Connecting-IP": "203.0.113.9",
