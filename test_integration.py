@@ -280,6 +280,20 @@ asyncio.run(main())
         require("Background job completed" in output, output)
         require("background-finished" in output, output)
 
+    async def background_notice_claimed_once_across_workers():
+        # A second Tools instance stands in for another OWUI worker. Whichever
+        # claims first (this worker's poller or the other's bash), one report.
+        other = Tools()
+        other.valves = tools.valves
+        marker = f"claimed-once-{uuid.uuid4().hex}"
+        output = await tools.bash(f"sleep 3; printf '{marker}'", foreground_seconds=0, **ctx)
+        require("Backgrounded" in output, output)
+        await asyncio.sleep(6)
+        reports = (await other.bash("true", **ctx)).count(marker)
+        await asyncio.sleep(15)  # outlast the launching worker's next poll
+        reports += (await tools.read(test_file, **ctx)).count(marker)
+        require(reports == 1, f"expected one completion report, saw {reports}")
+
     async def bounded_command_retention():
         import re
         output = await tools.bash("python3 -c 'print(\"x\" * 1000000)'", **ctx)
@@ -690,6 +704,7 @@ asyncio.run(main())
             ("independent toolkit workers share interpreter identity", multiworker_interpreter),
             ("bounded command retention", bounded_command_retention),
             ("background completion notice", background_completion_notice),
+            ("background notice claimed once across workers", background_notice_claimed_once_across_workers),
             ("signed preview URL", expose_contract),
             ("desktop input, screenshots and VNC transport", computer_roundtrip),
             ("ordinary workspace survives sandbox stop", workspace_survives_stop),

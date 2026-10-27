@@ -90,9 +90,12 @@ updates. Unknown journal versions fail closed rather than silently migrating.
 ## Other multi-worker state
 
 Orientation suppression and deferred harness messages remain disposable local
-state. Orientation may repeat. Background bash completion notices are best-effort
-and may be stranded on another worker or lost when its observer exits. Bash logs
-and exit evidence remain sandbox-side and can be inspected by any worker. Preview
+state. Orientation may repeat. Background bash completion notices are registered
+sandbox-side (`CMD/notify`, naming the chat) and claimed by an atomic rename, so
+each is reported at most once, by whichever worker claims it: the launching
+worker's poller on any tool call, or else any worker's next bash call in that
+chat. A claim whose script result is lost in transit is not retried, and nothing
+wakes an idle chat. Bash logs and exit evidence remain sandbox-side. Preview
 registration is external; sandbox association/lifecycle authority stays in Daytona.
 Consistent toolkit source and valves across workers remain an OWUI deployment
 responsibility, not a Lathe configuration-distribution mechanism.
