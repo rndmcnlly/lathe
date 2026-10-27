@@ -487,6 +487,7 @@ asyncio.run(main())
 
     async def browser_roundtrip():
         import re
+        from urllib.parse import urlsplit
 
         # After the sandbox restart above every display process is down (Daytona
         # still reports "partial"). Input after an in-plugin stop/start cycle
@@ -502,16 +503,20 @@ asyncio.run(main())
         require("Desktop is active." in output, output)
         output = await tools.peek("page.text", **ctx)
         require("untrusted page text" in output and "documentation" in output, output)
+        def hosts(text):
+            return {urlsplit(u).hostname for u in re.findall(r"https?://\S+", text)}
+
         output = await tools.poke("page.click", {"text": "Learn more"}, **ctx)
-        require("iana.org" in output, output)
+        require(hosts(output) & {"iana.org", "www.iana.org"}, output)
         output = await tools.peek("page.list", **ctx)
-        require("iana.org" in output, output)
+        require(hosts(output) & {"iana.org", "www.iana.org"}, output)
 
         # Local pages: the form proves page.type reaches the page as trusted
         # input; localhost vs 127.0.0.1 makes the fetch cross-origin (no CORS).
         site = f"{WORKSPACE}/browser-site"
         await tools.write(f"{site}/form.html", (
-            "<title>Lathe form</title><form><input id=q value=old><button>Go</button></form>"
+            "<title>Lathe form</title><form><input id=q value=old><input id=ro value=fixed readonly>"
+            "<button>Go</button></form>"
             "<p id=out></p><script>document.forms[0].onsubmit = e => { e.preventDefault(); "
             "document.getElementById('out').textContent = 'submitted:' + "
             "document.getElementById('q').value.length + ':' + e.isTrusted; };</script>"), **ctx)
@@ -520,11 +525,16 @@ asyncio.run(main())
         output = await tools.poke("page.open", {"url": "http://127.0.0.1:8767/form.html", "newTab": True}, **ctx)
         require("Lathe form" in output, output)
         tab = re.search(r"Tab ([0-9A-F]{8})", output)[1]
+        # A read-only field takes focus but no text: rejected before any input.
+        output = await tools.poke("page.type", {"selector": "#ro", "text": "x", "submit": True, "tab": tab}, **ctx)
+        require(output.startswith("Error:") and "read-only" in output, output)
+        output = await tools.poke("page.eval", {"js": "document.getElementById('out').textContent === ''", "tab": tab}, **ctx)
+        require("true" in output, output)
         output = await tools.poke("page.type", {"selector": "#q", "text": "typed value", "submit": True, "tab": tab}, **ctx)
         require("pressed Enter" in output and "typed value" not in output, output)
         output = await tools.peek("page.text", {"selector": "#out", "tab": tab}, **ctx)
         require("submitted:11:true" in output, output)
-        output = await tools.poke("page.eval", {"js": "document.querySelectorAll('input').length + 41"}, **ctx)
+        output = await tools.poke("page.eval", {"js": "document.querySelectorAll('input').length + 40"}, **ctx)
         require("42" in output, output)
 
         rendered = f"{site}/doc.pdf"
@@ -536,6 +546,12 @@ asyncio.run(main())
         require("Saved" in output, output)
         output = await tools.bash(f"head -c 5 {fetched}; echo; cmp {rendered} {fetched} && echo identical", **ctx)
         require("%PDF-" in output and "identical" in output, output)
+        # Same origin: the streamed in-page fetch, not the cross-origin fallback.
+        same = f"{WORKSPACE}/same-origin.pdf"
+        output = await tools.poke("page.save", {"path": same, "url": "http://127.0.0.1:8767/doc.pdf"}, **ctx)
+        require("Saved" in output, output)
+        output = await tools.bash(f"cmp {rendered} {same} && echo identical", **ctx)
+        require("identical" in output, output)
         # A tab showing a PDF saves the served bytes, not a print of the viewer.
         output = await tools.poke("page.open", {"url": "http://127.0.0.1:8767/doc.pdf", "newTab": True}, **ctx)
         require("Error:" not in output, output)

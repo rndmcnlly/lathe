@@ -2025,6 +2025,124 @@ def test_challenge_notice_detects_cloudflare_and_carries_handoff(page_script, pa
         assert 'expose(target="vnc", access="private")' in note and "page.wait" in note
 
 
+def node_eval(stub, expression):
+    """Awaits one page-script expression in Node after a stub prelude; returns
+    its value and whatever the stub recorded in globalThis.log."""
+    out = subprocess.run(["node", "-e", "globalThis.log = [];" + stub + "Promise.resolve(eval("
+                          + json.dumps(expression) + ")).then(value => process.stdout.write("
+                          "JSON.stringify({value, log: globalThis.log})))"],
+                         capture_output=True, text=True, check=True, timeout=30).stdout
+    return json.loads(out)
+
+
+class NodeFieldSession:
+    """One element under a selector; Node runs the page script's JavaScript
+    against it and CDP input applies the field's own transform to the text."""
+    def __init__(self, element, accepts=lambda text: text):
+        self.element, self.accepts, self.calls = dict(element), accepts, []
+
+    def value(self, expression, timeout=30):
+        stub = ("const state = %s; const el = Object.assign(state, {focus() { document.activeElement = el; },"
+                "select() {}, scrollIntoView() {}, matches: q => q === ':disabled' && !!state.fieldsetDisabled});"
+                "globalThis.document = {activeElement: null, querySelector: () => el,"
+                "createRange: () => ({selectNodeContents() {}})};"
+                "globalThis.getSelection = () => ({removeAllRanges() {}, addRange() {}});"
+                % json.dumps(self.element))
+        return node_eval(stub, expression)["value"]
+
+    def call(self, method, params=None, timeout=30):
+        self.calls.append(method)
+        if method == "Input.insertText":
+            key = "value" if self.element["tagName"] in ("INPUT", "TEXTAREA") else "innerText"
+            self.element[key] = self.accepts(params["text"])
+            return {}
+        if method == "Input.dispatchKeyEvent":
+            return {}
+        raise AssertionError(f"unexpected CDP call {method}")
+
+    def settle(self, timeout=15):
+        return True
+
+
+@needs_node
+@pytest.mark.parametrize("element,error", [
+    ({"tagName": "INPUT", "type": "text", "value": "old"}, None),
+    ({"tagName": "TEXTAREA", "value": ""}, None),
+    ({"tagName": "DIV", "isContentEditable": True, "innerText": "old"}, None),
+    ({"tagName": "INPUT", "type": "text", "readOnly": True}, "is read-only"),
+    ({"tagName": "TEXTAREA", "disabled": True}, "is disabled"),
+    ({"tagName": "INPUT", "type": "text", "fieldsetDisabled": True}, "is disabled"),
+    ({"tagName": "BUTTON", "type": "submit"}, "is not a text field"),
+    ({"tagName": "INPUT", "type": "checkbox"}, "type checkbox"),
+])
+def test_page_type_rejects_non_editable_targets_before_input(page_script, element, error):
+    # Every element here accepts focus: focus alone must not count as editable.
+    session = NodeFieldSession(element)
+    args = {"selector": "#q", "text": "typed value", "submit": True}
+    if error:
+        with pytest.raises(page_script["Fail"], match=error):
+            page_script["page_type"](session, {}, args)
+        assert session.calls == []
+        return
+    result = page_script["page_type"](session, {}, args)
+    assert "Replaced" in result and "pressed Enter" in result
+    assert session.calls == ["Input.insertText", "Input.dispatchKeyEvent", "Input.dispatchKeyEvent"]
+
+
+@needs_node
+def test_page_type_reports_altered_field_and_withholds_enter(page_script):
+    # An input mask keeps three characters: the result must not claim success.
+    session = NodeFieldSession({"tagName": "INPUT", "type": "text", "value": ""}, accepts=lambda t: t[:3])
+    with pytest.raises(page_script["Fail"], match="holds 3 characters, not the 11.*Enter was not pressed"):
+        page_script["page_type"](session, {}, {"selector": "#q", "text": "typed value", "submit": True})
+    assert "Input.dispatchKeyEvent" not in session.calls
+
+
+class NodeFetchSession:
+    """Runs the page script's fetch in Node against a streamed body of
+    `total` bytes (None: endless) that records how much was pulled."""
+    def __init__(self, total, length_header=None):
+        self.total, self.length_header, self.log = total, length_header, None
+
+    def value(self, expression, timeout=30):
+        headers = {"content-type": "application/pdf"}
+        if self.length_header is not None:
+            headers["content-length"] = str(self.length_header)
+        stub = ("let sent = 0; const total = %s;"
+                "globalThis.fetch = async () => new Response(new ReadableStream({"
+                "pull(c) { const n = total === null ? 256 : Math.min(256, total - sent);"
+                "  if (n <= 0) return c.close(); sent += n; log.push(['pulled', sent]);"
+                "  c.enqueue(new Uint8Array(n).fill(65)); },"
+                "cancel() { log.push(['cancelled', sent]); }}), {status: 200, headers: %s});"
+                % (json.dumps(self.total), json.dumps(headers)))
+        result = node_eval(stub, expression)
+        self.log = result["log"]
+        return result["value"]
+
+    def call(self, method, params=None, timeout=30):
+        raise AssertionError(f"unexpected CDP call {method}")
+
+
+@needs_node
+@pytest.mark.parametrize("total,length_header,saved", [
+    (1000, None, True),
+    (None, None, False),        # endless body: must stop reading at the limit
+    (1000, 5000, False),        # declared too large: refused before reading
+])
+def test_page_save_fetch_streams_and_stops_at_limit(page_script, monkeypatch, total, length_header, saved):
+    monkeypatch.setitem(page_script, "SAVE_LIMIT", 2048)
+    session = NodeFetchSession(total, length_header)
+    if saved:
+        status, ctype, data = page_script["fetch_resource"](session, "https://example.org/x.pdf")
+        assert (status, ctype, data) == (200, "application/pdf", b"A" * 1000)
+        return
+    with pytest.raises(page_script["Fail"], match="exceeds the 64 MiB save limit"):
+        page_script["fetch_resource"](session, "https://example.org/x.pdf")
+    pulled = max([n for kind, n in session.log if kind == "pulled"], default=0)
+    # Streams may pull a chunk or two ahead of the reader; never the whole body.
+    assert pulled <= 2048 + 4 * 256 and ["cancelled", pulled] in session.log
+
+
 @pytest.mark.parametrize("tool,command,right", [
     ("peek", "page.open", "poke"), ("peek", "page.click", "poke"), ("peek", "mouse.click", "poke"),
     ("poke", "page.text", "peek"), ("poke", "page.list", "peek"), ("poke", "screenshot", "peek"),

@@ -2038,18 +2038,51 @@ def page_click(session, target, args):
     return note + "."
 
 
+# Focus is not proof of editability: buttons and read-only fields take it too.
+# Checked before any input so nothing is typed into, or submitted from, them.
+TYPE_TARGET = r"""(sel => {
+  const el = document.querySelector(sel);
+  if (!el) return null;
+  const tag = el.tagName.toLowerCase(), type = (el.type || 'text').toLowerCase();
+  let problem = null;
+  if (tag === 'input' && !['text', 'search', 'email', 'url', 'tel', 'password', 'number'].includes(type))
+    problem = `is an input of type ${type}, which takes no typed text`;
+  else if (tag !== 'input' && tag !== 'textarea' && !el.isContentEditable)
+    problem = 'is not a text field (input, textarea or contenteditable)';
+  else if (el.disabled || el.matches(':disabled')) problem = 'is disabled';
+  else if ((tag === 'input' || tag === 'textarea') && el.readOnly) problem = 'is read-only';
+  if (problem) return {tag, problem};
+  el.scrollIntoView({block: 'center'}); el.focus();
+  if (typeof el.select === 'function') el.select();
+  else { const r = document.createRange(); r.selectNodeContents(el);
+    const s = getSelection(); s.removeAllRanges(); s.addRange(r); }
+  return {tag, focused: document.activeElement === el};
+})"""
+# Lengths only: the field's contents may echo what was typed.
+TYPED = r"""((sel, want) => {
+  const el = document.querySelector(sel);
+  if (!el) return null;
+  const got = (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') ? el.value : el.innerText;
+  const trim = s => s.replace(/\n+$/, '');
+  return {ok: got === want || trim(got) === trim(want), length: got.length};
+})"""
+
+
 def page_type(session, target, args):
-    focused = session.value(r"""(sel => { const el = document.querySelector(sel); if (!el) return null;
-      el.scrollIntoView({block: 'center'}); el.focus();
-      if (typeof el.select === 'function') el.select();
-      else if (el.isContentEditable) { const r = document.createRange(); r.selectNodeContents(el);
-        const s = getSelection(); s.removeAllRanges(); s.addRange(r); }
-      return {tag: el.tagName.toLowerCase(), focused: document.activeElement === el}; })(""" + js(args["selector"]) + ")")
+    focused = session.value(TYPE_TARGET + "(" + js(args["selector"]) + ")")
     if not focused:
         raise Fail("no element matches the selector.")
+    if focused.get("problem"):
+        raise Fail(f"<{focused['tag']}> {focused['problem']}; nothing was typed. Select an editable field.")
     if not focused["focused"]:
-        raise Fail(f"<{focused['tag']}> did not accept focus; it may not be editable.")
+        raise Fail(f"<{focused['tag']}> did not accept focus; nothing was typed.")
     session.call("Input.insertText", {"text": args["text"]})
+    typed = session.value(TYPED + "(" + js(args["selector"]) + ", " + js(args["text"]) + ")")
+    if not typed or not typed["ok"]:
+        held = f"now holds {typed['length']} characters" if typed else "is gone from the page"
+        raise Fail(f"typed into <{focused['tag']}>, but the field {held}, not the {len(args['text'])} "
+                   "requested (an input mask, maxlength, number field or page script intervened)."
+                   + (" Enter was not pressed." if args.get("submit") else ""))
     note = f"Replaced the contents of <{focused['tag']}> with {len(args['text'])} characters"
     if args.get("submit"):
         key = {"key": "Enter", "code": "Enter", "windowsVirtualKeyCode": 13, "nativeVirtualKeyCode": 13}
@@ -2060,12 +2093,24 @@ def page_type(session, target, args):
     return note + "."
 
 
+# Streamed so an oversized body is cancelled at the limit, not buffered whole.
 FETCH = r"""(async (u, limit) => {
   const r = await fetch(u, {credentials: 'include'});
-  const b = new Uint8Array(await r.arrayBuffer());
-  if (b.length > limit) return {status: r.status, size: b.length};
+  const reader = r.body ? r.body.getReader() : null;
+  const declared = Number(r.headers.get('content-length')) || 0;
+  if (declared > limit) { if (reader) await reader.cancel(); return {status: r.status, size: declared}; }
+  const parts = [];
+  let size = 0;
+  while (reader) {
+    const {done, value} = await reader.read();
+    if (done) break;
+    size += value.length;
+    if (size > limit) { await reader.cancel(); return {status: r.status, size}; }
+    parts.push(value);
+  }
   let s = '';
-  for (let i = 0; i < b.length; i += 32768) s += String.fromCharCode.apply(null, b.subarray(i, i + 32768));
+  for (const b of parts)
+    for (let i = 0; i < b.length; i += 32768) s += String.fromCharCode.apply(null, b.subarray(i, i + 32768));
   return {status: r.status, type: r.headers.get('content-type') || '', data: btoa(s)};
 })"""
 
@@ -2088,6 +2133,7 @@ def fetch_resource(session, url):
             chunk = base64.b64decode(data) if part.get("base64Encoded") else data.encode()
             size += len(chunk)
             if size > SAVE_LIMIT:
+                session.call("IO.close", {"handle": res["stream"]})
                 raise Fail("resource exceeds the 64 MiB save limit. Use bash with the browser's cookies.")
             chunks.append(chunk)
             if part.get("eof"):
@@ -4209,7 +4255,9 @@ class Tools:
               (when the user asked you to try it), click inside those bounds: a
               Turnstile checkbox sits near the frame's left edge, vertically
               centered (about x+30, center y).
-            - page.type replaces the field's contents; submit presses Enter.
+            - page.type replaces the field's contents; submit presses Enter. It
+              rejects targets that are not editable text fields, and fails
+              without pressing Enter if the field ends up different.
             - page.save with url fetches through the browser with its cookies, so
               the shared browser's logins apply. HTML instead of a document usually
               means a login, paywall or verification page. Without url, a tab
@@ -4327,7 +4375,7 @@ class Tools:
             No coercion, arbitrary HTTP paths, batches or unknown fields. Omit
             optional fields rather than passing null. pid is only for scope=pid;
             optional mouse x/y must be supplied together. page.click takes exactly
-            one of text/selector; page.save exactly one of format/url.
+            one of text/selector; page.save at most one of format/url.
             {computer_commands}
             """),
         "services": textwrap.dedent("""\

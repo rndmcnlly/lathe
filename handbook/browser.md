@@ -41,7 +41,7 @@ from playwright.sync_api import sync_playwright
 with sync_playwright() as p:
     browser = p.chromium.connect_over_cdp("http://127.0.0.1:9222")
     context = browser.contexts[0]          # the shared, logged-in context
-    page = context.pages[0] if context.pages else context.new_page()
+    page = context.new_page()              # your own tab, not the user's
     page.goto("https://example.org", wait_until="domcontentloaded")
     page.get_by_role("link", name="Learn more").click()
     page.wait_for_load_state("networkidle")
