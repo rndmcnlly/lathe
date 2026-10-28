@@ -1320,12 +1320,27 @@ async def test_foreground_result_is_never_reported_again(tools, sandbox, http, c
             "true", workdir=str(tmp_path), __user__=USER, __chat_id__="chat")
 
 
+async def test_released_background_job_reports_its_real_duration(tools, sandbox, http, clock, tmp_path, monkeypatch):
+    # The poller's release deletes CMD/pid before any tool call claims the
+    # notice (production chat af745571 reported "took 0s" for a 40 s job).
+    monkeypatch.setattr(lathe, "_EPHEMERAL_ROOT", str(tmp_path / "lathe"))
+    two_workers(tools)
+    http(shared_sandbox())
+    await tools.bash("sleep 2; echo timed", workdir=str(tmp_path),
+                     foreground_seconds=0, __user__=USER, __chat_id__="chat")
+    await let_pollers_finish()
+    assert not list((tmp_path / "lathe" / "cmd").glob("*/pid"))  # released before the claim
+    later = await tools.bash("true", workdir=str(tmp_path), __user__=USER, __chat_id__="chat")
+    assert later.count("Background job completed") == 1 and "(took 2s)" in later
+
+
 async def test_notice_duration_uses_sandbox_start_and_end(tools, sandbox, http, tmp_path, monkeypatch):
     monkeypatch.setattr(lathe, "_EPHEMERAL_ROOT", str(tmp_path))
     job = tmp_path / "cmd" / "job"
     job.mkdir(parents=True)
-    for name, content, mtime in (("pid", "1\n", 1000), ("log", "out\n", 1042), ("exit", "0\n", 1042),
-                                 ("notify", json.dumps({"chat": "chat"}), 1040)):
+    # As after release: the reaper has deleted pid; notify, written at launch, remains.
+    for name, content, mtime in (("notify", json.dumps({"chat": "chat"}), 1000),
+                                 ("log", "out\n", 1042), ("exit", "0\n", 1042)):
         (job / name).write_text(content)
         os.utime(job / name, (mtime, mtime))
     tools._chat_state["chat"] = {"init": True, "pending": []}

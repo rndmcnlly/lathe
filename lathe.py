@@ -5,7 +5,7 @@ author_url: https://adamsmith.as
 description: Coding agent tools (lathe, bash, read, write, edit, glob, grep, view, show, peek, poke, interpret, onboard, expose, destroy) backed by per-user sandbox VMs with transparent lifecycle management.
 required_open_webui_version: 0.12.0
 requirements: httpx, pydantic>=2, cachetools, PyYAML
-version: 1.3.2
+version: 1.3.3
 licence: MIT
 """
 
@@ -2620,11 +2620,12 @@ def _build_bash_reap_script(preserve_log_for: str | None = None,
                                     tail = f.read().decode("utf-8", errors="replace")
                             except OSError:
                                 tail = "(Preview unavailable; use the full log path below.)"
-                            # Sandbox clock only: the pid file is written as
-                            # the job starts, the evidence file as it ends.
+                            # Sandbox clock only: notify is written as the job
+                            # starts (the rename keeps its mtime; the reaper
+                            # deletes pid), the evidence file as it ends.
                             try:
                                 elapsed = (os.path.getmtime(evidence)
-                                           - os.path.getmtime(os.path.join(command_dir, "pid")))
+                                           - os.path.getmtime(notify_path + ".claimed"))
                             except OSError:
                                 elapsed = 0
                             print("notice " + json.dumps({{

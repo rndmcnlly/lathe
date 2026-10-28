@@ -12,6 +12,7 @@ Requires ``DAYTONA_API_KEY`` in the environment or ``.env``.
 
 import asyncio
 import json
+import re
 import os
 import sys
 import time
@@ -279,6 +280,8 @@ asyncio.run(main())
             raise AssertionError("background completion notice never arrived on a read")
         require(output.count("Background job completed") == 1, output)
         require("background-finished" in output, output)
+        took = re.search(r"\(took (\d+)s\)", output)
+        require(took is not None and int(took.group(1)) >= 2, output)  # sandbox start to end, not 0
         output = await tools.read(test_file, **ctx)
         require("Background job completed" not in output, output)
 
