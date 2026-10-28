@@ -343,7 +343,7 @@ not the public deployment's handbook. See the development-handbook playbook in
 ```bash
 uv run pytest                               # offline, no credentials
 uv run python test_integration.py            # needs DAYTONA_API_KEY in .env
-uv run python test_deployment.py [--verbose] # also needs OWUI_URL, OWUI_TOKEN, OWUI_MODEL
+uv run python test_deployment.py [--verbose] # OWUI credentials/model: see .env.example
 ```
 
 The tiers cover different boundaries:
@@ -351,6 +351,16 @@ The tiers cover different boundaries:
 - The offline suite checks local behavior without provisioning resources. Use `uv run pytest -k interpreter` for a focused selection; `uv run python test_unit.py` is also supported.
 - `test_integration.py` verifies the live Daytona API using an isolated test identity and deletes test sandboxes on exit. Cleanup failure makes the run fail.
 - `test_deployment.py` is a disposable end-to-end OWUI smoke test for local source, loaded schema, and model-mediated dispatch, including `view()`. It uses isolated staging identities and cleans them up on exit.
+
+Existing-host deployment tests require separate credentials: admin `OWUI_TOKEN`
+for staging setup/inspection/cleanup, and `OWUI_TEST_TOKEN` plus
+`OWUI_TEST_EMAIL` for a dedicated ordinary test user. Provision that account and
+give it access to `OWUI_MODEL` and any underlying base model before running the suite.
+It must have no access to
+other local toolkits (including through public grants or groups). The suite grants
+only that user read access to its staging toolkit; it never publishes it globally.
+Missing or mismatched credentials fail before staging changes or model requests.
+Socket events are filtered by both chat and message ID before recording them.
 
 Run only one instance of each live suite at a time: staging identities are shared.
 See [AGENTS.md](AGENTS.md#testing-policy) for contributor testing policy.

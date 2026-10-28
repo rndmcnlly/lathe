@@ -48,7 +48,7 @@ def workspace_model():
 def sanitize(text):
     """Redact before persistence, including bearer URLs with unfamiliar formats."""
     for value in [*SECRETS, *(os.environ.get(k, "") for k in
-                  ("OPENROUTER_API_KEY", "DAYTONA_API_KEY", "OWUI_TOKEN", "GITHUB_TOKEN"))]:
+                  ("OPENROUTER_API_KEY", "DAYTONA_API_KEY", "OWUI_TOKEN", "OWUI_TEST_TOKEN", "GITHUB_TOKEN"))]:
         if value:
             text = text.replace(value, "[REDACTED]")
     text = re.sub(r"(?:sk-or-v1-|dtn_)[A-Za-z0-9_-]+", "[REDACTED]", text)
@@ -221,6 +221,36 @@ async def bootstrap(base, key, *, display_name=None):
     return token
 
 
+async def completion_account(base, admin_token):
+    """Create a separate ordinary user on this fresh disposable OWUI only."""
+    password = secrets.token_urlsafe(32)
+    SECRETS.append(password)
+    async with httpx.AsyncClient(base_url=base, timeout=30,
+            headers={"Authorization": f"Bearer {admin_token}"}) as client:
+        response = await client.post("/api/v1/auths/add", json={
+            "name": "Lathe Completion Test", "email": "completion@lathe.invalid",
+            "password": password, "role": "user"})
+        response.raise_for_status()
+        account = response.json()
+        if account.get("role") != "user" or not account.get("token"):
+            raise RuntimeError("Disposable completion account is not an authenticated ordinary user")
+        SECRETS.append(account["token"])
+        # OWUI enforces every base-model hop at completion time, even when the
+        # workspace alias is visible in /api/models. This endpoint also registers
+        # the provider's base model, which fresh admin-only setups can omit.
+        for model_id in (requested_model(), workspace_model()):
+            response = await client.post("/api/v1/models/model/access/update", json={
+                "id": model_id, "access_grants": [
+                    {"principal_type": "user", "principal_id": account["id"], "permission": "read"}]})
+            response.raise_for_status()
+        response = await client.get("/api/models",
+            headers={"Authorization": f"Bearer {account['token']}"})
+        response.raise_for_status()
+        if workspace_model() not in {m["id"] for m in response.json()["data"]}:
+            raise RuntimeError("Disposable completion account cannot access the test model")
+    return account
+
+
 async def inside(directory):
     from aiohttp import web
 
@@ -235,7 +265,9 @@ async def inside(directory):
     try:
         base = "http://127.0.0.1:8080"
         token = await bootstrap(base, relay.key)
+        account = await completion_account(base, token)
         os.environ.update(OWUI_URL=base, OWUI_TOKEN=token, OWUI_MODEL=workspace_model(),
+                          OWUI_TEST_TOKEN=account["token"], OWUI_TEST_EMAIL=account["email"],
                           LATHE_ISOLATED_CI="1", LATHE_TEST_TOOL_ID="lathe_test")
         import test_deployment as suite
         suite.TRACE = trace

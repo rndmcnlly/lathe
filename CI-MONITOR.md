@@ -40,7 +40,9 @@ port. SQLite and other OWUI state live in the disposable container's storage.
 There is no reusable data volume.
 
 `bootstrap()` creates the first admin headlessly and configures a native-tool
-workspace model. Its base model is `openrouter/pareto-code`. OWUI's workspace
+workspace model. The monitor then creates a separate ordinary completion account
+and grants it access to both that model and its registered provider base model.
+Its base model is `openrouter/pareto-code`. OWUI's workspace
 model `custom_params` inject this request-level configuration:
 
 ```json
@@ -116,6 +118,11 @@ or override automatically.
 
 The monitor reuses `test_deployment.py`: byte-identical source, the complete
 independent schema contract, bash, write/read, interpreter, and image middleware.
+Its fresh loopback-only OWUI uses separate synthetic admin and non-admin completion
+accounts, exercising the same identity checks as existing-host tests. Both paths filter socket
+events by active chat/message IDs before recording them. Request-end evidence
+includes elapsed time, HTTP acceptance/task ID, completed-call count, and the last
+matching status; unrelated account traffic never enters diagnostics.
 It then runs a first-time journey with a separate read-back check:
 
 1. Consult the built-in overview.
