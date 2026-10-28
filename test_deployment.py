@@ -250,32 +250,77 @@ async def delete_staging_tool(admin):
         require(response.json() is True, f"toolkit deletion returned {response.text}")
 
 
+# Listing bounds fail CLOSED: exceeding either raises, so cleanup reports failure
+# rather than absence. 200 pages x 100 is far beyond any staging/lab org.
+LIST_MAX_PAGES = 200
+LIST_DEADLINE_SECONDS = 120.0
+DELETE_DEADLINE_SECONDS = 60.0
+
+
+async def labelled_sandboxes(http, label, emails=None, *, max_pages=LIST_MAX_PAGES,
+                             deadline=LIST_DEADLINE_SECONDS, clock=time.monotonic):
+    """IDs/labels of sandboxes carrying `label`, following every `nextCursor` page.
+
+    GET /sandbox is eventually consistent and cursor-paginated (Daytona's
+    ListSandboxesResponseDto: `items`, `nextCursor`). With `emails`, use Lathe's
+    exact server-side {label: email} filter, for known owners. Without, scan for
+    the label KEY with any owner value: cleanup cannot assume who created a
+    sandbox. Errored/deleting records are included so stragglers stay visible.
+    `http` carries the Daytona authorization header.
+    """
+    found, pages, stop = {}, 0, clock() + deadline
+    for email in emails or [None]:
+        params = {"includeErroredDeleted": "true", "limit": 100}
+        if email is not None:
+            params["labels"] = json.dumps({label: email})
+        cursor, seen = None, set()
+        while True:
+            require(pages < max_pages, f"Daytona listing exceeded {max_pages} pages; absence not established")
+            require(clock() < stop, f"Daytona listing exceeded {deadline}s; absence not established")
+            pages += 1
+            response = await http.get("https://app.daytona.io/api/sandbox", timeout=30,
+                                      params={**params, **({"cursor": cursor} if cursor else {})})
+            response.raise_for_status()
+            payload = response.json()
+            for sandbox in payload if isinstance(payload, list) else payload.get("items", []):
+                labels = sandbox.get("labels") or {}
+                if label in labels and (email is None or labels[label] == email):  # Re-check the server.
+                    found[sandbox["id"]] = {"id": sandbox["id"], "labels": {label: labels[label]}}
+            cursor = payload.get("nextCursor") if isinstance(payload, dict) else None
+            if not cursor:
+                break
+            require(cursor not in seen, "Daytona repeated a pagination cursor")
+            seen.add(cursor)
+    return list(found.values())
+
+
+async def await_deleted(http, sandbox_id, *, deadline=DELETE_DEADLINE_SECONDS, interval=1.0, clock=time.monotonic):
+    """Authoritative per-ID deletion proof: 404 or a deleted/destroyed state.
+
+    The label index is eventually consistent, so its emptiness alone never
+    proves deletion. Raises at the deadline instead of assuming success.
+    """
+    stop = clock() + deadline
+    while True:
+        response = await http.get(f"https://app.daytona.io/api/sandbox/{sandbox_id}", timeout=30)
+        if response.status_code == 404:
+            return
+        response.raise_for_status()
+        if response.json().get("state") in ("deleted", "destroyed"):
+            return
+        if clock() >= stop:
+            raise RuntimeError(f"Sandbox {sandbox_id} did not finish deletion within {deadline}s")
+        await asyncio.sleep(interval)
+
+
 async def cleanup_test_sandboxes():
     """Delete only sandboxes carrying the staging deployment-label key."""
     headers = {
         "Authorization": f"Bearer {DAYTONA_API_KEY}",
         "Content-Type": "application/json",
     }
-    async with httpx.AsyncClient() as client:
-        sandboxes = []
-        cursor = None
-        seen = set()
-        while True:
-            response = await client.get(
-                "https://app.daytona.io/api/sandbox", headers=headers,
-                params={"cursor": cursor} if cursor else {}, timeout=30,
-            )
-            response.raise_for_status()
-            payload = response.json()
-            sandboxes.extend(payload if isinstance(payload, list) else payload.get("items", []))
-            cursor = payload.get("cursor") if isinstance(payload, dict) else None
-            if not cursor:
-                break
-            require(cursor not in seen, "Daytona repeated a pagination cursor")
-            seen.add(cursor)
-        for sandbox in sandboxes:
-            if DEPLOYMENT_LABEL not in sandbox.get("labels", {}):
-                continue
+    async with httpx.AsyncClient(headers=headers) as client:
+        for sandbox in await labelled_sandboxes(client, DEPLOYMENT_LABEL):
             response = await client.delete(
                 f"https://app.daytona.io/api/sandbox/{sandbox['id']}",
                 params={"force": "true"},
@@ -284,17 +329,7 @@ async def cleanup_test_sandboxes():
             )
             if response.status_code != 404:
                 response.raise_for_status()
-            for _ in range(60):
-                response = await client.get(
-                    f"https://app.daytona.io/api/sandbox/{sandbox['id']}",
-                    headers=headers, timeout=30,
-                )
-                if response.status_code == 404:
-                    break
-                response.raise_for_status()
-                await asyncio.sleep(1)
-            else:
-                raise RuntimeError(f"Staging sandbox {sandbox['id']} did not finish deletion")
+            await await_deleted(client, sandbox["id"])
             TRACE("sandbox_deleted", id=sandbox["id"])
 
 
@@ -637,15 +672,12 @@ async def main():
         # Bypass both the model's claims and Lathe's output formatting.
         async with httpx.AsyncClient() as http:
             headers = {"Authorization": f"Bearer {DAYTONA_API_KEY}"}
-            response = await http.get("https://app.daytona.io/api/sandbox",
-                params={"labels": json.dumps({DEPLOYMENT_LABEL: user["email"].strip().lower()})},
-                headers=headers, timeout=30)
+            http.headers.update(headers)
+            matches = await labelled_sandboxes(http, DEPLOYMENT_LABEL, [user["email"].strip().lower()])
+            require(len(matches) == 1, f"Expected one test-identity sandbox, observed {len(matches)}")
+            response = await http.get(f"https://app.daytona.io/api/sandbox/{matches[0]['id']}", timeout=30)
             response.raise_for_status()
-            data = response.json()
-            matches = [s for s in (data if isinstance(data, list) else data.get("items", []))
-                       if s.get("labels", {}).get(DEPLOYMENT_LABEL) == user["email"].strip().lower()]
-            require(len(matches) == 1, "Expected one test-identity sandbox")
-            sandbox = matches[0]
+            sandbox = response.json()  # Authoritative per-ID record, not the index.
             require(not sandbox.get("volumes"), "Monitor sandbox has persistent volumes")
             for filename in (source, destination):
                 response = await http.get(
