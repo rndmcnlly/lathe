@@ -128,9 +128,65 @@ Qualified `lathe.py` SHA-256 (before the release-only version bump to 1.1.0):
   passed. The staging toolkit and its isolated sandbox were deleted on exit;
   production Lathe was not updated.
 
-These live checks are separate from synthetic coordination evidence. They do
-not yet qualify requests load-balanced across multiple live uvicorn workers or
-replicas, nor archive/resume or every cold-provisioning/lifecycle race on Daytona.
+Those October 21 live checks are separate from synthetic coordination evidence.
+They did not qualify requests load-balanced across multiple live uvicorn workers
+or replicas, archive/resume, or every cold-provisioning/lifecycle race on Daytona.
 Automatic background completion delivery remains deliberately best-effort, not
 an unimplemented reliable-delivery guarantee. Adversarial record substitution by
 the sandbox owner is outside the agreed threat model, not a qualification target.
+
+### Additional 1.3.1 qualification: 2026-10-28 UTC
+
+Qualified runtime SHA-256:
+`a9089a2e4b93621a450ee5c6f889c73191782adb06ad6d26ce2fe1bf8216a58d`.
+
+**Real Daytona lifecycle:** a disposable lab exercised the production resolver
+and tools, with independent file downloads. Two concurrent resolver tasks sent
+real competing creates: one platform 409 and authoritative name lookup converged
+on the winner. This was not an independent-OWUI-worker test.
+
+- Stop/archive/resume preserved ordinary file bytes, the prior generation marker,
+  and a byte-identical completed run record. A fresh toolkit then reported Python
+  memory loss, absent old globals, and a new generation.
+- Delete/recreate produced a new sandbox ID, a fresh-environment warning, and a
+  404 for the old ordinary file.
+- A deliberately conflicting suite-owned name/owner-label association produced
+  a real 409 and ownership refusal, without a subsequent toolbox request.
+- All three owned sandbox IDs were deleted and per-ID 404 verified, followed by
+  exact-label cleanup. No volumes; daytona-small (1 vCPU, 1 GiB, 3 GiB disk),
+  30-minute TTL, 39.63-second run, no inference. Evidence and exact scope are
+  recorded in [#110's lifecycle comment](https://github.com/rndmcnlly/lathe/issues/110#issuecomment-6457832043).
+
+**Live OWUI routing, partial lab result:**
+[Actions run 40614126169](https://github.com/rndmcnlly/lathe/actions/runs/40614126169)
+tested lab commit `773bdb4801f681b5453da7e5b01a383f51d6a9ea` on released OWUI
+0.12.4, image digest
+`sha256:41812075aede8ada8497cb2b71c76412978633eee72775bb77796f593d03b677`.
+Two processes shared one disposable container filesystem, PostgreSQL/pgvector,
+Redis, source, valves and keys; this is not an arbitrary-replica qualification.
+
+Actual handler observations established A (PID 7) → B (23) → A (7), followed by
+continuity on replaced B (64). Four completed `interpret` calls and independent
+file/state downloads showed counts 1–4, an unchanged sandbox-generated nonce,
+Python PID 153 and generation `2e3f8b7c88e944a1add626b0c77f57a6`. The expected
+nonce was not supplied in model prompts. Requested and observed model was
+GLM-5.3-Flash. Sandbox deletion and container/network absence were verified.
+
+That run's full scenario list did not pass: an extra final A request timed out
+before another provider request was recorded (a relay body-size limit in the lab
+harness is the likely cause, not established). The routing and replacement
+observations above are the accepted #110 result.
+
+**Not qualified:** overlapping first use of one interpreter from two workers;
+arbitrary replicas across hosts; Lathe-managed background completion waking an
+idle chat (#67, no supported OWUI dispatch boundary). OWUI's native
+`delegate_task(background=true)` is an alternative outside Lathe: in
+[run 40624797681](https://github.com/rndmcnlly/lathe/actions/runs/40624797681)
+a real child ran and OWUI resumed the idle parent with its model, toolkit and
+system prompt, and independent downloads matched. That run's evidence collector
+then failed, and the busy-parent case was never reached.
+
+The lab (two-worker OWUI with PostgreSQL/pgvector and Redis, pinned images,
+credential-free preflight) is archived unmaintained at tag
+[`readiness-lab-archive-20261028`](https://github.com/rndmcnlly/lathe/tree/readiness-lab-archive-20261028).
+Nearly all of its failed live attempts were harness defects, not Lathe defects.
