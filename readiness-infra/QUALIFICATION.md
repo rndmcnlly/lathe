@@ -438,3 +438,27 @@ explicit proof limitations. Runtime SHA256 remains
 root controller remains `2134e1e5d12c357bed9658f9b6ea312039c379277340f9c7b01ddae55ce93b22`.
 Overlapping first use remains unqualified and direct-bash wakeup unsupported;
 neither #110 nor #67 is closed or fully qualified by this run.
+
+### Observer/oracle correction: offline and key-free only
+
+Worker streams now start eagerly with identity/start receipts, even with zero
+completion events. Both actual key-free OWUI/controller paths verify them against
+HTTP identity and real PID. Replacement startup must find the prior stream and
+supervisor-known PID, and links previous incarnations; streams cannot silently
+restart from missing/truncated history. Consumers distinguish startup from actual
+completion/native-handler events, and reject missing/unreadable/malformed streams
+and wrong worker/incarnation/context/association or human-resubmitted continuation.
+
+The shared production native-evidence pipeline now persists the paired synthetic
+32-byte canary source/copy before observer collection. Small fixed-name receipts
+contain sandbox ID/path, byte count, SHA256 and base64 of the actual downloaded
+bytes. Paths, sandbox IDs, lengths and lowercase-hex content are constrained;
+arbitrary sandbox files, headers and credentials are not retained. Receipt write
+failures still reach exact-owner teardown. Artifact export requires both worker
+streams even for successful config-only qualification.
+
+Offline fixtures use selected retained events from run 40624797681, clearly
+separating real native record shapes from synthetic startup test records. Replay
+calls the actual writer/collector/context/oracle functions, not a model or native
+dispatcher replacement. The historical run remains **FAILED qualification** and
+its busy case **NOT REACHED**. No live/provider dispatch accompanies this fix.

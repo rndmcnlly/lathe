@@ -17,6 +17,6 @@ dev = ["pytest>=8", "pytest-asyncio>=1", "ripgrep>=15"]
 
 [tool.pytest.ini_options]
 testpaths = ["test_unit.py", "test_interpreter.py", "test_monitor.py", "test_demo_local.py",
-             "test_readiness.py", "readiness-infra/test_infra.py"]
+             "test_readiness.py", "readiness-infra/test_infra.py", "readiness-infra/test_evidence.py"]
 asyncio_mode = "auto"
 addopts = "-q"

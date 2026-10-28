@@ -100,7 +100,7 @@ jobs:
       - name: Offline readiness contracts
         run: |
           uv run --locked pytest
-          uv run --locked pytest readiness-infra/test_infra.py test_readiness.py test_monitor.py
+          uv run --locked pytest readiness-infra/test_infra.py readiness-infra/test_evidence.py test_readiness.py test_monitor.py
       - name: Disposable multi-worker readiness lab
         if: inputs.lab == 'readiness'
         timeout-minutes: 30

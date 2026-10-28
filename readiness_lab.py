@@ -277,6 +277,7 @@ async def inside(scope="full", config_only=False):
                           ("WEBUI_SECRET_KEY", "OAUTH_SESSION_TOKEN_ENCRYPTION_KEY"))
     directory = Path("/lab/artifacts")
     directory.mkdir(parents=True, exist_ok=True)
+    from evidence import read_observer, collect_observers
     for name in ("lathe.py", "testing_support.py"):
         require(Path("/tmp", name).read_bytes() == Path("/opt/staged", name).read_bytes(),
                 "Controller source differs from qualified staged source")
@@ -298,6 +299,7 @@ async def inside(scope="full", config_only=False):
     relay_app = relay_application(relay, reservation, trace)
     runner = web.AppRunner(relay_app, access_log=None)
     processes = workers.processes
+    identities = {}
     client = None
     exit_code = 1
     platform_ready = False
@@ -318,11 +320,20 @@ async def inside(scope="full", config_only=False):
                     response.raise_for_status()
                     value = response.json()
                     require(value["pid"] == processes[name].pid, "Backend PID mismatch")
+                    read_observer(value)
+                    identities[name] = value
                     trace("backend_identity", **value)
                     return value
                 except httpx.HTTPError:
                     await asyncio.sleep(1)
         raise RuntimeError(f"Worker {name} readiness deadline")
+
+    def observer_gate():
+        records = collect_observers(identities)
+        require(all(record["kind"] == "worker_start" for record in records),
+                "unexpected completion in key-free/startup observer gate")
+        trace("observer_startups_verified", starts=len(records), completions=0,
+              workers=[identities[name]["observer_start"] for name in PORTS])
 
     try:
         async with asyncio.timeout(22 * 60):
@@ -340,6 +351,7 @@ async def inside(scope="full", config_only=False):
             initial_a = await identity("A")
             workers.start("B")
             initial_b = await identity("B")
+            observer_gate()
             if config_only:
                 workers.replace("B")
                 new_b = await identity("B")
@@ -390,6 +402,7 @@ async def inside(scope="full", config_only=False):
                     await identity(name)
                 async with httpx.AsyncClient(timeout=30) as http:
                     await verify_workers(http, suite, relay.key, installed, trace)
+                observer_gate()
 
             async with httpx.AsyncClient(timeout=180) as http:
                 if config_only:
@@ -413,7 +426,7 @@ async def inside(scope="full", config_only=False):
             client = suite.OWUIClient()
             await client.connect()  # Keep the authenticated socket on A throughout.
             if scope == "native":
-                await native_scenarios(suite, client.session_id, user, trace)
+                await native_scenarios(suite, client.session_id, user, trace, identities)
                 relay.verify_evidence()
                 raise NativeComplete
             async with httpx.AsyncClient(timeout=30, headers=suite.auth_headers(completion=True)) as http:
@@ -529,7 +542,7 @@ async def inside(scope="full", config_only=False):
                 require(before["incarnation"] != after["incarnation"], "Worker was not replaced")
                 trace("worker_replaced", before=before, after=after)
                 await turn("B", 4)
-            await native_scenarios(suite, client.session_id, user, trace)
+            await native_scenarios(suite, client.session_id, user, trace, identities)
             relay.verify_evidence()
             exit_code = 0
     except NativeComplete:
@@ -574,7 +587,7 @@ async def inside(scope="full", config_only=False):
     return exit_code
 
 
-async def native_scenarios(suite, session_id, user, trace):
+async def native_scenarios(suite, session_id, user, trace, identities):
     """Real model delegation and server-owned continuation, with file barriers.
 
     Poll authoritative saved chats instead of admitting unrelated account-wide
@@ -583,6 +596,8 @@ async def native_scenarios(suite, session_id, user, trace):
     """
     import httpx
     import shlex
+    from evidence import collect_native_evidence
+    submitted = []
 
     sandboxes = await owned_sandboxes(suite.DAYTONA_API_KEY, suite.DEPLOYMENT_LABEL)
     require(len(sandboxes) == 1, "Native lab requires the single owned sandbox")
@@ -645,6 +660,7 @@ async def native_scenarios(suite, session_id, user, trace):
                 "session_id": session_id, "stream": True, "tool_ids": [suite.TOOL_ID], "background_tasks": {}}
             response = await http.post(f"http://127.0.0.1:{PORTS[name]}/api/chat/completions", json=payload)
             response.raise_for_status()
+            submitted.append(aid)
             trace("native_request", chat_id=chat_id, message_id=aid, worker=name,
                   pid=response.headers.get("X-Lathe-Lab-Pid"),
                   incarnation=response.headers.get("X-Lathe-Lab-Incarnation"))
@@ -729,6 +745,8 @@ async def native_scenarios(suite, session_id, user, trace):
 
             result = await wait_for(result_message, "native result insertion")
             require(result["meta"].get("subagent_chat_id") == child_id, "Result child identity mismatch")
+            trace("native_result_association", chat_id=parent_id, message_id=result["id"],
+                  child_id=child_id, meta=result["meta"])
             if busy:
                 require(result["meta"].get("status") == "pending", "Busy parent result was not pending")
                 tasks = await http.get(suite.OWUI_BASE + f"/api/tasks/chat/{parent_id}")
@@ -750,29 +768,25 @@ async def native_scenarios(suite, session_id, user, trace):
             continuation = await wait_for(continued, "server-owned continuation")
             output = continuation.get("output", [])
             trace("native_continuation", chat_id=parent_id, child_id=child_id,
-                  message_id=continuation["id"], output=output)
+                  message_id=continuation["id"], parent_message_id=continuation.get("parentId"), output=output)
             require(any(c.get("name", "").endswith("read") for c in suite.tool_calls(output)),
                     "Resumed parent did not use Lathe read")
-            original_bytes, copied_bytes = await download(source), await download(copied)
-            require(len(original_bytes) == 32 and copied_bytes == original_bytes, "Independent native file oracle mismatch")
             child = await saved(child_id)
             child_messages = list(child["chat"]["history"]["messages"].values())
             trace("native_child_results", chat_id=child_id, messages=child_messages)
             require(any(c.get("name", "").endswith("interpret") for m in child_messages
                         for c in suite.tool_calls(m.get("output", []))), "Child did not use interpret")
-            entries = [json.loads(line) for name in PORTS
-                       for line in Path(f"/lab/artifacts/worker-{name}.jsonl").read_text().splitlines()]
-            entry = next((e for e in entries if e.get("kind") == "native_handler_entry"
-                          and e.get("message_id") == continuation["id"]), None)
             expected_system = hashlib.sha256(json.dumps(
                 [{"role": "system", "content": system}], sort_keys=True).encode()).hexdigest()
-            require(entry and entry.get("model") == suite.MODEL
-                    and entry.get("tool_ids") == [suite.TOOL_ID]
-                    and entry.get("system_hash") == expected_system,
-                    "Continuation lost actual model/tool/system context")
-            trace("native_context_verified", **{k: v for k, v in entry.items() if k != "kind"})
+            oracle, entry = await collect_native_evidence(http, expected=identities,
+                canary=dict(sandbox=sandbox_id, source=source, copied=copied, headers=cloud_headers, scenario=scenario),
+                context=dict(parent=parent_id, child=child_id, initial=first, continuation=continuation["id"],
+                    child_messages=[m["id"] for m in child_messages if m.get("role") == "assistant"],
+                    association=meta, delegation=dispatched["delegation_id"], submitted=submitted,
+                    model=suite.MODEL, tool=suite.TOOL_ID, system_hash=expected_system))
             trace("independent_native_reads", chat_id=parent_id, child_id=child_id,
-                  sha256=hashlib.sha256(original_bytes).hexdigest(), paths=[source, copied])
+                  receipt=f"{scenario}-canary.json", sha256=oracle["files"][0]["sha256"], paths=[source, copied])
+            trace("native_context_verified", **{k: v for k, v in entry.items() if k != "kind"})
             trace("scenario_pass", name=scenario)
 
 
@@ -878,12 +892,13 @@ def controller_action(infra, directory, *, config_only=False):
             return status
         finally:
             infra.docker("stop", "--time", "20", app, timeout=40)
-            for filename in ("trace.jsonl", "summary.json", "transport-preflight.json", "worker-A.jsonl", "worker-B.jsonl"):
+            for filename in ("trace.jsonl", "summary.json", "transport-preflight.json", "worker-A.jsonl", "worker-B.jsonl",
+                             "native_idle-canary.json", "native_busy-canary.json"):
                 try:
                     infra.docker("cp", f"{app}:/lab/artifacts/{filename}", str(directory / filename))
                 except RuntimeError:
                     if filename in ("trace.jsonl", "summary.json") or (status == 0 and
-                            (filename == "transport-preflight.json" or not config_only)):
+                            (filename in ("transport-preflight.json", "worker-A.jsonl", "worker-B.jsonl") or not config_only)):
                         raise
     return action
 

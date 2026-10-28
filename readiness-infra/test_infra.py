@@ -207,7 +207,7 @@ def test_controller_cleans_owned_resources_despite_evidence_failures(tmp_path, m
 
 
 @pytest.mark.parametrize("callback_failure", [RuntimeError("cloud callback failed"), PermissionError("evidence export failed")])
-@pytest.mark.parametrize("failure_phase", ["controller", "postgres", "diagnostics"])
+@pytest.mark.parametrize("failure_phase", ["controller", "postgres", "diagnostics", "oracle-write"])
 def test_shared_lifecycle_always_cleans_after_controller_failure(tmp_path, monkeypatch, callback_failure, failure_phase):
     source = tmp_path / "source"
     source.mkdir()
@@ -243,9 +243,30 @@ def test_shared_lifecycle_always_cleans_after_controller_failure(tmp_path, monke
         return ""
     def action(app):
         assert app in containers
+        if failure_phase == "oracle-write":
+            import asyncio
+            import httpx
+            spec = importlib.util.spec_from_file_location("oracle_evidence", Path(__file__).with_name("evidence.py"))
+            evidence = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(evidence)
+            original = Path.write_text
+            def write(path, *args, **kwargs):
+                if path.name == "native_idle-canary.json":
+                    raise callback_failure
+                return original(path, *args, **kwargs)
+            monkeypatch.setattr(Path, "write_text", write)
+            async def oracle():
+                async with httpx.AsyncClient(transport=httpx.MockTransport(lambda request:
+                        httpx.Response(200, stream=httpx.ByteStream(b"a" * 32)))) as http:
+                    await evidence.retain_canary(http, sandbox="11111111-1111-1111-1111-111111111111",
+                        source="/home/daytona/next-" + "a" * 32 + ".child",
+                        copied="/home/daytona/next-" + "a" * 32 + ".continued", headers={},
+                        scenario="native_idle", directory=tmp_path / "oracle")
+            asyncio.run(oracle())
+            pytest.fail("actual canary receipt persistence did not fail")
         raise callback_failure
     monkeypatch.setattr(lab, "docker", docker)
-    if failure_phase != "controller":
+    if failure_phase in ("postgres", "diagnostics"):
         def failed_gate(pg):
             assert pg in containers
             raise callback_failure
@@ -261,7 +282,7 @@ def test_shared_lifecycle_always_cleans_after_controller_failure(tmp_path, monke
                      deployment_label="lathe-ci-next-0123456789abcdef")
     assert not containers and not networks
     assert json.loads((tmp_path / "run/cleanup.json").read_text())["verified_absent"]
-    if failure_phase != "controller":
+    if failure_phase in ("postgres", "diagnostics"):
         result = json.loads((tmp_path / "run/result.json").read_text())
         assert result["phase"] == "PostgreSQL startup"
         assert result["postgres_startup"] == ({"diagnostics_unavailable": True} if failure_phase == "diagnostics"

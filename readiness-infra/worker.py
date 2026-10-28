@@ -3,22 +3,23 @@ import json
 import os
 from pathlib import Path
 import hashlib
-import time
 import uuid
+from evidence import append_observer
 
+
+identity = {"worker": os.environ.get("READINESS_WORKER", "migration"),
+            "pid": os.getpid(), "incarnation": uuid.uuid4().hex}
+startup = append_observer(identity, "worker_start", previous_pid=(
+    int(os.environ["READINESS_PREVIOUS_PID"]) if "READINESS_PREVIOUS_PID" in os.environ else None)
+    ) if identity["worker"] in ("A", "B") else None
 
 from guard import install_egress_guard
 install_egress_guard()
 from open_webui.main import app as owui  # noqa: E402
 
-identity = {"worker": os.environ.get("READINESS_WORKER", "migration"),
-            "pid": os.getpid(), "incarnation": uuid.uuid4().hex}
-
 
 def note(kind, **data):
-    if os.environ.get("READINESS_EGRESS") == "live":
-        with Path(f"/lab/artifacts/worker-{identity['worker']}.jsonl").open("a") as stream:
-            stream.write(json.dumps({"kind": kind, "time": time.time(), **identity, **data}) + "\n")
+    return append_observer(identity, kind, **data)
 
 
 original_handler = owui.state.CHAT_COMPLETION_HANDLER
@@ -53,7 +54,7 @@ async def app(scope, receive, send):
     if path not in {"/_readiness/identity", "/_readiness/emit", "/_readiness/loaded"}:
         return await owui(scope, receive, observed)
     status = 200
-    data = {**identity, "migration": json.loads(Path("/run/readiness/migration.json").read_text()),
+    data = {**identity, "observer_start": startup, "migration": json.loads(Path("/run/readiness/migration.json").read_text()),
             "shared_marker": Path("/app/backend/data/readiness-marker").read_text()}
     if path in {"/_readiness/emit", "/_readiness/loaded"}:
         from open_webui.utils.auth import get_verified_user_by_token

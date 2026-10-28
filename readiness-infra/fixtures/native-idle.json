@@ -1,0 +1,31 @@
+{
+  "provenance": "Selected actual events from FAILED run 40624797681 at dad4390. Offline replay only, not native qualification. Startup events are absent historically and are generated separately by the production writer in tests.",
+  "identities": {
+    "A": {"worker": "A", "pid": 34, "incarnation": "efb83ed1a41b4d4d9fb4df232f68adbb"},
+    "B": {"worker": "B", "pid": 51, "incarnation": "4224be38d52c4644b06df14cd0d19674"}
+  },
+  "records": [
+    {"kind": "http_completion", "time": 1793157006.0932477, "worker": "A", "pid": 34, "incarnation": "efb83ed1a41b4d4d9fb4df232f68adbb", "status": 200},
+    {"kind": "native_handler_entry", "time": 1793157026.836133, "worker": "A", "pid": 34, "incarnation": "efb83ed1a41b4d4d9fb4df232f68adbb", "chat_id": "d27041b4-606a-417a-bed4-ea3d7304cf0b", "message_id": "736a4a8a-2155-4ba7-a1b9-26bca13fca31", "internal": true, "model": "lathe-ci-direct", "tool_ids": ["lathe_test"], "system_hash": "be83f3d581941cf0b92fff3981452b051a375f9ff2e9afb1f2556181f8e31325"},
+    {"kind": "native_handler_entry", "time": 1793157036.7715173, "worker": "A", "pid": 34, "incarnation": "efb83ed1a41b4d4d9fb4df232f68adbb", "chat_id": "8bbf9346-a7f6-4a08-8871-9faa1c2b3930", "message_id": "7c3e9b0e-2d5b-4243-903c-1a0b98f5c937", "internal": false, "model": "lathe-ci-direct", "tool_ids": ["lathe_test"], "system_hash": "670396c6fc151496a1a1666f0ba3e1178076c8a2df3d5584907dd01fa893f8af"}
+  ],
+  "context": {
+    "parent": "8bbf9346-a7f6-4a08-8871-9faa1c2b3930",
+    "child": "d27041b4-606a-417a-bed4-ea3d7304cf0b",
+    "initial": "bdecf960-b9b3-4c1a-9760-1c4c510da3b1",
+    "continuation": "7c3e9b0e-2d5b-4243-903c-1a0b98f5c937",
+    "child_messages": ["736a4a8a-2155-4ba7-a1b9-26bca13fca31"],
+    "association": {"internal": true, "type": "subagent", "parent_chat_id": "8bbf9346-a7f6-4a08-8871-9faa1c2b3930", "parent_message_id": "bdecf960-b9b3-4c1a-9760-1c4c510da3b1", "delegation_id": "deleg_1cfa7e97", "mode": "background"},
+    "delegation": "deleg_1cfa7e97",
+    "submitted": ["bdecf960-b9b3-4c1a-9760-1c4c510da3b1"],
+    "model": "lathe-ci-direct",
+    "tool": "lathe_test",
+    "system_hash": "670396c6fc151496a1a1666f0ba3e1178076c8a2df3d5584907dd01fa893f8af"
+  },
+  "canary": {
+    "sandbox": "acf6c346-9854-4758-a96b-870966fc5b27",
+    "source": "/home/daytona/next-aa4c2918f72b40e48d571057e973c5eb.child",
+    "copied": "/home/daytona/next-aa4c2918f72b40e48d571057e973c5eb.continued",
+    "retained_read_payload": "8637e4c80491fdbc56d9335941c76a21"
+  }
+}

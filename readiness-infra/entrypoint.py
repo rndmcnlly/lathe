@@ -41,6 +41,9 @@ class Workers:
         handle = open(f"/run/readiness/{name}-{time.time_ns()}.raw.log", "wb")
         self.handles.append(handle)
         env = dict(os.environ, ENABLE_DB_MIGRATIONS="false", READINESS_WORKER=name)
+        env.pop("READINESS_PREVIOUS_PID", None)
+        if name in self.processes:
+            env["READINESS_PREVIOUS_PID"] = str(self.processes[name].pid)
         for key in ("DAYTONA_API_KEY", "OPENROUTER_API_KEY"):
             env.pop(key, None)
         self.processes[name] = subprocess.Popen([sys.executable, "-m", "uvicorn", "worker:app",

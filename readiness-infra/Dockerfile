@@ -5,7 +5,7 @@ RUN python -c 'import importlib.metadata as m; expected={"python-socketio":"5.16
     && python -m pip install --no-deps --disable-pip-version-check 'https://files.pythonhosted.org/packages/96/c5/1e741d26306c42e2bf6ab740b2202872727e0f606033c9dd713f8b93f5a8/cachetools-6.2.1-py3-none-any.whl#sha256=09868944b6dde876dfd44e1d47e18484541eaf12f26f29b7af91b26cc892d701' \
     && python -c 'import cachetools, yaml, pydantic; assert int(pydantic.__version__.split(".")[0]) >= 2' \
     && python -m pip check
-COPY worker.py entrypoint.py preflight.py guard.py transport_preflight.py /opt/readiness/
+COPY worker.py entrypoint.py preflight.py guard.py transport_preflight.py evidence.py /opt/readiness/
 ENV PYTHONPATH=/opt/readiness:/app/backend \
     OFFLINE_MODE=true HF_HUB_OFFLINE=1 ENABLE_VERSION_UPDATE_CHECK=false \
     ENABLE_OPENAI_API=false ENABLE_OLLAMA_API=false \

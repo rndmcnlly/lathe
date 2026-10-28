@@ -10,6 +10,7 @@ import sys
 import httpx
 import socketio
 import psycopg2
+from evidence import collect_observers
 
 sys.path.insert(0, "/opt/staged")
 from testing_support import EXPECTED_SCHEMA, normalize_schema
@@ -59,6 +60,9 @@ async def main():
             require((await request(port, "GET", "/api/version")).json()["version"] == "0.12.4",
                     f"worker {port}: version 0.12.4")
         require(identities[0]["pid"] != identities[1]["pid"], "two distinct OWUI processes")
+        records = collect_observers({value["worker"]: value for value in identities})
+        require(len(records) == 2 and all(record["kind"] == "worker_start" for record in records),
+                "both verified observer startup streams exist without completions")
         require(identities[0]["migration"] == identities[1]["migration"]
                 and identities[0]["migration"]["count"] == 1
                 and identities[0]["migration"]["pid"] not in {i["pid"] for i in identities},

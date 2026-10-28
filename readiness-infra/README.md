@@ -11,6 +11,8 @@ not conclusively attributed to, that race. The latest native-only trial observed
 idle delegation and automatic continuation, then failed its observer collection
 because the idle worker had no event file. Formal idle qualification **FAILED**;
 busy was **NOT REACHED**. See `QUALIFICATION.md`; no retry was dispatched.
+The observer/oracle fix below is qualified only by offline replay and key-free
+containers so far. It does not relabel that historical trial as a pass.
 
 ```sh
 uv run python readiness-infra/lab.py --preflight
@@ -54,7 +56,7 @@ cannot bypass the shared lifecycle's cleanup.
   the Dockerfile's single actual `FROM` before building.
   `images.json` records immutable multi-platform image/index digests resolved
   October 27, 2026. Native Docker architecture is used, not forced emulation.
-* A Dockerfile with a six-file allowlisted context. No repo root build context,
+* A Dockerfile with a seven-file allowlisted context. No repo root build context,
   dotenv reads, secret build arguments, bind mounts, or credential forwarding.
   Socket/HTTP helpers already exist in the pinned OWUI image. Lathe additionally
   needs cachetools: its hash-pinned 6.2.1 wheel is installed at build time with
@@ -179,3 +181,30 @@ Unknown producer state blocks cloud deletion. Every known topology gets a final
 teardown attempt; failure to store the final report preserves all sanitized
 errors in an exception group. Default pytest includes both cheap safeguard
 files; Docker qualification and live integration/deployment remain opt-in.
+
+## Observer and bounded oracle evidence
+
+Both workers eagerly create `worker_start` records before loading OWUI, including
+when they never receive a completion. The identity endpoint returns that exact
+startup receipt; the controller verifies it against the stream and actual PID.
+Replacement requires the prior supervisor-known PID and links the new startup
+to the previous incarnation, preserving history. Missing, malformed, truncated,
+unreadable, wrong-worker or stale-incarnation streams are failures, not empty
+activity. Startup records are distinct from actual HTTP/native-handler records.
+Both real key-free paths verify startup-only streams without fake completions.
+
+The native evidence path persists `native_idle-canary.json` or
+`native_busy-canary.json` before collecting observer/context evidence. Only the
+controller's paired `/home/daytona/next-<32 hex>.child` and `.continued` files in
+a canonical sandbox UUID may be downloaded for this receipt. Reads request
+identity encoding, check declared length, and bound raw streaming to 32 bytes;
+both bodies must be lowercase 32-byte hex canaries. Receipts retain sandbox/path,
+byte count, SHA256 and base64, including unequal valid canaries for diagnosis.
+Invalid paths, length/content or receipt writes fail qualification. No arbitrary
+sandbox files or credentials are exported. These two fixed filenames are the
+only added exports, and successful config-only runs require both startup streams.
+
+`test_evidence.py` replays selected real idle records from the historical failed
+run, with explicitly synthetic startup fixtures written by the production helper.
+It exercises the same collector/context/oracle pipeline as the controller. No
+LLM, native dispatcher, internal-message injector or scheduler is simulated.

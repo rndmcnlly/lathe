@@ -254,7 +254,7 @@ def test_cleanup_refuses_non_lab_namespace(monkeypatch, tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_worker_identity_precedes_existing_frontend_catchall(monkeypatch):
+async def test_worker_identity_precedes_existing_frontend_catchall(monkeypatch, tmp_path):
     import importlib.util
     from pathlib import Path
 
@@ -270,6 +270,11 @@ async def test_worker_identity_precedes_existing_frontend_catchall(monkeypatch):
     monkeypatch.setitem(sys.modules, "open_webui", SimpleNamespace())
     monkeypatch.setitem(sys.modules, "open_webui.main", SimpleNamespace(app=app))
     monkeypatch.setitem(sys.modules, "guard", SimpleNamespace(install_egress_guard=lambda: None))
+    evidence_spec = importlib.util.spec_from_file_location("worker_evidence", lab.root() / "readiness-infra/evidence.py")
+    evidence = importlib.util.module_from_spec(evidence_spec)
+    evidence_spec.loader.exec_module(evidence)
+    evidence.DIRECTORY = tmp_path
+    monkeypatch.setitem(sys.modules, "evidence", evidence)
     monkeypatch.setenv("READINESS_WORKER", "A")
     read_text = Path.read_text
     def text(path, *a, **k):
@@ -288,6 +293,8 @@ async def test_worker_identity_precedes_existing_frontend_catchall(monkeypatch):
     await worker.app({"type": "http", "path": "/_readiness/identity"}, None, send)
     result = json.loads(sent[-1]["body"])
     assert result["worker"] == "A" and result["pid"] > 0 and result["incarnation"]
+    records = evidence.read_observer(result)
+    assert len(records) == 1 and records[0] == result["observer_start"]
 
 
 @pytest.mark.asyncio
@@ -448,3 +455,25 @@ def test_transport_gate_subprocess_never_inherits_platform_credentials(monkeypat
         return subprocess.CompletedProcess(args, 0, json.dumps(expected).encode(), b"")
     monkeypatch.setattr(lab.subprocess, "run", run)
     assert lab.check_transport() == expected
+
+
+@pytest.mark.parametrize("config_only,missing,should_fail", [
+    (True, "worker-B.jsonl", True), (True, "native_idle-canary.json", False),
+    (False, "native_idle-canary.json", True),
+])
+def test_successful_controller_requires_observers_and_applicable_canary_exports(tmp_path, config_only, missing, should_fail):
+    events = []
+    def docker(*args, **kwargs):
+        events.append(args)
+        if args[0] == "wait":
+            return "0"
+        if args[0] == "cp" and args[1].endswith("/" + missing):
+            raise RuntimeError("injected missing/unreadable required artifact")
+        return ""
+    action = lab.controller_action(SimpleNamespace(docker=docker), tmp_path, config_only=config_only)
+    if should_fail:
+        with pytest.raises(RuntimeError, match="required artifact"):
+            action("owned-app")
+    else:
+        assert action("owned-app") == 0
+    assert events[1][0] == "stop"
