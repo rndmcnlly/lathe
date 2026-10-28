@@ -512,13 +512,14 @@ LABEL = "lathe-ci-next-0123456789abcdef"
 OWNER = "completion@lathe.invalid"
 
 
-def daytona(views, *, page_size=100, server_filters=True, record=None):
+def daytona(views, *, page_size=100, server_filters=True, record=None, alive=None):
     """MockTransport for Daytona sandbox endpoints with `nextCursor` paging.
 
     `views` is one org-wide sandbox list per successive list query (per labels
     filter value), modelling the eventually consistent index; the last repeats.
     `server_filters=False` returns unfiltered pages, so the client re-check and
-    pagination must find owned sandboxes beyond page one."""
+    pagination must find owned sandboxes beyond page one. `alive` maps IDs to
+    the per-ID endpoint's state regardless of the index (deletion lagging it)."""
     calls = {}
     def respond(request):
         if record is not None:
@@ -538,6 +539,8 @@ def daytona(views, *, page_size=100, server_filters=True, record=None):
             return httpx.Response(200, json={"items": page, "nextCursor": None if nxt is None else str(nxt)})
         if request.method == "GET" and path.startswith("/api/sandbox/"):
             sandbox_id = path.rsplit("/", 1)[1]
+            if sandbox_id in (alive or {}):
+                return httpx.Response(200, json={"id": sandbox_id, "state": alive[sandbox_id]})
             for s in views[-1]:
                 if s["id"] == sandbox_id:
                     return httpx.Response(200, json={**s, "state": "started", "volumes": []})
@@ -603,3 +606,25 @@ async def test_cloud_cleanup_deletes_exact_label_and_verifies_absence(case):
     deletes = [r[1].rsplit("/", 1)[1] for r in requests if r[0] == "DELETE"]
     # Only exactly-labelled lab sandboxes are deleted, each once; never noise or another owner.
     assert sorted(deletes) == sorted({target["id"]} | ({owned(9)["id"]} if case == "straggler-page-two" else set()))
+
+
+def advancing_clock(step=1.0):
+    """Lab-scoped clock: each read advances `step` seconds; no global sleep patching."""
+    ticks = iter(range(10**6))
+    return lambda: next(ticks) * step
+
+
+@pytest.mark.parametrize("state,passes", [("started", False), ("destroying", False), ("destroyed", True)])
+async def test_cloud_cleanup_requires_per_id_deletion_proof_beyond_empty_index(state, passes):
+    requests = []
+    target = owned(1)
+    # The index drops the sandbox at once, but the authoritative per-ID record lags.
+    transport = daytona([NOISE + [target], NOISE], record=requests, alive={target["id"]: state})
+    call = lab.cloud_cleanup("offline-key", LABEL, attempts=8, interval=0, transport=transport,
+                             clock=advancing_clock())
+    if passes:
+        assert await call == [target["id"]]
+    else:
+        with pytest.raises(RuntimeError, match=f"{target['id']} did not finish deletion within 60"):
+            await call
+    assert ("GET", f"/api/sandbox/{target['id']}") in [r[:2] for r in requests]

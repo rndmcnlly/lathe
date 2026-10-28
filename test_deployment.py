@@ -250,7 +250,15 @@ async def delete_staging_tool(admin):
         require(response.json() is True, f"toolkit deletion returned {response.text}")
 
 
-async def labelled_sandboxes(http, label, emails=None):
+# Listing bounds fail CLOSED: exceeding either raises, so cleanup reports failure
+# rather than absence. 200 pages x 100 is far beyond any staging/lab org.
+LIST_MAX_PAGES = 200
+LIST_DEADLINE_SECONDS = 120.0
+DELETE_DEADLINE_SECONDS = 60.0
+
+
+async def labelled_sandboxes(http, label, emails=None, *, max_pages=LIST_MAX_PAGES,
+                             deadline=LIST_DEADLINE_SECONDS, clock=time.monotonic):
     """IDs/labels of sandboxes carrying `label`, following every `nextCursor` page.
 
     GET /sandbox is eventually consistent and cursor-paginated (Daytona's
@@ -260,13 +268,16 @@ async def labelled_sandboxes(http, label, emails=None):
     sandbox. Errored/deleting records are included so stragglers stay visible.
     `http` carries the Daytona authorization header.
     """
-    found = {}
+    found, pages, stop = {}, 0, clock() + deadline
     for email in emails or [None]:
         params = {"includeErroredDeleted": "true", "limit": 100}
         if email is not None:
             params["labels"] = json.dumps({label: email})
         cursor, seen = None, set()
         while True:
+            require(pages < max_pages, f"Daytona listing exceeded {max_pages} pages; absence not established")
+            require(clock() < stop, f"Daytona listing exceeded {deadline}s; absence not established")
+            pages += 1
             response = await http.get("https://app.daytona.io/api/sandbox", timeout=30,
                                       params={**params, **({"cursor": cursor} if cursor else {})})
             response.raise_for_status()
@@ -281,6 +292,25 @@ async def labelled_sandboxes(http, label, emails=None):
             require(cursor not in seen, "Daytona repeated a pagination cursor")
             seen.add(cursor)
     return list(found.values())
+
+
+async def await_deleted(http, sandbox_id, *, deadline=DELETE_DEADLINE_SECONDS, interval=1.0, clock=time.monotonic):
+    """Authoritative per-ID deletion proof: 404 or a deleted/destroyed state.
+
+    The label index is eventually consistent, so its emptiness alone never
+    proves deletion. Raises at the deadline instead of assuming success.
+    """
+    stop = clock() + deadline
+    while True:
+        response = await http.get(f"https://app.daytona.io/api/sandbox/{sandbox_id}", timeout=30)
+        if response.status_code == 404:
+            return
+        response.raise_for_status()
+        if response.json().get("state") in ("deleted", "destroyed"):
+            return
+        if clock() >= stop:
+            raise RuntimeError(f"Sandbox {sandbox_id} did not finish deletion within {deadline}s")
+        await asyncio.sleep(interval)
 
 
 async def cleanup_test_sandboxes():
@@ -299,17 +329,7 @@ async def cleanup_test_sandboxes():
             )
             if response.status_code != 404:
                 response.raise_for_status()
-            for _ in range(60):
-                response = await client.get(
-                    f"https://app.daytona.io/api/sandbox/{sandbox['id']}",
-                    headers=headers, timeout=30,
-                )
-                if response.status_code == 404:
-                    break
-                response.raise_for_status()
-                await asyncio.sleep(1)
-            else:
-                raise RuntimeError(f"Staging sandbox {sandbox['id']} did not finish deletion")
+            await await_deleted(client, sandbox["id"])
             TRACE("sandbox_deleted", id=sandbox["id"])
 
 

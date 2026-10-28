@@ -3,6 +3,7 @@
 import importlib.util
 import asyncio
 import json
+import sys
 from pathlib import Path
 
 import httpx
@@ -254,6 +255,64 @@ async def test_known_owner_lookup_uses_exact_server_filter_across_pages(suite):
     # IDs and the owning label only; other labels never leave the helper.
     assert found == [{"id": "owned", "labels": {"lathe-ci-this-run": "test@lathe.invalid"}}]
     assert [r.get("cursor") for r in requests] == [None, "p2"]
+
+
+def endless_pages(requests):
+    """Distinct cursors forever: a misbehaving or adversarial listing."""
+    def respond(request):
+        requests.append((request.method, request.url.path))
+        assert request.method == "GET" and request.url.path == "/api/sandbox", "no deletion while listing is unproven"
+        n = int(request.url.params.get("cursor", "0"))
+        return httpx.Response(200, json={"items": [{"id": f"noise-{n}", "labels": {"other": "x"}}],
+                                         "nextCursor": str(n + 1)})
+    return respond
+
+
+async def test_cleanup_fails_closed_on_unbounded_pagination(suite, monkeypatch):
+    requests = []
+    client_type = httpx.AsyncClient
+    monkeypatch.setattr(suite.httpx, "AsyncClient",
+                        lambda **kw: client_type(transport=httpx.MockTransport(endless_pages(requests)), **kw))
+    with pytest.raises(AssertionError, match="exceeded 200 pages; absence not established"):
+        await suite.cleanup_test_sandboxes()
+    assert len(requests) == suite.LIST_MAX_PAGES and all(r[0] == "GET" for r in requests)
+
+
+async def test_monitor_cleanup_path_fails_closed_on_unbounded_pagination(monkeypatch):
+    # monitor_e2e delegates to the real test_deployment cleanup; its caller turns
+    # any exception into cleanup failure, never a reported absence.
+    monkeypatch.setenv("LATHE_ISOLATED_CI", "1")
+    monkeypatch.setenv("LATHE_TEST_DEPLOYMENT_LABEL", "lathe-ci-this-run")
+    monkeypatch.delitem(sys.modules, "test_deployment", raising=False)
+    requests = []
+    client_type = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient",
+                        lambda **kw: client_type(transport=httpx.MockTransport(endless_pages(requests)), **kw))
+    with pytest.raises(AssertionError, match="absence not established"):
+        await monitor.cleanup_sandboxes()
+    assert requests and all(r[0] == "GET" for r in requests)
+
+
+async def test_listing_fails_closed_at_wall_clock_deadline(suite):
+    requests = []
+    ticks = iter(range(10**6))
+    clock = lambda: next(ticks) * 50.0  # Lab-scoped: each read advances 50 s.
+    async with httpx.AsyncClient(transport=httpx.MockTransport(endless_pages(requests))) as http:
+        with pytest.raises(AssertionError, match="exceeded 120.0s; absence not established"):
+            await suite.labelled_sandboxes(http, "lathe-ci-this-run", clock=clock)
+    assert 0 < len(requests) < suite.LIST_MAX_PAGES
+
+
+async def test_deletion_proof_is_per_id_and_deadline_bounded(suite):
+    requests = []
+    def respond(request):
+        requests.append(request.url.path)
+        return httpx.Response(200, json={"id": "owned", "state": "started"})
+    ticks = iter(range(10**6))
+    async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as http:
+        with pytest.raises(RuntimeError, match="owned did not finish deletion within 60"):
+            await suite.await_deleted(http, "owned", interval=0, clock=lambda: next(ticks))
+    assert set(requests) == {"/api/sandbox/owned"}
 
 
 @pytest.mark.parametrize("display_name", ["Lathe Test", "Lathe"])

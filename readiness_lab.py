@@ -146,9 +146,13 @@ async def owned_sandboxes(http, label, emails=LAB_EMAILS):
     One implementation, shared with the deployment suite's cleanup (this lab may
     import test_deployment, never the reverse).
     """
+    return await deployment_suite().labelled_sandboxes(http, label, emails)
+
+
+def deployment_suite():
     setup_imports()  # Disables dotenv BEFORE test_deployment is imported.
     import test_deployment
-    return await test_deployment.labelled_sandboxes(http, label, emails)
+    return test_deployment
 
 
 async def single_owned_sandbox(http, label, email, *, attempts=60, interval=1.0):
@@ -172,11 +176,14 @@ async def single_owned_sandbox(http, label, email, *, attempts=60, interval=1.0)
     raise RuntimeError(f"Expected one owned sandbox after {attempts} polls, observed {count}")
 
 
-async def cloud_cleanup(key, label, *, emails=LAB_EMAILS, attempts=60, interval=2.0, settle=3, transport=None):
+async def cloud_cleanup(key, label, *, emails=LAB_EMAILS, attempts=60, interval=2.0, settle=3,
+                        transport=None, clock=time.monotonic):
     """Delete only exactly-labelled lab sandboxes, then require the index to show none.
 
     The index is eventually consistent, so absence means `settle` consecutive
-    empty reads, not one: a lagging entry still gets a chance to surface.
+    empty reads, not one: a lagging entry still gets a chance to surface. Index
+    emptiness alone is never deletion proof: every deleted ID must also pass the
+    deployment suite's bounded per-ID check (404 or deleted/destroyed).
     """
     import httpx
     deleted, remaining, empty = [], [], 0
@@ -186,6 +193,8 @@ async def cloud_cleanup(key, label, *, emails=LAB_EMAILS, attempts=60, interval=
             remaining = await owned_sandboxes(http, label, emails)
             empty = 0 if remaining else empty + 1
             if empty >= settle:
+                for sandbox_id in deleted:
+                    await deployment_suite().await_deleted(http, sandbox_id, interval=interval, clock=clock)
                 return deleted
             for sandbox in remaining:  # Late index arrivals are deleted too, each once.
                 if sandbox["id"] not in deleted:
