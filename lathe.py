@@ -5,7 +5,7 @@ author_url: https://adamsmith.as
 description: Coding agent tools (lathe, bash, read, write, edit, glob, grep, view, show, peek, poke, interpret, onboard, expose, destroy) backed by per-user sandbox VMs with transparent lifecycle management.
 required_open_webui_version: 0.12.0
 requirements: httpx, pydantic>=2, cachetools, PyYAML
-version: 1.3.1
+version: 1.3.2
 licence: MIT
 """
 
