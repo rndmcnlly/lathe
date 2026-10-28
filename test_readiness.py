@@ -37,7 +37,7 @@ def test_unbudgeted_requests_refused_without_reservation(change):
 
 
 def test_budget_is_reserved_before_dispatch_and_never_overdrawn(monkeypatch):
-    monkeypatch.setattr(lab, "BUDGET", Decimal("0.09"))
+    monkeypatch.setattr(lab, "BUDGET", Decimal("0.18"))
     budget = lab.Reservation()
     request = payload()
     cost = budget.reserve(request, lab.MAX_PROMPT_BYTES)
@@ -56,12 +56,82 @@ def test_request_cap(monkeypatch):
         budget.reserve(payload(), 100)
 
 
+def test_larger_text_ceiling_still_exhausts_real_two_dollar_budget():
+    budget = lab.Reservation()
+    cost = budget.reserve(payload(), lab.MAX_PROMPT_BYTES)
+    while budget.reserved + cost <= lab.BUDGET and budget.calls < lab.MAX_REQUESTS:
+        budget.reserve(payload(), lab.MAX_PROMPT_BYTES)
+    assert budget.reserved <= Decimal("2.00")
+    assert budget.calls < lab.MAX_REQUESTS
+    before = (budget.calls, budget.reserved)
+    with pytest.raises(RuntimeError, match="reservation budget exhausted"):
+        budget.reserve(payload(), lab.MAX_PROMPT_BYTES)
+    assert (budget.calls, budget.reserved) == before
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", ["valid", "oversized", "chunked_oversized", "invalid", "budget", "upstream"])
+async def test_real_aiohttp_admission_before_read_and_rejection(case, monkeypatch):
+    from aiohttp import web
+    from aiohttp.test_utils import TestClient, TestServer
+
+    events, forwarded = [], []
+    request = payload()
+    request["messages"][0]["content"] = "private-body-" + "x" * (
+        lab.MAX_PROMPT_BYTES if "oversized" in case else 100)
+    body = json.dumps(request).encode() if case != "invalid" else b"private-invalid-json"
+    budget = lab.Reservation()
+    if case == "budget":
+        monkeypatch.setattr(lab, "BUDGET", Decimal("0"))
+
+    async def handle(incoming):
+        forwarded.append(await incoming.read())
+        return web.Response(status=503 if case == "upstream" else 200)
+
+    app = lab.relay_application(SimpleNamespace(handle=handle), budget,
+                                lambda kind, **data: events.append({"kind": kind, **data}))
+
+    async def chunks():
+        for start in range(0, len(body), 4096):
+            yield body[start:start + 4096]
+
+    async with TestClient(TestServer(app)) as client:
+        response = await client.post("/v1/chat/completions",
+            data=chunks() if case == "chunked_oversized" else body,
+            headers={"Authorization": "Bearer private-test-secret"})
+        await response.read()
+    expected = 413 if "oversized" in case else 400 if case in ("invalid", "budget") else 503 if case == "upstream" else 200
+    assert response.status == expected
+    assert events[0]["kind"] == "relay_admission"
+    assert events[-1]["kind"] == "relay_status" and events[-1]["status"] == expected
+    assert events[0]["observation"] == events[-1]["observation"]
+    assert events[-1]["declared_bytes"] == (None if case == "chunked_oversized" else len(body))
+    assert "private" not in json.dumps(events)
+    if case in ("valid", "upstream"):
+        assert forwarded == [body] and budget.calls == 1
+        assert events[1]["prompt_tokens_reserved"] == len(body) * 4 + 16384
+    else:
+        assert not forwarded and budget.calls == 0 and budget.reserved == 0
+
+
 def test_default_and_plan_do_not_import_live_helpers(monkeypatch, capsys):
     monkeypatch.setattr(lab, "setup_imports", lambda: pytest.fail("Live helper imported"))
     for args in (["readiness_lab.py"], ["readiness_lab.py", "--plan"]):
         monkeypatch.setattr(sys, "argv", args)
         assert lab.main() == 0
         assert json.loads(capsys.readouterr().out)["network_or_cloud_work"] is False
+
+
+def test_native_scope_plan_and_host_selection_without_live_work(monkeypatch, capsys):
+    monkeypatch.setattr(sys, "argv", ["readiness_lab.py", "--plan", "--scope", "native"])
+    assert lab.main() == 0
+    plan = json.loads(capsys.readouterr().out)
+    assert plan["scope"] == "native" and plan["network_or_cloud_work"] is False
+    scopes = []
+    monkeypatch.setattr(lab, "host", lambda scope: scopes.append(scope) or 0)
+    monkeypatch.setattr(lab.signal, "signal", lambda *args: None)
+    monkeypatch.setattr(sys, "argv", ["readiness_lab.py", "--run", "--scope", "native"])
+    assert lab.main() == 0 and scopes == ["native"]
 
 
 @pytest.mark.parametrize("cloud_fails,removal_sticks", [(False, False), (True, False), (False, True)])

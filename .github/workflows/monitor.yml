@@ -12,6 +12,11 @@ on:
         description: OpenRouter model for isolated qualification of the selected trusted ref
         type: string
         default: openrouter/pareto-code
+      readiness_scope:
+        description: Readiness scope (native uses fresh idle/busy saved chats only)
+        type: choice
+        options: [native, full]
+        default: native
   schedule:
     - cron: '17 9 * * 1'
   push:
@@ -99,7 +104,7 @@ jobs:
         env:
           DAYTONA_API_KEY: ${{ secrets.DAYTONA_API_KEY }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-        run: uv run --locked python readiness_lab.py --run
+        run: uv run --locked python readiness_lab.py --run --scope "${{ inputs.readiness_scope }}"
       - name: Exact-run teardown and verification
         if: always()
         env:

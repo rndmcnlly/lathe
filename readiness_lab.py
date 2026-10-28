@@ -26,7 +26,8 @@ from types import SimpleNamespace
 IMAGE = "ghcr.io/open-webui/open-webui:v0.12.4-slim"
 MODEL = "z-ai/glm-5.3-flash"
 MAX_REQUESTS = 40
-MAX_PROMPT_BYTES = 64_000
+# Allow valid text schemas/history; the nonrefundable $2 reservation stays fixed.
+MAX_PROMPT_BYTES = 128_000
 PRICE = {"prompt": Decimal("0.00000015"), "completion": Decimal("0.0000005")}
 PROVIDER = {"data_collection": "deny", "zdr": True,
             "max_price": {"prompt": 0.15, "completion": 0.5, "request": 0, "image": 0}}
@@ -69,6 +70,49 @@ class Reservation:
         self.reserved += cost
         self.calls += 1
         return cost
+
+
+def relay_application(relay, reservation, trace):
+    """Observe admission before aiohttp reads; never retain bodies or headers."""
+    from aiohttp import web
+
+    @web.middleware
+    async def admission(request, handler):
+        observation = uuid.uuid4().hex
+        request["observation"] = observation
+        trace("relay_admission", observation=observation, declared_bytes=request.content_length,
+              ceiling_bytes=MAX_PROMPT_BYTES)
+        status, error = 500, None
+        try:
+            response = await handler(request)
+            status = response.status
+            return response
+        except web.HTTPException as exc:
+            status, error = exc.status, type(exc).__name__
+            raise
+        except Exception as exc:
+            error = type(exc).__name__
+            raise
+        finally:
+            trace("relay_status", observation=observation, status=status, error=error,
+                  declared_bytes=request.content_length, read_bytes=request.get("read_bytes"))
+
+    async def bounded(request):
+        body = await request.read()
+        request["read_bytes"] = len(body)
+        try:
+            payload = json.loads(body)
+            cost = reservation.reserve(payload, len(body))
+        except (ValueError, TypeError, AttributeError, RuntimeError):
+            raise web.HTTPBadRequest(text="Invalid or unbudgeted inference request") from None
+        trace("reservation", cost=str(cost), total=str(reservation.reserved), ceiling=str(BUDGET),
+              observation=request["observation"],
+              wire_bytes=len(body), prompt_tokens_reserved=len(body) * 4 + 16384)
+        return await relay.handle(request)
+
+    app = web.Application(client_max_size=MAX_PROMPT_BYTES, middlewares=[admission])
+    app.router.add_post("/v1/chat/completions", bounded)
+    return app
 
 
 def root():
@@ -228,7 +272,7 @@ def worker(name):
     uvicorn.run(app, host="127.0.0.1", port=PORTS[name], access_log=False)
 
 
-async def inside():
+async def inside(scope="full"):
     import httpx
     from aiohttp import web
 
@@ -248,21 +292,16 @@ async def inside():
     import test_deployment as suite
     suite.TRACE = trace
     relay = monitor.RecordingRelay(trace, os.environ["OPENROUTER_API_KEY"])
-    relay_app = web.Application(client_max_size=MAX_PROMPT_BYTES)
     reservation = Reservation()
-
-    async def bounded_relay(request):
-        payload = await request.json()
-        cost = reservation.reserve(payload, len(await request.read()))
-        trace("reservation", cost=str(cost), total=str(reservation.reserved), ceiling=str(BUDGET))
-        return await relay.handle(request)
-
-    relay_app.router.add_post("/v1/chat/completions", bounded_relay)
+    relay_app = relay_application(relay, reservation, trace)
     runner = web.AppRunner(relay_app, access_log=None)
     processes = {}
     handles = []
     client = None
     exit_code = 1
+
+    class NativeComplete(Exception):
+        """Leave the full-scope path while retaining common teardown/return."""
 
     def start(name, migrations=False):
         env = dict(os.environ, ENABLE_DB_MIGRATIONS=str(migrations).lower())
@@ -355,6 +394,10 @@ async def inside():
             await identity("B")
             client = suite.OWUIClient()
             await client.connect()  # Keep the authenticated socket on A throughout.
+            if scope == "native":
+                await native_scenarios(suite, client.session_id, user, trace)
+                relay.verify_evidence()
+                raise NativeComplete
             async with httpx.AsyncClient(timeout=30, headers=suite.auth_headers(completion=True)) as http:
                 response = await http.post(suite.OWUI_BASE + "/api/v1/chats/new", json={
                     "chat": {"title": "NEXT continuity", "models": [suite.MODEL],
@@ -469,10 +512,11 @@ async def inside():
                 require(before["incarnation"] != after["incarnation"], "Worker was not replaced")
                 trace("worker_replaced", before=before, after=after)
                 await turn("B", 4)
-                await turn("A", 5)
             await native_scenarios(suite, client.session_id, user, trace)
             relay.verify_evidence()
             exit_code = 0
+    except NativeComplete:
+        exit_code = 0
     except BaseException as exc:
         if isinstance(exc, httpx.HTTPStatusError):
             trace("http_failure", method=exc.request.method, path=exc.request.url.path,
@@ -506,7 +550,7 @@ async def inside():
         for handle in handles:
             handle.close()
         (directory / "summary.json").write_text(monitor.sanitize(json.dumps({
-            "exit_code": exit_code, "first_failure": trace.first_failure,
+            "exit_code": exit_code, "first_failure": trace.first_failure, "scope": scope,
             "requested_model": MODEL, "served_models": sorted(trace.models),
             "provider_requests": relay.requests, "reserved_usd": str(reservation.reserved),
             "reservation_ceiling_usd": str(BUDGET), "unimplemented": UNIMPLEMENTED})))
@@ -549,12 +593,15 @@ async def native_scenarios(suite, session_id, user, trace):
             trace("barrier_release", path=path)
 
         async def wait_for(fn, detail, timeout=150):
-            async with asyncio.timeout(timeout):
-                while True:
-                    result = await fn()
-                    if result:
-                        return result
-                    await asyncio.sleep(0.5)
+            try:
+                async with asyncio.timeout(timeout):
+                    while True:
+                        result = await fn()
+                        if result:
+                            return result
+                        await asyncio.sleep(0.5)
+            except TimeoutError:
+                raise TimeoutError(f"Native deadline: {detail}") from None
 
         async def wait_message(chat_id, message_id):
             async def done():
@@ -631,14 +678,21 @@ async def native_scenarios(suite, session_id, user, trace):
                 except (ValueError, AttributeError):
                     pass
             calls = suite.tool_calls(initial.get("output", []))
-            require(len(dispatches) == 1 and any(c.get("name") == "delegate_task" for c in calls),
+            delegations = [c for c in calls if c.get("name") == "delegate_task"]
+            require(len(dispatches) == 1 and len(delegations) == 1,
                     "No actual native background delegation observed")
+            args = delegations[0].get("arguments", {})
+            args = json.loads(args) if isinstance(args, str) else args
+            require(args.get("background") is True and args.get("task") == task
+                    and args.get("context", "") == "", "Native delegation arguments changed")
             dispatched = dispatches[0]
+            trace("native_dispatch", chat_id=parent_id, calls=calls, result=dispatched)
             child_id = dispatched["subagent_chat_id"]
             child = await saved(child_id)
             meta = child.get("meta") or {}
             require(meta.get("parent_chat_id") == parent_id and meta.get("delegation_id") == dispatched["delegation_id"],
                     "Native child association mismatch")
+            trace("native_association", chat_id=parent_id, child_id=child_id, meta=meta)
             await wait_for(lambda: download(child_started, True), "child entered interpreter")
             busy_aid = None
             if busy:
@@ -685,9 +739,21 @@ async def native_scenarios(suite, session_id, user, trace):
             original_bytes, copied_bytes = await download(source), await download(copied)
             require(len(original_bytes) == 32 and copied_bytes == original_bytes, "Independent native file oracle mismatch")
             child = await saved(child_id)
-            child_messages = child["chat"]["history"]["messages"].values()
+            child_messages = list(child["chat"]["history"]["messages"].values())
+            trace("native_child_results", chat_id=child_id, messages=child_messages)
             require(any(c.get("name", "").endswith("interpret") for m in child_messages
                         for c in suite.tool_calls(m.get("output", []))), "Child did not use interpret")
+            entries = [json.loads(line) for name in PORTS
+                       for line in Path(f"/lab/artifacts/worker-{name}.jsonl").read_text().splitlines()]
+            entry = next((e for e in entries if e.get("kind") == "native_handler_entry"
+                          and e.get("message_id") == continuation["id"]), None)
+            expected_system = hashlib.sha256(json.dumps(
+                [{"role": "system", "content": system}], sort_keys=True).encode()).hexdigest()
+            require(entry and entry.get("model") == suite.MODEL
+                    and entry.get("tool_ids") == [suite.TOOL_ID]
+                    and entry.get("system_hash") == expected_system,
+                    "Continuation lost actual model/tool/system context")
+            trace("native_context_verified", **{k: v for k, v in entry.items() if k != "kind"})
             trace("independent_native_reads", chat_id=parent_id, child_id=child_id,
                   sha256=hashlib.sha256(original_bytes).hexdigest(), paths=[source, copied])
             trace("scenario_pass", name=scenario)
@@ -746,7 +812,7 @@ def cleanup(label, output):
     return not errors
 
 
-def host():
+def host(scope="full"):
     monitor = setup_imports()
     require(all(os.environ.get(k) for k in ("DAYTONA_API_KEY", "OPENROUTER_API_KEY")),
             "Export repository provider secrets through the trusted runner environment")
@@ -808,16 +874,17 @@ def host():
                     "--label", f"lathe.readiness={label}",
                     "--tmpfs", "/app/backend/data",
                     "--entrypoint", "python", "-e", "DAYTONA_API_KEY", "-e", "OPENROUTER_API_KEY",
-                    *options, IMAGE, "/tmp/readiness_lab.py", "--inside")
+                    *options, IMAGE, "/tmp/readiness_lab.py", "--inside", "--scope", scope)
         owned.append(app)
         # docker cp creates no host bind mount and copies no .env or other secrets.
         run_command("docker", "cp", str(Path(__file__).resolve()), app + ":/tmp/readiness_lab.py")
         for filename in ("monitor_e2e.py", "test_deployment.py", "testing_support.py", "lathe.py"):
             run_command("docker", "cp", str(root() / filename), app + ":/tmp/" + filename)
-        metadata = {"label": label, "owui_image": IMAGE, "model": MODEL,
+        metadata = {"label": label, "owui_image": IMAGE, "model": MODEL, "scope": scope,
                     "lathe_sha256": hashlib.sha256((root() / "lathe.py").read_bytes()).hexdigest(),
                     "checkout_sha": run_command("git", "-C", str(root()), "rev-parse", "HEAD"),
                     "max_provider_requests": MAX_REQUESTS, "max_request_bytes": MAX_PROMPT_BYTES,
+                    "max_prompt_token_reservation": MAX_PROMPT_BYTES * 4 + 16384,
                     "max_output_tokens_per_request": 4096, "sandbox_ttl_minutes": 30,
                     "lab_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
                     "provider_reservation_usd": str(BUDGET),
@@ -856,6 +923,8 @@ def main():
     mode.add_argument("--cleanup", action="store_true")
     mode.add_argument("--inside", action="store_true", help=argparse.SUPPRESS)
     mode.add_argument("--worker", choices=PORTS, help=argparse.SUPPRESS)
+    parser.add_argument("--scope", choices=("full", "native"), default="full",
+                        help="native runs only fresh-chat idle/busy continuation trials")
     args = parser.parse_args()
     if args.cleanup:
         state = root() / "monitor-artifacts" / "readiness-state.json"
@@ -870,14 +939,15 @@ def main():
         return 0
     if args.inside:
         require(Path("/tmp/monitor_e2e.py").is_file(), "Internal controller requires disposable helper copy")
-        return asyncio.run(inside())
+        return asyncio.run(inside(args.scope))
     if not args.run:
         require(all((root() / p).is_file() for p in
                     ("lathe.py", "monitor_e2e.py", "test_deployment.py", "testing_support.py")),
                 "Required checkout helper missing")
         print(json.dumps({"network_or_cloud_work": False,
             "topology": "two loopback OWUI processes, shared container filesystem, PostgreSQL/pgvector + Redis",
-            "owui": IMAGE, "model": MODEL, "routing": ["A", "B", "A", "replace B", "B", "A"],
+            "owui": IMAGE, "model": MODEL, "scope": args.scope,
+            "routing": ["A", "B"] if args.scope == "native" else ["A", "B", "A", "replace B", "B"],
             "saved_chat_endpoints": ["POST /api/v1/chats/new", "POST /api/chat/completions",
                                      "GET /api/v1/chats/{id}"],
             "limits": {"requests": MAX_REQUESTS, "input_bytes": MAX_PROMPT_BYTES,
@@ -891,7 +961,7 @@ def main():
     def interrupted(signum, frame):
         raise KeyboardInterrupt(f"signal {signum}")
     signal.signal(signal.SIGTERM, interrupted)
-    return host()
+    return host(args.scope)
 
 
 if __name__ == "__main__":
