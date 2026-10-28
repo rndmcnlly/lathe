@@ -131,6 +131,9 @@ def run_command(*args, timeout=120, capture=True):
 
 def worker(name):
     """Lab-only HTTP observation; no replacement of toolkit/runtime functions."""
+    # The image normally launches `python -m uvicorn` from /app/backend.
+    # A /tmp script gets /tmp, not that working directory, on sys.path.
+    sys.path.insert(0, "/app/backend")
     import uvicorn
     from fastapi import Request
     from open_webui.main import app
@@ -176,6 +179,8 @@ async def inside():
     from aiohttp import web
 
     monitor = setup_imports()
+    monitor.SECRETS.extend(os.environ.get(k, "") for k in
+                          ("WEBUI_SECRET_KEY", "OAUTH_SESSION_TOKEN_ENCRYPTION_KEY"))
     directory = Path("/lab/artifacts")
     directory.mkdir(parents=True, exist_ok=True)
     trace = monitor.Trace(directory)
