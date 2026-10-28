@@ -596,7 +596,7 @@ async def native_scenarios(suite, session_id, user, trace, identities):
     """
     import httpx
     import shlex
-    from evidence import collect_native_evidence
+    from evidence import collect_native_evidence, select_continuation
     submitted = []
 
     sandboxes = await owned_sandboxes(suite.DAYTONA_API_KEY, suite.DEPLOYMENT_LABEL)
@@ -760,30 +760,33 @@ async def native_scenarios(suite, session_id, user, trace, identities):
 
             async def continued():
                 data = await saved(parent_id)
-                messages = data["chat"]["history"]["messages"]
-                return next((m for m in messages.values() if m.get("role") == "assistant"
-                    and m.get("done") is True and (messages.get(m.get("parentId")) or {}).get("meta", {})
-                    .get("delegation_id") == dispatched["delegation_id"]), None)
+                return select_continuation(data["chat"]["history"]["messages"], dispatched["delegation_id"])
 
             continuation = await wait_for(continued, "server-owned continuation")
-            output = continuation.get("output", [])
-            trace("native_continuation", chat_id=parent_id, child_id=child_id,
-                  message_id=continuation["id"], parent_message_id=continuation.get("parentId"), output=output)
-            require(any(c.get("name", "").endswith("read") for c in suite.tool_calls(output)),
-                    "Resumed parent did not use Lathe read")
-            child = await saved(child_id)
-            child_messages = list(child["chat"]["history"]["messages"].values())
-            trace("native_child_results", chat_id=child_id, messages=child_messages)
-            require(any(c.get("name", "").endswith("interpret") for m in child_messages
-                        for c in suite.tool_calls(m.get("output", []))), "Child did not use interpret")
+
+            async def behavior():
+                # Model/tool-iteration diagnosis; runs only after canary persistence.
+                output = continuation.get("output", [])
+                trace("native_continuation", chat_id=parent_id, child_id=child_id,
+                      message_id=continuation["id"], parent_message_id=continuation.get("parentId"), output=output)
+                require(any(c.get("name", "").endswith("read") for c in suite.tool_calls(output)),
+                        "Resumed parent did not use Lathe read")
+                child = await saved(child_id)
+                child_messages = list(child["chat"]["history"]["messages"].values())
+                trace("native_child_results", chat_id=child_id, messages=child_messages)
+                require(any(c.get("name", "").endswith("interpret") for m in child_messages
+                            for c in suite.tool_calls(m.get("output", []))), "Child did not use interpret")
+                return {"child_messages": [m["id"] for m in child_messages if m.get("role") == "assistant"]}
+
             expected_system = hashlib.sha256(json.dumps(
                 [{"role": "system", "content": system}], sort_keys=True).encode()).hexdigest()
-            oracle, entry = await collect_native_evidence(http, expected=identities,
+            oracle, entry = await collect_native_evidence(http, expected=identities, check=behavior,
                 canary=dict(sandbox=sandbox_id, source=source, copied=copied, headers=cloud_headers, scenario=scenario),
                 context=dict(parent=parent_id, child=child_id, initial=first, continuation=continuation["id"],
-                    child_messages=[m["id"] for m in child_messages if m.get("role") == "assistant"],
                     association=meta, delegation=dispatched["delegation_id"], submitted=submitted,
                     model=suite.MODEL, tool=suite.TOOL_ID, system_hash=expected_system))
+            # A second resumed reply arriving after the first must still fail.
+            require((await continued() or {}).get("id") == continuation["id"], "Continuation changed after evidence")
             trace("independent_native_reads", chat_id=parent_id, child_id=child_id,
                   receipt=f"{scenario}-canary.json", sha256=oracle["files"][0]["sha256"], paths=[source, copied])
             trace("native_context_verified", **{k: v for k, v in entry.items() if k != "kind"})
@@ -886,20 +889,30 @@ def controller_action(infra, directory, *, config_only=False):
     """Wait/export only. The shared lifecycle owns local resources, even on failure."""
     directory.mkdir(parents=True, exist_ok=True)
     def action(app):
-        status = None
+        status, errors = None, []
         try:
             status = int(infra.docker("wait", app, timeout=25 * 60).strip())
-            return status
-        finally:
+        except BaseException as exc:  # Still stop and export, then report it.
+            errors.append(exc)
+        try:
             infra.docker("stop", "--time", "20", app, timeout=40)
-            for filename in ("trace.jsonl", "summary.json", "transport-preflight.json", "worker-A.jsonl", "worker-B.jsonl",
-                             "native_idle-canary.json", "native_busy-canary.json"):
-                try:
-                    infra.docker("cp", f"{app}:/lab/artifacts/{filename}", str(directory / filename))
-                except RuntimeError:
-                    if filename in ("trace.jsonl", "summary.json") or (status == 0 and
-                            (filename in ("transport-preflight.json", "worker-A.jsonl", "worker-B.jsonl") or not config_only)):
-                        raise
+        except RuntimeError as exc:
+            errors.append(exc)
+        # Each file is attempted independently, canary receipts first, so one
+        # missing artifact never prevents exporting the independent oracle.
+        for filename in ("native_idle-canary.json", "native_busy-canary.json", "trace.jsonl", "summary.json",
+                         "transport-preflight.json", "worker-A.jsonl", "worker-B.jsonl"):
+            try:
+                infra.docker("cp", f"{app}:/lab/artifacts/{filename}", str(directory / filename))
+            except RuntimeError as exc:
+                if filename in ("trace.jsonl", "summary.json") or (status == 0 and
+                        (filename in ("transport-preflight.json", "worker-A.jsonl", "worker-B.jsonl") or not config_only)):
+                    errors.append(exc)
+        if len(errors) == 1:
+            raise errors[0]
+        if errors:
+            raise BaseExceptionGroup("readiness controller/export failures", errors)
+        return status
     return action
 
 

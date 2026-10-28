@@ -90,6 +90,16 @@ def collect_observers(expected, *, directory=None):
             for record in read_observer(expected[name], directory=directory)]
 
 
+def select_continuation(messages, delegation):
+    """The one server-owned resumed parent reply: None while pending, never first-of-many."""
+    results = {key for key, message in messages.items() if message.get("role") == "user"
+               and (message.get("meta") or {}).get("delegation_id") == delegation}
+    resumed = [message for message in messages.values()
+               if message.get("role") == "assistant" and message.get("parentId") in results]
+    require(len(resumed) <= 1, "multiple resumed continuations for one delegation")
+    return resumed[0] if resumed and resumed[0].get("done") is True else None
+
+
 def verify_native_context(records, *, parent, child, initial, continuation, child_messages,
                           association, delegation, submitted, model, tool, system_hash):
     require(association.get("parent_chat_id") == parent and association.get("parent_message_id") == initial
@@ -98,6 +108,11 @@ def verify_native_context(records, *, parent, child, initial, continuation, chil
             "native child association mismatch")
     require(initial in submitted and continuation not in submitted, "continuation was a submitted human request")
     entries = [record for record in records if record["kind"] == "native_handler_entry"]
+    # Worker-side check too: every parent-chat handler entry the controller did
+    # not submit must be this single continuation, whatever the saved chat shows.
+    resumed = {entry.get("message_id") for entry in entries
+               if entry.get("chat_id") == parent and entry.get("message_id") not in submitted}
+    require(resumed == {continuation}, "missing or multiple resumed parent continuations observed")
     matches = [entry for entry in entries if entry.get("message_id") == continuation]
     require(len(matches) == 1, "missing or ambiguous native continuation observation")
     entry = matches[0]
@@ -141,9 +156,23 @@ async def retain_canary(http, *, sandbox, source, copied, headers, scenario, dir
     return receipt
 
 
-async def collect_native_evidence(http, *, canary, expected, context, directory=None):
-    # Persist the independently downloaded bytes BEFORE any observer/context
-    # collection can fail. This ordering is shared with offline replay tests.
-    oracle = await retain_canary(http, **canary, directory=directory)
+async def collect_native_evidence(http, *, canary, expected, context, check=None, directory=None):
+    """Persist the canary BEFORE behavior traces/assertions or observer collection.
+
+    `check` is the controller's model/tool-iteration diagnosis; it returns extra
+    context. If the oracle fails, the check still runs so a missing copy is
+    reported alongside why (e.g. the model never called read), not instead of it.
+    """
+    try:
+        oracle = await retain_canary(http, **canary, directory=directory)
+    except Exception as failure:
+        if check is not None:
+            try:
+                await check()
+            except Exception as diagnosis:
+                raise ExceptionGroup("native oracle and behavior failures", [failure, diagnosis]) from None
+        raise
+    if check is not None:
+        context = {**context, **await check()}
     records = collect_observers(expected, directory=directory)
     return oracle, verify_native_context(records, **context)

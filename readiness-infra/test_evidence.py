@@ -197,3 +197,71 @@ async def test_production_collection_pipeline_persists_oracle_before_observer_fa
             assert oracle["equal"] and entry["message_id"] == context["continuation"]
     receipt = json.loads((directory / "native_idle-canary.json").read_text())
     assert receipt["equal"] and all(base64.b64decode(file["base64"]) == payload for file in receipt["files"])
+
+
+def saved_parent(context, *continuations):
+    """Saved-chat shape from the replayed run: result message, then resumed reply/replies."""
+    messages = {context["initial"]: {"id": context["initial"], "role": "assistant", "done": True},
+                "result": {"id": "result", "role": "user", "parentId": context["initial"],
+                           "meta": {"delegation_id": context["delegation"]}}}
+    for message_id in continuations:
+        messages[message_id] = {"id": message_id, "role": "assistant", "parentId": "result", "done": True}
+    return messages
+
+
+def test_exactly_one_resumed_continuation_in_saved_chat(replay):
+    fixture, _, _ = replay
+    context = fixture["context"]
+    assert evidence.select_continuation(saved_parent(context), context["delegation"]) is None
+    assert evidence.select_continuation(saved_parent(context, context["continuation"]),
+                                        context["delegation"])["id"] == context["continuation"]
+    with pytest.raises(RuntimeError, match="multiple resumed"):
+        evidence.select_continuation(saved_parent(context, context["continuation"], "second-resume"),
+                                     context["delegation"])
+
+
+@pytest.mark.parametrize("extra", ["second-resume", None])
+def test_observed_duplicate_or_missing_continuation_fails(replay, extra):
+    fixture, expected, directory = replay
+    path = directory / "worker-A.jsonl"
+    lines = path.read_text().splitlines()
+    parent_entry = json.loads(lines[-1])
+    assert parent_entry["message_id"] == fixture["context"]["continuation"]
+    if extra:  # A second distinct resumed parent reply, same worker/context.
+        lines.append(json.dumps({**parent_entry, "message_id": extra, "time": parent_entry["time"] + 1}))
+    else:  # Zero: the continuation's handler entry is absent.
+        lines.pop()
+    path.write_text("\n".join(lines) + "\n")
+    with pytest.raises(RuntimeError, match="resumed parent continuations"):
+        evidence.verify_native_context(evidence.collect_observers(expected, directory=directory), **fixture["context"])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fault", ["tool-assertion", "trace-write", "oracle-and-behavior"])
+async def test_canary_persists_before_behavior_traces_and_assertions(replay, fault):
+    fixture, expected, directory = replay
+    canary = fixture["canary"]
+    payload = canary["retained_read_payload"].encode()
+    def respond(request):
+        if fault == "oracle-and-behavior" and request.url.params["path"] == canary["copied"]:
+            return httpx.Response(404)  # The model never made the copy.
+        return httpx.Response(200, stream=httpx.ByteStream(payload))
+    async def check():
+        assert fault == "oracle-and-behavior" or (directory / "native_idle-canary.json").exists()
+        if fault == "trace-write":
+            raise PermissionError("injected trace write failure")
+        raise RuntimeError("Resumed parent did not use Lathe read")
+    async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as http:
+        with pytest.raises(Exception) as caught:
+            await evidence.collect_native_evidence(http, expected=expected, context=fixture["context"],
+                check=check, directory=directory,
+                canary=dict(sandbox=canary["sandbox"], source=canary["source"], copied=canary["copied"],
+                            headers={}, scenario="native_idle"))
+    if fault == "oracle-and-behavior":
+        # Both the oracle failure and the model-behavior diagnosis are reported.
+        assert isinstance(caught.value, ExceptionGroup)
+        assert [type(e) for e in caught.value.exceptions] == [httpx.HTTPStatusError, RuntimeError]
+        assert not (directory / "native_idle-canary.json").exists()
+    else:
+        receipt = json.loads((directory / "native_idle-canary.json").read_text())
+        assert receipt["equal"] and all(base64.b64decode(f["base64"]) == payload for f in receipt["files"])

@@ -462,3 +462,15 @@ separating real native record shapes from synthetic startup test records. Replay
 calls the actual writer/collector/context/oracle functions, not a model or native
 dispatcher replacement. The historical run remains **FAILED qualification** and
 its busy case **NOT REACHED**. No live/provider dispatch accompanies this fix.
+
+### Review fixes after 7a4ef7c: offline only
+
+Continuation selection now requires exactly one resumed parent reply for the
+delegation, both in the saved chat (zero pending, two or more fail, re-checked
+after evidence collection) and in worker handler observations (every
+unsubmitted parent-chat entry must be that one message). Canary receipts persist
+before continuation/child traces and model tool-use assertions; if the oracle
+itself fails, the behavior diagnosis still runs and both are reported. Artifact
+export attempts canary receipts first and every file independently, then reports
+all controller/stop/export failures. Fault-injected replay and controller tests
+fail against 7a4ef7c. No live, cloud or provider calls accompanied this change.

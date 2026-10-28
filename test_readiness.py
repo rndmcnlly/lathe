@@ -2,6 +2,7 @@
 import copy
 import json
 import sys
+from pathlib import Path
 from decimal import Decimal
 from types import SimpleNamespace
 
@@ -477,3 +478,34 @@ def test_successful_controller_requires_observers_and_applicable_canary_exports(
     else:
         assert action("owned-app") == 0
     assert events[1][0] == "stop"
+
+
+@pytest.mark.parametrize("fault", ["trace-missing", "stop-and-summary", "wait-interrupted"])
+def test_canary_receipts_export_independently_of_other_artifact_failures(tmp_path, fault):
+    def docker(*args, **kwargs):
+        if args[0] == "wait":
+            if fault == "wait-interrupted":
+                raise KeyboardInterrupt("injected runner termination")
+            return "1"
+        if args[0] == "stop" and fault == "stop-and-summary":
+            raise RuntimeError("injected stop failure")
+        if args[0] == "cp":
+            name = args[1].rsplit("/", 1)[1]
+            if (fault == "trace-missing" and name == "trace.jsonl") or (
+                    fault == "stop-and-summary" and name == "summary.json"):
+                raise RuntimeError(f"injected {name} export failure")
+            if name.endswith("-canary.json") or fault == "wait-interrupted":
+                Path(args[2]).write_text(name)
+        return ""
+    action = lab.controller_action(SimpleNamespace(docker=docker), tmp_path)
+    with pytest.raises((RuntimeError, BaseExceptionGroup, KeyboardInterrupt)) as caught:
+        action("owned-app")
+    # The independent oracle receipts are exported even though another artifact failed.
+    assert all((tmp_path / f"native_{s}-canary.json").exists() for s in ("idle", "busy"))
+    if fault == "trace-missing":
+        assert "trace.jsonl export failure" in str(caught.value)
+    elif fault == "stop-and-summary":
+        messages = [str(e) for e in caught.value.exceptions]
+        assert messages == ["injected stop failure", "injected summary.json export failure"]
+    else:
+        assert isinstance(caught.value, KeyboardInterrupt)
