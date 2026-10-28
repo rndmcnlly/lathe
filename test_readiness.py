@@ -112,6 +112,8 @@ async def test_real_aiohttp_admission_before_read_and_rejection(case, monkeypatc
         assert events[1]["prompt_tokens_reserved"] == len(body) * 4 + 16384
     else:
         assert not forwarded and budget.calls == 0 and budget.reserved == 0
+        if case == "oversized":
+            assert events[-1]["read_bytes"] is None  # Declared length rejected before request.read().
 
 
 def test_default_and_plan_do_not_import_live_helpers(monkeypatch, capsys):
@@ -137,42 +139,52 @@ def test_native_scope_plan_and_host_selection_without_live_work(monkeypatch, cap
 @pytest.mark.parametrize("cloud_fails,removal_sticks", [(False, False), (True, False), (False, True)])
 def test_cleanup_orders_and_independently_verifies(monkeypatch, tmp_path, cloud_fails, removal_sticks):
     label = "lathe-ci-next-0123456789abcdef"
-    names = {label + suffix for suffix in ("-app", "-pg", "-redis")}
-    networks = {label + "-net"}
+    infra = lab.infrastructure()
+    owner = "1" * 32
+    network = "lathe-preflight-" + owner
+    manifest = {"owner": owner, "network": network,
+                "containers": [network + suffix for suffix in ("-pg", "-redis", "-app")]}
+    (tmp_path / "live").mkdir()
+    infra.save(tmp_path / "live/owner.json", manifest)
+    names = set(manifest["containers"])
+    networks = {network}
     calls = []
 
     def command(*args, **kwargs):
         calls.append(args)
-        if args[1:3] == ("ps", "-a"):
+        if args[0] == "ps":
             return "\n".join(names)
-        if args[1:3] == ("network", "ls"):
+        if args[:2] == ("network", "ls"):
             return "\n".join(networks)
-        if args[1] == "inspect":
-            return "false"
-        if args[1] == "rm" and not removal_sticks:
+        if args[0] == "inspect":
+            return json.dumps([{"Name": "/" + args[1], "Id": args[1],
+                                "Config": {"Labels": {infra.LABEL: owner}}}])
+        if args[:2] == ("network", "inspect"):
+            return json.dumps([{"Id": network, "Labels": {infra.LABEL: owner}, "Containers": {}}])
+        if args[0] == "rm" and not removal_sticks:
             names.discard(args[-1])
-        if args[1:3] == ("network", "rm"):
+        if args[:2] == ("network", "rm"):
             networks.discard(args[-1])
         return ""
 
     async def cloud_cleanup():
-        assert any(c[1] == "stop" for c in calls)
-        assert not any(c[1] == "rm" for c in calls)
+        assert not names and not networks
         if cloud_fails:
             raise KeyboardInterrupt("interrupted cloud cleanup")
 
     async def no_sandboxes(*args):
         return []
 
-    monkeypatch.setattr(lab, "run_command", command)
+    monkeypatch.setattr(infra, "docker", command)
+    monkeypatch.setattr(lab, "infrastructure", lambda: infra)
     monkeypatch.setattr(lab, "owned_sandboxes", no_sandboxes)
     monkeypatch.setattr(lab, "setup_imports", lambda: SimpleNamespace(sanitize=lambda x: x))
     monkeypatch.setitem(sys.modules, "test_deployment", SimpleNamespace(cleanup_test_sandboxes=cloud_cleanup))
     monkeypatch.setenv("DAYTONA_API_KEY", "offline-fake-key")
     assert lab.cleanup(label, tmp_path) is (not cloud_fails and not removal_sticks)
     record = json.loads(next(tmp_path.glob("cleanup-*.json")).read_text())
-    assert record["owui_stopped_before_cloud_cleanup"]
-    assert any(c[1] == "rm" for c in calls)
+    assert record["owui_stopped_before_cloud_cleanup"] is (not removal_sticks)
+    assert any(c[0] == "rm" for c in calls)
     assert not networks
 
 
@@ -185,24 +197,38 @@ def test_cleanup_refuses_non_lab_namespace(monkeypatch, tmp_path):
 
 @pytest.mark.asyncio
 async def test_worker_identity_precedes_existing_frontend_catchall(monkeypatch):
-    middleware = []
+    import importlib.util
+    from pathlib import Path
 
     async def original(*args, **kwargs):
         pass
 
-    app = SimpleNamespace(state=SimpleNamespace(CHAT_COMPLETION_HANDLER=original),
-        middleware=lambda kind: lambda fn: middleware.append(fn) or fn)
-    monkeypatch.setitem(sys.modules, "uvicorn", SimpleNamespace(run=lambda *a, **k: None))
-    monkeypatch.setitem(sys.modules, "fastapi", SimpleNamespace(Request=object))
-    monkeypatch.setitem(sys.modules, "fastapi.responses", SimpleNamespace(JSONResponse=lambda data: data))
+    async def spa_fallback(*args):
+        pytest.fail("Identity request reached existing SPA fallback")
+    class App:
+        state = SimpleNamespace(CHAT_COMPLETION_HANDLER=original)
+        __call__ = spa_fallback
+    app = App()
     monkeypatch.setitem(sys.modules, "open_webui", SimpleNamespace())
     monkeypatch.setitem(sys.modules, "open_webui.main", SimpleNamespace(app=app))
-    lab.worker("A")
-
-    async def spa_fallback(request):
-        pytest.fail("Identity request reached existing SPA fallback")
-
-    result = await middleware[0](SimpleNamespace(url=SimpleNamespace(path="/__lathe_lab_identity")), spa_fallback)
+    monkeypatch.setitem(sys.modules, "guard", SimpleNamespace(install_egress_guard=lambda: None))
+    monkeypatch.setenv("READINESS_WORKER", "A")
+    read_text = Path.read_text
+    def text(path, *a, **k):
+        if str(path) == "/run/readiness/migration.json":
+            return '{"pid":1,"count":1}'
+        if str(path) == "/app/backend/data/readiness-marker":
+            return "marker"
+        return read_text(path, *a, **k)
+    monkeypatch.setattr(Path, "read_text", text)
+    spec = importlib.util.spec_from_file_location("shared_worker", lab.root() / "readiness-infra/worker.py")
+    worker = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(worker)
+    sent = []
+    async def send(message):
+        sent.append(message)
+    await worker.app({"type": "http", "path": "/_readiness/identity"}, None, send)
+    result = json.loads(sent[-1]["body"])
     assert result["worker"] == "A" and result["pid"] > 0 and result["incarnation"]
 
 
@@ -257,3 +283,96 @@ async def test_real_provisioning_configuration_and_installed_valve_gate(fault):
             info = await coroutine
             assert info["id"] == "sandbox-id"
             assert requests[-2:] == [("GET", "/api/v1/tools/id/lathe_test/valves"), ("POST", "/api/sandbox")]
+
+
+@pytest.mark.parametrize("failure", [None, "preflight", "config", "live", "export"])
+def test_host_runs_shared_keyfree_gates_before_live_and_always_cleans(tmp_path, monkeypatch, failure):
+    import hashlib
+    for name in ("lathe.py", "testing_support.py"):
+        (tmp_path / name).write_text(name)
+    hashes = {name: hashlib.sha256((tmp_path / name).read_bytes()).hexdigest()
+              for name in ("lathe.py", "testing_support.py")}
+    calls = []
+    qualified = {"built_image_id": "sha256:qualified", "staged_sha256": hashes}
+    def preflight(directory, source):
+        calls.append("preflight")
+        if failure == "preflight":
+            raise RuntimeError("injected preflight failure")
+        return qualified
+    def topology(directory, source, **kwargs):
+        phase = "config" if kwargs.get("config_only") else "live"
+        calls.append(phase)
+        assert kwargs["image_id"] == "sha256:qualified"
+        assert kwargs["qualified"] is qualified
+        if failure == phase:
+            raise RuntimeError("injected controller failure")
+        if phase == "live" and failure == "export":
+            raise PermissionError("injected export failure")
+    async def prices():
+        assert calls == ["preflight", "config"]
+        calls.append("prices")
+        return {}
+    def cleanup(label, directory, *, cloud):
+        calls.append("cleanup-cloud" if cloud else "cleanup-keyfree")
+        return True
+    monkeypatch.setenv("DAYTONA_API_KEY", "unused-test-key")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "unused-test-key")
+    monkeypatch.setattr(lab, "root", lambda: tmp_path)
+    monkeypatch.setattr(lab, "setup_imports", lambda: SimpleNamespace(sanitize=lambda value: value))
+    monkeypatch.setattr(lab, "infrastructure", lambda: SimpleNamespace(
+        preflight=preflight, topology=topology, IMAGES={"owui": "pinned"}))
+    monkeypatch.setattr(lab, "verify_prices", prices)
+    monkeypatch.setattr(lab, "cleanup", cleanup)
+    def command(*args, **kwargs):
+        assert args[0] == "git", "host attempted legacy Docker bootstrap"
+        return "checkout"
+    monkeypatch.setattr(lab, "run_command", command)
+    assert lab.host("native") == (0 if failure is None else 1)
+    assert calls[-1] == ("cleanup-keyfree" if failure in ("preflight", "config") else "cleanup-cloud")
+    if failure == "preflight":
+        assert calls == ["preflight", "cleanup-keyfree"]
+    if failure == "config":
+        assert calls == ["preflight", "config", "cleanup-keyfree"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stale_worker", [None, "A", "B"])
+async def test_cross_worker_loaded_configuration_gate(tmp_path, monkeypatch, stale_worker):
+    import hashlib
+    import lathe
+    from pathlib import Path
+    installed = {"daytona_api_key": "synthetic", "auto_create_sandbox": False}
+    normalized = lathe.Tools.Valves(**installed).model_dump()
+    digest = hashlib.sha256(json.dumps(normalized, sort_keys=True).encode()).hexdigest()
+    real_read = Path.read_bytes
+    monkeypatch.setattr(Path, "read_bytes", lambda path: b"staged" if str(path) == "/opt/staged/lathe.py" else real_read(path))
+    seen = []
+    def respond(request):
+        worker = "A" if request.url.port == lab.PORTS["A"] else "B"
+        seen.append((worker, request.url.path))
+        if request.url.path == "/openai/config":
+            value = {"ENABLE_OPENAI_API": True, "OPENAI_API_BASE_URLS": ["http://127.0.0.1:9099/v1"],
+                     "OPENAI_API_KEYS": ["relay"], "OPENAI_API_CONFIGS": {"0": {"model_ids": [lab.MODEL]}}}
+        elif request.url.path == "/api/v1/models/model":
+            value = {"base_model_id": lab.MODEL, "params": {"function_calling": "native", "max_tokens": 4096,
+                     "custom_params": {"provider": lab.PROVIDER}}}
+        elif request.url.path == "/api/models":
+            value = {"data": [{"id": "workspace"}]}
+        elif request.url.path.endswith("/valves"):
+            value = installed
+        elif request.url.path == "/_readiness/loaded":
+            value = {"worker": worker, "pid": request.url.port, "incarnation": worker,
+                     "tools": ["interpret", "read", "bash"], "valves_sha256": "stale" if stale_worker == worker else digest,
+                     "source_sha256": hashlib.sha256(b"staged").hexdigest()}
+        else:
+            pytest.fail(str(request.url))
+        return httpx.Response(200, json=value)
+    suite = SimpleNamespace(MODEL="workspace", auth_headers=lambda **kwargs: {})
+    async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as http:
+        check = lab.verify_workers(http, suite, "relay", installed, lambda *a, **k: None)
+        if stale_worker:
+            with pytest.raises(RuntimeError, match="loaded toolkit mismatch"):
+                await check
+        else:
+            await check
+            assert {name for name, path in seen if path == "/_readiness/loaded"} == {"A", "B"}

@@ -1,0 +1,5 @@
+{
+  "owui": "ghcr.io/open-webui/open-webui@sha256:41812075aede8ada8497cb2b71c76412978633eee72775bb77796f593d03b677",
+  "postgres": "pgvector/pgvector:pg16@sha256:7b822b0aac60967beb1ea5e576b8602c94c300a157d187f385ae3e0da199b90a",
+  "redis": "redis:7.4.6-alpine@sha256:3b73847e72874be07e6657b129a94761662b79bc0f679273757d4218573b2a98"
+}

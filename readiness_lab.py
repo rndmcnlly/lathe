@@ -23,7 +23,6 @@ import uuid
 from decimal import Decimal
 from types import SimpleNamespace
 
-IMAGE = "ghcr.io/open-webui/open-webui:v0.12.4-slim"
 MODEL = "z-ai/glm-5.3-flash"
 MAX_REQUESTS = 40
 # Allow valid text schemas/history; the nonrefundable $2 reservation stays fixed.
@@ -32,7 +31,7 @@ PRICE = {"prompt": Decimal("0.00000015"), "completion": Decimal("0.0000005")}
 PROVIDER = {"data_collection": "deny", "zdr": True,
             "max_price": {"prompt": 0.15, "completion": 0.5, "request": 0, "image": 0}}
 BUDGET = Decimal("2.00")
-PORTS = {"A": 8080, "B": 8081}
+PORTS = {"A": 8081, "B": 8082}
 SNAPSHOT = "daytona-small"
 UNIMPLEMENTED = {
     "overlapping_first_use": "NOT IMPLEMENTED: requires an observed admission barrier",
@@ -84,6 +83,9 @@ def relay_application(relay, reservation, trace):
               ceiling_bytes=MAX_PROMPT_BYTES)
         status, error = 500, None
         try:
+            if request.content_length is not None and request.content_length > MAX_PROMPT_BYTES:
+                raise web.HTTPRequestEntityTooLarge(max_size=MAX_PROMPT_BYTES,
+                                                   actual_size=request.content_length)
             response = await handler(request)
             status = response.status
             return response
@@ -167,7 +169,7 @@ async def verify_prices():
             "source": "https://openrouter.ai/api/v1/models"}
 
 
-async def provision_small(http, base, admin_headers, key, label, email, trace):
+async def provision_small(http, base, admin_headers, key, label, email, trace, before_provision=None):
     """Preflight the snapshot, install/read back complete valves, create one VM.
 
     OWUI valve updates are replacements, not JSON merge patches. Preserve the
@@ -205,6 +207,8 @@ async def provision_small(http, base, admin_headers, key, label, email, trace):
             and json.loads(installed.get("sandbox_create_overrides", "null")) == overrides,
             "Installed staging valves do not match snapshot/lifetime/ownership policy")
     trace("installed_valves_verified", **expected, sandbox_create_overrides=overrides)
+    if before_provision:
+        await before_provision(installed)
     response = await http.post("https://app.daytona.io/api/sandbox", headers=cloud_headers, json={
         **overrides, "name": label, "labels": {label: email.strip().lower()},
         "autoStopInterval": 5, "autoArchiveInterval": 5, "autoDeleteInterval": 0})
@@ -219,6 +223,44 @@ async def provision_small(http, base, admin_headers, key, label, email, trace):
     return info
 
 
+async def verify_workers(http, suite, relay_key, installed, trace):
+    """Read both processes after restart, including their actual loaded toolkit."""
+    import lathe
+    normalized = lathe.Tools.Valves(**installed).model_dump()
+    expected_valves = hashlib.sha256(json.dumps(normalized, sort_keys=True).encode()).hexdigest()
+    for name, port in PORTS.items():
+        base = f"http://127.0.0.1:{port}"
+        async def get(path, completion=False):
+            response = await http.get(base + path, headers=suite.auth_headers(completion=completion))
+            response.raise_for_status()
+            return response.json()
+        provider = await get("/openai/config")
+        require(provider.get("ENABLE_OPENAI_API") is True
+                and provider.get("OPENAI_API_BASE_URLS") == ["http://127.0.0.1:9099/v1"]
+                and provider.get("OPENAI_API_KEYS") == [relay_key]
+                and provider.get("OPENAI_API_CONFIGS", {}).get("0", {}).get("model_ids") == [MODEL],
+                f"Worker {name} provider policy mismatch")
+        model = await get("/api/v1/models/model?id=" + suite.MODEL)
+        require(model.get("base_model_id") == MODEL
+                and model.get("params", {}).get("function_calling") == "native"
+                and model.get("params", {}).get("max_tokens") == 4096
+                and model.get("params", {}).get("custom_params", {}).get("provider") == PROVIDER,
+                f"Worker {name} model policy mismatch")
+        require(suite.MODEL in {m["id"] for m in (await get("/api/models", True))["data"]},
+                f"Worker {name} ordinary-user model access missing")
+        valves = await get("/api/v1/tools/id/lathe_test/valves")
+        require(valves == installed, f"Worker {name} valve readback mismatch")
+        loaded = await get("/_readiness/loaded", True)
+        trace("worker_loaded_observation", expected_valves_sha256=expected_valves, **loaded)
+        require(loaded.get("valves_sha256") == expected_valves
+                and loaded.get("source_sha256") == hashlib.sha256(Path("/opt/staged/lathe.py").read_bytes()).hexdigest()
+                and {"interpret", "read", "bash"} <= set(loaded.get("tools", [])),
+                f"Worker {name} loaded toolkit mismatch")
+        trace("worker_config_verified", worker=name, pid=loaded["pid"],
+              incarnation=loaded["incarnation"], valves_sha256=expected_valves,
+              source_sha256=loaded["source_sha256"], model=suite.MODEL)
+
+
 def run_command(*args, timeout=120, capture=True):
     result = subprocess.run(args, check=True, timeout=timeout,
                             stdout=subprocess.PIPE if capture else subprocess.DEVNULL,
@@ -226,53 +268,7 @@ def run_command(*args, timeout=120, capture=True):
     return result.stdout.decode().strip() if capture else ""
 
 
-def worker(name):
-    """Lab-only HTTP observation; no replacement of toolkit/runtime functions."""
-    # The image normally launches `python -m uvicorn` from /app/backend.
-    # A /tmp script gets /tmp, not that working directory, on sys.path.
-    sys.path.insert(0, "/app/backend")
-    import uvicorn
-    from fastapi import Request
-    from fastapi.responses import JSONResponse
-    from open_webui.main import app
-
-    identity = {"worker": name, "pid": os.getpid(), "incarnation": uuid.uuid4().hex}
-
-    def note(kind, **data):
-        with open(f"/lab/artifacts/worker-{name}.jsonl", "a") as out:
-            out.write(json.dumps({"kind": kind, "time": time.time(), **identity, **data}) + "\n")
-
-    # Observe OWUI's own invocation, never dispatch internal messages ourselves.
-    original = app.state.CHAT_COMPLETION_HANDLER
-
-    async def observe_handler(request, form_data, *args, **kwargs):
-        note("native_handler_entry", chat_id=form_data.get("chat_id"),
-             message_id=form_data.get("id"), internal=getattr(request.state, "internal", False),
-             model=form_data.get("model"), tool_ids=form_data.get("tool_ids"),
-             system_hash=hashlib.sha256(json.dumps([m for m in form_data.get("messages", [])
-                 if m.get("role") == "system"], sort_keys=True).encode()).hexdigest())
-        return await original(request, form_data, *args, **kwargs)
-
-    app.state.CHAT_COMPLETION_HANDLER = observe_handler
-
-    @app.middleware("http")
-    async def observed(request: Request, call_next):
-        # OWUI's SPA catch-all mount is already registered at import. A route
-        # appended here would return the frontend HTML instead of JSON.
-        if request.url.path == "/__lathe_lab_identity":
-            return JSONResponse(identity)
-        response = await call_next(request)
-        if request.url.path == "/api/chat/completions":
-            note("http_completion", status=response.status_code)
-        response.headers["X-Lathe-Lab-Pid"] = str(identity["pid"])
-        response.headers["X-Lathe-Lab-Incarnation"] = identity["incarnation"]
-        return response
-
-    # Only the controller in this container can access either worker or relay.
-    uvicorn.run(app, host="127.0.0.1", port=PORTS[name], access_log=False)
-
-
-async def inside(scope="full"):
+async def inside(scope="full", config_only=False):
     import httpx
     from aiohttp import web
 
@@ -281,13 +277,20 @@ async def inside(scope="full"):
                           ("WEBUI_SECRET_KEY", "OAUTH_SESSION_TOKEN_ENCRYPTION_KEY"))
     directory = Path("/lab/artifacts")
     directory.mkdir(parents=True, exist_ok=True)
+    for name in ("lathe.py", "testing_support.py"):
+        require(Path("/tmp", name).read_bytes() == Path("/opt/staged", name).read_bytes(),
+                "Controller source differs from qualified staged source")
+    from guard import install_egress_guard
+    install_egress_guard(controller=True)
+    from entrypoint import Workers
+    workers = Workers()
     trace = monitor.Trace(directory)
     os.environ["LATHE_MONITOR_MODEL"] = MODEL
     # Do not inherit an operator's existing OWUI configuration or preview keys.
     for key in list(os.environ):
         if key.startswith(("OWUI_", "LATHE_PREVIEW_")):
             del os.environ[key]
-    os.environ.update(OWUI_URL="http://127.0.0.1:8080",
+    os.environ.update(OWUI_URL="http://127.0.0.1:8081",
                       LATHE_TEST_TOOL_ID="lathe_test")
     import test_deployment as suite
     suite.TRACE = trace
@@ -295,33 +298,23 @@ async def inside(scope="full"):
     reservation = Reservation()
     relay_app = relay_application(relay, reservation, trace)
     runner = web.AppRunner(relay_app, access_log=None)
-    processes = {}
-    handles = []
+    processes = workers.processes
     client = None
     exit_code = 1
 
     class NativeComplete(Exception):
         """Leave the full-scope path while retaining common teardown/return."""
 
-    def start(name, migrations=False):
-        env = dict(os.environ, ENABLE_DB_MIGRATIONS=str(migrations).lower())
-        # Raw logs stay inside disposable storage and are never exported.
-        handle = open(f"/lab/{name}-{uuid.uuid4().hex}.raw.log", "wb")
-        handles.append(handle)
-        processes[name] = subprocess.Popen(
-            [sys.executable, __file__, "--worker", name], env=env,
-            stdout=handle, stderr=subprocess.STDOUT)
-
     async def identity(name):
         async with httpx.AsyncClient(timeout=3) as http:
             for _ in range(120):
                 if processes[name].poll() is not None:
                     # Extract only a sanitized bounded tail, never export raw logs.
-                    handle = handles[-1]
-                    trace("worker_failure", worker=name, tail=Path(handle.name).read_text(errors="replace")[-5000:])
+                    handle = workers.handles[-1]
+                    trace("worker_failure", worker=name, tail=Path(handle.name).read_text(errors="replace")[-1800:])
                     raise RuntimeError(f"Worker {name} exited")
                 try:
-                    response = await http.get(f"http://127.0.0.1:{PORTS[name]}/__lathe_lab_identity")
+                    response = await http.get(f"http://127.0.0.1:{PORTS[name]}/_readiness/identity")
                     response.raise_for_status()
                     value = response.json()
                     require(value["pid"] == processes[name].pid, "Backend PID mismatch")
@@ -331,23 +324,22 @@ async def inside(scope="full"):
                     await asyncio.sleep(1)
         raise RuntimeError(f"Worker {name} readiness deadline")
 
-    def stop(name):
-        process = processes.get(name)
-        if process and process.poll() is None:
-            process.terminate()
-            try:
-                process.wait(timeout=15)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait(timeout=10)
-        require(not process or process.poll() is not None, "Worker did not stop")
-
     try:
         async with asyncio.timeout(22 * 60):
             await runner.setup()
             await web.TCPSite(runner, "127.0.0.1", 9099).start()
-            start("A", migrations=True)
-            await identity("A")
+            workers.migrate()
+            workers.start("A")
+            initial_a = await identity("A")
+            workers.start("B")
+            initial_b = await identity("B")
+            if config_only:
+                workers.replace("B")
+                new_b = await identity("B")
+                stable_a = await identity("A")
+                require(initial_a == stable_a and initial_b["incarnation"] != new_b["incarnation"]
+                        and new_b["migration"]["count"] == 1, "credential-free worker replacement failed")
+                trace("replacement_verified", before=initial_b, after=new_b, stable=stable_a)
             async with httpx.AsyncClient(timeout=10) as http:
                 version = await http.get(suite.OWUI_BASE + "/api/version")
                 version.raise_for_status()
@@ -385,13 +377,33 @@ async def inside(scope="full"):
             # Provision exactly one small CPU sandbox ourselves, with authoritative
             # ownership label. Lathe only discovers/starts it; it cannot provision more.
             trace("bootstrap_step", name="single_small_sandbox")
+            async def refresh(installed):
+                for name in PORTS:
+                    workers.replace(name)
+                    await identity(name)
+                async with httpx.AsyncClient(timeout=30) as http:
+                    await verify_workers(http, suite, relay.key, installed, trace)
+
             async with httpx.AsyncClient(timeout=180) as http:
+                if config_only:
+                    endpoint = suite.OWUI_BASE + "/api/v1/tools/id/lathe_test/valves"
+                    response = await http.get(endpoint, headers=suite.auth_headers())
+                    response.raise_for_status()
+                    installed = response.json()
+                    installed.update(auto_create_sandbox=False,
+                        sandbox_create_overrides=json.dumps({"snapshot": SNAPSHOT, "ttlMinutes": 30}))
+                    response = await http.post(endpoint + "/update", headers=suite.auth_headers(), json=installed)
+                    response.raise_for_status()
+                    await refresh(installed)
+                    require(relay.requests == 0 and reservation.calls == 0, "key-free adapter attempted inference")
+                    denied = Path("/run/readiness/egress-denied")
+                    require(not denied.exists() or not denied.read_text(), "key-free adapter attempted external egress")
+                    trace("config_preflight_pass", provider_requests=0)
+                    raise NativeComplete
                 await provision_small(http, suite.OWUI_BASE, suite.auth_headers(), suite.DAYTONA_API_KEY,
-                                      suite.DEPLOYMENT_LABEL, user["email"], trace)
+                                      suite.DEPLOYMENT_LABEL, user["email"], trace, before_provision=refresh)
             await suite.check_staging_access(admin, user)
             # B starts after DB migrations and shared configuration are committed.
-            start("B")
-            await identity("B")
             client = suite.OWUIClient()
             await client.connect()  # Keep the authenticated socket on A throughout.
             if scope == "native":
@@ -506,8 +518,7 @@ async def inside(scope="full"):
                 await turn("B", 2)
                 await turn("A", 3)
                 before = await identity("B")
-                stop("B")
-                start("B")
+                workers.replace("B")
                 after = await identity("B")
                 require(before["incarnation"] != after["incarnation"], "Worker was not replaced")
                 trace("worker_replaced", before=before, after=after)
@@ -526,13 +537,14 @@ async def inside(scope="full"):
         # Stop request producers BEFORE deleting their cloud resources.
         for name in ("B", "A"):
             try:
-                stop(name)
+                workers.stop(name)
             except Exception as exc:
                 exit_code = 1
                 trace("cleanup_error", error=str(exc))
         try:
             require(all(p.poll() is not None for p in processes.values()), "Live worker blocks cloud cleanup")
-            await suite.cleanup_test_sandboxes()
+            if not config_only:
+                await suite.cleanup_test_sandboxes()
         except Exception as exc:
             exit_code = 1
             trace("cleanup_error", error=str(exc))
@@ -547,10 +559,9 @@ async def inside(scope="full"):
         except Exception as exc:
             exit_code = 1
             trace("cleanup_error", error=str(exc))
-        for handle in handles:
-            handle.close()
+        workers.close()
         (directory / "summary.json").write_text(monitor.sanitize(json.dumps({
-            "exit_code": exit_code, "first_failure": trace.first_failure, "scope": scope,
+            "exit_code": exit_code, "first_failure": trace.first_failure, "scope": scope, "config_only": config_only,
             "requested_model": MODEL, "served_models": sorted(trace.models),
             "provider_requests": relay.requests, "reserved_usd": str(reservation.reserved),
             "reservation_ceiling_usd": str(BUDGET), "unimplemented": UNIMPLEMENTED})))
@@ -759,57 +770,79 @@ async def native_scenarios(suite, session_id, user, trace):
             trace("scenario_pass", name=scenario)
 
 
-def cleanup(label, output):
-    """Repeatable last-resort teardown; never acts on names without ownership labels."""
+def cleanup(label, output, *, cloud=True):
+    """Stop the shared topology before exact-label cloud cleanup, even on failure."""
     monitor = setup_imports()
     require(re.fullmatch(r"lathe-ci-next-[a-f0-9]{16}", label), "Invalid owned lab label")
-    expected = [label + suffix for suffix in ("-app", "-redis", "-pg")]
-    errors, deleted, removed = [], [], []
+    infra = infrastructure()
+    directories = [output / name for name in ("preflight", "config-preflight", "live")]
+    errors, deleted = [], []
     stopped = False
     try:
-        names = run_command("docker", "ps", "-a", "--filter", f"label=lathe.readiness={label}",
-                            "--format", "{{.Names}}").splitlines()
-        require(set(names) <= set(expected), "Unexpected labelled container")
-        if expected[0] in names:
-            run_command("docker", "stop", "--time", "20", expected[0], timeout=40)
-            require(run_command("docker", "inspect", "--format", "{{.State.Running}}", expected[0]) == "false",
-                    "OWUI still running")
+        for directory in directories:
+            if directory.exists():
+                infra.cleanup(directory)
         stopped = True
-        import test_deployment as suite
-        suite.DEPLOYMENT_LABEL = label
-        suite.DAYTONA_API_KEY = os.environ["DAYTONA_API_KEY"]
-        suite.TRACE = lambda kind, **data: deleted.append(data["id"]) if kind == "sandbox_deleted" else None
-        asyncio.run(suite.cleanup_test_sandboxes())
-        require(not asyncio.run(owned_sandboxes(suite.DAYTONA_API_KEY, label)), "Owned sandboxes remain")
+        if cloud:
+            import test_deployment as suite
+            suite.DEPLOYMENT_LABEL = label
+            suite.DAYTONA_API_KEY = os.environ["DAYTONA_API_KEY"]
+            suite.TRACE = lambda kind, **data: deleted.append(data["id"]) if kind == "sandbox_deleted" else None
+            asyncio.run(suite.cleanup_test_sandboxes())
+            require(not asyncio.run(owned_sandboxes(suite.DAYTONA_API_KEY, label)), "Owned sandboxes remain")
     except BaseException as exc:
         errors.append(monitor.sanitize(f"{type(exc).__name__}: {exc}"))
-    # Even after cloud cleanup failure, kill producers and remove local resources.
+    # Never let a cloud callback or evidence failure prevent local teardown.
     try:
-        names = run_command("docker", "ps", "-a", "--filter", f"label=lathe.readiness={label}",
-                            "--format", "{{.Names}}").splitlines()
-        require(set(names) <= set(expected), "Unexpected labelled container")
-        for name in expected:
-            if name in names:
-                run_command("docker", "rm", "--force", "--volumes", name)
-                removed.append(name)
-        networks = run_command("docker", "network", "ls", "--filter", f"label=lathe.readiness={label}",
-                               "--format", "{{.Name}}").splitlines()
-        require(set(networks) <= {label + "-net"}, "Unexpected labelled network")
-        for name in networks:
-            run_command("docker", "network", "rm", name)
-            removed.append(name)
-        all_names = run_command("docker", "ps", "-a", "--format", "{{.Names}}").splitlines()
-        all_networks = run_command("docker", "network", "ls", "--format", "{{.Name}}").splitlines()
-        require(not set(expected) & set(all_names) and label + "-net" not in all_networks,
-                "Exact container/network removal not verified")
+        for directory in directories:
+            if directory.exists():
+                infra.cleanup(directory)
     except BaseException as exc:
         errors.append(monitor.sanitize(f"{type(exc).__name__}: {exc}"))
     result = {"label": label, "owui_stopped_before_cloud_cleanup": stopped,
-              "sandbox_deletions_verified": deleted, "local_removed": removed,
+              "sandbox_deletions_verified": deleted,
               "success": not errors, "errors": errors}
     output.mkdir(parents=True, exist_ok=True)
     (output / f"cleanup-{time.time_ns()}.json").write_text(json.dumps(result, indent=2))
     return not errors
+
+
+def infrastructure():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("readiness_infrastructure", root() / "readiness-infra/lab.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def controller_action(infra, directory, *, config_only=False):
+    """Wait/export only. The shared lifecycle owns local resources, even on failure."""
+    directory.mkdir(parents=True, exist_ok=True)
+    def action(app):
+        status = None
+        try:
+            status = int(infra.docker("wait", app, timeout=25 * 60).strip())
+            return status
+        finally:
+            infra.docker("stop", "--time", "20", app, timeout=40)
+            for filename in ("trace.jsonl", "summary.json", "worker-A.jsonl", "worker-B.jsonl"):
+                try:
+                    infra.docker("cp", f"{app}:/lab/artifacts/{filename}", str(directory / filename))
+                except RuntimeError:
+                    if filename in ("trace.jsonl", "summary.json") or (status == 0 and not config_only):
+                        raise
+    return action
+
+
+def local_preflight(infra, output, label):
+    qualified = infra.preflight(output / "preflight", root())
+    for name, digest in qualified["staged_sha256"].items():
+        require(hashlib.sha256((root() / name).read_bytes()).hexdigest() == digest,
+                "Source changed after key-free qualification")
+    infra.topology(output / "config-preflight", root(), image_id=qualified["built_image_id"],
+                   live_action=controller_action(infra, output / "config-evidence", config_only=True),
+                   config_only=True, qualified=qualified, deployment_label=label)
+    return qualified
 
 
 def host(scope="full"):
@@ -818,69 +851,20 @@ def host(scope="full"):
             "Export repository provider secrets through the trusted runner environment")
     label = "lathe-ci-next-" + secrets.token_hex(8)
     os.environ["LATHE_TEST_DEPLOYMENT_LABEL"] = label
-    network, database, redis, app = [label + suffix for suffix in ("-net", "-pg", "-redis", "-app")]
-    owned = []
     output = root() / "monitor-artifacts" / "readiness-results" / label
     output.mkdir(parents=True, exist_ok=False)
-    (root() / "monitor-artifacts" / "readiness-state.json").write_text(json.dumps({"label": label}))
+    state = root() / "monitor-artifacts" / "readiness-state.json"
+    state.write_text(json.dumps({"label": label, "cloud": False}))
     status = 1
+    live_started = False
+    infra = infrastructure()
     try:
+        # No cloud calls, keys, or model configuration in the first topology.
+        qualified = local_preflight(infra, output, label)
         pricing = asyncio.run(verify_prices())
         (output / "pricing.json").write_text(json.dumps(pricing, indent=2))
-        run_command("docker", "network", "create", "--label", f"lathe.readiness={label}", network)
-        for name, image, options in [
-            (database, "pgvector/pgvector:pg16", ["--tmpfs", "/var/lib/postgresql/data",
-                "-e", "POSTGRES_USER=lathe", "-e", "POSTGRES_PASSWORD=disposable", "-e", "POSTGRES_DB=lathe"]),
-            (redis, "redis:7-alpine", ["--tmpfs", "/data"]),
-        ]:
-            run_command("docker", "create", "--name", name, "--network", network,
-                        "--label", f"lathe.readiness={label}", *options, image)
-            owned.append(name)
-            run_command("docker", "start", name)
-        for _ in range(60):
-            try:
-                run_command("docker", "exec", database, "pg_isready", "-U", "lathe", timeout=5)
-                break
-            except subprocess.CalledProcessError:
-                time.sleep(1)
-        else:
-            raise RuntimeError("PostgreSQL readiness deadline")
-        for _ in range(60):
-            try:
-                require(run_command("docker", "exec", redis, "redis-cli", "ping", timeout=5) == "PONG",
-                        "Redis not ready")
-                break
-            except (subprocess.CalledProcessError, RuntimeError):
-                time.sleep(1)
-        else:
-            raise RuntimeError("Redis readiness deadline")
-        run_command("docker", "exec", database, "psql", "-U", "lathe", "-d", "lathe", "-c",
-                    "CREATE EXTENSION IF NOT EXISTS vector;")
-        shared_key = secrets.token_urlsafe(32)
-        monitor.SECRETS.append(shared_key)
-        env = {
-            "DATABASE_URL": f"postgresql://lathe:disposable@{database}:5432/lathe",
-            "VECTOR_DB": "pgvector", "PGVECTOR_DB_URL": f"postgresql://lathe:disposable@{database}:5432/lathe",
-            "REDIS_URL": f"redis://{redis}:6379/0", "WEBSOCKET_REDIS_URL": f"redis://{redis}:6379/0",
-            "WEBSOCKET_MANAGER": "redis", "ENABLE_WEBSOCKET_SUPPORT": "true",
-            "REDIS_KEY_PREFIX": label, "WEBSOCKET_REDIS_ROOM_CHANNELS": "true",
-            "WEBUI_SECRET_KEY": shared_key, "OAUTH_SESSION_TOKEN_ENCRYPTION_KEY": shared_key,
-            "DATA_DIR": "/lab/data", "CHAT_RESPONSE_MAX_TOOL_CALL_ITERATIONS": "8",
-            "RAG_EMBEDDING_ENGINE": "openai", "ENABLE_OLLAMA_API": "false",
-            "LATHE_TEST_DEPLOYMENT_LABEL": label, "LATHE_ISOLATED_CI": "1",
-        }
-        options = [item for k, v in env.items() for item in ("-e", f"{k}={v}")]
-        run_command("docker", "create", "--name", app, "--network", network,
-                    "--label", f"lathe.readiness={label}",
-                    "--tmpfs", "/app/backend/data",
-                    "--entrypoint", "python", "-e", "DAYTONA_API_KEY", "-e", "OPENROUTER_API_KEY",
-                    *options, IMAGE, "/tmp/readiness_lab.py", "--inside", "--scope", scope)
-        owned.append(app)
-        # docker cp creates no host bind mount and copies no .env or other secrets.
-        run_command("docker", "cp", str(Path(__file__).resolve()), app + ":/tmp/readiness_lab.py")
-        for filename in ("monitor_e2e.py", "test_deployment.py", "testing_support.py", "lathe.py"):
-            run_command("docker", "cp", str(root() / filename), app + ":/tmp/" + filename)
-        metadata = {"label": label, "owui_image": IMAGE, "model": MODEL, "scope": scope,
+        metadata = {"label": label, "images": infra.IMAGES, "built_image_id": qualified["built_image_id"],
+                    "model": MODEL, "scope": scope,
                     "lathe_sha256": hashlib.sha256((root() / "lathe.py").read_bytes()).hexdigest(),
                     "checkout_sha": run_command("git", "-C", str(root()), "rev-parse", "HEAD"),
                     "max_provider_requests": MAX_REQUESTS, "max_request_bytes": MAX_PROMPT_BYTES,
@@ -891,25 +875,18 @@ def host(scope="full"):
                     "snapshot": SNAPSHOT,
                     "compute_estimate_usd": "<=0.034 at 1 vCPU/1GiB/3GiB for 30min; one sandbox only",
                     "unimplemented": UNIMPLEMENTED}
-        metadata["image"] = json.loads(run_command("docker", "image", "inspect", IMAGE,
-                                                    "--format", "{{json .RepoDigests}}"))
         (output / "environment.json").write_text(json.dumps(metadata, indent=2))
-        run_command("docker", "start", app)
-        status = int(run_command("docker", "wait", app, timeout=25 * 60))
+
+        state.write_text(json.dumps({"label": label, "cloud": True}))
+        live_started = True
+        infra.topology(output / "live", root(), image_id=qualified["built_image_id"],
+                       live_action=controller_action(infra, output), scope=scope, qualified=qualified,
+                       deployment_label=label)
+        status = 0
     except BaseException as exc:
         (output / "host-error.log").write_text(monitor.sanitize(f"{type(exc).__name__}: {exc}"))
     finally:
-        if app in owned:
-            try:
-                run_command("docker", "stop", "--time", "20", app, timeout=40)
-            except Exception as exc:
-                (output / "stop-error.log").write_text(monitor.sanitize(str(exc)))
-            for filename in ("trace.jsonl", "summary.json", "worker-A.jsonl", "worker-B.jsonl"):
-                try:
-                    run_command("docker", "cp", f"{app}:/lab/artifacts/{filename}", str(output / filename))
-                except Exception:
-                    pass  # Startup failures legitimately have no inner evidence.
-        if not cleanup(label, output):
+        if not cleanup(label, output, cloud=live_started):
             status = 1
     print(f"Readiness lab exit={status}; sanitized evidence: {output}")
     return status
@@ -920,33 +897,43 @@ def main():
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--run", action="store_true")
     mode.add_argument("--plan", action="store_true")
+    mode.add_argument("--preflight", action="store_true", help="key-free Docker boundaries and controller/config checks only")
     mode.add_argument("--cleanup", action="store_true")
     mode.add_argument("--inside", action="store_true", help=argparse.SUPPRESS)
-    mode.add_argument("--worker", choices=PORTS, help=argparse.SUPPRESS)
+    parser.add_argument("--config-only", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--scope", choices=("full", "native"), default="full",
                         help="native runs only fresh-chat idle/busy continuation trials")
     args = parser.parse_args()
+    def interrupted(signum, frame):
+        raise KeyboardInterrupt(f"signal {signum}")
+    if args.run or args.preflight or args.inside:
+        signal.signal(signal.SIGTERM, interrupted)
+    if args.preflight:
+        infra = infrastructure()
+        output = infra.ROOT / "runs" / ("shared-" + uuid.uuid4().hex)
+        print(f"Key-free artifacts: {output}", flush=True)
+        local_preflight(infra, output, "lathe-ci-next-" + secrets.token_hex(8))
+        print("Shared infrastructure and controller/config preflight passed; exact owned resources removed.")
+        return 0
     if args.cleanup:
         state = root() / "monitor-artifacts" / "readiness-state.json"
         if not state.exists():
             print("No readiness run manifest: nothing owned")
             return 0
-        label = json.loads(state.read_text())["label"]
-        return 0 if cleanup(label, root() / "monitor-artifacts" / "readiness-results" / label) else 1
-    if args.worker:
-        require(Path("/tmp/monitor_e2e.py").is_file(), "Internal worker mode requires disposable helper copy")
-        worker(args.worker)
-        return 0
+        saved = json.loads(state.read_text())
+        label = saved["label"]
+        return 0 if cleanup(label, root() / "monitor-artifacts" / "readiness-results" / label,
+                            cloud=saved.get("cloud", True)) else 1
     if args.inside:
         require(Path("/tmp/monitor_e2e.py").is_file(), "Internal controller requires disposable helper copy")
-        return asyncio.run(inside(args.scope))
+        return asyncio.run(inside(args.scope, config_only=args.config_only))
     if not args.run:
         require(all((root() / p).is_file() for p in
                     ("lathe.py", "monitor_e2e.py", "test_deployment.py", "testing_support.py")),
                 "Required checkout helper missing")
         print(json.dumps({"network_or_cloud_work": False,
             "topology": "two loopback OWUI processes, shared container filesystem, PostgreSQL/pgvector + Redis",
-            "owui": IMAGE, "model": MODEL, "scope": args.scope,
+            "images": infrastructure().IMAGES, "model": MODEL, "scope": args.scope,
             "routing": ["A", "B"] if args.scope == "native" else ["A", "B", "A", "replace B", "B"],
             "saved_chat_endpoints": ["POST /api/v1/chats/new", "POST /api/chat/completions",
                                      "GET /api/v1/chats/{id}"],
@@ -957,10 +944,6 @@ def main():
             "warning": "Requires explicit --run and trusted provider secrets. No production config is read."
         }, indent=2))
         return 0
-    # Convert runner termination into normal unwinding so finally cleanup runs.
-    def interrupted(signum, frame):
-        raise KeyboardInterrupt(f"signal {signum}")
-    signal.signal(signal.SIGTERM, interrupted)
     return host(args.scope)
 
 

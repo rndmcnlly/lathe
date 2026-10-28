@@ -1,0 +1,6 @@
+*
+!Dockerfile
+!worker.py
+!entrypoint.py
+!preflight.py
+!guard.py

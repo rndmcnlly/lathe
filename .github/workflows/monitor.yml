@@ -98,7 +98,9 @@ jobs:
         with:
           enable-cache: true
       - name: Offline readiness contracts
-        run: uv run --locked pytest test_readiness.py test_monitor.py
+        run: |
+          uv run --locked pytest
+          uv run --locked pytest readiness-infra/test_infra.py
       - name: Disposable multi-worker readiness lab
         timeout-minutes: 30
         env:
