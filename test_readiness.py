@@ -185,7 +185,7 @@ def test_cleanup_orders_and_independently_verifies(monkeypatch, tmp_path, cloud_
             networks.discard(args[-1])
         return ""
 
-    async def cloud_cleanup():
+    async def cloud_cleanup(key, label):
         events.append("cloud")
         assert not names and not networks
         if local_receipt_fails:
@@ -193,8 +193,6 @@ def test_cleanup_orders_and_independently_verifies(monkeypatch, tmp_path, cloud_
             assert "daemon-read" in events[failed + 1:-1], "receipt failure was not independently reverified"
         if cloud_fails:
             raise KeyboardInterrupt("interrupted cloud cleanup")
-
-    async def no_sandboxes(*args):
         return []
 
     actual_save = infra.save
@@ -218,9 +216,8 @@ def test_cleanup_orders_and_independently_verifies(monkeypatch, tmp_path, cloud_
     monkeypatch.setattr(infra, "save", save)
     monkeypatch.setattr(Path, "write_text", write)
     monkeypatch.setattr(lab, "infrastructure", lambda: infra)
-    monkeypatch.setattr(lab, "owned_sandboxes", no_sandboxes)
+    monkeypatch.setattr(lab, "cloud_cleanup", cloud_cleanup)
     monkeypatch.setattr(lab, "setup_imports", lambda: SimpleNamespace(sanitize=lambda x: x))
-    monkeypatch.setitem(sys.modules, "test_deployment", SimpleNamespace(cleanup_test_sandboxes=cloud_cleanup))
     monkeypatch.setenv("DAYTONA_API_KEY", "offline-fake-key")
     if final_receipt_fails:
         with pytest.raises(ExceptionGroup) as caught:
@@ -509,3 +506,100 @@ def test_canary_receipts_export_independently_of_other_artifact_failures(tmp_pat
         assert messages == ["injected stop failure", "injected summary.json export failure"]
     else:
         assert isinstance(caught.value, KeyboardInterrupt)
+
+
+LABEL = "lathe-ci-next-0123456789abcdef"
+OWNER = "completion@lathe.invalid"
+
+
+def daytona(views, *, page_size=100, server_filters=True, record=None):
+    """MockTransport for Daytona sandbox endpoints with `nextCursor` paging.
+
+    `views` is one org-wide sandbox list per successive list query (per labels
+    filter value), modelling the eventually consistent index; the last repeats.
+    `server_filters=False` returns unfiltered pages, so the client re-check and
+    pagination must find owned sandboxes beyond page one."""
+    calls = {}
+    def respond(request):
+        if record is not None:
+            record.append((request.method, request.url.path, dict(request.url.params)))
+        path = request.url.path
+        if request.method == "GET" and path == "/api/sandbox":
+            labels = request.url.params.get("labels", "{}")  # Absent: unfiltered org listing.
+            cursor = int(request.url.params.get("cursor", 0))
+            if cursor == 0:
+                calls[labels] = calls.get(labels, 0) + 1
+            view = views[min(calls[labels], len(views)) - 1]
+            wanted = json.loads(labels)
+            items = [s for s in view if not server_filters
+                     or all(s["labels"].get(k) == v for k, v in wanted.items())]
+            page = items[cursor:cursor + page_size]
+            nxt = cursor + page_size if cursor + page_size < len(items) else None
+            return httpx.Response(200, json={"items": page, "nextCursor": None if nxt is None else str(nxt)})
+        if request.method == "GET" and path.startswith("/api/sandbox/"):
+            sandbox_id = path.rsplit("/", 1)[1]
+            for s in views[-1]:
+                if s["id"] == sandbox_id:
+                    return httpx.Response(200, json={**s, "state": "started", "volumes": []})
+            return httpx.Response(404)
+        if request.method == "DELETE":
+            return httpx.Response(200, json={})
+        raise AssertionError(f"unexpected Daytona request {request.method} {path}")
+    return httpx.MockTransport(respond)
+
+
+def owned(n, label=LABEL, email=OWNER):
+    return {"id": f"0000000{n}-0000-4000-8000-000000000000", "labels": {label: email}}
+
+
+# Unrelated org sandboxes, including a same-key/other-value one.
+NOISE = [{"id": f"noise-{i}", "labels": {"other": "x"}} for i in range(150)] + [
+    {"id": "same-key-other-owner", "labels": {LABEL: "someone@else.invalid"}}]
+
+
+@pytest.mark.parametrize("case", ["eventually-consistent", "page-two", "two-owned", "never-appears"])
+async def test_bootstrap_polls_exact_label_until_one_confirmed(case):
+    requests = []
+    views = {"eventually-consistent": [NOISE, NOISE, NOISE + [owned(1)]],
+             "page-two": [NOISE + [owned(1)]], "two-owned": [[owned(1)] + NOISE + [owned(2)]],
+             "never-appears": [NOISE]}[case]
+    transport = daytona(views, page_size=100, server_filters=case not in ("page-two", "two-owned"), record=requests)
+    async with httpx.AsyncClient(transport=transport) as http:
+        call = lab.single_owned_sandbox(http, LABEL, OWNER, attempts=5, interval=0)
+        if case == "two-owned":
+            with pytest.raises(RuntimeError, match=r"observed 2: \['00000001"):
+                await call
+        elif case == "never-appears":
+            with pytest.raises(RuntimeError, match="after 5 polls, observed 0"):
+                await call
+        else:
+            assert (await call)["id"] == owned(1)["id"]
+            # Confirmed by the authoritative per-ID endpoint, not the index alone.
+            assert requests[-1][:2] == ("GET", f"/api/sandbox/{owned(1)['id']}")
+    lists = [r for r in requests if r[1] == "/api/sandbox"]
+    assert all(json.loads(r[2]["labels"]) == {LABEL: OWNER} for r in lists)  # Exact server-side filter.
+    if case == "page-two":
+        assert [r[2].get("cursor") for r in lists] == [None, "100"]  # Owned sandbox is item 152, page 2.
+
+
+@pytest.mark.parametrize("case", ["clean", "late-arrival", "straggler-page-two"])
+async def test_cloud_cleanup_deletes_exact_label_and_verifies_absence(case):
+    requests = []
+    target = owned(1, email="monitor@lathe.invalid")
+    views = {"clean": [NOISE + [target], NOISE],
+             # Lagging index: empty twice, then the owned sandbox appears, then gone.
+             "late-arrival": [NOISE, NOISE, NOISE + [target], NOISE],
+             # Deletion never takes effect, and both owned sandboxes sit beyond page one.
+             "straggler-page-two": [NOISE + [owned(9), target]]}[case]
+    transport = daytona(views, server_filters=case != "straggler-page-two", record=requests)
+    call = lab.cloud_cleanup("offline-key", LABEL, attempts=8, interval=0, transport=transport)
+    if case == "straggler-page-two":
+        with pytest.raises(RuntimeError, match="remain after 8 checks: 2"):
+            await call
+    else:
+        assert await call == [target["id"]]
+    lists = [r for r in requests if r[1] == "/api/sandbox"]
+    assert {r[2]["labels"] for r in lists} == {json.dumps({LABEL: e}) for e in lab.LAB_EMAILS}
+    deletes = [r[1].rsplit("/", 1)[1] for r in requests if r[0] == "DELETE"]
+    # Only exactly-labelled lab sandboxes are deleted, each once; never noise or another owner.
+    assert sorted(deletes) == sorted({target["id"]} | ({owned(9)["id"]} if case == "straggler-page-two" else set()))

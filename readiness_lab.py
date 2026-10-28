@@ -33,6 +33,9 @@ PROVIDER = {"data_collection": "deny", "zdr": True,
 BUDGET = Decimal("2.00")
 PORTS = {"A": 8081, "B": 8082}
 SNAPSHOT = "daytona-small"
+DAYTONA = "https://app.daytona.io/api"
+# monitor_e2e's fixed disposable identities: the only label values lab sandboxes carry.
+LAB_EMAILS = ("completion@lathe.invalid", "monitor@lathe.invalid")
 UNIMPLEMENTED = {
     "overlapping_first_use": "NOT IMPLEMENTED: requires an observed admission barrier",
     "direct_bash_wakeup": "UNSUPPORTED: no generic supported native dispatch boundary",
@@ -137,22 +140,79 @@ def require(condition, message):
         raise RuntimeError(message)
 
 
-async def owned_sandboxes(key, label):
-    import httpx
-    matches, cursor, seen = [], None, set()
-    async with httpx.AsyncClient(timeout=30, headers={"Authorization": f"Bearer {key}"}) as http:
+async def owned_sandboxes(http, label, emails=LAB_EMAILS):
+    """Exact server-side {label: email} filter over every page; IDs/labels only.
+
+    GET /sandbox is eventually consistent and cursor-paginated via `nextCursor`
+    (Daytona ListSandboxesResponseDto). Errored/deleting records are included so
+    a stuck straggler is never invisible to an absence check.
+    """
+    found = {}
+    for email in emails:
+        cursor, seen = None, set()
         while True:
-            response = await http.get("https://app.daytona.io/api/sandbox",
-                                      params={"cursor": cursor} if cursor else {})
+            params = {"labels": json.dumps({label: email}), "includeErroredDeleted": "true", "limit": 100}
+            if cursor:
+                params["cursor"] = cursor
+            response = await http.get(DAYTONA + "/sandbox", params=params)
             response.raise_for_status()
             payload = response.json()
-            matches.extend(s for s in (payload if isinstance(payload, list) else payload.get("items", []))
-                           if label in s.get("labels", {}))
-            cursor = payload.get("cursor") if isinstance(payload, dict) else None
+            for sandbox in payload if isinstance(payload, list) else payload.get("items", []):
+                if (sandbox.get("labels") or {}).get(label) == email:  # Re-check the server filter.
+                    found[sandbox["id"]] = {"id": sandbox["id"], "labels": {label: email}}
+            cursor = payload.get("nextCursor") if isinstance(payload, dict) else None
             if not cursor:
-                return matches
-            require(cursor not in seen, "Repeated pagination cursor")
+                break
+            require(cursor not in seen, "Repeated Daytona pagination cursor")
             seen.add(cursor)
+    return list(found.values())
+
+
+async def single_owned_sandbox(http, label, email, *, attempts=60, interval=1.0):
+    """Poll the index until exactly one owned sandbox, then confirm it by ID."""
+    count = 0
+    for _ in range(attempts):
+        matches = await owned_sandboxes(http, label, (email,))
+        count = len(matches)
+        # Two can never converge to one legitimately: fail at once, IDs only.
+        require(count <= 1, f"Expected one owned sandbox, observed {count}: {sorted(m['id'] for m in matches)}")
+        if matches:
+            response = await http.get(f"{DAYTONA}/sandbox/{matches[0]['id']}")
+            if response.status_code != 404:  # 404: a ghost index entry, keep polling.
+                response.raise_for_status()
+                sandbox = response.json()
+                require(sandbox.get("id") == matches[0]["id"] and (sandbox.get("labels") or {}).get(label) == email
+                        and not sandbox.get("volumes"), "Owned sandbox ID confirmation mismatch")
+                return matches[0]
+            count = 0
+        await asyncio.sleep(interval)
+    raise RuntimeError(f"Expected one owned sandbox after {attempts} polls, observed {count}")
+
+
+async def cloud_cleanup(key, label, *, emails=LAB_EMAILS, attempts=60, interval=2.0, settle=3, transport=None):
+    """Delete only exactly-labelled lab sandboxes, then require the index to show none.
+
+    The index is eventually consistent, so absence means `settle` consecutive
+    empty reads, not one: a lagging entry still gets a chance to surface.
+    """
+    import httpx
+    deleted, remaining, empty = [], [], 0
+    async with httpx.AsyncClient(timeout=30, transport=transport,
+                                 headers={"Authorization": f"Bearer {key}"}) as http:
+        for _ in range(attempts):
+            remaining = await owned_sandboxes(http, label, emails)
+            empty = 0 if remaining else empty + 1
+            if empty >= settle:
+                return deleted
+            for sandbox in remaining:  # Late index arrivals are deleted too, each once.
+                if sandbox["id"] not in deleted:
+                    response = await http.delete(f"{DAYTONA}/sandbox/{sandbox['id']}", params={"force": "true"})
+                    if response.status_code != 404:
+                        response.raise_for_status()
+                    deleted.append(sandbox["id"])
+            await asyncio.sleep(interval)
+    raise RuntimeError(f"Owned sandboxes remain after {attempts} checks: {len(remaining)} "
+                       f"{sorted(s['id'] for s in remaining)}")
 
 
 async def verify_prices():
@@ -495,14 +555,8 @@ async def inside(scope="full", config_only=False):
                                 "Expected one actual interpret call")
                         # Independent filesystem oracle, not assistant text or tool stdout.
                         headers = {"Authorization": f"Bearer {suite.DAYTONA_API_KEY}"}
-                        response = await http.get("https://app.daytona.io/api/sandbox", headers=headers,
-                            params={"labels": json.dumps({suite.DEPLOYMENT_LABEL: user["email"].lower()})})
-                        response.raise_for_status()
-                        data = response.json()
-                        matches = [s for s in (data if isinstance(data, list) else data.get("items", []))
-                                   if s.get("labels", {}).get(suite.DEPLOYMENT_LABEL) == user["email"].lower()]
-                        require(len(matches) == 1 and not matches[0].get("volumes"), "Sandbox ownership/volume mismatch")
-                        sandbox = matches[0]
+                        async with httpx.AsyncClient(timeout=30, headers=headers) as cloud:
+                            sandbox = await single_owned_sandbox(cloud, suite.DEPLOYMENT_LABEL, user["email"].lower())
                         response = await http.get(
                             f"https://proxy.app.daytona.io/toolbox/{sandbox['id']}/files/download",
                             params={"path": filename}, headers=headers)
@@ -563,7 +617,8 @@ async def inside(scope="full", config_only=False):
         try:
             require(all(p.poll() is not None for p in processes.values()), "Live worker blocks cloud cleanup")
             if not config_only and platform_ready:
-                await suite.cleanup_test_sandboxes()
+                for sandbox_id in await cloud_cleanup(suite.DAYTONA_API_KEY, suite.DEPLOYMENT_LABEL):
+                    trace("sandbox_deleted", id=sandbox_id)
         except Exception as exc:
             exit_code = 1
             trace("cleanup_error", error=str(exc))
@@ -599,11 +654,10 @@ async def native_scenarios(suite, session_id, user, trace, identities):
     from evidence import collect_native_evidence, select_continuation
     submitted = []
 
-    sandboxes = await owned_sandboxes(suite.DAYTONA_API_KEY, suite.DEPLOYMENT_LABEL)
-    require(len(sandboxes) == 1, "Native lab requires the single owned sandbox")
-    sandbox_id = sandboxes[0]["id"]
-    toolbox = f"https://proxy.app.daytona.io/toolbox/{sandbox_id}"
     cloud_headers = {"Authorization": f"Bearer {suite.DAYTONA_API_KEY}"}
+    async with httpx.AsyncClient(timeout=30, headers=cloud_headers) as cloud:
+        sandbox_id = (await single_owned_sandbox(cloud, suite.DEPLOYMENT_LABEL, user["email"].lower()))["id"]
+    toolbox = f"https://proxy.app.daytona.io/toolbox/{sandbox_id}"
     async with httpx.AsyncClient(timeout=35, headers=suite.auth_headers(completion=True)) as http:
         async def saved(chat_id):
             response = await http.get(suite.OWUI_BASE + f"/api/v1/chats/{chat_id}")
@@ -835,12 +889,9 @@ def cleanup(label, output, *, cloud=True):
     try:
         if stopped and cloud:
             cloud_attempted = True
-            import test_deployment as suite
-            suite.DEPLOYMENT_LABEL = label
-            suite.DAYTONA_API_KEY = os.environ["DAYTONA_API_KEY"]
-            suite.TRACE = lambda kind, **data: deleted.append(data["id"]) if kind == "sandbox_deleted" else None
-            asyncio.run(suite.cleanup_test_sandboxes())
-            require(not asyncio.run(owned_sandboxes(suite.DAYTONA_API_KEY, label)), "Owned sandboxes remain")
+            # Delete-then-verify through the exact server-side label filter;
+            # raises with the remaining count/IDs if a straggler persists.
+            deleted.extend(asyncio.run(cloud_cleanup(os.environ["DAYTONA_API_KEY"], label)))
     except BaseException as exc:
         record(exc)
     finally:

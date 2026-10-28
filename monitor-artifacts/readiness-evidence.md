@@ -1,5 +1,25 @@
 # Readiness lab: partial live proof, cleaned up
 
+## Sandbox discovery/cleanup fix after 40628835065 (offline + key-free only)
+
+Read-only check (local `.env` Daytona key; same org as the repository secret is
+unverified; that key sees 3 sandboxes total): exact `{label: email}` filter for
+both lab identities, errored/deleted included, plus name-prefix, for all 9
+`lathe-ci-next-*` labels in retained evidence: **0 remaining each**, no
+`lathe-ci-` names. Nothing deleted.
+
+Root cause class: Daytona `GET /sandbox` is eventually consistent and paginates
+with `nextCursor`; the old readiness lister read `cursor`, listed unfiltered and
+matched label keys locally (page 1 only; errored/deleted excluded). Fix: exact
+server-side filter over every page with client re-check; bootstrap polls (bounded)
+until exactly one, confirms by `GET /api/sandbox/{id}`, reports the observed
+count and IDs only; cleanup deletes only exact-labelled lab sandboxes and requires
+three consecutive empty reads. Against the old code the offline scenarios show:
+lagging index and page-2 owned sandbox fail bootstrap (observed 0), two owned
+falsely accepted (page 1 only), page-2 straggler falsely passes absence.
+`test_deployment.cleanup_test_sandboxes` has the same `cursor` defect; the
+readiness lab no longer uses it, and it was not changed here.
+
 ## Native-only trial 40628835065 at dc69ff0: FAILED in bootstrap, native NOT REACHED
 
 Run: https://github.com/rndmcnlly/lathe/actions/runs/40628835065 (one dispatch,
