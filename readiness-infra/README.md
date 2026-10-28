@@ -7,8 +7,10 @@ The prior bytes-hostname guard bug has a normalization fix and a key-free
 live-policy HTTPX gate. PostgreSQL now requires final TCP readiness and real SQL
 on that same endpoint. A controlled initializer pause demonstrates why Unix-only
 readiness was insufficient. The earlier runner failure remains consistent with,
-not conclusively attributed to, that race. Native qualification remains
-**NOT REACHED**. See `QUALIFICATION.md`; key-free success is not platform acceptance.
+not conclusively attributed to, that race. The latest native-only trial observed
+idle delegation and automatic continuation, then failed its observer collection
+because the idle worker had no event file. Formal idle qualification **FAILED**;
+busy was **NOT REACHED**. See `QUALIFICATION.md`; no retry was dispatched.
 
 ```sh
 uv run python readiness-infra/lab.py --preflight

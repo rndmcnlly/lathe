@@ -365,3 +365,76 @@ real platform/native qualification, not an automatic paid retry or issue closure
 Uploaded artifact: `readiness-40624089294-1`. Its retained local copy, including
 full per-topology source/image hashes, cleanup receipts and workflow logs, is
 `runs/runner-40624089294/`. Runtime and root controller remain unchanged.
+
+### Authorized native-only trial at dad4390: idle observed, observer qualification failed
+
+Exactly one trial completed: [40624797681](https://github.com/rndmcnlly/lathe/actions/runs/40624797681),
+source `dad43900af91dd9c65c3331a5844fbc72f62453a`. Runner offline gates passed
+**924 default / 242 focused tests**. All 22 key-free infrastructure checks and
+the actual controller/config/HTTPX gates passed before platform access. Preflight,
+config preflight and fresh live topology all used the exact built image ID
+`sha256:47f063a1f7cc80baaaecf4b754125dcdc8657e0d11301fcffc49847b98fd8f7a`,
+with identical staged source/helper/infrastructure hashes. The live TCP SQL and
+pgvector gate passed. Both restarted workers independently verified loaded tools,
+valves and provider/model configuration before one small sandbox was provisioned.
+
+**Native idle: FAILED qualification due to a harness observer bug. Native busy:
+NOT REACHED.** This was not a model/tool-iteration or unsupported upstream-protocol
+failure. Actual idle behavior was observed:
+
+* Parent `8bbf9346-a7f6-4a08-8871-9faa1c2b3930`, initial assistant message
+  `bdecf960-b9b3-4c1a-9760-1c4c510da3b1`, made one real `delegate_task` call with
+  `background=true`; OWUI returned delegation `deleg_1cfa7e97` and child chat
+  `d27041b4-606a-417a-bed4-ea3d7304cf0b`. Saved child metadata matched parent,
+  initial message and delegation, with `internal=true`, type `subagent`.
+* Child assistant `736a4a8a-2155-4ba7-a1b9-26bca13fca31` called `interpret` once
+  with the exact supplied Python, including `secrets.token_hex(16)`. The controller
+  released only the filesystem barrier. The child completed normally.
+* Without a second human request, the parent resumed as assistant
+  `7c3e9b0e-2d5b-4243-903c-1a0b98f5c937`, called `read`, then `bash` to copy the
+  payload. The server observer recorded worker A, PID34, incarnation
+  `efb83ed1a41b4d4d9fb4df232f68adbb`, model `lathe-ci-direct`, tool IDs
+  `["lathe_test"]`. Its system hash
+  `670396c6fc151496a1a1666f0ba3e1178076c8a2df3d5584907dd01fa893f8af`
+  matches the original system message in a post-run check. The observed request
+  `internal` flag was false for the resumed parent, true for the child.
+* The real controller independently downloaded source/copy files, passed its
+  32-byte equality assertion, and emitted `native_child_results`. It then tried
+  to read both workers' event files unconditionally. B51 had served configuration
+  but no completion/native-handler request in this A-only case, so
+  `/lab/artifacts/worker-B.jsonl` did not exist. That `FileNotFoundError` was the
+  first failure; there was no `scenario_pass`, `native_context_verified` or final
+  `independent_native_reads` event. The native busy scenario did not start.
+
+The retained read-tool payload is `8637e4c80491fdbc56d9335941c76a21`; it was absent
+from the initial system/task prompts. Its SHA256, derived post-run from that read
+payload, is `4b54b9c5875bdd800eb0fd605408157e4c3317d842cb2315ff2df1f61d299ab2`.
+The independent download responses themselves were not retained: their successful
+comparison is established by actual controller execution reaching the following
+`native_child_results` event. This is stronger than assistant text, but is not a
+standalone retained download receipt. The observer/context comparison can be
+completed from A's existing events post-run; that does not upgrade the failed
+qualification or supply the missing busy/result-message evidence.
+
+Requested and served model: **z-ai/glm-5.3-flash**. All **7** provider requests
+returned HTTP200, maximum wire body **48,963 bytes**, maximum completion **1,986
+tokens**. Summed provider-reported inference cost: **$0.004868994**; nonrefundable
+cumulative reservations: **$0.20299460 / $2**. Daytona compute charge was not
+measured. No monetary/request/output/TTL/wall/privacy/price constraint was raised.
+
+The one sandbox, `acf6c346-9854-4758-a96b-870966fc5b27`, was deleted after request
+producers stopped. All three exact local topologies were verified absent. Both
+host and always-run workflow cleanup passed, including independent cloud-label
+absence checks. Evidence upload completed. No implementation patch or live retry
+followed. Next review concerns the observer's assumption that every healthy worker
+must already have an event file, and early persistence of the independent oracle.
+
+Full actual events, per-topology source/image hashes and cleanup receipts are in
+artifact `readiness-40624797681-1`, retained locally under
+`monitor-artifacts/readiness-results/run-40624797681/`. Its ignored `handoff.json`
+contains validated IDs/context, all input hashes, usage/costs, cleanup reports and
+explicit proof limitations. Runtime SHA256 remains
+`a9089a2e4b93621a450ee5c6f889c73191782adb06ad6d26ce2fe1bf8216a58d`;
+root controller remains `2134e1e5d12c357bed9658f9b6ea312039c379277340f9c7b01ddae55ce93b22`.
+Overlapping first use remains unqualified and direct-bash wakeup unsupported;
+neither #110 nor #67 is closed or fully qualified by this run.
