@@ -2,10 +2,10 @@
 title: Lathe
 author: Adam Smith
 author_url: https://adamsmith.as
-description: Coding agent tools (lathe, bash, read, write, edit, glob, grep, view, peek, poke, interpret, onboard, expose, destroy) backed by per-user sandbox VMs with transparent lifecycle management.
+description: Coding agent tools (lathe, bash, read, write, edit, glob, grep, view, show, peek, poke, interpret, onboard, expose, destroy) backed by per-user sandbox VMs with transparent lifecycle management.
 required_open_webui_version: 0.12.0
 requirements: httpx, pydantic>=2, cachetools, PyYAML
-version: 1.3.0
+version: 1.3.1
 licence: MIT
 """
 
@@ -2084,23 +2084,30 @@ CLICK_TARGET = r"""((sel, text) => {
     return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none'; };
   const label = el => (el.innerText || el.value || el.getAttribute('aria-label') || el.title ||
     el.getAttribute('alt') || '').trim().replace(/\s+/g, ' ');
+  const clickable = 'a, button, input[type=button], input[type=submit], input[type=reset], ' +
+    'input[type=checkbox], input[type=radio], summary, label, [role=button], [role=link], ' +
+    '[role=tab], [role=menuitem], [role=option], [role=checkbox], [onclick]';
   let found;
   if (sel) { found = [...document.querySelectorAll(sel)].filter(visible); }
   else {
     const want = text.trim().replace(/\s+/g, ' ').toLowerCase();
-    const all = [...document.querySelectorAll('a, button, input[type=button], input[type=submit], ' +
-      'input[type=reset], input[type=checkbox], input[type=radio], summary, label, [role=button], ' +
-      '[role=link], [role=tab], [role=menuitem], [role=option], [role=checkbox], [onclick]')].filter(visible);
+    const all = [...document.querySelectorAll(clickable)].filter(visible);
     const exact = all.filter(el => label(el).toLowerCase() === want);
-    found = exact.length ? exact : all.filter(el => label(el).toLowerCase().includes(want));
+    // A session title can be a span inside a button with additional status text.
+    const labelled = exact.length ? exact : all.filter(el => [...el.querySelectorAll('*')].some(child =>
+      visible(child) && label(child).toLowerCase() === want && child.closest(clickable) === el));
+    found = labelled.length ? labelled : all.filter(el => label(el).toLowerCase().includes(want));
   }
   if (!found.length) return null;
+  if (found.length > 1) return {count: found.length, candidates: found.slice(0, 5).map(el =>
+    ({tag: el.tagName.toLowerCase(), label: label(el).slice(0, 80)}))};
   const el = found[0];
   el.scrollIntoView({block: 'center', inline: 'center'});
   const r = el.getBoundingClientRect(), x = r.left + r.width / 2, y = r.top + r.height / 2;
   const hit = document.elementFromPoint(x, y);
   return {x, y, count: found.length, tag: el.tagName.toLowerCase(), label: label(el).slice(0, 80),
-          covered: !!hit && hit !== el && !el.contains(hit) && !hit.contains(el)};
+          covered: !hit || (hit !== el && !el.contains(hit)) ||
+            hit.closest(clickable) !== el.closest(clickable)};
 })"""
 
 
@@ -2109,18 +2116,22 @@ def page_click(session, target, args):
     if not spot:
         frames = frames_note(session)
         raise Fail("no visible matching element. Inspect with page.text or page.eval, or use a selector. "
-                   "Elements inside iframes and closed shadow roots are not searched."
-                   + ("\n" + frames if frames else ""))
+                    "Elements inside iframes and closed shadow roots are not searched."
+                    + ("\n" + frames if frames else ""))
+    if spot["count"] > 1:
+        candidates = "; ".join(f"<{c['tag']}> {json.dumps(c['label'], ensure_ascii=False)}"
+                               for c in spot["candidates"])
+        raise Fail(f"ambiguous click: {spot['count']} visible matches; no input sent. "
+                   f"Use a unique CSS selector. Candidates (up to 5): {candidates}")
+    if spot["covered"]:
+        raise Fail("target centre is covered or outside the viewport; no input sent. "
+                   "Dismiss the overlay or inspect the page before trying again.")
     point = {"x": spot["x"], "y": spot["y"]}
     # Real input events at the element centre: sites see trusted clicks.
     session.call("Input.dispatchMouseEvent", {"type": "mouseMoved", **point})
     for kind in ("mousePressed", "mouseReleased"):
         session.call("Input.dispatchMouseEvent", {"type": kind, "button": "left", "clickCount": 1, **point})
     note = f"Clicked <{spot['tag']}> \"{spot['label']}\""
-    if spot["count"] > 1:
-        note += f" (first of {spot['count']} matches)"
-    if spot["covered"]:
-        note += ". Another element covered its centre, so the click may have hit an overlay"
     session.settle(15)
     return note + "."
 
@@ -2352,7 +2363,14 @@ async def _page_request(valves, sandbox_id, client, command, args, *, launch):
     if not isinstance(result, dict) or not isinstance(result.get("text"), str):
         raise _ToolFailure("browser script returned an invalid result. No input was retried.")
     if not result.get("ok"):
-        detail = _redact_typed(result["text"], args, 1500) or "details omitted because they echoed typed text"
+        detail = _redact_typed(result["text"], args, 1500)
+        if not detail and command == "page.click" and result["text"].startswith("ambiguous click:"):
+            # Short search text can occur in candidate labels. Preserve steering
+            # without relaxing typed-value redaction or repeating page content.
+            detail = "ambiguous click; no input sent. Use a unique CSS selector."
+        if not detail and command == "page.click" and result["text"].startswith("target centre is covered"):
+            detail = "target is covered; no input sent. Dismiss the overlay or inspect the page."
+        detail = detail or "details omitted because they echoed typed text"
         raise _ToolFailure(f"{command} failed: {detail}")
     return result["text"]
 
@@ -2759,7 +2777,7 @@ async def _core_bash(valves, sandbox_id: str, client: httpx.AsyncClient, *,
     shell state (such as exports and cd) does not persist between calls.
     Runs with set -e -o pipefail: an unhandled command or pipeline failure can
     abort the remaining script. Handle expected probe failures explicitly
-    (for example, with if); use && for commands with dependent prerequisites.
+    (for example, with if or cmd || true); use && for commands with dependent prerequisites.
     Nonzero command exits return an exit status and captured output, distinct
     from errors launching or observing execution.
     Commands that finish within the foreground window return output directly.
@@ -3641,7 +3659,9 @@ async def _chat_auto_init(
     )
     parts.append(
         "For websites that block curl or need JavaScript, a login or browser "
-        'cookies, use the shared Chromium via peek/poke page.* commands; read lathe(manpage="computer").'
+        'cookies, use the shared Chromium via peek/poke page.* commands; read lathe(manpage="computer"). '
+        'Ask before browser use unless requested, and before desktop input beyond it. '
+        'peek(command="screenshot") captures the desktop without a custom shell pipeline.'
     )
     guidance = _installation_guidance(valves)
     if guidance:
@@ -4298,6 +4318,11 @@ class Tools:
             Daytona images include the stack; custom snapshots may not, which is
             an administrator/image concern.
 
+            Quick reference: page.open/click/type act; page.text/list/wait observe;
+            page.save exports a file; page.eval runs JavaScript. For the desktop,
+            peek screenshot observes; poke mouse/keyboard verbs act. For a human
+            live view, expose(target="vnc", access="private"). Details follow.
+
             ## Consent and a live view
 
             Users can read shell traffic, but browser and desktop traffic is
@@ -4326,18 +4351,24 @@ class Tools:
             peek(command="page.list")
             peek(command="page.wait", args={"gone":"Loading","timeout":20})
 
-            - page.wait polls instead of sleeping: exactly one of text (appears),
-              gone (disappears; both case-insensitive in the title and visible
+            - page.wait polls instead of sleeping: exactly one of text (is present),
+              gone (is absent; both case-insensitive in the title and visible
               text), selector
               (present and visible) or url (substring), timeout 1-30 s (default
-              10). A timeout is a normal result; observe and decide.
+              10). It checks current state, not a transition: a 0.0 s text match
+              may be old content, not a new reply. A timeout is a normal result.
+            - page.text takes the beginning of the selected element's visible
+              text. For a chat's newest reply, target that message's selector or
+              use page.eval to read the last matching message, not a broad main.
             - tab is an id prefix from page.list; the default is the most recently
               used tab. Results echo the tab, URL and title after the action.
               page.open reuses the current tab unless newTab is true.
             - page.click picks a visible clickable element by text (exact, then
-              substring) or CSS selector, scrolls it into view and clicks its
-              center with real input events. It reports overlays and multiple
-              matches. Iframes are not searched. page.text, and page.click when
+              exact text inside its nearest clickable ancestor, then unique
+              substring) or CSS selector. Multiple visible matches and covered
+              centers refuse before input: use a unique selector or dismiss the
+              overlay. A unique target is scrolled into view and clicked with
+              real input events. Iframes are not searched. page.text, and page.click when
               nothing matches, list visible frames with origin and SCREEN bounds
               usable with poke mouse.click. For a challenge widget in a frame
               (when the user asked you to try it), click inside those bounds: a
@@ -4357,7 +4388,9 @@ class Tools:
               compose one.
             - page.eval awaits a returned promise (up to 60 s), so one call can
               click, wait and read: {"js":"(async () => { document.querySelector('#go').click();
-              await new Promise(r => setTimeout(r, 2000)); return document.querySelector('#out')?.innerText; })()"}
+               await new Promise(r => setTimeout(r, 2000)); return document.querySelector('#out')?.innerText; })()"}
+              Calls share the page's global JavaScript scope. Use an IIFE with
+              an explicit return, as above, to keep const/let declarations local.
             - Subagents and chats share one browser and its default tab. To work
               in parallel, page.open with newTab, then pass that tab to every
               later command; otherwise serialize.
@@ -4477,6 +4510,12 @@ class Tools:
             readiness, shared control and human login; VNC ports are not selected
             by the model. expose still does not start desktop processes.
 
+            Quick workflow: inspect installation/port ownership; launch with
+            bash(foreground_seconds=0); check HTTP and logs; expose privately;
+            recheck after sleep. Shell &/nohup does not select Lathe background
+            mode and may still wait for the foreground window. For independent
+            probes under set -e, use cmd || true when failure is expected.
+
             ## Install and operate ordinary programs
 
             Lathe has no app installer or managed application bundle. For a first
@@ -4505,6 +4544,10 @@ class Tools:
             PID/start identity. Check HTTP readiness with a bounded timeout and
             inspect logs on failure before exposing. Verify browser behavior too:
             a listening socket does not prove IDE or terminal WebSockets work.
+            Prefer selected config fields and bounded logs over raw dumps. Redact
+            token/secret/key values and login-token URLs from screen-facing
+            inspection unless the user asked for those values; this is a display
+            habit, not automatic secret detection.
             Use the least reachable bind address the proxy can actually access.
             Disable app authentication only behind a verified private authenticated
             proxy with no unauthenticated direct path; otherwise retain app auth.

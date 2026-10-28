@@ -459,7 +459,12 @@ def verify_journey(output, destination, marker):
         if call.get("name") == "lathe" and args.get("manpage", "overview") == "overview":
             overview_seen = any(value.strip() and not value.startswith(("Error:", "Unknown manpage"))
                                 for value in values)
-        if call.get("name") in ("write", "bash", "interpret") and destination in json.dumps(args):
+        name = call.get("name")
+        # File tools require absolute paths; shell/Python programs may use
+        # relative paths. This only identifies a candidate mutation: the
+        # separate read and independent Daytona downloads prove its effects.
+        target = Path(destination).name if name in ("bash", "interpret") else destination
+        if name in ("write", "bash", "interpret") and target in json.dumps(args):
             require(overview_seen, "Copying happened before overview discovery")
             copied |= any(value.strip() and not value.startswith(("Error:", "Exit code:")) for value in values)
         if copied and call.get("name") == "read":

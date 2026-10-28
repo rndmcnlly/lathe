@@ -29,7 +29,11 @@ and workflow guidance live in `lathe(manpage="computer")`.
   sandbox loopback 127.0.0.1:9222. No CDP traffic from OWUI, no preview of 9222.
   Chromium runs visibly with its sandbox intact and a persistent profile at
   `~/.config/lathe-browser`. Clicks are real `Input.dispatchMouseEvent` events
-  at the element center. `page.save` with `url` fetches through the page with
+  at the element center. `page.click` prefers exact clickable text, then an
+  exact descendant label's nearest clickable ancestor, then a unique substring.
+  Ambiguous text or selectors, covered centers (including nested controls), and centers outside the viewport
+  are refused before input; inspection/scrolling is not an atomic transaction
+  with input on a shared page. `page.save` with `url` fetches through the page with
   its cookies, falling back to `Network.loadNetworkResource` for cross-origin.
 - A closed command registry owns transport mapping and strict argument models.
   Unknown commands/fields, invalid types (including bool-for-int), invalid

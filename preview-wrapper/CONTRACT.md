@@ -583,8 +583,8 @@ Decisions (2026-10-27):
 - **Fetch Metadata forwarding: MUST**, adopted in revision 3 (section 5.2
   step 4).
 
-Open questions:
-
-- Whether the public-injection acknowledgement should become a wire field
-  (section 4.2). If it does, follow the optional-then-required sequence in
-  section 0.
+- **Public-injection acknowledgement stays client-side** (Lathe #118).
+  It is a conversational UX/AX safeguard in Lathe, not a registration wire
+  field or a requirement on independently owned APIs such as BayLeaf's.
+  An authenticated API caller's explicit public access and injection request
+  already expresses that policy; another boolean would not prove human consent.
