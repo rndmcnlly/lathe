@@ -212,18 +212,20 @@ def suite_transport(suite, monkeypatch):
 
 
 async def test_cleanup_owns_only_exact_run_and_follows_pages(suite, monkeypatch):
+    # Daytona's ListSandboxesResponseDto pages with `nextCursor`; the owned
+    # sandbox is a straggler on page 2, behind other runs and production.
     requests = []
 
     def daytona(request):
-        requests.append((request.method, request.url.path))
+        requests.append((request.method, request.url.path, request.url.params.get("cursor")))
         if request.url.path == "/api/sandbox":
             if request.url.params.get("cursor") == "page2":
                 return httpx.Response(200, json={"items": [
-                    {"id": "owned", "labels": {"lathe-ci-this-run": "monitor@lathe.invalid"}}]})
+                    {"id": "owned", "labels": {"lathe-ci-this-run": "monitor@lathe.invalid"}}], "nextCursor": None})
             return httpx.Response(200, json={"items": [
                 {"id": "prod", "labels": {"production": "user"}},
                 {"id": "other-ci", "labels": {"lathe-ci-other-run": "monitor@lathe.invalid"}},
-            ], "cursor": "page2"})
+            ], "nextCursor": "page2"})
         assert request.url.path == "/api/sandbox/owned"
         return httpx.Response(200 if request.method == "DELETE" else 404)
 
@@ -231,8 +233,27 @@ async def test_cleanup_owns_only_exact_run_and_follows_pages(suite, monkeypatch)
     monkeypatch.setattr(suite.httpx, "AsyncClient",
                         lambda **kw: client_type(transport=httpx.MockTransport(daytona), **kw))
     await suite.cleanup_test_sandboxes()
-    assert requests == [("GET", "/api/sandbox"), ("GET", "/api/sandbox"),
-                        ("DELETE", "/api/sandbox/owned"), ("GET", "/api/sandbox/owned")]
+    assert requests == [("GET", "/api/sandbox", None), ("GET", "/api/sandbox", "page2"),
+                        ("DELETE", "/api/sandbox/owned", None), ("GET", "/api/sandbox/owned", None)]
+
+
+async def test_known_owner_lookup_uses_exact_server_filter_across_pages(suite):
+    requests = []
+    def daytona(request):
+        requests.append(dict(request.url.params))
+        assert json.loads(request.url.params["labels"]) == {"lathe-ci-this-run": "test@lathe.invalid"}
+        assert request.url.params["includeErroredDeleted"] == "true"
+        if request.url.params.get("cursor") == "p2":
+            return httpx.Response(200, json={"items": [
+                {"id": "owned", "labels": {"lathe-ci-this-run": "test@lathe.invalid", "secret": "x"}}], "nextCursor": None})
+        # A server that under-filters: same key, other owner, must be re-checked away.
+        return httpx.Response(200, json={"items": [
+            {"id": "other-owner", "labels": {"lathe-ci-this-run": "someone@lathe.invalid"}}], "nextCursor": "p2"})
+    async with httpx.AsyncClient(transport=httpx.MockTransport(daytona)) as http:
+        found = await suite.labelled_sandboxes(http, "lathe-ci-this-run", ["test@lathe.invalid"])
+    # IDs and the owning label only; other labels never leave the helper.
+    assert found == [{"id": "owned", "labels": {"lathe-ci-this-run": "test@lathe.invalid"}}]
+    assert [r.get("cursor") for r in requests] == [None, "p2"]
 
 
 @pytest.mark.parametrize("display_name", ["Lathe Test", "Lathe"])

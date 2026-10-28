@@ -141,31 +141,14 @@ def require(condition, message):
 
 
 async def owned_sandboxes(http, label, emails=LAB_EMAILS):
-    """Exact server-side {label: email} filter over every page; IDs/labels only.
+    """Exact server-side {label: email} lookup for known lab owners; IDs/labels only.
 
-    GET /sandbox is eventually consistent and cursor-paginated via `nextCursor`
-    (Daytona ListSandboxesResponseDto). Errored/deleting records are included so
-    a stuck straggler is never invisible to an absence check.
+    One implementation, shared with the deployment suite's cleanup (this lab may
+    import test_deployment, never the reverse).
     """
-    found = {}
-    for email in emails:
-        cursor, seen = None, set()
-        while True:
-            params = {"labels": json.dumps({label: email}), "includeErroredDeleted": "true", "limit": 100}
-            if cursor:
-                params["cursor"] = cursor
-            response = await http.get(DAYTONA + "/sandbox", params=params)
-            response.raise_for_status()
-            payload = response.json()
-            for sandbox in payload if isinstance(payload, list) else payload.get("items", []):
-                if (sandbox.get("labels") or {}).get(label) == email:  # Re-check the server filter.
-                    found[sandbox["id"]] = {"id": sandbox["id"], "labels": {label: email}}
-            cursor = payload.get("nextCursor") if isinstance(payload, dict) else None
-            if not cursor:
-                break
-            require(cursor not in seen, "Repeated Daytona pagination cursor")
-            seen.add(cursor)
-    return list(found.values())
+    setup_imports()  # Disables dotenv BEFORE test_deployment is imported.
+    import test_deployment
+    return await test_deployment.labelled_sandboxes(http, label, emails)
 
 
 async def single_owned_sandbox(http, label, email, *, attempts=60, interval=1.0):
