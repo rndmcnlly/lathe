@@ -13,6 +13,7 @@ platform acceptance.
 uv run python readiness-infra/lab.py --preflight
 uv run python readiness-infra/lab.py --cleanup readiness-infra/runs/<run>
 uv run pytest readiness-infra/test_infra.py
+uv run pytest  # also includes all cheap readiness/controller safeguards
 uv run python readiness_lab.py --preflight  # also exercises the live controller, without keys/inference
 uv run python readiness-infra/transport_preflight.py  # synthetic live-policy HTTPX transport only
 ```
@@ -150,3 +151,10 @@ denials are observable. Credentials are never build inputs or evidence fields.
 Request producers stop before exact-label cloud cleanup. The shared lifecycle
 removes local resources even if the controller, cloud callback, or evidence
 export fails. Successful runs require their trace and summary exports.
+The cloud-cleanup controller independently verifies exact daemon absence after
+local teardown, separately from receipt persistence. A failed receipt remains a
+failure but cannot block cloud cleanup when absence is independently verified.
+Unknown producer state blocks cloud deletion. Every known topology gets a final
+teardown attempt; failure to store the final report preserves all sanitized
+errors in an exception group. Default pytest includes both cheap safeguard
+files; Docker qualification and live integration/deployment remain opt-in.

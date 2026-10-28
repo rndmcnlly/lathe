@@ -783,13 +783,41 @@ def cleanup(label, output, *, cloud=True):
     infra = infrastructure()
     directories = [output / name for name in ("preflight", "config-preflight", "live")]
     errors, deleted = [], []
-    stopped = False
-    try:
-        for directory in directories:
+    owned = []
+    stopped = True
+    cloud_attempted = False
+
+    def record(exc):
+        errors.append(monitor.sanitize(f"{type(exc).__name__}: {exc}"))
+
+    # Retain validated ownership even if receipt storage disappears afterward.
+    for directory in directories:
+        try:
             if directory.exists():
-                infra.cleanup(directory)
-        stopped = True
-        if cloud:
+                owned.append((directory, infra.load_manifest(directory)))
+        except BaseException as exc:
+            stopped = False
+            record(exc)
+    if cloud and not any(directory.name == "live" for directory, _ in owned):
+        stopped = False
+        record(RuntimeError("live ownership manifest unavailable; producer state unknown"))
+
+    for directory, manifest in owned:
+        try:
+            infra.cleanup(directory, manifest=manifest)
+        except BaseException as exc:
+            record(exc)
+        # A cleanup receipt failure is not a producer-state verdict. Only an
+        # independent successful daemon read can authorize the cloud callback.
+        try:
+            infra.verify_absent(manifest)
+        except BaseException as exc:
+            stopped = False
+            record(exc)
+
+    try:
+        if stopped and cloud:
+            cloud_attempted = True
             import test_deployment as suite
             suite.DEPLOYMENT_LABEL = label
             suite.DAYTONA_API_KEY = os.environ["DAYTONA_API_KEY"]
@@ -797,19 +825,27 @@ def cleanup(label, output, *, cloud=True):
             asyncio.run(suite.cleanup_test_sandboxes())
             require(not asyncio.run(owned_sandboxes(suite.DAYTONA_API_KEY, label)), "Owned sandboxes remain")
     except BaseException as exc:
-        errors.append(monitor.sanitize(f"{type(exc).__name__}: {exc}"))
-    # Never let a cloud callback or evidence failure prevent local teardown.
-    try:
-        for directory in directories:
-            if directory.exists():
-                infra.cleanup(directory)
-    except BaseException as exc:
-        errors.append(monitor.sanitize(f"{type(exc).__name__}: {exc}"))
+        record(exc)
+    finally:
+        # Try every known topology even after cloud, teardown or receipt errors.
+        for directory, manifest in owned:
+            try:
+                infra.cleanup(directory, manifest=manifest)
+            except BaseException as exc:
+                record(exc)
     result = {"label": label, "owui_stopped_before_cloud_cleanup": stopped,
+              "cloud_cleanup_attempted": cloud_attempted,
               "sandbox_deletions_verified": deleted,
               "success": not errors, "errors": errors}
-    output.mkdir(parents=True, exist_ok=True)
-    (output / f"cleanup-{time.time_ns()}.json").write_text(json.dumps(result, indent=2))
+    try:
+        output.mkdir(parents=True, exist_ok=True)
+        (output / f"cleanup-{time.time_ns()}.json").write_text(json.dumps(result, indent=2))
+    except BaseException as exc:
+        record(exc)
+        # Preserve every sanitized failure if even the final report cannot be
+        # stored. A receipt error must never turn an attempted cleanup into PASS.
+        raise ExceptionGroup("readiness cleanup/evidence failures",
+                             [RuntimeError(error) for error in errors]) from None
     return not errors
 
 

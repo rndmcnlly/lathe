@@ -78,6 +78,14 @@ def cleanup(directory, *, manifest=None):
         if info["Labels"].get(LABEL) != owner or info["Containers"]:
             raise RuntimeError("refusing cleanup: network ownership mismatch or foreign endpoints")
         docker("network", "rm", info["Id"])
+    verify_absent(manifest)
+    save(directory / "cleanup.json", {"verified_absent": True, **manifest})
+
+
+def verify_absent(manifest):
+    """Read daemon state independently of teardown and receipt persistence."""
+    manifest = validate_manifest(manifest)
+    owner = manifest["owner"]
     remaining = set(docker("ps", "-a", "--format", "{{.Names}}").splitlines())
     networks = set(docker("network", "ls", "--format", "{{.Name}}").splitlines())
     if remaining.intersection(manifest["containers"]) or manifest["network"] in networks:
@@ -85,7 +93,6 @@ def cleanup(directory, *, manifest=None):
     if docker("ps", "-aq", "--filter", f"label={LABEL}={owner}").strip() or docker(
             "network", "ls", "-q", "--filter", f"label={LABEL}={owner}").strip():
         raise RuntimeError("unexpected resources with this run's owner label")
-    save(directory / "cleanup.json", {"verified_absent": True, **manifest})
 
 
 def stage(app, source):

@@ -195,10 +195,10 @@ native acceptance. **No live/cloud retry has been dispatched.**
 
 Verification after the fix: **224 focused tests passed** (46 infrastructure plus
 178 readiness/monitor), and **821 default tests passed**. The earlier default
-count of 829 was incorrect: default `testpaths` do not include `test_readiness.py`.
+count of 829 was incorrect: default `testpaths` at that point omitted `test_readiness.py`.
 Counts were checked against actual pytest collection.
-The readiness workflow now explicitly runs both the infrastructure and controller
-contracts in addition to the default suite, since default collection omits them.
+The readiness workflow explicitly ran both the infrastructure and controller
+contracts in addition to that earlier default suite.
 
 Credential-free shared-image evidence:
 `runs/shared-5719707561204a58bdbf48edc40baf31/`. Both fresh topologies passed and
@@ -211,3 +211,29 @@ requests, actual HTTPX `bytes` lookups, a byte-exact independent download and si
 observed denials. Provider requests/reservations remain **0/$0**; the $2 monetary
 ceiling and other live limits are unchanged. Full staged source, helper and
 infrastructure hashes are retained in each `result.json`.
+
+## Final review: cleanup persistence and default offline gates
+
+Exact daemon absence is now independently verifiable without writing a receipt.
+The root cleanup controller retains validated manifests, records local cleanup
+errors, independently verifies absence, and only then permits the exact-owned
+cloud callback. A receipt-write failure after removal cannot skip that callback;
+an unresolved producer, failed daemon read or missing live manifest still blocks
+it. Final local teardown attempts every known topology even after callback or
+evidence errors. An unwritable final report raises all sanitized failures together.
+
+Production-path regressions invoke both actual cleanup implementations, faulting
+only Docker responses, cloud callbacks and persistence: receipt failure after
+removal, unresolved producers, unavailable daemon, callback interruption and final
+report failure (including combined failures). Default pytest now includes
+`test_readiness.py` and `readiness-infra/test_infra.py`. Live suites and Docker
+qualification remain manual. No runtime/version change or live/cloud retry.
+
+After these fixes, **912 default offline tests passed** (now including both cheap
+safeguard files), and **230 focused infrastructure/readiness/monitor tests passed**.
+Credential-free evidence: `runs/shared-5ba8f84925644a5d80d9b6738de70074/`.
+The 22 real-container infrastructure gates passed in 16.04 seconds; the controller
+qualification passed in 26.32 seconds, including four synthetic HTTP requests and
+six observed guard denials. Both fresh topologies used
+`sha256:2de8657cb6e2c16494fdf0beceb8ca5a33f899ef5cd60063019322d9e6d73d02`
+and verified exact owned resource absence. Provider requests/reservations: **0/$0**.

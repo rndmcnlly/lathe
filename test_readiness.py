@@ -136,8 +136,20 @@ def test_native_scope_plan_and_host_selection_without_live_work(monkeypatch, cap
     assert lab.main() == 0 and scopes == ["native"]
 
 
-@pytest.mark.parametrize("cloud_fails,removal_sticks", [(False, False), (True, False), (False, True)])
-def test_cleanup_orders_and_independently_verifies(monkeypatch, tmp_path, cloud_fails, removal_sticks):
+@pytest.mark.parametrize("cloud_fails,removal_sticks,local_receipt_fails,final_receipt_fails,daemon_fails", [
+    (False, False, False, False, False),
+    (True, False, False, False, False),
+    (False, True, False, False, False),
+    (False, False, True, False, False),
+    (True, False, True, False, False),
+    (False, True, True, False, False),
+    (False, False, False, True, False),
+    (True, False, True, True, False),
+    (False, False, False, False, True),
+])
+def test_cleanup_orders_and_independently_verifies(monkeypatch, tmp_path, cloud_fails, removal_sticks,
+                                                  local_receipt_fails, final_receipt_fails, daemon_fails):
+    from pathlib import Path
     label = "lathe-ci-next-0123456789abcdef"
     infra = lab.infrastructure()
     owner = "1" * 32
@@ -149,10 +161,14 @@ def test_cleanup_orders_and_independently_verifies(monkeypatch, tmp_path, cloud_
     names = set(manifest["containers"])
     networks = {network}
     calls = []
+    events = []
 
     def command(*args, **kwargs):
         calls.append(args)
         if args[0] == "ps":
+            events.append("daemon-read")
+            if daemon_fails:
+                raise RuntimeError("injected daemon unavailable")
             return "\n".join(names)
         if args[:2] == ("network", "ls"):
             return "\n".join(networks)
@@ -160,7 +176,8 @@ def test_cleanup_orders_and_independently_verifies(monkeypatch, tmp_path, cloud_
             return json.dumps([{"Name": "/" + args[1], "Id": args[1],
                                 "Config": {"Labels": {infra.LABEL: owner}}}])
         if args[:2] == ("network", "inspect"):
-            return json.dumps([{"Id": network, "Labels": {infra.LABEL: owner}, "Containers": {}}])
+            return json.dumps([{"Id": network, "Labels": {infra.LABEL: owner},
+                                "Containers": {name: {} for name in names}}])
         if args[0] == "rm" and not removal_sticks:
             names.discard(args[-1])
         if args[:2] == ("network", "rm"):
@@ -168,24 +185,65 @@ def test_cleanup_orders_and_independently_verifies(monkeypatch, tmp_path, cloud_
         return ""
 
     async def cloud_cleanup():
+        events.append("cloud")
         assert not names and not networks
+        if local_receipt_fails:
+            failed = events.index("local-receipt-failed")
+            assert "daemon-read" in events[failed + 1:-1], "receipt failure was not independently reverified"
         if cloud_fails:
             raise KeyboardInterrupt("interrupted cloud cleanup")
 
     async def no_sandboxes(*args):
         return []
 
+    actual_save = infra.save
+    def save(path, value):
+        if path.name == "cleanup.json":
+            # This faults the real cleanup's persistence, only AFTER its actual
+            # successful daemon verification and exact resource removal.
+            assert not names and not networks
+            events.append("local-receipt-failed" if local_receipt_fails else "local-receipt")
+            if local_receipt_fails:
+                raise PermissionError("injected local cleanup receipt failure")
+        actual_save(path, value)
+
+    actual_write = Path.write_text
+    def write(path, *args, **kwargs):
+        if path.parent == tmp_path and path.name.startswith("cleanup-") and final_receipt_fails:
+            raise PermissionError("injected final cleanup report failure")
+        return actual_write(path, *args, **kwargs)
+
     monkeypatch.setattr(infra, "docker", command)
+    monkeypatch.setattr(infra, "save", save)
+    monkeypatch.setattr(Path, "write_text", write)
     monkeypatch.setattr(lab, "infrastructure", lambda: infra)
     monkeypatch.setattr(lab, "owned_sandboxes", no_sandboxes)
     monkeypatch.setattr(lab, "setup_imports", lambda: SimpleNamespace(sanitize=lambda x: x))
     monkeypatch.setitem(sys.modules, "test_deployment", SimpleNamespace(cleanup_test_sandboxes=cloud_cleanup))
     monkeypatch.setenv("DAYTONA_API_KEY", "offline-fake-key")
-    assert lab.cleanup(label, tmp_path) is (not cloud_fails and not removal_sticks)
-    record = json.loads(next(tmp_path.glob("cleanup-*.json")).read_text())
-    assert record["owui_stopped_before_cloud_cleanup"] is (not removal_sticks)
-    assert any(c[0] == "rm" for c in calls)
-    assert not networks
+    if final_receipt_fails:
+        with pytest.raises(ExceptionGroup) as caught:
+            lab.cleanup(label, tmp_path)
+        errors = [str(exc) for exc in caught.value.exceptions]
+        assert "injected final cleanup report failure" in errors[-1]
+    else:
+        assert lab.cleanup(label, tmp_path) is (not any((cloud_fails, removal_sticks, local_receipt_fails, daemon_fails)))
+        record = json.loads(next(tmp_path.glob("cleanup-*.json")).read_text())
+        assert record["owui_stopped_before_cloud_cleanup"] is (not removal_sticks and not daemon_fails)
+        assert record["cloud_cleanup_attempted"] is (not removal_sticks and not daemon_fails)
+        errors = record["errors"]
+    if local_receipt_fails and not removal_sticks:
+        assert any("injected local cleanup receipt failure" in error for error in errors)
+    if cloud_fails:
+        assert any("interrupted cloud cleanup" in error for error in errors)
+    assert events.count("cloud") == (0 if removal_sticks or daemon_fails else 1)
+    if removal_sticks or daemon_fails:
+        assert names and networks
+        assert sum(c[0] == "ps" for c in calls) >= 3  # initial, independent verification, final teardown
+    else:
+        assert not names and not networks
+        receipts = [i for i, event in enumerate(events) if event.startswith("local-receipt")]
+        assert len(receipts) == 2 and receipts[0] < events.index("cloud") < receipts[1]
 
 
 def test_cleanup_refuses_non_lab_namespace(monkeypatch, tmp_path):
