@@ -376,3 +376,17 @@ async def test_cross_worker_loaded_configuration_gate(tmp_path, monkeypatch, sta
         else:
             await check
             assert {name for name, path in seen if path == "/_readiness/loaded"} == {"A", "B"}
+
+
+def test_transport_gate_subprocess_never_inherits_platform_credentials(monkeypatch):
+    import subprocess
+    monkeypatch.setenv("DAYTONA_API_KEY", "must-not-pass-to-fixture")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "must-not-pass-to-fixture")
+    expected = {"status": "passed", "synthetic_loopback_only": True, "platform_acceptance": False}
+    def run(args, **kwargs):
+        assert args == [sys.executable, "/opt/readiness/transport_preflight.py"]
+        assert kwargs["env"] == {"PYTHONUNBUFFERED": "1"}
+        assert kwargs["timeout"] == 30
+        return subprocess.CompletedProcess(args, 0, json.dumps(expected).encode(), b"")
+    monkeypatch.setattr(lab.subprocess, "run", run)
+    assert lab.check_transport() == expected

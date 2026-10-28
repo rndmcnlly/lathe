@@ -4,3 +4,4 @@
 !entrypoint.py
 !preflight.py
 !guard.py
+!transport_preflight.py

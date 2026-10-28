@@ -107,7 +107,7 @@ UDP attempts. The internal Docker network separately blocks internet egress.
 ## Shared-path qualification
 
 The shared lifecycle refactor passed **22 infrastructure offline tests**,
-**177 readiness/monitor tests**, and **829 default offline tests**. These include
+**177 readiness/monitor tests**, and **821 default offline tests**. These include
 production-path adapters proving ordered key-free gates, identical live image
 selection, no legacy Docker bootstrap, both-worker loaded-valve validation,
 observable Python egress denial, and local cleanup after cloud/export failures.
@@ -168,3 +168,46 @@ Dockerfile SHA256:
 `92b7551270e7ddb4d81f06b9cbf59ad0b24a76e1a613ce9f76c2ad500d334b68`.
 Full sanitized receipts are in the workflow artifact and the ignored local copy
 `monitor-artifacts/readiness-results/run-40618676311/`.
+
+## Bytes-host fix and deterministic transport gate (no live retry)
+
+The guard now canonicalizes supported hostname representations before applying
+the unchanged exact allowlist: ASCII bytes, string/IDNA names, DNS case, one root
+dot and normalized IP spellings. Invalid bytes and malformed names are rejected
+explicitly and journaled before the client receives an error.
+
+`transport_preflight.py` runs the actual guard and default HTTPX transport against
+a loopback HTTP server with strictly scoped DNS answers. It verifies real HTTPX
+bytes-host lookups, case/root-dot requests, snapshot-shaped JSON and byte-exact
+download reads. Forbidden suffixes, another IDNA name, an unrelated IP and
+malformed representations produce observed denials; no timeout substitutes for
+that evidence. Fault injection proves the gate detects missing bytes handling
+and a suffix-policy bypass. Additional HTTPX tests preserve preflight blocking
+and the worker's lack of controller-only provider access.
+
+The controller runs this key-free subprocess before installing its own guard or
+contacting any platform, in both its config-only and live modes. It inherits no
+platform credentials; fixture DNS and socket patches are restored. Its separate
+`transport-preflight.json` receipt distinguishes intentional synthetic denials
+from the real preflight's zero-guard-observed-external-attempt requirement.
+This is synthetic transport qualification, not real platform DNS/TLS/API or
+native acceptance. **No live/cloud retry has been dispatched.**
+
+Verification after the fix: **224 focused tests passed** (46 infrastructure plus
+178 readiness/monitor), and **821 default tests passed**. The earlier default
+count of 829 was incorrect: default `testpaths` do not include `test_readiness.py`.
+Counts were checked against actual pytest collection.
+The readiness workflow now explicitly runs both the infrastructure and controller
+contracts in addition to the default suite, since default collection omits them.
+
+Credential-free shared-image evidence:
+`runs/shared-5719707561204a58bdbf48edc40baf31/`. Both fresh topologies passed and
+verified exact owned resource absence: 22 infrastructure gates in 16.17 seconds,
+then the actual controller/config gate in 26.14 seconds. Their identical image ID:
+`sha256:9a2558b6b1ae49ca63a2852b939bd1c22915d30ada337dad2ae8e97a664a51bf`.
+The first controller trace event is `transport_preflight`, before worker startup
+or platform resolution. Its exported receipt records four real loopback HTTP
+requests, actual HTTPX `bytes` lookups, a byte-exact independent download and six
+observed denials. Provider requests/reservations remain **0/$0**; the $2 monetary
+ceiling and other live limits are unchanged. Full staged source, helper and
+infrastructure hashes are retained in each `result.json`.

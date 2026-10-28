@@ -3,16 +3,18 @@
 This qualifies local infrastructure, without `.env`, platform credentials, cloud
 resources, or inference. It does **not** qualify real-model dispatch, native
 subagents, Daytona wake-up, or multi-host/shared-filesystem production deployment.
-The single shared-path live attempt stopped at a guard bug before provisioning:
-permitted DNS names supplied as `bytes` are rejected. Native qualification is
-**NOT REACHED**. See `QUALIFICATION.md`; do not interpret key-free success as live
-egress acceptance.
+The prior shared-path live attempt stopped at the bytes-hostname guard bug before
+provisioning. That bug now has a normalization fix and a key-free live-policy
+HTTPX gate. No subsequent live run is authorized: native qualification remains
+**NOT REACHED**. See `QUALIFICATION.md`; synthetic transport success is not real
+platform acceptance.
 
 ```sh
 uv run python readiness-infra/lab.py --preflight
 uv run python readiness-infra/lab.py --cleanup readiness-infra/runs/<run>
 uv run pytest readiness-infra/test_infra.py
 uv run python readiness_lab.py --preflight  # also exercises the live controller, without keys/inference
+uv run python readiness-infra/transport_preflight.py  # synthetic live-policy HTTPX transport only
 ```
 
 `--artifacts NEW_DIRECTORY` chooses evidence storage. `--source REPO_DIRECTORY`
@@ -30,7 +32,7 @@ Disposable image tags/build cache remain available; no container or network does
   the Dockerfile's single actual `FROM` before building.
   `images.json` records immutable multi-platform image/index digests resolved
   October 27, 2026. Native Docker architecture is used, not forced emulation.
-* A Dockerfile with a five-file allowlisted context. No repo root build context,
+* A Dockerfile with a six-file allowlisted context. No repo root build context,
   dotenv reads, secret build arguments, bind mounts, or credential forwarding.
   Socket/HTTP helpers already exist in the pinned OWUI image. Lathe additionally
   needs cachetools: its hash-pinned 6.2.1 wheel is installed at build time with
@@ -111,6 +113,27 @@ normalized loaded-valve checks through each worker. Neither topology inherits
 cloud keys or configures a usable external provider. They make zero inference
 requests. A failed gate stops before cloud access. Fresh workers initialize
 persistent configuration sequentially to avoid a shared singleton-insert race.
+
+Before installing its own guard or resolving platform names, the controller runs
+`transport_preflight.py` in a subprocess with no inherited environment credentials.
+It exercises the actual live-controller guard and HTTPX default HTTP transport
+against an ephemeral loopback HTTP server. Test-scoped DNS maps only exact
+whitelisted names to loopback and never falls back to internet DNS. Snapshot-shaped
+GET and byte-exact toolbox download reads exercise transport, not platform APIs.
+The receipt proves HTTPX supplied bytes hostnames; case/root-dot names work, while
+unrelated suffixes, IDNA names, IPs and malformed representations are rejected
+with observed denials, not client timeouts. Intentional fixture denials are kept
+in its separate receipt, not the real preflight's zero-external-attempt journal.
+The fixture restores socket hooks, and its subprocess cannot alter controller DNS.
+`transport-preflight.json` is a required successful-run export.
+
+The guard canonicalizes ASCII bytes and string/IDNA DNS names once at each socket
+boundary, including case and a single terminal root dot, before exact comparison
+and resolution. Malformed bytes fail clearly without echoing their contents.
+Names are not suffix-matched; the live versus preflight and controller versus
+worker allowlists are unchanged. This synthetic plain-HTTP fixture qualifies
+Python DNS/TCP/HTTPX compatibility, not platform DNS/TLS, authorization, payload
+acceptance, provisioning, inference or native continuation.
 
 Only then may a third fresh topology receive explicit live credentials and the
 exact previously built image ID. Source, helper and infrastructure hashes must

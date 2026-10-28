@@ -277,3 +277,89 @@ def test_python_egress_denials_are_observable(tmp_path, monkeypatch, policy):
     attempts = [json.loads(line) for line in (tmp_path / "denied").read_text().splitlines()]
     assert [(item["operation"], item["host"]) for item in attempts] == [
         ("lookup", "not-allowed.invalid"), ("connect", "203.0.113.1")]
+
+
+@pytest.fixture
+def transport_modules(monkeypatch):
+    import sys
+    def load(name, filename):
+        spec = importlib.util.spec_from_file_location(name, Path(__file__).with_name(filename))
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+    guard = load("infra_guard", "guard.py")
+    monkeypatch.setitem(sys.modules, "guard", guard)
+    return guard, load("transport_preflight", "transport_preflight.py")
+
+
+@pytest.mark.parametrize("host,expected", [
+    ("APP.DAYTONA.IO.", "app.daytona.io"), (b"APP.DAYTONA.IO.", "app.daytona.io"),
+    ("app.daytona.io", "app.daytona.io"), (b"app.daytona.io", "app.daytona.io"),
+    ("bücher.invalid", "xn--bcher-kva.invalid"), (b"xn--bcher-kva.invalid.", "xn--bcher-kva.invalid"),
+    (b"127.0.0.1", "127.0.0.1"), ("0:0:0:0:0:0:0:1", "::1"),
+    ("app.daytona.io.attacker.invalid", "app.daytona.io.attacker.invalid"),
+])
+def test_hostname_normalization_preserves_exact_dns_identity(transport_modules, host, expected):
+    guard, _ = transport_modules
+    assert guard.canonical_host(host) == expected
+
+
+@pytest.mark.parametrize("host", [b"app.daytona.io\xff", b"app.daytona.io\x00", "app.daytona.io..",
+                                "app.daytona.io%00", " app.daytona.io", "app.daytona.io:443",
+                                "user@app.daytona.io", "app_daytona.io", b"", 123])
+def test_malformed_hostname_representations_are_not_coerced(transport_modules, host):
+    guard, _ = transport_modules
+    with pytest.raises((ValueError, UnicodeError)):
+        guard.canonical_host(host)
+
+
+@pytest.mark.asyncio
+async def test_actual_httpx_live_policy_transport_with_loopback_dns_only(transport_modules):
+    import socket
+    guard, transport = transport_modules
+    hooks = socket.getaddrinfo, socket.socket.connect, socket.socket.connect_ex
+    receipt = await transport.qualify()
+    assert receipt["status"] == "passed" and receipt["synthetic_loopback_only"]
+    assert receipt["platform_acceptance"] is False and receipt["provider_requests"] == 0
+    assert "bytes" in receipt["httpx_lookup_input_types"]
+    assert receipt["binary_download_verified"] and len(receipt["http_requests"]) == 4
+    assert [x["reason"] for x in receipt["observed_denials"]] == [
+        "not_allowed", "not_allowed", "not_allowed", "not_allowed", "malformed_hostname", "malformed_hostname"]
+    assert (socket.getaddrinfo, socket.socket.connect, socket.socket.connect_ex) == hooks
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fault", ["bytes-regression", "suffix-policy-bypass"])
+async def test_httpx_gate_detects_representation_and_policy_faults(transport_modules, monkeypatch, fault):
+    import httpx
+    guard, transport = transport_modules
+    canonical = guard.canonical_host
+    def broken(host):
+        if fault == "bytes-regression" and isinstance(host, bytes):
+            raise ValueError("injected missing bytes support")
+        value = canonical(host)
+        return value.removesuffix(".attacker.invalid") if fault == "suffix-policy-bypass" else value
+    monkeypatch.setattr(guard, "canonical_host", broken)
+    if fault == "bytes-regression":
+        with pytest.raises(httpx.ConnectError, match="malformed hostname representation"):
+            await transport.qualify()
+    else:
+        with pytest.raises(RuntimeError, match="forbidden fixture request was admitted"):
+            await transport.qualify()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("policy", ["preflight", "live-worker"])
+async def test_httpx_transport_keeps_preflight_and_worker_policy_restricted(transport_modules, monkeypatch, policy):
+    import os
+    import httpx
+    from unittest.mock import patch
+    guard, transport = transport_modules
+    def restricted(**kwargs):
+        with patch.dict(os.environ, {"READINESS_EGRESS": "preflight" if policy == "preflight" else "live"}):
+            guard.install_egress_guard(controller=policy != "live-worker", denied_path=kwargs["denied_path"])
+    monkeypatch.setattr(transport, "install_egress_guard", restricted)
+    # Preflight must reject the first Daytona request. A live worker may reach
+    # Daytona, but not the controller-only OpenRouter fixture request.
+    with pytest.raises(httpx.ConnectError, match="forbids external network access"):
+        await transport.qualify()

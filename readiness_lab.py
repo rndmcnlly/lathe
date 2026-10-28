@@ -281,7 +281,6 @@ async def inside(scope="full", config_only=False):
         require(Path("/tmp", name).read_bytes() == Path("/opt/staged", name).read_bytes(),
                 "Controller source differs from qualified staged source")
     from guard import install_egress_guard
-    install_egress_guard(controller=True)
     from entrypoint import Workers
     workers = Workers()
     trace = monitor.Trace(directory)
@@ -301,6 +300,7 @@ async def inside(scope="full", config_only=False):
     processes = workers.processes
     client = None
     exit_code = 1
+    platform_ready = False
 
     class NativeComplete(Exception):
         """Leave the full-scope path while retaining common teardown/return."""
@@ -326,6 +326,13 @@ async def inside(scope="full", config_only=False):
 
     try:
         async with asyncio.timeout(22 * 60):
+            transport = check_transport()
+            (directory / "transport-preflight.json").write_text(json.dumps(transport, indent=2))
+            trace("transport_preflight", **transport)
+            # Only after the key-free live-policy adapter gate may the controller
+            # resolve real platform hosts or start any request producer.
+            install_egress_guard(controller=True)
+            platform_ready = True
             await runner.setup()
             await web.TCPSite(runner, "127.0.0.1", 9099).start()
             workers.migrate()
@@ -403,7 +410,6 @@ async def inside(scope="full", config_only=False):
                 await provision_small(http, suite.OWUI_BASE, suite.auth_headers(), suite.DAYTONA_API_KEY,
                                       suite.DEPLOYMENT_LABEL, user["email"], trace, before_provision=refresh)
             await suite.check_staging_access(admin, user)
-            # B starts after DB migrations and shared configuration are committed.
             client = suite.OWUIClient()
             await client.connect()  # Keep the authenticated socket on A throughout.
             if scope == "native":
@@ -543,7 +549,7 @@ async def inside(scope="full", config_only=False):
                 trace("cleanup_error", error=str(exc))
         try:
             require(all(p.poll() is not None for p in processes.values()), "Live worker blocks cloud cleanup")
-            if not config_only:
+            if not config_only and platform_ready:
                 await suite.cleanup_test_sandboxes()
         except Exception as exc:
             exit_code = 1
@@ -815,6 +821,17 @@ def infrastructure():
     return module
 
 
+def check_transport():
+    """Isolate fixture DNS/guard hooks and never pass platform credentials."""
+    result = subprocess.run([sys.executable, "/opt/readiness/transport_preflight.py"],
+                            env={"PYTHONUNBUFFERED": "1"}, capture_output=True, timeout=30)
+    require(result.returncode == 0, "key-free live transport gate failed: " + result.stderr.decode(errors="replace")[-2000:])
+    receipt = json.loads(result.stdout)
+    require(receipt.get("status") == "passed" and receipt.get("synthetic_loopback_only") is True
+            and receipt.get("platform_acceptance") is False, "invalid transport qualification receipt")
+    return receipt
+
+
 def controller_action(infra, directory, *, config_only=False):
     """Wait/export only. The shared lifecycle owns local resources, even on failure."""
     directory.mkdir(parents=True, exist_ok=True)
@@ -825,11 +842,12 @@ def controller_action(infra, directory, *, config_only=False):
             return status
         finally:
             infra.docker("stop", "--time", "20", app, timeout=40)
-            for filename in ("trace.jsonl", "summary.json", "worker-A.jsonl", "worker-B.jsonl"):
+            for filename in ("trace.jsonl", "summary.json", "transport-preflight.json", "worker-A.jsonl", "worker-B.jsonl"):
                 try:
                     infra.docker("cp", f"{app}:/lab/artifacts/{filename}", str(directory / filename))
                 except RuntimeError:
-                    if filename in ("trace.jsonl", "summary.json") or (status == 0 and not config_only):
+                    if filename in ("trace.jsonl", "summary.json") or (status == 0 and
+                            (filename == "transport-preflight.json" or not config_only)):
                         raise
     return action
 
