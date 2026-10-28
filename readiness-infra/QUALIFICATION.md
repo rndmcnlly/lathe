@@ -122,3 +122,49 @@ stable A across B replacement and normalized loaded-toolkit checks through both
 restarted workers are retained in `runs/shared-final-config-evidence-1/trace.jsonl`.
 Live native behavior remains a separate paid qualification, not established by
 this key-free controller trial.
+
+## Single native-only attempt: NOT REACHED
+
+Source commit: `98e47fc8626a5f52fac087ea2d42584eb871c99b`.
+Workflow: [40618676311](https://github.com/rndmcnlly/lathe/actions/runs/40618676311).
+The run completed, including successful exact-run teardown and evidence upload.
+No second attempt was dispatched.
+
+Both runner-side key-free topologies passed: all 22 infrastructure gates, then
+the actual controller/config trial. B changed PID 20 → 29 while A stayed PID 11;
+migration count remained one. After configuration restart, A39 and B56 both
+verified provider/model access and the actual loaded toolkit/normalized valves.
+Preflight, config trial and live topology used the identical built image ID:
+`sha256:88045ab90cf420f247ce858c1870d839553f47bfb1f74bf599c344318a4fe346`.
+The final local CLI trial used
+`sha256:a34c05b0dda36e0a9b02b9416398c8e53193ebaba8f0e30e4afc862d2cd5d8d5`.
+
+The live controller failed at its first Daytona snapshot request, before sandbox
+creation or native dispatch: `ConnectError: Readiness infrastructure forbids
+external network access`. The inner cleanup callback encountered the same guard
+failure; the outer host cleanup and subsequent independent cleanup step both
+verified cloud absence. All three exact local topologies were verified absent.
+
+An offline reproduction through actual HTTPX reproduced the same error before
+any socket connection. A second direct production-guard probe isolated the cause:
+`socket.getaddrinfo("app.daytona.io", 443)` is permitted, but the equivalent
+`bytes` hostname is rejected because the guard compares it against string names.
+The guard's denial evidence renders that bytes value as `non-hostname`. The
+denied-host tests did not cover permitted hosts through HTTPX/AnyIO. This is a
+known shared-seam blocker, not evidence that Daytona is unreachable. The guard
+was not relaxed and no paid startup debugging or retry followed.
+
+Requested model: `z-ai/glm-5.3-flash`. Actual serving model: none. Inference
+requests: **0**. Inference cost/reservations: **$0/$0**, with the $2 ceiling intact.
+Sandboxes provisioned: **0**. Idle and busy native continuation: **NOT REACHED**;
+there are no child/parent native observations or independent nonce/file proofs.
+Overlapping first use remains unqualified; direct-bash wakeup remains unsupported.
+
+Runtime SHA256 is unchanged:
+`a9089a2e4b93621a450ee5c6f889c73191782adb06ad6d26ce2fe1bf8216a58d`.
+Controller SHA256:
+`a4258b70bf7eda739055f5db6b38e81a6768f59ba2215daf08ed7b247d22ccc1`.
+Dockerfile SHA256:
+`92b7551270e7ddb4d81f06b9cbf59ad0b24a76e1a613ce9f76c2ad500d334b68`.
+Full sanitized receipts are in the workflow artifact and the ignored local copy
+`monitor-artifacts/readiness-results/run-40618676311/`.

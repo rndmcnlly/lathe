@@ -3,6 +3,10 @@
 This qualifies local infrastructure, without `.env`, platform credentials, cloud
 resources, or inference. It does **not** qualify real-model dispatch, native
 subagents, Daytona wake-up, or multi-host/shared-filesystem production deployment.
+The single shared-path live attempt stopped at a guard bug before provisioning:
+permitted DNS names supplied as `bytes` are rejected. Native qualification is
+**NOT REACHED**. See `QUALIFICATION.md`; do not interpret key-free success as live
+egress acceptance.
 
 ```sh
 uv run python readiness-infra/lab.py --preflight
