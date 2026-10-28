@@ -237,3 +237,52 @@ qualification passed in 26.32 seconds, including four synthetic HTTP requests an
 six observed guard denials. Both fresh topologies used
 `sha256:2de8657cb6e2c16494fdf0beceb8ca5a33f899ef5cd60063019322d9e6d73d02`
 and verified exact owned resource absence. Provider requests/reservations: **0/$0**.
+
+## Authorized native-only trial at 9780e19: infrastructure failure, NOT REACHED
+
+Completed workflow [40622252912](https://github.com/rndmcnlly/lathe/actions/runs/40622252912)
+used source commit `9780e199a9cb81882589f20e4648df79a5f4c3f5`. Runner offline gates
+passed: **912 default tests** and **230 focused tests**. Exactly one attempt was
+dispatched; there was no automatic retry or implementation change after failure.
+
+The first key-free topology failed after **26.02 seconds**, in `private services`,
+before source staging, OWUI migrations/workers or boundary checks. Its PG
+`pg_isready` command succeeded via the default Unix socket, but the subsequent
+`psql` call to create the vector extension found no socket at
+`/var/run/postgresql/.s.PGSQL.5432`. Controller/HTTPX qualification and the fresh
+live topology were therefore **NOT REACHED**, as were both native idle/busy cases.
+There are no delegate calls, parent/child/message associations, server-native
+model/tool/worker observations, or independent nonce/file proofs from this run.
+
+The pinned PG entrypoint was inspected read-only with no network or database
+startup. It starts a socket-only initialization server (`listen_addresses=''`),
+then stops it before executing the final server. The existing socket-only health
+probe can admit that temporary server. The retained error is consistent with
+this shutdown/startup gap, but PG container logs were not retained at this phase,
+so an independent crash cannot be excluded. This is an **infrastructure readiness
+failure**, not model/tool iteration failure or evidence about native upstream
+behavior. A candidate next fix is an authenticated TCP readiness/SQL boundary that
+cannot admit the socket-only initializer, plus bounded PG failure logs. That fix
+and any subsequent trial require separate review/authorization.
+
+Requested model: GLM-5.3-Flash; no serving model or price-catalogue check was
+reached. Provider requests, inference cost and reservations: **0/$0/$0**. No Daytona
+API request or sandbox provisioning occurred. The $2/40-request/128000-byte/
+4096-output-token caps, ZDR/data-collection/price policy, TTL30 and wall25 limits
+were unchanged and were never exercised by inference.
+
+The built (not fully qualified) preflight image ID was
+`sha256:808cf8370238e1d546beaed6d244dd457e87f22481b0907fa9e5a6cdfab5c95b`.
+No live image comparison was reached. Runtime SHA256 remains
+`a9089a2e4b93621a450ee5c6f889c73191782adb06ad6d26ce2fe1bf8216a58d`;
+controller SHA256 was
+`2134e1e5d12c357bed9658f9b6ea312039c379277340f9c7b01ddae55ce93b22`.
+Every input source/infrastructure hash and pinned image reference is retained in
+the uploaded `preflight/result.json` and the ignored local
+`monitor-artifacts/readiness-results/run-40622252912/handoff.json`.
+
+Exact owned container/network absence was verified after failure and again by
+host/workflow cleanup. Both cleanup reports passed with `cloud_cleanup_attempted`
+false: no cloud deletion or cloud-absence API query was needed or performed.
+The read-only diagnostic container was removed. Overlapping first use remains
+unqualified, direct-bash wakeup unsupported, and no #110/#67 closure is claimed.

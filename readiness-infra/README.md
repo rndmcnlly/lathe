@@ -3,10 +3,11 @@
 This qualifies local infrastructure, without `.env`, platform credentials, cloud
 resources, or inference. It does **not** qualify real-model dispatch, native
 subagents, Daytona wake-up, or multi-host/shared-filesystem production deployment.
-The prior shared-path live attempt stopped at the bytes-hostname guard bug before
-provisioning. That bug now has a normalization fix and a key-free live-policy
-HTTPX gate. No subsequent live run is authorized: native qualification remains
-**NOT REACHED**. See `QUALIFICATION.md`; synthetic transport success is not real
+The prior bytes-hostname guard bug has a normalization fix and a key-free
+live-policy HTTPX gate. The next authorized attempt stopped earlier, at the
+PostgreSQL Unix-socket readiness/SQL boundary, before any live stack or platform
+contact. Native qualification remains **NOT REACHED**; no automatic retry was
+dispatched. See `QUALIFICATION.md`; synthetic transport success is not real
 platform acceptance.
 
 ```sh
