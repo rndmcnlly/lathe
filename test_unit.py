@@ -2144,8 +2144,9 @@ def node_eval(stub, expression):
 
 class NodeClickSession:
     """Runs the shipped click resolver against a small element tree in Node."""
-    def __init__(self, elements, covered=False):
+    def __init__(self, elements, covered=False, hit_index=None):
         self.elements, self.covered, self.calls, self.dom_log = elements, covered, [], []
+        self.hit_index = hit_index
 
     def value(self, expression, timeout=30):
         stub = r"""
@@ -2166,9 +2167,10 @@ globalThis.document = {
     : sel === 'button' ? n.tagName === 'BUTTON' : n.clickable !== false); },
   elementFromPoint(x) { return COVERED === 'outside' ? null : COVERED === 'ancestor'
     ? {contains() { return true; }} : COVERED
-    ? {parent: null, contains() { return false; }} : nodes[Math.floor(x / 100)]; }
+    ? {parent: null, contains() { return false; }} : nodes[HIT === null ? Math.floor(x / 100) : HIT]; }
 };
-""".replace("ELEMENTS", json.dumps(self.elements)).replace("COVERED", json.dumps(self.covered))
+""".replace("ELEMENTS", json.dumps(self.elements)).replace("COVERED", json.dumps(self.covered)).replace(
+            "HIT", json.dumps(self.hit_index))
         result = node_eval(stub, expression)
         self.dom_log.extend(result["log"])
         return result["value"]
@@ -2218,6 +2220,12 @@ def test_page_click_refuses_ambiguity_before_scroll_or_input(page_script, args, 
     ], 0),
     # Hidden matches do not make a visible target ambiguous.
     ({"text": "Save"}, [{"innerText": "Save", "hidden": True}, {"innerText": "Save"}], 1),
+    # An outer clickable card must not also claim its nested control's title.
+    ({"text": "Hi"}, [
+        {"innerText": "Archived"}, {"tag": "div", "innerText": "Hi online Remove"},
+        {"innerText": "Hi online", "parent": 1},
+        {"tag": "span", "innerText": "Hi", "parent": 2, "clickable": False},
+    ], 2),
 ])
 def test_page_click_uses_one_unambiguous_target(page_script, args, elements, index):
     session = NodeClickSession(elements)
@@ -2233,6 +2241,18 @@ def test_page_click_refuses_covered_target_before_input(page_script, covered):
     session = NodeClickSession([{"innerText": "Save"}], covered=covered)
     with pytest.raises(page_script["Fail"], match="target centre is covered.*no input sent"):
         page_script["page_click"](session, {}, {"text": "Save"})
+    assert session.calls == []
+
+
+@needs_node
+def test_page_click_refuses_nested_control_at_target_centre(page_script):
+    session = NodeClickSession([
+        {"tag": "div", "innerText": "Hi Delete"},
+        {"tag": "span", "innerText": "Hi", "parent": 0, "clickable": False},
+        {"innerText": "Delete", "parent": 0},
+    ], hit_index=2)
+    with pytest.raises(page_script["Fail"], match="no input sent"):
+        page_script["page_click"](session, {}, {"text": "Hi"})
     assert session.calls == []
 
 

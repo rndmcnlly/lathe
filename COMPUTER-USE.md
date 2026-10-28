@@ -31,7 +31,7 @@ and workflow guidance live in `lathe(manpage="computer")`.
   `~/.config/lathe-browser`. Clicks are real `Input.dispatchMouseEvent` events
   at the element center. `page.click` prefers exact clickable text, then an
   exact descendant label's nearest clickable ancestor, then a unique substring.
-  Ambiguous text or selectors, covered centers, and centers outside the viewport
+  Ambiguous text or selectors, covered centers (including nested controls), and centers outside the viewport
   are refused before input; inspection/scrolling is not an atomic transaction
   with input on a shared page. `page.save` with `url` fetches through the page with
   its cookies, falling back to `Network.loadNetworkResource` for cross-origin.

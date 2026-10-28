@@ -2106,7 +2106,8 @@ CLICK_TARGET = r"""((sel, text) => {
   const r = el.getBoundingClientRect(), x = r.left + r.width / 2, y = r.top + r.height / 2;
   const hit = document.elementFromPoint(x, y);
   return {x, y, count: found.length, tag: el.tagName.toLowerCase(), label: label(el).slice(0, 80),
-          covered: !hit || (hit !== el && !el.contains(hit))};
+          covered: !hit || (hit !== el && !el.contains(hit)) ||
+            hit.closest(clickable) !== el.closest(clickable)};
 })"""
 
 

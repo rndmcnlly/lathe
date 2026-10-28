@@ -562,9 +562,19 @@ asyncio.run(main())
         require("session:true" in output, output)
         output = await tools.poke("page.eval", {"js": (
             "document.body.insertAdjacentHTML('beforeend', "
-            "'<div style=\"position:fixed;inset:0;z-index:9999\">overlay</div>')"), "tab": safety_tab}, **ctx)
+            "'<div id=overlay style=\"position:fixed;inset:0;z-index:9999\">overlay</div>')"), "tab": safety_tab}, **ctx)
         require(not output.startswith("Error:"), output)
         output = await tools.poke("page.click", {"selector": "#session", "tab": safety_tab}, **ctx)
+        require(output.startswith("Error:") and "no input sent" in output, output)
+        output = await tools.peek("page.text", {"selector": "#out", "tab": safety_tab}, **ctx)
+        require("session:true" in output, output)
+        output = await tools.poke("page.eval", {"js": (
+            "document.getElementById('overlay').remove(); document.body.insertAdjacentHTML('beforeend', "
+            "'<div role=button style=\"position:relative;width:200px;height:100px\">"
+            "<span>Nested title</span><button id=delete style=\"position:absolute;left:50%;top:50%;"
+            "transform:translate(-50%,-50%)\">Delete</button></div>')"), "tab": safety_tab}, **ctx)
+        require(not output.startswith("Error:"), output)
+        output = await tools.poke("page.click", {"text": "Nested title", "tab": safety_tab}, **ctx)
         require(output.startswith("Error:") and "no input sent" in output, output)
         output = await tools.peek("page.text", {"selector": "#out", "tab": safety_tab}, **ctx)
         require("session:true" in output, output)
