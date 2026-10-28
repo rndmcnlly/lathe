@@ -315,6 +315,22 @@ async def test_deletion_proof_is_per_id_and_deadline_bounded(suite):
     assert set(requests) == {"/api/sandbox/owned"}
 
 
+@pytest.mark.parametrize("states,polls", [
+    (["deleted"], 1), (["destroyed"], 1),
+    (["deleting", "destroying", "destroyed"], 3), (["destroying", "deleted"], 2),
+])
+async def test_deletion_proof_waits_out_transitional_states(suite, states, polls):
+    # Only a finished state proves deletion; transitional states keep polling.
+    replies = iter(states)
+    requests = []
+    def respond(request):
+        requests.append(request.url.path)
+        return httpx.Response(200, json={"id": "owned", "state": next(replies)})
+    async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as http:
+        await suite.await_deleted(http, "owned", interval=0)
+    assert len(requests) == polls
+
+
 @pytest.mark.parametrize("display_name", ["Lathe Test", "Lathe"])
 @pytest.mark.parametrize("preview_only", [False, True])
 async def test_staging_deployment_accepts_current_valves_and_sets_expiry(suite, monkeypatch, display_name, preview_only):
