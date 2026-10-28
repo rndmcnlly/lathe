@@ -32,6 +32,7 @@ PROVIDER = {"data_collection": "deny", "zdr": True,
             "max_price": {"prompt": 0.15, "completion": 0.5, "request": 0, "image": 0}}
 BUDGET = Decimal("2.00")
 PORTS = {"A": 8080, "B": 8081}
+SNAPSHOT = "daytona-small"
 UNIMPLEMENTED = {
     "overlapping_first_use": "NOT IMPLEMENTED: requires an observed admission barrier",
     "direct_bash_wakeup": "UNSUPPORTED: no generic supported native dispatch boundary",
@@ -120,6 +121,58 @@ async def verify_prices():
     return {"pricing": model["pricing"], "provider_price_filter": PROVIDER,
             "reservation_ceiling_usd": str(BUDGET), "checked_at": time.time(),
             "source": "https://openrouter.ai/api/v1/models"}
+
+
+async def provision_small(http, base, admin_headers, key, label, email, trace):
+    """Preflight the snapshot, install/read back complete valves, create one VM.
+
+    OWUI valve updates are replacements, not JSON merge patches. Preserve the
+    deployed credentials rather than accidentally replacing them with defaults.
+    Snapshot resources are selected by Daytona, never by resource overrides.
+    """
+    cloud_headers = {"Authorization": f"Bearer {key}"}
+    response = await http.get(f"https://app.daytona.io/api/snapshots/{SNAPSHOT}", headers=cloud_headers)
+    response.raise_for_status()
+    snapshot = response.json()
+    require(snapshot.get("name") == SNAPSHOT and snapshot.get("state") == "active",
+            "Named small snapshot is not active")
+    require(all(type(snapshot.get(k)) in (int, float) and 0 < snapshot[k] <= maximum
+                for k, maximum in (("cpu", 1), ("mem", 1), ("disk", 3)))
+            and snapshot.get("gpu") == 0, "Snapshot exceeds declared small CPU budget")
+    trace("snapshot_preflight", name=SNAPSHOT, id=snapshot.get("id"),
+          resources={k: snapshot[k] for k in ("cpu", "mem", "disk", "gpu")})
+    endpoint = base + "/api/v1/tools/id/lathe_test/valves"
+    response = await http.get(endpoint, headers=admin_headers)
+    response.raise_for_status()
+    valves = response.json()
+    require(valves.get("daytona_api_key") == key and valves.get("deployment_label") == label,
+            "Staging credentials/ownership missing before valve update")
+    overrides = {"snapshot": SNAPSHOT, "ttlMinutes": 30}
+    expected = {"deployment_label": label, "auto_create_sandbox": False,
+                "auto_stop_minutes": 5, "auto_archive_minutes": 5, "auto_delete_minutes": 0}
+    valves.update(expected, sandbox_create_overrides=json.dumps(overrides))
+    response = await http.post(endpoint + "/update", headers=admin_headers, json=valves)
+    response.raise_for_status()
+    response = await http.get(endpoint, headers=admin_headers)
+    response.raise_for_status()
+    installed = response.json()
+    require(all(installed.get(k) == v for k, v in expected.items())
+            and installed.get("daytona_api_key") == key
+            and json.loads(installed.get("sandbox_create_overrides", "null")) == overrides,
+            "Installed staging valves do not match snapshot/lifetime/ownership policy")
+    trace("installed_valves_verified", **expected, sandbox_create_overrides=overrides)
+    response = await http.post("https://app.daytona.io/api/sandbox", headers=cloud_headers, json={
+        **overrides, "name": label, "labels": {label: email.strip().lower()},
+        "autoStopInterval": 5, "autoArchiveInterval": 5, "autoDeleteInterval": 0})
+    response.raise_for_status()
+    info = response.json()
+    require(all(type(info.get(k)) in (int, float) and 0 < info[k] <= limit
+                for k, limit in (("cpu", 1), ("memory", 1), ("disk", 3))),
+            "Created sandbox exceeds preflighted small CPU resources")
+    require(info.get("labels", {}).get(label) == email.strip().lower()
+            and not info.get("volumes"), "Created sandbox ownership/volume mismatch")
+    trace("provisioned", id=info["id"], resources={k: info[k] for k in ("cpu", "memory", "disk")})
+    return info
 
 
 def run_command(*args, timeout=120, capture=True):
@@ -290,29 +343,12 @@ async def inside():
             admin, user = await suite.check_test_identity()
             trace("bootstrap_step", name="toolkit_deployment")
             await suite.deploy_staging_tool(admin, user, display_name="Disposable NEXT lab")
-            async with httpx.AsyncClient(timeout=30, headers=suite.auth_headers()) as http:
-                response = await http.post(suite.OWUI_BASE + "/api/v1/tools/id/lathe_test/valves/update",
-                    json={"sandbox_create_overrides": json.dumps({"ttlMinutes": 30}),
-                          "auto_create_sandbox": False})
-                response.raise_for_status()
             # Provision exactly one small CPU sandbox ourselves, with authoritative
             # ownership label. Lathe only discovers/starts it; it cannot provision more.
             trace("bootstrap_step", name="single_small_sandbox")
             async with httpx.AsyncClient(timeout=180) as http:
-                response = await http.post("https://app.daytona.io/api/sandbox",
-                    headers={"Authorization": f"Bearer {suite.DAYTONA_API_KEY}"}, json={
-                        "name": suite.DEPLOYMENT_LABEL,
-                        "cpu": 1, "memory": 2, "disk": 5,
-                        "labels": {suite.DEPLOYMENT_LABEL: user["email"].lower()},
-                        "autoStopInterval": 5, "autoArchiveInterval": 5,
-                        "autoDeleteInterval": 0, "ttlMinutes": 30})
-                response.raise_for_status()
-                info = response.json()
-                require(all(isinstance(info.get(k), (int, float)) and 0 < info[k] <= limit
-                            for k, limit in (("cpu", 2), ("memory", 4), ("disk", 10))),
-                        "Sandbox exceeds small-CPU compute budget or has unknown resources")
-                require(not info.get("volumes"), "Persistent sandbox volumes prohibited")
-                trace("provisioned", id=info["id"], resources={k: info[k] for k in ("cpu", "memory", "disk")})
+                await provision_small(http, suite.OWUI_BASE, suite.auth_headers(), suite.DAYTONA_API_KEY,
+                                      suite.DEPLOYMENT_LABEL, user["email"], trace)
             await suite.check_staging_access(admin, user)
             # B starts after DB migrations and shared configuration are committed.
             start("B")
@@ -785,7 +821,8 @@ def host():
                     "max_output_tokens_per_request": 4096, "sandbox_ttl_minutes": 30,
                     "lab_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
                     "provider_reservation_usd": str(BUDGET),
-                    "compute_estimate_usd": "<=0.084 at 2 vCPU/4GiB/10GiB for 30min; one sandbox only",
+                    "snapshot": SNAPSHOT,
+                    "compute_estimate_usd": "<=0.034 at 1 vCPU/1GiB/3GiB for 30min; one sandbox only",
                     "unimplemented": UNIMPLEMENTED}
         metadata["image"] = json.loads(run_command("docker", "image", "inspect", IMAGE,
                                                     "--format", "{{json .RepoDigests}}"))

@@ -6,6 +6,7 @@ from decimal import Decimal
 from types import SimpleNamespace
 
 import pytest
+import httpx
 
 import readiness_lab as lab
 
@@ -133,3 +134,56 @@ async def test_worker_identity_precedes_existing_frontend_catchall(monkeypatch):
 
     result = await middleware[0](SimpleNamespace(url=SimpleNamespace(path="/__lathe_lab_identity")), spa_fallback)
     assert result["worker"] == "A" and result["pid"] > 0 and result["incarnation"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fault", [None, "large_snapshot", "valve_resource_override", "lost_key", "policy_drift"])
+async def test_real_provisioning_configuration_and_installed_valve_gate(fault):
+    label, key, email = "lathe-ci-next-0123456789abcdef", "offline-key", "completion@lathe.invalid"
+    installed = {"daytona_api_key": key, "deployment_label": label,
+                 "foreground_timeout_seconds": 30, "sandbox_create_overrides": "{}"}
+    requests, trace = [], []
+
+    def respond(request):
+        nonlocal installed
+        path = request.url.path
+        requests.append((request.method, path))
+        if path == "/api/snapshots/daytona-small":
+            return httpx.Response(200, json={"name": "daytona-small", "id": "snapshot-id",
+                "state": "active", "cpu": 8 if fault == "large_snapshot" else 1,
+                "mem": 1, "disk": 3, "gpu": 0})
+        if path.endswith("/valves/update"):
+            installed = json.loads(request.content)
+            # The exact object production posts to OWUI, not a copied builder.
+            assert json.loads(installed["sandbox_create_overrides"]) == {"snapshot": "daytona-small", "ttlMinutes": 30}
+            assert installed["daytona_api_key"] == key
+            assert installed["foreground_timeout_seconds"] == 30
+            if fault == "valve_resource_override":
+                installed["sandbox_create_overrides"] = '{"snapshot":"daytona-small","ttlMinutes":30,"cpu":1}'
+            if fault == "lost_key":
+                installed["daytona_api_key"] = ""
+            if fault == "policy_drift":
+                installed["auto_delete_minutes"] = 60
+            return httpx.Response(200, json=installed)
+        if path.endswith("/valves"):
+            return httpx.Response(200, json=installed)
+        if path == "/api/sandbox":
+            create = json.loads(request.content)
+            assert create == {"snapshot": "daytona-small", "ttlMinutes": 30, "name": label,
+                "labels": {label: email}, "autoStopInterval": 5, "autoArchiveInterval": 5, "autoDeleteInterval": 0}
+            assert trace[-1][0] == "installed_valves_verified"
+            return httpx.Response(200, json={"id": "sandbox-id", "cpu": 1, "memory": 1, "disk": 3,
+                                            "labels": {label: email}, "volumes": []})
+        pytest.fail(f"Unexpected request: {request.method} {path}")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as http:
+        coroutine = lab.provision_small(http, "http://owui", {"Authorization": "Bearer admin"}, key, label, email,
+                                       lambda kind, **data: trace.append((kind, data)))
+        if fault:
+            with pytest.raises(RuntimeError):
+                await coroutine
+            assert ("POST", "/api/sandbox") not in requests
+        else:
+            info = await coroutine
+            assert info["id"] == "sandbox-id"
+            assert requests[-2:] == [("GET", "/api/v1/tools/id/lathe_test/valves"), ("POST", "/api/sandbox")]
