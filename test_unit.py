@@ -543,8 +543,8 @@ async def test_completed_bash_retention_is_bounded(tools, monkeypatch, tmp_path,
     original_reap_builder = lathe._build_bash_reap_script
     monkeypatch.setattr(
         lathe, "_build_bash_reap_script",
-        lambda preserve_log_for=None, release_lease_for=None: original_reap_builder(
-            preserve_log_for, release_lease_for, str(proc_root),
+        lambda preserve_log_for=None, release_lease_for=None, **claim: original_reap_builder(
+            preserve_log_for, release_lease_for, str(proc_root), **claim,
         ),
     )
 
@@ -798,7 +798,7 @@ async def test_bash_preview_failure_preserves_lifecycle(
             return httpx.Response(200, json={"commands": [command]})
         if request.method == "POST" and request.url.path == "/sb/process/execute":
             script = shlex.split(json.loads(request.content)["command"])[2]
-            if "f.seek" in script:
+            if "f.seek" in script and "lease" not in script:  # preview, not the reaper
                 previews += 1
                 if previews == 1:
                     if failure == "http": return httpx.Response(503)
@@ -1182,25 +1182,23 @@ async def test_background_bash_poll_delivers_once(tools, sandbox, http, clock, t
     log.parent.mkdir(parents=True)
     ending = "\n".join(f"final output {n}" for n in range(5))
     log.write_text(prefix + ending + "\n")
+    (log.parent / "exit").write_text("7\n")
+    (log.parent / "notify").write_text(json.dumps({"chat": "chat"}))
     tools._chat_state["chat"] = {"init": True, "pending": []}
     statuses = iter([httpx.Response(503), httpx.Response(200, json={"commands": [{"id": "cmd"}]}),
                      httpx.Response(200, json={"commands": [{"id": "cmd", "exitCode": 7}]})])
-    requests = []
     def handler(request):
-        requests.append(request.url.path)
         if (request.method, request.url.path) == ("POST", "/sb/process/execute"):
             script = shlex.split(json.loads(request.content)["command"])[2]
-            if "f.seek" in script:
+            if "lease" in script:  # the reaper, which claims the notice
                 return httpx.Response(200, json={"exitCode": 0, "result": run_script(script)})
             return httpx.Response(200, json={"exitCode": 0, "result": "caller output"})
-        assert request.method == "GET"
-        if request.url.path == "/sb/process/session/session":
-            return next(statuses)
-        assert request.url.path == "/sb/process/session/session/command/cmd/logs"
-        return httpx.Response(200, text="final output")
+        if request.method == "DELETE":
+            return httpx.Response(204)
+        assert (request.method, request.url.path) == ("GET", "/sb/process/session/session")
+        return next(statuses)
     http(handler)
-    await lathe._poll_bg_bash(tools.valves, "sb", "session", "cmd", "job", 0, tools._chat_state, "chat")
-    assert len(requests) == 5
+    await lathe._poll_bg_bash(tools.valves, "sb", "session", "cmd", "job", tools._chat_state, "chat")
     # Observe delivery through an ordinary wrapper, not by draining its queue.
     assert await tools.read("/file", __user__=USER, __chat_id__="other") == "caller output"
     result = await tools.read("/file", __user__=USER, __chat_id__="chat")
@@ -1209,6 +1207,166 @@ async def test_background_bash_poll_delivers_once(tools, sandbox, http, clock, t
     displayed_tail = result.split("Last lines of output:\n", 1)[1].split("\nFull output:", 1)[0]
     assert displayed_tail == "\n".join(f"  {line}" for line in ending.splitlines())
     assert await tools.read("/file", __user__=USER, __chat_id__="chat") == "caller output"
+
+
+def shared_sandbox(*, lose_first_poller=False, die_watching=False):
+    """One real local "sandbox" (temp files, real scripts) shared by workers.
+
+    die_watching: the first status read fails, as if the worker watching a
+    foreground command died; the command itself has already run.
+    """
+    sessions = {}
+    def handler(request):
+        if request.method == "POST" and request.url.path == "/sb/files/upload":
+            path = Path(request.url.params["path"])
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(request.content.split(b"\r\n\r\n", 1)[1].rsplit(b"\r\n--", 1)[0])
+            return httpx.Response(200)
+        if request.method == "POST" and request.url.path in ("/sb/process/session", "/sb/files/folder"):
+            return httpx.Response(201)
+        if request.method == "POST" and request.url.path.endswith("/exec"):
+            # The job finishes before the launching worker registers its notice.
+            subprocess.run(json.loads(request.content)["command"], shell=True, check=True,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+            return httpx.Response(200, json={"cmdId": "cmd"})
+        if request.method == "GET" and "/process/session/" in request.url.path:
+            # Running at the foreground check, finished for the poller after;
+            # with lose_first_poller, the first job's poller never sees it end.
+            sessions.setdefault("first", request.url.path)
+            if die_watching and not sessions.get("died"):
+                sessions["died"] = True
+                raise httpx.ConnectError("worker died mid-command")
+            reads = sessions[request.url.path] = sessions.get(request.url.path, 0) + 1
+            command = {"id": "cmd"}
+            if reads > 1 and not (lose_first_poller and request.url.path == sessions["first"]):
+                command["exitCode"] = 0
+            return httpx.Response(200, json={"commands": [command]})
+        if request.method == "POST" and request.url.path == "/sb/process/execute":
+            script = shlex.split(json.loads(request.content)["command"])[2]
+            return httpx.Response(200, json={"exitCode": 0, "result": run_script(script)})
+        assert request.method == "DELETE"
+        return httpx.Response(204)
+    return handler
+
+
+def two_workers(tools):
+    other_worker = lathe.Tools()
+    other_worker.valves = tools.valves
+    for worker in (tools, other_worker):
+        for chat in ("chat", "other"):
+            worker._chat_state[chat] = {"init": True, "pending": []}
+    return other_worker
+
+
+async def let_pollers_finish():
+    for _ in range(50):
+        await asyncio.sleep(0)
+
+
+async def test_poller_does_not_strand_notice_on_its_worker(tools, sandbox, http, clock, tmp_path, monkeypatch):
+    # Worker A's poller sees the job finish while the chat is idle; the next
+    # call lands on worker B. B must report it, and A must not report it again.
+    monkeypatch.setattr(lathe, "_EPHEMERAL_ROOT", str(tmp_path / "lathe"))
+    other_worker = two_workers(tools)
+    http(shared_sandbox())
+    started = await tools.bash("echo idle-finish", workdir=str(tmp_path),
+                               foreground_seconds=0, __user__=USER, __chat_id__="chat")
+    assert "Backgrounded after" in started
+    await let_pollers_finish()
+    on_b = await other_worker.bash("true", workdir=str(tmp_path), __user__=USER, __chat_id__="chat")
+    assert on_b.count("Background job completed") == 1 and "idle-finish" in on_b
+    on_a = await tools.bash("true", workdir=str(tmp_path), __user__=USER, __chat_id__="chat")
+    assert "Background job completed" not in on_a
+
+
+async def test_poller_fast_path_reports_on_any_tool_of_its_worker(tools, sandbox, http, clock, tmp_path, monkeypatch):
+    monkeypatch.setattr(lathe, "_EPHEMERAL_ROOT", str(tmp_path / "lathe"))
+    two_workers(tools)
+    http(shared_sandbox())
+    await tools.bash("echo fast-path", workdir=str(tmp_path),
+                     foreground_seconds=0, __user__=USER, __chat_id__="chat")
+    await let_pollers_finish()
+    target = tmp_path / "plain.txt"
+    target.write_text("plain\n")
+    first = await tools.read(str(target), __user__=USER, __chat_id__="chat")
+    assert first.count("Background job completed") == 1 and "fast-path" in first
+    assert "Background job completed" not in await tools.read(str(target), __user__=USER, __chat_id__="chat")
+
+
+async def test_command_whose_watcher_died_still_reports_once(tools, sandbox, http, clock, tmp_path, monkeypatch):
+    # Intent before effect: the launch script registered the notice, so a
+    # foreground call that dies midway cannot lose the command's outcome.
+    monkeypatch.setattr(lathe, "_EPHEMERAL_ROOT", str(tmp_path / "lathe"))
+    other_worker = two_workers(tools)
+    http(shared_sandbox(die_watching=True))
+    died = await tools.bash("echo survived-restart", workdir=str(tmp_path),
+                            __user__=USER, __chat_id__="chat")
+    assert died.startswith("Error:") and "survived-restart" not in died
+    later = await other_worker.bash("true", workdir=str(tmp_path), __user__=USER, __chat_id__="chat")
+    assert later.count("Background job completed") == 1 and "survived-restart" in later
+    for worker in (tools, other_worker):
+        assert "Background job completed" not in await worker.bash(
+            "true", workdir=str(tmp_path), __user__=USER, __chat_id__="chat")
+
+
+async def test_foreground_result_is_never_reported_again(tools, sandbox, http, clock, tmp_path, monkeypatch):
+    monkeypatch.setattr(lathe, "_EPHEMERAL_ROOT", str(tmp_path / "lathe"))
+    other_worker = two_workers(tools)
+    http(shared_sandbox())
+    shown = await tools.bash("echo seen-once", workdir=str(tmp_path), __user__=USER, __chat_id__="chat")
+    assert "seen-once" in shown and "Backgrounded" not in shown
+    for worker in (other_worker, tools):
+        assert "Background job completed" not in await worker.bash(
+            "true", workdir=str(tmp_path), __user__=USER, __chat_id__="chat")
+
+
+async def test_notice_duration_uses_sandbox_start_and_end(tools, sandbox, http, tmp_path, monkeypatch):
+    monkeypatch.setattr(lathe, "_EPHEMERAL_ROOT", str(tmp_path))
+    job = tmp_path / "cmd" / "job"
+    job.mkdir(parents=True)
+    for name, content, mtime in (("pid", "1\n", 1000), ("log", "out\n", 1042), ("exit", "0\n", 1042),
+                                 ("notify", json.dumps({"chat": "chat"}), 1040)):
+        (job / name).write_text(content)
+        os.utime(job / name, (mtime, mtime))
+    tools._chat_state["chat"] = {"init": True, "pending": []}
+    def handler(request):
+        if request.method == "DELETE":
+            return httpx.Response(204)
+        script = shlex.split(json.loads(request.content)["command"])[2]
+        return httpx.Response(200, json={"exitCode": 0, "result": run_script(script)})
+    http(handler)
+    async with lathe.httpx.AsyncClient() as client:
+        notices = await lathe._reap_bash_commands(tools.valves, "sb", client, claim_chat="chat")
+    assert len(notices) == 1 and "took 42s" in notices[0]
+
+
+async def test_background_notice_survives_lost_poller_on_another_worker(
+    tools, sandbox, http, clock, tmp_path, monkeypatch,
+):
+    # Two Tools instances stand in for two OWUI workers sharing one sandbox.
+    monkeypatch.setattr(lathe, "_EPHEMERAL_ROOT", str(tmp_path / "lathe"))
+    other_worker = lathe.Tools()
+    other_worker.valves = tools.valves
+    for worker in (tools, other_worker):
+        for chat in ("chat", "other"):
+            worker._chat_state[chat] = {"init": True, "pending": []}
+    http(shared_sandbox(lose_first_poller=True))
+    started = await tools.bash("echo cross-worker-output", workdir=str(tmp_path),
+                               foreground_seconds=0, __user__=USER, __chat_id__="chat")
+    assert "Backgrounded after" in started
+    async with asyncio.timeout(5):  # the launching worker's poller gives up
+        while clock() < lathe._BG_BASH_POLL_MAX_SECONDS:
+            await asyncio.sleep(0)
+    for _ in range(50):
+        await asyncio.sleep(0)
+    assert "Background job completed" not in await tools.bash(
+        "true", workdir=str(tmp_path), __user__=USER, __chat_id__="other")
+    claimed = await other_worker.bash("true", workdir=str(tmp_path), __user__=USER, __chat_id__="chat")
+    assert claimed.count("Background job completed") == 1
+    assert "cross-worker-output" in claimed and "Exit code: 0" in claimed
+    for worker in (tools, other_worker):
+        assert "Background job completed" not in await worker.bash(
+            "true", workdir=str(tmp_path), __user__=USER, __chat_id__="chat")
 
 
 async def test_background_bash_poll_deadline(tools, http, clock, monkeypatch):
@@ -1221,7 +1379,7 @@ async def test_background_bash_poll_deadline(tools, http, clock, monkeypatch):
     http(handler)
     monkeypatch.setattr(lathe, "_BG_BASH_POLL_MAX_SECONDS", 5)
     await asyncio.wait_for(lathe._poll_bg_bash(
-        tools.valves, "sb", "session", "cmd", "job", 0, tools._chat_state, "chat"), 1)
+        tools.valves, "sb", "session", "cmd", "job", tools._chat_state, "chat"), 1)
     assert clock() >= 5
     assert requests and len(requests) < 10
     assert tools._chat_state["chat"]["pending"] == []

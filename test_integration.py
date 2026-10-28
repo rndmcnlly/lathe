@@ -267,18 +267,34 @@ asyncio.run(main())
         )
         require("Backgrounded" in output, output)
 
+        # Observe through ordinary non-bash calls on the launching worker: its
+        # poller marks the job ready, and the next tool call claims the notice.
         deadline = time.monotonic() + 20
         while time.monotonic() < deadline:
-            state = tools._chat_state.get(chat_id, {})
-            if any("Background job completed" in msg for msg in state.get("pending", [])):
+            output = await tools.read(test_file, **ctx)
+            if "Background job completed" in output:
                 break
             await asyncio.sleep(0.5)
         else:
-            raise AssertionError("background completion notice was not queued")
-
-        output = await tools.read(test_file, **ctx)
-        require("Background job completed" in output, output)
+            raise AssertionError("background completion notice never arrived on a read")
+        require(output.count("Background job completed") == 1, output)
         require("background-finished" in output, output)
+        output = await tools.read(test_file, **ctx)
+        require("Background job completed" not in output, output)
+
+    async def background_notice_claimed_once_across_workers():
+        # A second Tools instance stands in for another OWUI worker. Whichever
+        # claims first (this worker's poller or the other's bash), one report.
+        other = Tools()
+        other.valves = tools.valves
+        marker = f"claimed-once-{uuid.uuid4().hex}"
+        output = await tools.bash(f"sleep 3; printf '{marker}'", foreground_seconds=0, **ctx)
+        require("Backgrounded" in output, output)
+        await asyncio.sleep(6)
+        reports = (await other.bash("true", **ctx)).count(marker)
+        await asyncio.sleep(15)  # outlast the launching worker's next poll
+        reports += (await tools.read(test_file, **ctx)).count(marker)
+        require(reports == 1, f"expected one completion report, saw {reports}")
 
     async def bounded_command_retention():
         import re
@@ -690,6 +706,7 @@ asyncio.run(main())
             ("independent toolkit workers share interpreter identity", multiworker_interpreter),
             ("bounded command retention", bounded_command_retention),
             ("background completion notice", background_completion_notice),
+            ("background notice claimed once across workers", background_notice_claimed_once_across_workers),
             ("signed preview URL", expose_contract),
             ("desktop input, screenshots and VNC transport", computer_roundtrip),
             ("ordinary workspace survives sandbox stop", workspace_survives_stop),
