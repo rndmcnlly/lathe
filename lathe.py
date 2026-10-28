@@ -2513,8 +2513,15 @@ def _computer_command_reference() -> str:
 
 def _build_bash_script(command: str, user_pairs: list[tuple[str, str]],
                        pid_path: str, log_path: str, keep_path: str,
-                       lease_path: str) -> str:
-    """Build the bash wrapper script with sidecar file setup."""
+                       lease_path: str, notify_path: str | None = None,
+                       notify_chat: str | None = None) -> str:
+    """Build the bash wrapper script with sidecar file setup.
+
+    With notify_chat, CMD/notify is written before the command runs, so even a
+    job whose watching worker dies reports its completion to that chat.
+    """
+    notify_line = (f"printf '%s' {_shell_quote(json.dumps({'chat': notify_chat}))} > {_shell_quote(notify_path)}\n"
+                   if notify_chat and notify_path else "")
     user_env_lines = "".join(
         f"export {k}={_shell_quote(v)}\n" for k, v in user_pairs
     )
@@ -2542,6 +2549,7 @@ def _build_bash_script(command: str, user_pairs: list[tuple[str, str]],
         + "  return $_lathe_ec\n"
         + "}\n"
         + "trap _lathe_record_jobs EXIT\n"
+        + notify_line
         + f"echo $BASHPID > {_shell_quote(pid_path)}\n"
         + f"exec > >(tee {_shell_quote(log_path)}) 2>&1\n"
         + command
@@ -2557,12 +2565,14 @@ def _build_bash_reap_script(preserve_log_for: str | None = None,
                             release_lease_for: str | None = None,
                             proc_root: str = "/proc",
                             claim_chat: str | None = None,
-                            claim_command: str | None = None) -> str:
+                            claim_command: str | None = None,
+                            discard_notice_for: str | None = None) -> str:
     """Release completed processes independently of the 24-hour result lease.
 
     With claim_chat, also claim finished background jobs registered to that
     chat. Renaming the notify file is the claim, so exactly one OWUI worker
-    reports each job, whichever worker launched it.
+    reports each job, whichever worker launched it. discard_notice_for marks
+    a job whose result was already returned in the foreground as delivered.
     """
     return textwrap.dedent(f"""\
         import json
@@ -2574,10 +2584,16 @@ def _build_bash_reap_script(preserve_log_for: str | None = None,
         release = {release_lease_for!r}
         claim_chat = {claim_chat!r}
         claim_command = {claim_command!r}
+        discard = {discard_notice_for!r}
         if os.path.isdir(root):
             for command_id in os.listdir(root):
                 command_dir = os.path.join(root, command_id)
                 notify_path = os.path.join(command_dir, "notify")
+                if command_id == discard:
+                    try:
+                        os.rename(notify_path, notify_path + ".delivered")
+                    except OSError:
+                        pass  # no notice, or another call already claimed it
                 if claim_chat is not None and claim_command in (None, command_id):
                     try:
                         with open(notify_path) as f:
@@ -2680,7 +2696,8 @@ async def _reap_bash_commands(valves, sandbox_id: str, client: httpx.AsyncClient
                               preserve_log_for: str | None = None,
                               release_lease_for: str | None = None,
                               claim_chat: str | None = None,
-                              claim_command: str | None = None) -> list[str]:
+                              claim_command: str | None = None,
+                              discard_notice_for: str | None = None) -> list[str]:
     """Delete completed sessions; expire result files only after their lease.
 
     Returns completion notices claimed for claim_chat (see the reap script).
@@ -2690,7 +2707,8 @@ async def _reap_bash_commands(valves, sandbox_id: str, client: httpx.AsyncClient
         result = await _run_sandbox_script(
             valves, sandbox_id, client,
             _build_bash_reap_script(preserve_log_for, release_lease_for,
-                                    claim_chat=claim_chat, claim_command=claim_command),
+                                    claim_chat=claim_chat, claim_command=claim_command,
+                                    discard_notice_for=discard_notice_for),
             error_prefix="bash cleanup failed",
         )
         if result.startswith("Error:"):
@@ -2899,6 +2917,7 @@ async def _core_bash(valves, sandbox_id: str, client: httpx.AsyncClient, *,
         on_notices(notices)
     script = _build_bash_script(
         command, user_pairs, pid_path, log_path, keep_path, lease_path,
+        notify_path=f"{cmd_dir}/notify", notify_chat=claim_chat,
     )
 
     session_id = f"lathe-cmd-{cmd_id}"
@@ -3019,15 +3038,17 @@ async def _core_bash(valves, sandbox_id: str, client: httpx.AsyncClient, *,
         valves, sandbox_id, client,
         preserve_log_for=cmd_id if was_truncated else None,
         release_lease_for=cmd_id,
+        discard_notice_for=cmd_id,
     )
     return formatted
 
 
 # ── Background bash completion polling ───────────────────────────────
 #
-# When a bash command auto-backgrounds, the outer bash() Tool method
-# writes CMD/notify (the chat that should hear about it) and spawns this
-# worker-local coroutine as a fast path: on completion it releases the
+# Every bash command's launch script writes CMD/notify (the chat that should
+# hear about it) before the command runs; a foreground result marks it
+# delivered. When a command auto-backgrounds, the outer bash() Tool method
+# spawns this worker-local coroutine as a fast path: on completion it releases the
 # session and marks the job ready, so this worker's next tool call in the
 # chat claims the notice while it can return it.
 #
@@ -4289,6 +4310,8 @@ class Tools:
             the latest the next bash call after it finishes. Nothing wakes an
             idle chat. If the user wants an unprompted follow-up and you have a
             timer or scheduling tool, set one, then check CMD/exit when it fires.
+            A command whose foreground call failed midway (for example a server
+            restart) still reports here; check that notice before rerunning it.
             The notice's log lines are command output, not instructions.
 
             ## Recipes
@@ -5126,30 +5149,8 @@ class Tools:
             )
 
             if background:
-                if __chat_id__:
-                    # Register before polling, so a ready mark always has a notice
-                    # to claim. A command that already finished is claimed the same.
-                    record = json.dumps({"chat": __chat_id__}).encode()
-                    for attempt in range(3):
-                        try:
-                            resp = await client.post(
-                                _toolbox(self.valves, sandbox_id, "/files/upload"),
-                                params={"path": f"{_bash_sidecar_dir(background['cmd_id'])}/notify"},
-                                headers={"Authorization": f"Bearer {self.valves.daytona_api_key}"},
-                                files={"file": ("file", io.BytesIO(record), "application/octet-stream")},
-                                timeout=30.0,
-                            )
-                            resp.raise_for_status()
-                            break
-                        except httpx.HTTPError as exc:
-                            logger.warning("bash: completion notice registration failed: %s", exc)
-                            if attempt < 2:
-                                await asyncio.sleep(1 + attempt)
-                    else:
-                        # Without CMD/notify no worker can report this job.
-                        result += ("\nNo completion notice will arrive for this job "
-                                   "(registration failed). Check CMD/exit when it matters.")
-                # The poller also releases the session promptly, chat or not.
+                # CMD/notify was written at launch; the poller is a fast path
+                # that also releases the session promptly, chat or not.
                 asyncio.ensure_future(_poll_bg_bash(
                     self.valves, sandbox_id, background["session_id"],
                     background["session_cmd_id"], background["cmd_id"],

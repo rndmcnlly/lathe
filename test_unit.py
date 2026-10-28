@@ -1209,14 +1209,15 @@ async def test_background_bash_poll_delivers_once(tools, sandbox, http, clock, t
     assert await tools.read("/file", __user__=USER, __chat_id__="chat") == "caller output"
 
 
-def shared_sandbox(*, lose_first_poller=False, failing_uploads=0):
-    """One real local "sandbox" (temp files, real scripts) shared by workers."""
-    sessions, uploads = {}, {"failed": 0}
+def shared_sandbox(*, lose_first_poller=False, die_watching=False):
+    """One real local "sandbox" (temp files, real scripts) shared by workers.
+
+    die_watching: the first status read fails, as if the worker watching a
+    foreground command died; the command itself has already run.
+    """
+    sessions = {}
     def handler(request):
         if request.method == "POST" and request.url.path == "/sb/files/upload":
-            if request.url.params["path"].endswith("/notify") and uploads["failed"] < failing_uploads:
-                uploads["failed"] += 1
-                return httpx.Response(503)
             path = Path(request.url.params["path"])
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(request.content.split(b"\r\n\r\n", 1)[1].rsplit(b"\r\n--", 1)[0])
@@ -1232,6 +1233,9 @@ def shared_sandbox(*, lose_first_poller=False, failing_uploads=0):
             # Running at the foreground check, finished for the poller after;
             # with lose_first_poller, the first job's poller never sees it end.
             sessions.setdefault("first", request.url.path)
+            if die_watching and not sessions.get("died"):
+                sessions["died"] = True
+                raise httpx.ConnectError("worker died mid-command")
             reads = sessions[request.url.path] = sessions.get(request.url.path, 0) + 1
             command = {"id": "cmd"}
             if reads > 1 and not (lose_first_poller and request.url.path == sessions["first"]):
@@ -1289,18 +1293,31 @@ async def test_poller_fast_path_reports_on_any_tool_of_its_worker(tools, sandbox
     assert "Background job completed" not in await tools.read(str(target), __user__=USER, __chat_id__="chat")
 
 
-@pytest.mark.parametrize("failures,promised", [(2, True), (3, False)])
-async def test_failed_notice_registration_is_retried_then_disclosed(
-    tools, sandbox, http, clock, tmp_path, monkeypatch, failures, promised,
-):
+async def test_command_whose_watcher_died_still_reports_once(tools, sandbox, http, clock, tmp_path, monkeypatch):
+    # Intent before effect: the launch script registered the notice, so a
+    # foreground call that dies midway cannot lose the command's outcome.
     monkeypatch.setattr(lathe, "_EPHEMERAL_ROOT", str(tmp_path / "lathe"))
-    two_workers(tools)
-    http(shared_sandbox(lose_first_poller=True, failing_uploads=failures))
-    started = await tools.bash("echo registered", workdir=str(tmp_path),
-                               foreground_seconds=0, __user__=USER, __chat_id__="chat")
-    assert ("No completion notice will arrive" in started) is (not promised)
-    later = await tools.bash("true", workdir=str(tmp_path), __user__=USER, __chat_id__="chat")
-    assert later.count("Background job completed") == (1 if promised else 0)
+    other_worker = two_workers(tools)
+    http(shared_sandbox(die_watching=True))
+    died = await tools.bash("echo survived-restart", workdir=str(tmp_path),
+                            __user__=USER, __chat_id__="chat")
+    assert died.startswith("Error:") and "survived-restart" not in died
+    later = await other_worker.bash("true", workdir=str(tmp_path), __user__=USER, __chat_id__="chat")
+    assert later.count("Background job completed") == 1 and "survived-restart" in later
+    for worker in (tools, other_worker):
+        assert "Background job completed" not in await worker.bash(
+            "true", workdir=str(tmp_path), __user__=USER, __chat_id__="chat")
+
+
+async def test_foreground_result_is_never_reported_again(tools, sandbox, http, clock, tmp_path, monkeypatch):
+    monkeypatch.setattr(lathe, "_EPHEMERAL_ROOT", str(tmp_path / "lathe"))
+    other_worker = two_workers(tools)
+    http(shared_sandbox())
+    shown = await tools.bash("echo seen-once", workdir=str(tmp_path), __user__=USER, __chat_id__="chat")
+    assert "seen-once" in shown and "Backgrounded" not in shown
+    for worker in (other_worker, tools):
+        assert "Background job completed" not in await worker.bash(
+            "true", workdir=str(tmp_path), __user__=USER, __chat_id__="chat")
 
 
 async def test_notice_duration_uses_sandbox_start_and_end(tools, sandbox, http, tmp_path, monkeypatch):
