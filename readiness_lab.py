@@ -136,6 +136,7 @@ def worker(name):
     sys.path.insert(0, "/app/backend")
     import uvicorn
     from fastapi import Request
+    from fastapi.responses import JSONResponse
     from open_webui.main import app
 
     identity = {"worker": name, "pid": os.getpid(), "incarnation": uuid.uuid4().hex}
@@ -157,12 +158,12 @@ def worker(name):
 
     app.state.CHAT_COMPLETION_HANDLER = observe_handler
 
-    @app.get("/__lathe_lab_identity")
-    async def identify():
-        return identity
-
     @app.middleware("http")
     async def observed(request: Request, call_next):
+        # OWUI's SPA catch-all mount is already registered at import. A route
+        # appended here would return the frontend HTML instead of JSON.
+        if request.url.path == "/__lathe_lab_identity":
+            return JSONResponse(identity)
         response = await call_next(request)
         if request.url.path == "/api/chat/completions":
             note("http_completion", status=response.status_code)

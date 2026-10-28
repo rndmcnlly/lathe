@@ -110,3 +110,26 @@ def test_cleanup_refuses_non_lab_namespace(monkeypatch, tmp_path):
     monkeypatch.setattr(lab, "run_command", lambda *a, **k: pytest.fail("Unsafe Docker call"))
     with pytest.raises(RuntimeError, match="Invalid owned"):
         lab.cleanup("production", tmp_path)
+
+
+@pytest.mark.asyncio
+async def test_worker_identity_precedes_existing_frontend_catchall(monkeypatch):
+    middleware = []
+
+    async def original(*args, **kwargs):
+        pass
+
+    app = SimpleNamespace(state=SimpleNamespace(CHAT_COMPLETION_HANDLER=original),
+        middleware=lambda kind: lambda fn: middleware.append(fn) or fn)
+    monkeypatch.setitem(sys.modules, "uvicorn", SimpleNamespace(run=lambda *a, **k: None))
+    monkeypatch.setitem(sys.modules, "fastapi", SimpleNamespace(Request=object))
+    monkeypatch.setitem(sys.modules, "fastapi.responses", SimpleNamespace(JSONResponse=lambda data: data))
+    monkeypatch.setitem(sys.modules, "open_webui", SimpleNamespace())
+    monkeypatch.setitem(sys.modules, "open_webui.main", SimpleNamespace(app=app))
+    lab.worker("A")
+
+    async def spa_fallback(request):
+        pytest.fail("Identity request reached existing SPA fallback")
+
+    result = await middleware[0](SimpleNamespace(url=SimpleNamespace(path="/__lathe_lab_identity")), spa_fallback)
+    assert result["worker"] == "A" and result["pid"] > 0 and result["incarnation"]
