@@ -148,6 +148,8 @@ async def _tool_context(emitter, fn, harness=None):
     try:
         async with httpx.AsyncClient() as client:
             result = await fn(client)
+            if harness is not None:
+                await harness.claim_ready(client)
     except RuntimeError as e:
         await _emit(emitter, f"Error: {e}", done=True)
         result = f"Error: {e}"
@@ -172,6 +174,17 @@ class _HarnessDelivery:
         self.chat_id = chat_id
         self.warning = None
         self.image_result = image_result
+
+    async def claim_ready(self, client: httpx.AsyncClient):
+        """Claim notices for jobs this worker saw finish, now that a result can
+        carry them. A job another worker already claimed yields nothing."""
+        if not self.chat_id or self.chat_id not in self.chat_state:
+            return
+        ready = self.chat_state[self.chat_id].pop("ready", {})
+        for cmd_id, (valves, sandbox_id) in ready.items():
+            for notice in await _reap_bash_commands(valves, sandbox_id, client,
+                                                    claim_chat=self.chat_id, claim_command=cmd_id):
+                _push_bg_notice(self.chat_state, self.chat_id, notice)
 
     def deliver(self, result):
         if self.image_result and result.startswith("data:image/"):
@@ -227,6 +240,14 @@ def _push_bg_notice(chat_state: LRUCache, chat_id: str | None, notice: str):
         state["pending"] = [notice]
     else:
         pending.append(notice)
+
+
+def _mark_bg_ready(chat_state: LRUCache, chat_id: str | None, cmd_id: str,
+                   valves, sandbox_id: str):
+    """Note that a job finished, without claiming it: claiming waits for a
+    tool call in this chat, so the notice is never stranded on this worker."""
+    if chat_id and chat_id in chat_state:
+        chat_state[chat_id].setdefault("ready", {})[cmd_id] = (valves, sandbox_id)
 
 
 def _format_bg_bash_notice(cmd_id: str, exit_code: int | None,
@@ -2583,12 +2604,13 @@ def _build_bash_reap_script(preserve_log_for: str | None = None,
                                     tail = f.read().decode("utf-8", errors="replace")
                             except OSError:
                                 tail = "(Preview unavailable; use the full log path below.)"
-                            # Sandbox clock only: registration time plus the
-                            # foreground seconds the worker had already waited.
-                            waited = record.get("waited")
-                            waited = waited if isinstance(waited, (int, float)) else 0
-                            elapsed = max(waited, waited + os.path.getmtime(evidence)
-                                          - os.path.getmtime(notify_path + ".claimed"))
+                            # Sandbox clock only: the pid file is written as
+                            # the job starts, the evidence file as it ends.
+                            try:
+                                elapsed = (os.path.getmtime(evidence)
+                                           - os.path.getmtime(os.path.join(command_dir, "pid")))
+                            except OSError:
+                                elapsed = 0
                             print("notice " + json.dumps({{
                                 "cmd_id": command_id, "exit_code": exit_code,
                                 "elapsed": max(0, int(elapsed)), "tail": tail,
@@ -3005,19 +3027,21 @@ async def _core_bash(valves, sandbox_id: str, client: httpx.AsyncClient, *,
 #
 # When a bash command auto-backgrounds, the outer bash() Tool method
 # writes CMD/notify (the chat that should hear about it) and spawns this
-# worker-local coroutine as a fast path: on completion it claims the notice
-# and queues it for the chat's next tool call on this worker.
+# worker-local coroutine as a fast path: on completion it releases the
+# session and marks the job ready, so this worker's next tool call in the
+# chat claims the notice while it can return it.
 #
-# The sandbox owns delivery. The poller may die with its worker or stop at
-# its 10-minute limit; any worker's next bash call in that chat then claims
-# the notice through the same atomic rename, so it is reported once.
+# The sandbox owns delivery. Claiming only when a result can carry the notice
+# keeps it from being stranded in one worker's queue. The poller may die with
+# its worker or stop at its 10-minute limit; any worker's next bash call in
+# that chat then claims through the same atomic rename, so it is reported once.
 
 _BG_BASH_POLL_MAX_SECONDS = 600
 
 async def _poll_bg_bash(valves, sandbox_id: str, session_id: str,
                         session_cmd_id: str, cmd_id: str,
                         chat_state: LRUCache, chat_id: str):
-    """Poll a backgrounded bash command and claim its completion notice."""
+    """Poll a backgrounded bash command and mark its notice ready to claim."""
     poll_interval = 2.0
     deadline = time.time() + _BG_BASH_POLL_MAX_SECONDS
     exit_code = None
@@ -3051,11 +3075,8 @@ async def _poll_bg_bash(valves, sandbox_id: str, session_id: str,
             else:
                 return  # timed out; a later bash call claims the notice
 
-            for notice in await _reap_bash_commands(
-                valves, sandbox_id, poll_client, release_lease_for=cmd_id,
-                claim_chat=chat_id or None, claim_command=cmd_id,
-            ):
-                _push_bg_notice(chat_state, chat_id, notice)
+            await _reap_bash_commands(valves, sandbox_id, poll_client, release_lease_for=cmd_id)
+            _mark_bg_ready(chat_state, chat_id, cmd_id, valves, sandbox_id)
 
         except Exception as e:
             logger.debug("bg-poll: poller failed: %s", e)
@@ -5106,21 +5127,28 @@ class Tools:
 
             if background:
                 if __chat_id__:
-                    # Register before polling so the poller's claim can find it.
-                    # A command that already finished is claimed just the same.
-                    record = json.dumps({"chat": __chat_id__, "waited":
-                                         time.time() - background["start_time"]})
-                    try:
-                        resp = await client.post(
-                            _toolbox(self.valves, sandbox_id, "/files/upload"),
-                            params={"path": f"{_bash_sidecar_dir(background['cmd_id'])}/notify"},
-                            headers={"Authorization": f"Bearer {self.valves.daytona_api_key}"},
-                            files={"file": ("file", io.BytesIO(record.encode()), "application/octet-stream")},
-                            timeout=30.0,
-                        )
-                        resp.raise_for_status()
-                    except httpx.HTTPError as exc:
-                        logger.warning("bash: completion notice registration failed: %s", exc)
+                    # Register before polling, so a ready mark always has a notice
+                    # to claim. A command that already finished is claimed the same.
+                    record = json.dumps({"chat": __chat_id__}).encode()
+                    for attempt in range(3):
+                        try:
+                            resp = await client.post(
+                                _toolbox(self.valves, sandbox_id, "/files/upload"),
+                                params={"path": f"{_bash_sidecar_dir(background['cmd_id'])}/notify"},
+                                headers={"Authorization": f"Bearer {self.valves.daytona_api_key}"},
+                                files={"file": ("file", io.BytesIO(record), "application/octet-stream")},
+                                timeout=30.0,
+                            )
+                            resp.raise_for_status()
+                            break
+                        except httpx.HTTPError as exc:
+                            logger.warning("bash: completion notice registration failed: %s", exc)
+                            if attempt < 2:
+                                await asyncio.sleep(1 + attempt)
+                    else:
+                        # Without CMD/notify no worker can report this job.
+                        result += ("\nNo completion notice will arrive for this job "
+                                   "(registration failed). Check CMD/exit when it matters.")
                 # The poller also releases the session promptly, chat or not.
                 asyncio.ensure_future(_poll_bg_bash(
                     self.valves, sandbox_id, background["session_id"],

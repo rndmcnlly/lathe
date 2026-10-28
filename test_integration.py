@@ -267,18 +267,20 @@ asyncio.run(main())
         )
         require("Backgrounded" in output, output)
 
+        # Observe through ordinary non-bash calls on the launching worker: its
+        # poller marks the job ready, and the next tool call claims the notice.
         deadline = time.monotonic() + 20
         while time.monotonic() < deadline:
-            state = tools._chat_state.get(chat_id, {})
-            if any("Background job completed" in msg for msg in state.get("pending", [])):
+            output = await tools.read(test_file, **ctx)
+            if "Background job completed" in output:
                 break
             await asyncio.sleep(0.5)
         else:
-            raise AssertionError("background completion notice was not queued")
-
-        output = await tools.read(test_file, **ctx)
-        require("Background job completed" in output, output)
+            raise AssertionError("background completion notice never arrived on a read")
+        require(output.count("Background job completed") == 1, output)
         require("background-finished" in output, output)
+        output = await tools.read(test_file, **ctx)
+        require("Background job completed" not in output, output)
 
     async def background_notice_claimed_once_across_workers():
         # A second Tools instance stands in for another OWUI worker. Whichever

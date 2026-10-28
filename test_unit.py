@@ -1183,7 +1183,7 @@ async def test_background_bash_poll_delivers_once(tools, sandbox, http, clock, t
     ending = "\n".join(f"final output {n}" for n in range(5))
     log.write_text(prefix + ending + "\n")
     (log.parent / "exit").write_text("7\n")
-    (log.parent / "notify").write_text(json.dumps({"chat": "chat", "waited": 3}))
+    (log.parent / "notify").write_text(json.dumps({"chat": "chat"}))
     tools._chat_state["chat"] = {"init": True, "pending": []}
     statuses = iter([httpx.Response(503), httpx.Response(200, json={"commands": [{"id": "cmd"}]}),
                      httpx.Response(200, json={"commands": [{"id": "cmd", "exitCode": 7}]})])
@@ -1209,19 +1209,14 @@ async def test_background_bash_poll_delivers_once(tools, sandbox, http, clock, t
     assert await tools.read("/file", __user__=USER, __chat_id__="chat") == "caller output"
 
 
-async def test_background_notice_survives_lost_poller_on_another_worker(
-    tools, sandbox, http, clock, tmp_path, monkeypatch,
-):
-    # Two Tools instances stand in for two OWUI workers sharing one sandbox.
-    monkeypatch.setattr(lathe, "_EPHEMERAL_ROOT", str(tmp_path / "lathe"))
-    other_worker = lathe.Tools()
-    other_worker.valves = tools.valves
-    for worker in (tools, other_worker):
-        for chat in ("chat", "other"):
-            worker._chat_state[chat] = {"init": True, "pending": []}
-    sessions = {}
+def shared_sandbox(*, lose_first_poller=False, failing_uploads=0):
+    """One real local "sandbox" (temp files, real scripts) shared by workers."""
+    sessions, uploads = {}, {"failed": 0}
     def handler(request):
         if request.method == "POST" and request.url.path == "/sb/files/upload":
+            if request.url.params["path"].endswith("/notify") and uploads["failed"] < failing_uploads:
+                uploads["failed"] += 1
+                return httpx.Response(503)
             path = Path(request.url.params["path"])
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(request.content.split(b"\r\n\r\n", 1)[1].rsplit(b"\r\n--", 1)[0])
@@ -1234,10 +1229,12 @@ async def test_background_notice_survives_lost_poller_on_another_worker(
                            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
             return httpx.Response(200, json={"cmdId": "cmd"})
         if request.method == "GET" and "/process/session/" in request.url.path:
-            # The first job's poller never observes completion; later jobs finish.
-            sessions.setdefault("lost", request.url.path)
+            # Running at the foreground check, finished for the poller after;
+            # with lose_first_poller, the first job's poller never sees it end.
+            sessions.setdefault("first", request.url.path)
+            reads = sessions[request.url.path] = sessions.get(request.url.path, 0) + 1
             command = {"id": "cmd"}
-            if request.url.path != sessions["lost"]:
+            if reads > 1 and not (lose_first_poller and request.url.path == sessions["first"]):
                 command["exitCode"] = 0
             return httpx.Response(200, json={"commands": [command]})
         if request.method == "POST" and request.url.path == "/sb/process/execute":
@@ -1245,7 +1242,98 @@ async def test_background_notice_survives_lost_poller_on_another_worker(
             return httpx.Response(200, json={"exitCode": 0, "result": run_script(script)})
         assert request.method == "DELETE"
         return httpx.Response(204)
+    return handler
+
+
+def two_workers(tools):
+    other_worker = lathe.Tools()
+    other_worker.valves = tools.valves
+    for worker in (tools, other_worker):
+        for chat in ("chat", "other"):
+            worker._chat_state[chat] = {"init": True, "pending": []}
+    return other_worker
+
+
+async def let_pollers_finish():
+    for _ in range(50):
+        await asyncio.sleep(0)
+
+
+async def test_poller_does_not_strand_notice_on_its_worker(tools, sandbox, http, clock, tmp_path, monkeypatch):
+    # Worker A's poller sees the job finish while the chat is idle; the next
+    # call lands on worker B. B must report it, and A must not report it again.
+    monkeypatch.setattr(lathe, "_EPHEMERAL_ROOT", str(tmp_path / "lathe"))
+    other_worker = two_workers(tools)
+    http(shared_sandbox())
+    started = await tools.bash("echo idle-finish", workdir=str(tmp_path),
+                               foreground_seconds=0, __user__=USER, __chat_id__="chat")
+    assert "Backgrounded after" in started
+    await let_pollers_finish()
+    on_b = await other_worker.bash("true", workdir=str(tmp_path), __user__=USER, __chat_id__="chat")
+    assert on_b.count("Background job completed") == 1 and "idle-finish" in on_b
+    on_a = await tools.bash("true", workdir=str(tmp_path), __user__=USER, __chat_id__="chat")
+    assert "Background job completed" not in on_a
+
+
+async def test_poller_fast_path_reports_on_any_tool_of_its_worker(tools, sandbox, http, clock, tmp_path, monkeypatch):
+    monkeypatch.setattr(lathe, "_EPHEMERAL_ROOT", str(tmp_path / "lathe"))
+    two_workers(tools)
+    http(shared_sandbox())
+    await tools.bash("echo fast-path", workdir=str(tmp_path),
+                     foreground_seconds=0, __user__=USER, __chat_id__="chat")
+    await let_pollers_finish()
+    target = tmp_path / "plain.txt"
+    target.write_text("plain\n")
+    first = await tools.read(str(target), __user__=USER, __chat_id__="chat")
+    assert first.count("Background job completed") == 1 and "fast-path" in first
+    assert "Background job completed" not in await tools.read(str(target), __user__=USER, __chat_id__="chat")
+
+
+@pytest.mark.parametrize("failures,promised", [(2, True), (3, False)])
+async def test_failed_notice_registration_is_retried_then_disclosed(
+    tools, sandbox, http, clock, tmp_path, monkeypatch, failures, promised,
+):
+    monkeypatch.setattr(lathe, "_EPHEMERAL_ROOT", str(tmp_path / "lathe"))
+    two_workers(tools)
+    http(shared_sandbox(lose_first_poller=True, failing_uploads=failures))
+    started = await tools.bash("echo registered", workdir=str(tmp_path),
+                               foreground_seconds=0, __user__=USER, __chat_id__="chat")
+    assert ("No completion notice will arrive" in started) is (not promised)
+    later = await tools.bash("true", workdir=str(tmp_path), __user__=USER, __chat_id__="chat")
+    assert later.count("Background job completed") == (1 if promised else 0)
+
+
+async def test_notice_duration_uses_sandbox_start_and_end(tools, sandbox, http, tmp_path, monkeypatch):
+    monkeypatch.setattr(lathe, "_EPHEMERAL_ROOT", str(tmp_path))
+    job = tmp_path / "cmd" / "job"
+    job.mkdir(parents=True)
+    for name, content, mtime in (("pid", "1\n", 1000), ("log", "out\n", 1042), ("exit", "0\n", 1042),
+                                 ("notify", json.dumps({"chat": "chat"}), 1040)):
+        (job / name).write_text(content)
+        os.utime(job / name, (mtime, mtime))
+    tools._chat_state["chat"] = {"init": True, "pending": []}
+    def handler(request):
+        if request.method == "DELETE":
+            return httpx.Response(204)
+        script = shlex.split(json.loads(request.content)["command"])[2]
+        return httpx.Response(200, json={"exitCode": 0, "result": run_script(script)})
     http(handler)
+    async with lathe.httpx.AsyncClient() as client:
+        notices = await lathe._reap_bash_commands(tools.valves, "sb", client, claim_chat="chat")
+    assert len(notices) == 1 and "took 42s" in notices[0]
+
+
+async def test_background_notice_survives_lost_poller_on_another_worker(
+    tools, sandbox, http, clock, tmp_path, monkeypatch,
+):
+    # Two Tools instances stand in for two OWUI workers sharing one sandbox.
+    monkeypatch.setattr(lathe, "_EPHEMERAL_ROOT", str(tmp_path / "lathe"))
+    other_worker = lathe.Tools()
+    other_worker.valves = tools.valves
+    for worker in (tools, other_worker):
+        for chat in ("chat", "other"):
+            worker._chat_state[chat] = {"init": True, "pending": []}
+    http(shared_sandbox(lose_first_poller=True))
     started = await tools.bash("echo cross-worker-output", workdir=str(tmp_path),
                                foreground_seconds=0, __user__=USER, __chat_id__="chat")
     assert "Backgrounded after" in started
