@@ -270,7 +270,10 @@ async def test_staging_deployment_accepts_current_valves_and_sets_expiry(suite, 
 
 @pytest.mark.parametrize("copy_tool,copy_args", [
     ("bash", {"command": "cp /source.txt /copy.txt"}),
+    ("bash", {"command": "cp source.txt copy.txt"}),
+    ("bash", {"command": "cd / && cp source.txt copy.txt && cmp source.txt copy.txt"}),
     ("interpret", {"code": "import shutil; shutil.copyfile('/source.txt', '/copy.txt')"}),
+    ("interpret", {"code": "import shutil; shutil.copyfile('source.txt', 'copy.txt')"}),
     ("write", {"path": "/copy.txt", "content": "FRESH_CANARY"}),
 ])
 @pytest.mark.parametrize("fault", [
