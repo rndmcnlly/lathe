@@ -286,3 +286,53 @@ host/workflow cleanup. Both cleanup reports passed with `cloud_cleanup_attempted
 false: no cloud deletion or cloud-absence API query was needed or performed.
 The read-only diagnostic container was removed. Overlapping first use remains
 unqualified, direct-bash wakeup unsupported, and no #110/#67 closure is claimed.
+
+## Final TCP PostgreSQL gate and deterministic initializer trial
+
+The authorized key-free fix uses the same shared `lab.postgres_ready()` in both
+the root controller and standalone preflight. `pg_isready` explicitly targets
+`127.0.0.1:5432`; authenticated `psql` targets the identical endpoint, creates
+pgvector and requires the SQL result `127.0.0.1|5432|1`. SQL errors fail immediately,
+not through blind retries. A monotonic deadline bounds TCP readiness polling.
+Startup failure retains only allowlisted state and event counts from a bounded
+log tail before teardown, never raw log lines, credentials or SQL. Injected
+diagnostic/evidence failures preserve the existing cleanup guarantees.
+
+`postgres_trial.py` copies a small 45-second-bounded barrier hook into the exact
+owned container's init directory using `docker cp`. It uses the pinned PG image,
+an internal network and tmpfs, with no host mounts, persistent volumes or ports.
+During the controlled pause, actual Unix readiness succeeds; the actual production
+TCP helper rejects the initializer and does not advance to SQL. Releasing the
+barrier permits final TCP SQL/pgvector success. The pinned entrypoint explicitly
+sets `listen_addresses=''` for its temporary server; its SHA256 is
+`9c440299ae04a0a79d55b8bf03307036d890a40979d2fb698073c9050d4b20a5`.
+This proves the mechanism, not the historical cause of run 40622252912: without
+its PG logs, an independent crash remains possible.
+
+Local evidence:
+
+* `runs/postgres-302c3b0369434549b28887a0599d5599`: barrier, Unix-ready/TCP-not-ready,
+  production helper held, final TCP SQL passed, exact cleanup verified.
+* `runs/postgres-fault-37bdc926dc86421296f39e472701e030`: an **in-memory only**
+  production-helper mutation restores the Unix probe. The same real trial
+  detects premature advancement/failure, retains sanitized startup facts
+  (one Unix listener, zero TCP listeners), and verifies cleanup. No deployed
+  runtime/toolkit or working-tree implementation was faulted.
+* `runs/shared-4cd04d0711a041f39eb2401ad8200ef2`: all 22 infrastructure gates,
+  actual controller/config replacement and restart gates, and synthetic live-policy
+  HTTPX passed. Both fresh topologies used image
+  `sha256:f392f3435cee5c250518dc3f619870574fe5b39b2d11e5378cb32c39e0840705`
+  and verified exact owned absence. Provider requests/reservations: **0/$0**.
+
+Runtime and controller source hashes remain unchanged from the previous trial.
+The PG helper SHA256 is
+`f0ea757059555bb97632efdbbd08f144cc0d08c2c8b6ae435bc2d00d67194321`.
+Immutable base image references remain in `images.json`; full staged source,
+image and infrastructure hashes are retained per topology in `result.json`.
+The new explicit manual workflow selector `lab=readiness-preflight` supplies no
+provider credentials and cannot enter live provisioning/inference. Native/cloud
+qualification is still a separate authorization gate.
+
+Offline guards: **924 default tests**, **242 focused infrastructure/readiness/
+monitor tests**, including SQL-result faults, TCP timeout, diagnostic failure
+before teardown, sanitized evidence, and the credential-free workflow boundary.

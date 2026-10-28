@@ -4,11 +4,11 @@ This qualifies local infrastructure, without `.env`, platform credentials, cloud
 resources, or inference. It does **not** qualify real-model dispatch, native
 subagents, Daytona wake-up, or multi-host/shared-filesystem production deployment.
 The prior bytes-hostname guard bug has a normalization fix and a key-free
-live-policy HTTPX gate. The next authorized attempt stopped earlier, at the
-PostgreSQL Unix-socket readiness/SQL boundary, before any live stack or platform
-contact. Native qualification remains **NOT REACHED**; no automatic retry was
-dispatched. See `QUALIFICATION.md`; synthetic transport success is not real
-platform acceptance.
+live-policy HTTPX gate. PostgreSQL now requires final TCP readiness and real SQL
+on that same endpoint. A controlled initializer pause demonstrates why Unix-only
+readiness was insufficient. The earlier runner failure remains consistent with,
+not conclusively attributed to, that race. Native qualification remains
+**NOT REACHED**. See `QUALIFICATION.md`; key-free success is not platform acceptance.
 
 ```sh
 uv run python readiness-infra/lab.py --preflight
@@ -17,6 +17,7 @@ uv run pytest readiness-infra/test_infra.py
 uv run pytest  # also includes all cheap readiness/controller safeguards
 uv run python readiness_lab.py --preflight  # also exercises the live controller, without keys/inference
 uv run python readiness-infra/transport_preflight.py  # synthetic live-policy HTTPX transport only
+uv run python readiness-infra/postgres_trial.py  # real PG initializer barrier, no host mounts
 ```
 
 `--artifacts NEW_DIRECTORY` chooses evidence storage. `--source REPO_DIRECTORY`
@@ -26,6 +27,23 @@ termination attempts cleanup and verifies absence. After a host crash or SIGKILL
 use `--cleanup` with that run's `owner.json`. It refuses mismatched resource
 labels/names and networks containing foreign endpoints. It never prunes Docker.
 Disposable image tags/build cache remain available; no container or network does.
+
+For a credential-free GitHub runner trial, manually dispatch `monitor.yml` with
+`lab=readiness-preflight`. It runs offline guards, the initializer trial and the
+same shared controller preflight, with separate always-run exact-owner cleanup.
+Credential-bearing live/cleanup steps and the monitor job are skipped. This
+selector cannot enter provisioning or inference.
+
+The initializer trial copies one bounded init hook into its exact owned PG
+container with `docker cp`. With the initializer held, Unix `pg_isready` succeeds
+but the actual production TCP probe rejects it and cannot advance to SQL. After
+release, the same helper creates pgvector and checks `inet_server_addr()` and
+`inet_server_port()` through TCP. Barrier, service probes and SQL have explicit
+timeouts; no extra startup sleep substitutes for readiness. PG failure diagnostics
+are captured before teardown: selected process-state facts and fixed lifecycle/
+severity counts from the last 60 log lines. Raw logs, queries, env and arbitrary
+error text are never retained by this diagnostic path. Diagnostic/evidence errors
+cannot bypass the shared lifecycle's cleanup.
 
 ## Small, explicit topology
 

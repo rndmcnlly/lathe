@@ -19,7 +19,7 @@ LABEL = "tools.lathe.readiness-infra"
 IMAGES = json.loads((ROOT / "images.json").read_text())
 
 
-def docker(*args, timeout=60, stdin=None, log=None):
+def docker(*args, timeout=60, stdin=None, log=None, combined=False):
     try:
         result = subprocess.run(["docker", *args], input=stdin, capture_output=True, timeout=timeout)
     except subprocess.TimeoutExpired:
@@ -29,7 +29,7 @@ def docker(*args, timeout=60, stdin=None, log=None):
     if result.returncode:
         # Our arguments can contain ephemeral DB/JWT secrets. Do not render them.
         raise RuntimeError(f"docker {args[0]} failed: " + result.stderr.decode(errors="replace")[-3000:])
-    return result.stdout.decode()
+    return (result.stdout + (result.stderr if combined else b"")).decode(errors="replace")
 
 
 def save(path, value):
@@ -111,6 +111,57 @@ def stage(app, source):
     return hashes
 
 
+def postgres_ready(pg, *, timeout=60):
+    """Ignore the entrypoint's Unix-only initializer; qualify final TCP + SQL."""
+    endpoint = ["-h", "127.0.0.1", "-p", "5432", "-U", "readiness", "-d", "readiness"]
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            docker("exec", pg, "pg_isready", *endpoint, "-t", "1", timeout=3)
+            break
+        except RuntimeError:
+            time.sleep(min(0.5, max(0, deadline - time.monotonic())))
+    else:
+        raise RuntimeError("PostgreSQL final TCP readiness timeout")
+    # Use the container's generated password without putting it in command
+    # arguments, SQL, or evidence. SQL failure is fatal, not blindly retried.
+    output = docker("exec", pg, "sh", "-c", 'PGPASSWORD="$POSTGRES_PASSWORD" exec "$@"', "sh",
+                    "psql", *endpoint, "-w", "-v", "ON_ERROR_STOP=1", "-At",
+                    "-c", "CREATE EXTENSION IF NOT EXISTS vector;",
+                    "-c", "SELECT inet_server_addr(), inet_server_port(), count(*) FROM pg_extension WHERE extname='vector';",
+                    timeout=10)
+    if output.strip().splitlines()[-1:] != ["127.0.0.1|5432|1"]:
+        raise RuntimeError("PostgreSQL final TCP SQL/pgvector proof missing")
+    return {"host": "127.0.0.1", "port": 5432, "sql_tcp_verified": True, "vector": True}
+
+
+def postgres_diagnostics(pg):
+    """Retain only allowlisted facts, never raw logs, SQL, env, or error text."""
+    result = {}
+    try:
+        state = json.loads(docker("inspect", "--format", "{{json .State}}", pg, timeout=5))
+        result["state"] = {key: state[key] for key in ("Running", "OOMKilled", "ExitCode")
+                           if isinstance(state.get(key), (bool, int))}
+    except (RuntimeError, ValueError, TypeError):
+        result["state_unavailable"] = True
+    try:
+        # Docker bounds the retained tail. Only fixed event names leave this
+        # function: no arbitrary line, credential, query, or server error does.
+        tail = docker("logs", "--tail", "60", pg, timeout=5, combined=True)
+        events = {
+            "unix_listener": "listening on Unix socket",
+            "tcp_listener": "listening on IPv4 address",
+            "accepting_connections": "database system is ready to accept connections",
+            "initializer_complete": "PostgreSQL init process complete; ready for start up.",
+            "shutdown": "database system is shut down",
+            "fatal": "FATAL:", "panic": "PANIC:", "error": "ERROR:",
+        }
+        result["tail_events"] = {name: tail.count(marker) for name, marker in events.items()}
+    except RuntimeError:
+        result["logs_unavailable"] = True
+    return result
+
+
 def topology(directory, source, *, image_id=None, live_action=None, scope="native", config_only=False,
              qualified=None, deployment_label=None):
     """Run one fresh topology, always removing its exact owned resources.
@@ -166,8 +217,11 @@ def topology(directory, source, *, image_id=None, live_action=None, scope="nativ
                "-e", "POSTGRES_PASSWORD=" + password])
         create(redis, IMAGES["redis"], ["--network-alias", "redis", "--tmpfs", "/data"],
                ["redis-server", "--save", "", "--appendonly", "no"])
+        phase = "PostgreSQL startup"
         docker("start", pg, redis)
-        for name, command in ((pg, ["pg_isready", "-U", "readiness"]), (redis, ["redis-cli", "ping"])):
+        evidence["postgres"] = postgres_ready(pg)
+        phase = "Redis startup"
+        for name, command in ((redis, ["redis-cli", "ping"]),):
             for _ in range(60):
                 try:
                     docker("exec", name, *command, timeout=5)
@@ -176,8 +230,6 @@ def topology(directory, source, *, image_id=None, live_action=None, scope="nativ
                     time.sleep(0.5)
             else:
                 raise RuntimeError("database/cache health gate timeout")
-        docker("exec", pg, "psql", "-U", "readiness", "-d", "readiness", "-v", "ON_ERROR_STOP=1",
-               "-c", "CREATE EXTENSION IF NOT EXISTS vector;")
         env = {"PGHOST": "pg", "REDIS_HOST": "redis", "READINESS_RUN": owner,
                "WEBUI_SECRET_KEY": secrets.token_hex(32), "WEBUI_JWT_SECRET_KEY": secrets.token_hex(32),
                "DATABASE_URL": f"postgresql://readiness:{password}@pg:5432/readiness",
@@ -228,6 +280,11 @@ def topology(directory, source, *, image_id=None, live_action=None, scope="nativ
         evidence["status"] = "passed"
     except BaseException as exc:
         evidence.update(status="failed", phase=phase, failure=f"{type(exc).__name__}: {exc}")
+        if phase == "PostgreSQL startup":
+            try:
+                evidence["postgres_startup"] = postgres_diagnostics(pg)
+            except Exception:
+                evidence["postgres_startup"] = {"diagnostics_unavailable": True}
         if phase == "OWUI boundaries":
             try:
                 evidence["completed_checks"] = json.loads(docker("exec", app, "cat", "/run/readiness/checks.json"))

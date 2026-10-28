@@ -207,13 +207,16 @@ def test_controller_cleans_owned_resources_despite_evidence_failures(tmp_path, m
 
 
 @pytest.mark.parametrize("callback_failure", [RuntimeError("cloud callback failed"), PermissionError("evidence export failed")])
-def test_shared_lifecycle_always_cleans_after_controller_failure(tmp_path, monkeypatch, callback_failure):
+@pytest.mark.parametrize("failure_phase", ["controller", "postgres", "diagnostics"])
+def test_shared_lifecycle_always_cleans_after_controller_failure(tmp_path, monkeypatch, callback_failure, failure_phase):
     source = tmp_path / "source"
     source.mkdir()
     for name in ("lathe.py", "testing_support.py", "readiness_lab.py", "monitor_e2e.py", "test_deployment.py"):
         (source / name).write_text(name)
     containers, networks = {}, {}
     def docker(*args, **kwargs):
+        if "psql" in args:
+            return "CREATE EXTENSION\n127.0.0.1|5432|1\n"
         if args[:2] == ("network", "create"):
             owner = args[args.index("--label") + 1].split("=")[1]
             networks[args[-1]] = {"Id": args[-1], "Labels": {lab.LABEL: owner}, "Containers": {}}
@@ -242,11 +245,114 @@ def test_shared_lifecycle_always_cleans_after_controller_failure(tmp_path, monke
         assert app in containers
         raise callback_failure
     monkeypatch.setattr(lab, "docker", docker)
+    if failure_phase != "controller":
+        def failed_gate(pg):
+            assert pg in containers
+            raise callback_failure
+        def diagnostics(pg):
+            assert pg in containers, "startup evidence must precede teardown"
+            if failure_phase == "diagnostics":
+                raise PermissionError("injected diagnostic failure")
+            return {"observed_before_teardown": True}
+        monkeypatch.setattr(lab, "postgres_ready", failed_gate)
+        monkeypatch.setattr(lab, "postgres_diagnostics", diagnostics)
     with pytest.raises(type(callback_failure), match=str(callback_failure)):
         lab.topology(tmp_path / "run", source, image_id="sha256:qualified", live_action=action,
                      deployment_label="lathe-ci-next-0123456789abcdef")
     assert not containers and not networks
     assert json.loads((tmp_path / "run/cleanup.json").read_text())["verified_absent"]
+    if failure_phase != "controller":
+        result = json.loads((tmp_path / "run/result.json").read_text())
+        assert result["phase"] == "PostgreSQL startup"
+        assert result["postgres_startup"] == ({"diagnostics_unavailable": True} if failure_phase == "diagnostics"
+                                               else {"observed_before_teardown": True})
+
+
+@pytest.fixture
+def postgres_clock(monkeypatch):
+    from types import SimpleNamespace
+    now = [0.0]
+    def advance(seconds):
+        now[0] += seconds
+    monkeypatch.setattr(lab, "time", SimpleNamespace(monotonic=lambda: now[0], sleep=advance))
+
+
+def test_postgres_gate_ignores_unix_initializer_and_executes_tcp_sql(monkeypatch, postgres_clock):
+    commands = []
+    def docker(*args, **kwargs):
+        commands.append(args)
+        # An omitted host would accept the temporary Unix server immediately.
+        if "pg_isready" in args and sum("pg_isready" in c for c in commands) == 1:
+            assert args[args.index("-h") + 1] == "127.0.0.1"
+            raise RuntimeError("temporary server has no TCP listener")
+        if "psql" in args:
+            return "CREATE EXTENSION\n127.0.0.1|5432|1\n"
+        return ""
+    monkeypatch.setattr(lab, "docker", docker)
+    assert lab.postgres_ready("owned-pg")["sql_tcp_verified"]
+    assert len(commands) == 3
+    for args in commands:
+        assert args[args.index("-h") + 1] == "127.0.0.1"
+        assert args[args.index("-p") + 1] == "5432"
+
+
+@pytest.mark.parametrize("fault", ["sql-fails", "unix-sql", "missing-vector", "empty-output"])
+def test_postgres_gate_rejects_sql_faults_without_retry(monkeypatch, fault):
+    calls = []
+    def docker(*args, **kwargs):
+        if "psql" in args:
+            calls.append(args)
+            if fault == "sql-fails":
+                raise RuntimeError("injected SQL failure")
+            return {"unix-sql": "|5432|1", "missing-vector": "127.0.0.1|5432|0",
+                    "empty-output": ""}[fault]
+        return ""
+    monkeypatch.setattr(lab, "docker", docker)
+    with pytest.raises(RuntimeError):
+        lab.postgres_ready("owned-pg")
+    assert len(calls) == 1
+
+
+def test_postgres_tcp_timeout_never_attempts_sql(monkeypatch, postgres_clock):
+    def docker(*args, **kwargs):
+        assert "pg_isready" in args and "psql" not in args
+        raise RuntimeError("no final listener")
+    monkeypatch.setattr(lab, "docker", docker)
+    with pytest.raises(RuntimeError, match="final TCP readiness timeout"):
+        lab.postgres_ready("owned-pg", timeout=5)
+
+
+def test_postgres_diagnostics_emit_only_bounded_allowlisted_facts(monkeypatch):
+    secret = "SECRET_SQL_AND_PASSWORD"
+    def docker(*args, **kwargs):
+        if args[0] == "inspect":
+            return json.dumps({"Running": True, "OOMKilled": False, "ExitCode": 0, "Error": secret})
+        assert args[:3] == ("logs", "--tail", "60") and kwargs["timeout"] == 5
+        return "listening on Unix socket " + secret + "\nERROR: " + secret
+    monkeypatch.setattr(lab, "docker", docker)
+    result = lab.postgres_diagnostics("owned-pg")
+    assert secret not in json.dumps(result)
+    assert result["tail_events"]["unix_listener"] == result["tail_events"]["error"] == 1
+
+
+def test_manual_preflight_cannot_inherit_credentials_or_enter_live_run():
+    import yaml
+    workflow = yaml.safe_load((lab.ROOT.parent / ".github/workflows/monitor.yml").read_text())
+    jobs = workflow["jobs"]
+    assert "inputs.lab != 'readiness-preflight'" in jobs["monitor"]["if"]
+    readiness = jobs["readiness"]
+    assert "env" not in workflow and "env" not in readiness
+    preflight_found = False
+    for step in readiness["steps"]:
+        # Both credential injection and live controller invocation require the
+        # other explicit selector, including last-resort cloud cleanup.
+        if "secrets." in json.dumps(step) or "readiness_lab.py --run" in step.get("run", ""):
+            assert step["if"] in ("inputs.lab == 'readiness'", "always() && inputs.lab == 'readiness'")
+        if "readiness_lab.py --preflight" in step.get("run", ""):
+            assert step["if"] == "inputs.lab == 'readiness-preflight'"
+            assert "env" not in step and "secrets." not in json.dumps(step)
+            preflight_found = True
+    assert preflight_found
 
 
 @pytest.mark.parametrize("policy", ["preflight", "live"])

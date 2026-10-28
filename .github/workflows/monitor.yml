@@ -6,7 +6,7 @@ on:
       lab:
         description: Disposable lab to run (readiness is manual only)
         type: choice
-        options: [monitor, readiness]
+        options: [monitor, readiness, readiness-preflight]
         default: monitor
       model:
         description: OpenRouter model for isolated qualification of the selected trusted ref
@@ -41,7 +41,7 @@ concurrency:
 
 jobs:
   monitor:
-    if: github.repository == 'rndmcnlly/lathe' && github.event_name != 'pull_request' && inputs.lab != 'readiness'
+    if: github.repository == 'rndmcnlly/lathe' && github.event_name != 'pull_request' && inputs.lab != 'readiness' && inputs.lab != 'readiness-preflight'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     env:
@@ -87,7 +87,7 @@ jobs:
           if-no-files-found: warn
 
   readiness:
-    if: github.repository == 'rndmcnlly/lathe' && github.event_name == 'workflow_dispatch' && inputs.lab == 'readiness'
+    if: github.repository == 'rndmcnlly/lathe' && github.event_name == 'workflow_dispatch' && (inputs.lab == 'readiness' || inputs.lab == 'readiness-preflight')
     runs-on: ubuntu-latest
     timeout-minutes: 40
     steps:
@@ -102,21 +102,46 @@ jobs:
           uv run --locked pytest
           uv run --locked pytest readiness-infra/test_infra.py test_readiness.py test_monitor.py
       - name: Disposable multi-worker readiness lab
+        if: inputs.lab == 'readiness'
         timeout-minutes: 30
         env:
           DAYTONA_API_KEY: ${{ secrets.DAYTONA_API_KEY }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
         run: uv run --locked python readiness_lab.py --run --scope "${{ inputs.readiness_scope }}"
+      - name: Credential-free initializer and shared controller qualification
+        if: inputs.lab == 'readiness-preflight'
+        timeout-minutes: 25
+        run: |
+          uv run --locked python readiness-infra/postgres_trial.py
+          uv run --locked python readiness_lab.py --preflight
       - name: Exact-run teardown and verification
-        if: always()
+        if: always() && inputs.lab == 'readiness'
         env:
           DAYTONA_API_KEY: ${{ secrets.DAYTONA_API_KEY }}
         run: uv run --locked python readiness_lab.py --cleanup
+      - name: Exact key-free teardown and verification
+        if: always() && inputs.lab == 'readiness-preflight'
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import subprocess
+          import sys
+
+          failures = []
+          for owner in Path("readiness-infra/runs").rglob("owner.json"):
+              result = subprocess.run([sys.executable, "readiness-infra/lab.py", "--cleanup", str(owner.parent)])
+              if result.returncode:
+                  failures.append(str(owner.parent))
+          if failures:
+              raise RuntimeError("Key-free cleanup failed: " + ", ".join(failures))
+          PY
       - name: Sanitized readiness evidence only
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: readiness-${{ github.run_id }}-${{ github.run_attempt }}
-          path: monitor-artifacts/readiness-results/
+          path: |
+            monitor-artifacts/readiness-results/
+            readiness-infra/runs/
           retention-days: 14
           if-no-files-found: warn
