@@ -262,7 +262,9 @@ async def inside():
                 require(version.json().get("version", "").lstrip("v") == "0.12.4",
                         "Expected released OWUI 0.12.4")
                 trace("owui_version", version=version.json()["version"])
+            trace("bootstrap_step", name="monitor_bootstrap")
             token = await monitor.bootstrap(suite.OWUI_BASE, relay.key)
+            trace("bootstrap_step", name="workspace_provider_policy")
             async with httpx.AsyncClient(timeout=30, headers={"Authorization": f"Bearer {token}"}) as http:
                 response = await http.post(suite.OWUI_BASE + "/api/v1/models/model/update", json={
                     "id": monitor.workspace_model(), "base_model_id": MODEL, "name": "NEXT GLM Flash",
@@ -272,18 +274,21 @@ async def inside():
                              "builtinTools": {"subagents": True}},
                 })
                 response.raise_for_status()
+                trace("bootstrap_step", name="subagents_config")
                 response = await http.post(suite.OWUI_BASE + "/api/v1/configs/subagents", json={
                     "ENABLE_SUBAGENTS": True, "SUBAGENTS_BACKGROUND_ENABLED": True,
                     "SUBAGENTS_MAX_CONCURRENT": 2, "SUBAGENTS_MAX_ASYNC": 2,
                     "SUBAGENTS_MAX_ITERATIONS": 8, "SUBAGENTS_MAX_OUTPUT": 6000,
                     "SUBAGENTS_SYSTEM_PROMPT": ""})
                 response.raise_for_status()
+            trace("bootstrap_step", name="ordinary_completion_account")
             account = await monitor.completion_account(suite.OWUI_BASE, token)
             suite.OWUI_TOKEN = token
             suite.OWUI_TEST_TOKEN = account["token"]
             suite.OWUI_TEST_EMAIL = account["email"]
             suite.MODEL = monitor.workspace_model()
             admin, user = await suite.check_test_identity()
+            trace("bootstrap_step", name="toolkit_deployment")
             await suite.deploy_staging_tool(admin, user, display_name="Disposable NEXT lab")
             async with httpx.AsyncClient(timeout=30, headers=suite.auth_headers()) as http:
                 response = await http.post(suite.OWUI_BASE + "/api/v1/tools/id/lathe_test/valves/update",
@@ -292,6 +297,7 @@ async def inside():
                 response.raise_for_status()
             # Provision exactly one small CPU sandbox ourselves, with authoritative
             # ownership label. Lathe only discovers/starts it; it cannot provision more.
+            trace("bootstrap_step", name="single_small_sandbox")
             async with httpx.AsyncClient(timeout=180) as http:
                 response = await http.post("https://app.daytona.io/api/sandbox",
                     headers={"Authorization": f"Bearer {suite.DAYTONA_API_KEY}"}, json={
@@ -432,6 +438,9 @@ async def inside():
             relay.verify_evidence()
             exit_code = 0
     except BaseException as exc:
+        if isinstance(exc, httpx.HTTPStatusError):
+            trace("http_failure", method=exc.request.method, path=exc.request.url.path,
+                  status=exc.response.status_code, detail=exc.response.text[:3000])
         trace("fatal", error=f"{type(exc).__name__}: {exc}")
     finally:
         # Stop request producers BEFORE deleting their cloud resources.
