@@ -1,5 +1,34 @@
 # Readiness lab: partial live proof, cleaned up
 
+## Native-only trial 40631364077 at 3022484: FAILED before live stack, native NOT REACHED
+
+Run: https://github.com/rndmcnlly/lathe/actions/runs/40631364077 (one dispatch,
+no retry). Source `3022484241bffca043521dcc4c74bea5826320cd` (per-ID deletion
+proof and bounded listing; prior fixes 167059d, 9a69a6e). `lathe.py` unchanged.
+
+- Runner offline gates passed. Key-free infrastructure preflight and
+  config-preflight both PASSED on `sha256:e5bbcccedc0720f52c7e4240a2b85469a8cd50da9ac9673b6a10e059f527fec6`
+  (config summary exit 0, 0 provider requests; restarted workers A42/B59 with
+  verified loaded source/valves and linked observer startups).
+- **First failure:** host `verify_prices()` (the step after key-free gates, before
+  pricing.json, live stack or any Daytona contact): `JSONDecodeError: Expecting ','
+  delimiter: line 1 column 753515` decoding OpenRouter's public
+  `GET /api/v1/models` catalog. Classification: transient upstream catalog
+  response (malformed/truncated body), not harness logic, model behavior or native
+  protocol. A single key-less catalog GET afterward parsed cleanly (HTTP 200, 464
+  models, GLM-5.3-Flash present, prices within caps). The lab fails closed on this
+  and has no retry, by design; no retry was dispatched.
+- Native idle: **NOT REACHED**. Native busy: **NOT REACHED**. No delegations,
+  parent/child/continuation IDs, native worker handling or canary receipts.
+- 0 provider requests, $0 inference cost, $0 reserved; no sandbox provisioned.
+- Cleanup: both host and workflow-repeat reports: OWUI stopped, cloud cleanup
+  correctly NOT attempted (live not started), success, no errors; preflight and
+  config-preflight topologies verified absent. Independent read-only check with
+  the fixed lister (local `.env` key; same org as the repo secret unverified):
+  label `lathe-ci-next-3e42a902fc8f571b` exact filter 0, any-owner key scan 0.
+- Possible hardening (not applied): bounded retry of the public price-catalog
+  read only, since it precedes all paid and platform work.
+
 ## Sandbox discovery/cleanup fix after 40628835065 (offline + key-free only)
 
 Read-only check (local `.env` Daytona key; same org as the repository secret is
