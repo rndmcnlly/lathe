@@ -336,3 +336,32 @@ qualification is still a separate authorization gate.
 Offline guards: **924 default tests**, **242 focused infrastructure/readiness/
 monitor tests**, including SQL-result faults, TCP timeout, diagnostic failure
 before teardown, sanitized evidence, and the credential-free workflow boundary.
+
+### Completed credential-free runner qualification
+
+Exactly one manual `readiness-preflight` dispatch completed successfully:
+[40624089294](https://github.com/rndmcnlly/lathe/actions/runs/40624089294), source
+`0a8ae7663ef258ded6ad361d5cf568c19663d137`. Job duration: **3m6s**.
+Runner guards passed **924 default** and **242 focused** tests.
+
+The real initializer trial independently reproduced Unix-ready/TCP-not-ready,
+proved the unchanged production helper did not advance during the pause, then
+passed final TCP SQL/pgvector. Its entrypoint and helper hashes match the local
+receipts above. The runner's resolved PG image ID was
+`sha256:f1447071e6c8449dcf4056aa0994c81d3566ce5ee232de36b04dc25696a116dd`.
+All 22 infrastructure gates and the real controller/config replacement/restart
+gates passed, including the synthetic HTTPX transport's four loopback requests
+and six observed denials. Both fresh shared topologies used exactly
+`sha256:3988c50dc06b433ce6fdb1fb491fb803c790f5669b2be7940655a2419d6b3ec1`.
+
+Every one of the three owned topologies verified exact container/network absence.
+The separate always-run key-free cleanup also passed; evidence upload succeeded.
+The monitor job, live readiness step and credential-bearing cloud cleanup step
+were **skipped**. No provider credentials were supplied to executed steps.
+Provider requests, reservations and inference cost: **0/$0/$0**. No Daytona
+provisioning or native dispatch occurred. Next gate remains separately authorized
+real platform/native qualification, not an automatic paid retry or issue closure.
+
+Uploaded artifact: `readiness-40624089294-1`. Its retained local copy, including
+full per-topology source/image hashes, cleanup receipts and workflow logs, is
+`runs/runner-40624089294/`. Runtime and root controller remain unchanged.
