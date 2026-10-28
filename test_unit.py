@@ -2142,6 +2142,100 @@ def node_eval(stub, expression):
     return json.loads(out)
 
 
+class NodeClickSession:
+    """Runs the shipped click resolver against a small element tree in Node."""
+    def __init__(self, elements, covered=False):
+        self.elements, self.covered, self.calls, self.dom_log = elements, covered, [], []
+
+    def value(self, expression, timeout=30):
+        stub = r"""
+const specs = ELEMENTS;
+const nodes = specs.map((s, i) => ({
+  ...s, tagName: (s.tag || 'button').toUpperCase(),
+  getAttribute(name) { return (s.attrs || {})[name] || null; },
+  getBoundingClientRect() { return {left: i * 100, top: 0, width: s.hidden ? 0 : 80, height: 20}; },
+  scrollIntoView() { log.push(['scroll', s.id]); },
+  contains(other) { for (let n = other; n; n = n.parent) if (n === this) return true; return false; },
+  closest() { for (let n = this; n; n = n.parent) if (n.clickable !== false) return n; return null; },
+  querySelectorAll() { return nodes.filter(n => n !== this && this.contains(n)); }
+}));
+nodes.forEach((n, i) => n.parent = specs[i].parent === undefined ? null : nodes[specs[i].parent]);
+globalThis.getComputedStyle = el => ({visibility: 'visible', display: 'block'});
+globalThis.document = {
+  querySelectorAll(sel) { return nodes.filter(n => sel.startsWith('#') ? n.id === sel.slice(1)
+    : sel === 'button' ? n.tagName === 'BUTTON' : n.clickable !== false); },
+  elementFromPoint(x) { return COVERED === 'outside' ? null : COVERED === 'ancestor'
+    ? {contains() { return true; }} : COVERED
+    ? {parent: null, contains() { return false; }} : nodes[Math.floor(x / 100)]; }
+};
+""".replace("ELEMENTS", json.dumps(self.elements)).replace("COVERED", json.dumps(self.covered))
+        result = node_eval(stub, expression)
+        self.dom_log.extend(result["log"])
+        return result["value"]
+
+    def call(self, method, params=None, timeout=30):
+        assert method == "Input.dispatchMouseEvent", method
+        self.calls.append(params)
+        return {}
+
+    def settle(self, timeout=15):
+        return True
+
+
+@needs_node
+@pytest.mark.parametrize("args,elements", [
+    ({"text": "Hi"}, [{"innerText": "Archived"}, {"innerText": "History"}]),
+    ({"text": "Save"}, [{"innerText": "Save"}, {"innerText": "Save"}]),
+    ({"selector": "button"}, [{"innerText": "Keep"}, {"innerText": "Delete"}]),
+    ({"text": "Hi"}, [
+        {"innerText": "Hi online"}, {"tag": "span", "innerText": "Hi", "parent": 0, "clickable": False},
+        {"innerText": "Hi offline"}, {"tag": "span", "innerText": "Hi", "parent": 2, "clickable": False},
+    ]),
+])
+def test_page_click_refuses_ambiguity_before_scroll_or_input(page_script, args, elements):
+    session = NodeClickSession(elements)
+    with pytest.raises(page_script["Fail"], match="ambiguous click: 2.*no input sent.*unique CSS selector") as error:
+        page_script["page_click"](session, {}, args)
+    assert "Candidates" in str(error.value)
+    assert session.calls == [] and session.dom_log == []
+
+
+@needs_node
+@pytest.mark.parametrize("args,elements,index", [
+    ({"text": "Save"}, [{"innerText": "Save draft"}, {"innerText": "Save"}], 1),
+    ({"text": "draft"}, [{"innerText": "Save draft"}, {"innerText": "Publish"}], 0),
+    ({"selector": "#keep"}, [{"id": "keep", "innerText": "Keep"}, {"innerText": "Delete"}], 0),
+    # Regression: a title span must beat unrelated fuzzy matches such as Archived.
+    ({"text": " hi "}, [
+        {"innerText": "Archived"}, {"id": "session", "innerText": "Hi online"},
+        {"tag": "span", "innerText": "Hi", "parent": 1, "clickable": False},
+    ], 1),
+    # Two exact descendants of one clickable element are one target, not two.
+    ({"text": "Hi"}, [
+        {"innerText": "Hi Hi online"},
+        {"tag": "span", "innerText": "Hi", "parent": 0, "clickable": False},
+        {"tag": "span", "innerText": "Hi", "parent": 0, "clickable": False},
+    ], 0),
+    # Hidden matches do not make a visible target ambiguous.
+    ({"text": "Save"}, [{"innerText": "Save", "hidden": True}, {"innerText": "Save"}], 1),
+])
+def test_page_click_uses_one_unambiguous_target(page_script, args, elements, index):
+    session = NodeClickSession(elements)
+    result = page_script["page_click"](session, {}, args)
+    assert result.startswith("Clicked")
+    assert [call["type"] for call in session.calls] == ["mouseMoved", "mousePressed", "mouseReleased"]
+    assert all(call["x"] == index * 100 + 40 for call in session.calls)
+
+
+@needs_node
+@pytest.mark.parametrize("covered", [True, "outside", "ancestor"])
+def test_page_click_refuses_covered_target_before_input(page_script, covered):
+    session = NodeClickSession([{"innerText": "Save"}], covered=covered)
+    with pytest.raises(page_script["Fail"], match="target centre is covered.*no input sent"):
+        page_script["page_click"](session, {}, {"text": "Save"})
+    assert session.calls == []
+
+
 class NodeFieldSession:
     """One element under a selector; Node runs the page script's JavaScript
     against it and CDP input applies the field's own transform to the text."""
@@ -2335,6 +2429,19 @@ async def test_browser_script_errors_are_redacted(tools, sandbox, http):
     result = await tools.poke("page.eval", {"js": "secretFunctionName()"}, __user__=USER)
     assert result.startswith("Error: page.eval failed: JavaScript error: ReferenceError: [typed text]")
     assert "secretFunction" not in result
+
+
+@pytest.mark.parametrize("text,message,expected", [
+    ("Hi", 'ambiguous click: 2 visible matches; no input sent. Candidates: <button> "History"',
+     "ambiguous click; no input sent. Use a unique CSS selector."),
+    ("a", "target centre is covered or outside the viewport; no input sent.", "target is covered; no input sent."),
+])
+async def test_click_refusal_steering_survives_short_text_redaction(tools, sandbox, http, text, message, expected):
+    desktop = fake_desktop(True, page_result={"ok": False, "text": message})
+    http(desktop["handler"])
+    result = await tools.poke("page.click", {"text": text}, __user__=USER)
+    assert expected in result
+    assert "History" not in result
 
 
 @pytest.mark.parametrize("tool,command,args", [

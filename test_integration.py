@@ -537,9 +537,41 @@ asyncio.run(main())
         output = await tools.poke("page.eval", {"js": "document.querySelectorAll('input').length + 40"}, **ctx)
         require("42" in output, output)
 
+        # Ambiguity must not change app state. An exact title inside a clickable
+        # ancestor must beat the unrelated "Hi" substring in Archived/History.
+        await tools.write(f"{site}/clicks.html", (
+            "<title>Click safety</title><button id=archive>Archived</button>"
+            "<button id=history>History</button>"
+            "<button id=session style='display:none'><span>Hi</span><span> online</span></button>"
+            "<p id=out>untouched</p><script>document.addEventListener('click', e => {"
+            "document.getElementById('out').textContent = (e.target.closest('button')?.id || 'other') + ':' + e.isTrusted;"
+            "});</script>"), **ctx)
+        output = await tools.poke("page.open", {"url": "http://127.0.0.1:8767/clicks.html", "newTab": True}, **ctx)
+        require("Click safety" in output, output)
+        safety_tab = re.search(r"Tab ([0-9A-F]{8})", output)[1]
+        output = await tools.poke("page.click", {"text": "Hi", "tab": safety_tab}, **ctx)
+        require(output.startswith("Error:") and "ambiguous click" in output and "no input sent" in output, output)
+        output = await tools.peek("page.text", {"selector": "#out", "tab": safety_tab}, **ctx)
+        require("untouched" in output, output)
+        output = await tools.poke("page.eval", {"js": "document.getElementById('session').style.display = 'inline-block'",
+                                              "tab": safety_tab}, **ctx)
+        require(not output.startswith("Error:"), output)
+        output = await tools.poke("page.click", {"text": "Hi", "tab": safety_tab}, **ctx)
+        require("Clicked" in output, output)
+        output = await tools.peek("page.text", {"selector": "#out", "tab": safety_tab}, **ctx)
+        require("session:true" in output, output)
+        output = await tools.poke("page.eval", {"js": (
+            "document.body.insertAdjacentHTML('beforeend', "
+            "'<div style=\"position:fixed;inset:0;z-index:9999\">overlay</div>')"), "tab": safety_tab}, **ctx)
+        require(not output.startswith("Error:"), output)
+        output = await tools.poke("page.click", {"selector": "#session", "tab": safety_tab}, **ctx)
+        require(output.startswith("Error:") and "no input sent" in output, output)
+        output = await tools.peek("page.text", {"selector": "#out", "tab": safety_tab}, **ctx)
+        require("session:true" in output, output)
+
         rendered = f"{site}/doc.pdf"
         # No url or format: an HTML page is rendered by the .pdf extension.
-        output = await tools.poke("page.save", {"path": rendered}, **ctx)
+        output = await tools.poke("page.save", {"path": rendered, "tab": tab}, **ctx)
         require("Saved" in output and "application/pdf" in output, output)
         fetched = f"{WORKSPACE}/fetched.pdf"
         output = await tools.poke("page.save", {"path": fetched, "url": "http://localhost:8767/doc.pdf"}, **ctx)
