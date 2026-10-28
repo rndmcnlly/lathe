@@ -1331,7 +1331,8 @@ async def test_released_background_job_reports_its_real_duration(tools, sandbox,
     await let_pollers_finish()
     assert not list((tmp_path / "lathe" / "cmd").glob("*/pid"))  # released before the claim
     later = await tools.bash("true", workdir=str(tmp_path), __user__=USER, __chat_id__="chat")
-    assert later.count("Background job completed") == 1 and "(took 2s)" in later
+    assert later.count("Background job completed") == 1
+    assert int(re.search(r"\(took (\d+)s\)", later).group(1)) >= 2  # exact values: fixed-mtime test
 
 
 async def test_notice_duration_uses_sandbox_start_and_end(tools, sandbox, http, tmp_path, monkeypatch):
