@@ -2,7 +2,7 @@
 /** Deterministic Playwright adapter for the declarative Lathe demo scenario. */
 
 import { mkdirSync, readFileSync, rmSync } from "node:fs";
-import { readFile, rename, writeFile } from "node:fs/promises";
+import { readFile, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -11,7 +11,7 @@ import { strFromU8, strToU8, unzipSync, zipSync } from "fflate";
 
 import { normalizedToolEvents, matchesToolExpectation, privatePreviewUrl, assertSuccessfulTurn } from "./evidence.mjs";
 import { runScenario } from "./interpreter.mjs";
-import { enableLathe as enableOwuiLathe, openOwuiChat, typeMessage } from "./owui.mjs";
+import { enableLathe as enableOwuiLathe, openOwuiChat, saveRecording, typeMessage } from "./owui.mjs";
 import { followDirectoryArtifact } from "./preview.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -557,10 +557,7 @@ try {
       log("trace", `Sanitization failed, removing trace from upload set: ${error.message}`);
       return import("node:fs/promises").then(({ rm }) => rm(tracePath, { force: true }));
     });
-    const video = state.page?.video();
-    await state.context.close();
-    const videoPath = await video?.path().catch(() => null);
-    if (videoPath) await rename(videoPath, resolve(OUT_DIR, "demo.webm"));
+    await saveRecording(state.page, state.context, resolve(OUT_DIR, "demo.webm"));
   }
   if (state.loginContext) await state.loginContext.close().catch(() => {});
   await browser.close();

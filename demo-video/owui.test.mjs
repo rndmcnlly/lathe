@@ -1,7 +1,30 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { chromium } from "playwright";
-import { enableLathe, openOwuiChat, typeMessage } from "./owui.mjs";
+import { enableLathe, openOwuiChat, saveRecording, typeMessage } from "./owui.mjs";
+
+test("recording delivery copies completed video instead of requiring a same-filesystem rename", { timeout: 15000 }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "lathe-recording-"));
+  const browser = await chromium.launch({ headless: true });
+  try {
+    const context = await browser.newContext({ recordVideo: { dir: join(directory, "raw") } });
+    const page = await context.newPage();
+    await page.setContent("<h1>Recorded artifact</h1>");
+    await page.screenshot(); // Ensure the browser has painted a frame.
+    const original = await page.video().path();
+    const destination = join(directory, "demo.webm");
+    await saveRecording(page, context, destination);
+    const bytes = await readFile(destination);
+    assert.ok(bytes.length > 0);
+    assert.deepEqual(bytes, await readFile(original), "delivery copies rather than renames the recording");
+  } finally {
+    await browser.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
 
 // Accessibility contract from OWUI v0.13.0 IntegrationsMenu.svelte:
 // https://github.com/open-webui/open-webui/pull/32940 (menu roles, Oct 22)

@@ -1,4 +1,11 @@
 /** Wait for usable chat UI, not network silence in a realtime application. */
+export async function saveRecording(page, context, path) {
+  const video = page?.video();
+  await context.close();
+  // Playwright copies the completed recording, including across filesystems.
+  if (video) await video.saveAs(path);
+}
+
 export async function enableLathe(page, {
   click = async (target) => target.click(),
   emphasize = async () => {},
