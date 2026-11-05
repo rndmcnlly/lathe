@@ -1,7 +1,69 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { chromium } from "playwright";
-import { openOwuiChat, typeMessage } from "./owui.mjs";
+import { enableLathe, openOwuiChat, typeMessage } from "./owui.mjs";
+
+// Accessibility contract from OWUI v0.13.0 IntegrationsMenu.svelte:
+// https://github.com/open-webui/open-webui/pull/32940 (menu roles, Oct 22)
+// https://github.com/open-webui/open-webui/pull/33065 (sibling controls, Oct 24)
+// Deliberately omit upstream IDs/classes and keep the visual switch inert.
+function integrationsFixture(name, checked, { broken = false } = {}) {
+  return `<!doctype html><html><body>
+    <p>Lathe</p><button>Tools 99</button>
+    <button aria-label="Integrations" onclick="document.querySelector('[role=menu]').hidden = false">Open</button>
+    <div role="menu" hidden>
+      <button role="menuitem" onclick="this.hidden = true; document.querySelector('#tool-list').hidden = false">Tools <span>2</span></button>
+      <section id="tool-list" hidden>
+        <button role="menuitemcheckbox" aria-checked="false">Other tool</button>
+        <div role="presentation" onclick="if (event.target.closest('[role=menuitemcheckbox]')) {
+          window.toggleClicks++;
+          if (!${broken}) this.querySelector('[role=menuitemcheckbox]').setAttribute('aria-checked', 'true');
+        }">
+          <button role="menuitemcheckbox" aria-checked="${checked}">${name}</button>
+          <button aria-label="Valves" onclick="window.valveClicks++">Settings</button>
+          <div inert><button role="switch" aria-checked="false">Decorative switch</button></div>
+        </div>
+      </section>
+    </div>
+    <script>
+      window.toggleClicks = 0;
+      window.valveClicks = 0;
+      document.addEventListener('keydown', event => {
+        if (event.key === 'Escape') document.querySelector('[role=menu]').hidden = true;
+      });
+    </script>
+  </body></html>`;
+}
+
+for (const name of ["Lathe", "Lathe Test"]) {
+  for (const checked of [false, true]) {
+    test(`enable ${name} through menu accessibility semantics, initially checked=${checked}`, { timeout: 10000 }, async () => {
+      const browser = await chromium.launch({ headless: true });
+      try {
+        const page = await browser.newPage();
+        await page.setContent(integrationsFixture(name, checked));
+        await enableLathe(page);
+        // Reopen the menu to observe the result, not the adapter's return value.
+        await page.getByRole("button", { name: "Integrations", exact: true }).click();
+        assert.equal(await page.getByRole("menuitemcheckbox", { name, exact: true }).isChecked(), true);
+        assert.equal(await page.getByRole("menuitemcheckbox", { name: "Other tool" }).isChecked(), false);
+        assert.deepEqual(await page.evaluate(() => [window.toggleClicks, window.valveClicks]), [checked ? 0 : 1, 0]);
+        assert.equal(await page.getByRole("switch").isChecked(), false, "decoration must not supply the authoritative checked state");
+      } finally { await browser.close(); }
+    });
+  }
+}
+
+test("enabling a tool requires observed checked state, not just a successful click", { timeout: 10000 }, async () => {
+  const browser = await chromium.launch({ headless: true });
+  try {
+    const page = await browser.newPage();
+    await page.setContent(integrationsFixture("Lathe", false, { broken: true }));
+    await assert.rejects(enableLathe(page), /Timeout/);
+    assert.equal(await page.evaluate(() => window.toggleClicks), 1);
+    assert.equal(await page.getByRole("menu").isVisible(), true, "failure must not advance to dismissing the menu");
+  } finally { await browser.close(); }
+});
 
 test("chat readiness dismisses release notes despite ongoing network activity and survives a fresh recording context", { timeout: 10000 }, async () => {
   const browser = await chromium.launch({ headless: true });

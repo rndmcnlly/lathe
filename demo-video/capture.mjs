@@ -11,7 +11,7 @@ import { strFromU8, strToU8, unzipSync, zipSync } from "fflate";
 
 import { normalizedToolEvents, matchesToolExpectation, privatePreviewUrl, assertSuccessfulTurn } from "./evidence.mjs";
 import { runScenario } from "./interpreter.mjs";
-import { openOwuiChat, typeMessage } from "./owui.mjs";
+import { enableLathe as enableOwuiLathe, openOwuiChat, typeMessage } from "./owui.mjs";
 import { followDirectoryArtifact } from "./preview.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -62,7 +62,6 @@ const ALLOWED_PROXY_DOMAINS = (
 const TARGETS = {
   "owui.chat-input": ["#chat-input"],
   "owui.send": ["#send-message-button"],
-  "owui.integration-menu": ["#integration-menu-button", "#tools-menu-button"],
 };
 
 const started = Date.now();
@@ -213,42 +212,18 @@ async function waitForResponse(page, timeoutMs) {
 }
 
 async function enableLathe(page, { tutorial = false } = {}) {
-  let menuSelector;
-  for (const selector of TARGETS["owui.integration-menu"]) {
-    if (await page.locator(selector).isVisible().catch(() => false)) {
-      menuSelector = selector;
-      break;
-    }
+  if (tutorial) await installTutorialCursor(page);
+  try {
+    return await enableOwuiLathe(page, tutorial ? {
+      click: (target, settleMs) => tutorialClick(page, target, settleMs),
+      emphasize: async (target) => {
+        await moveTutorialCursor(page, target, 450);
+        await emphasizeTutorialTarget(page, target, 850);
+      },
+    } : {});
+  } finally {
+    if (tutorial) await hideTutorialCursor(page);
   }
-  if (!menuSelector) throw new Error("Could not find the logical Open WebUI integration menu target");
-  const menu = page.locator(menuSelector);
-  if (tutorial) {
-    await installTutorialCursor(page);
-    await tutorialClick(page, menu, 650);
-  } else {
-    await menu.click();
-  }
-  const tools = page.getByRole("button", { name: /^Tools \d+$/ }).last();
-  await tools.waitFor({ state: "visible", timeout: 5000 });
-  if (tutorial) await tutorialClick(page, tools, 650);
-  else await tools.click();
-  const row = page.getByRole("button", { name: /Lathe(?: Test)?$/ }).last();
-  await row.waitFor({ state: "visible", timeout: 5000 });
-  const toggle = row.locator('button[role="switch"]');
-  await toggle.waitFor({ state: "visible", timeout: 5000 });
-  if (tutorial) {
-    await moveTutorialCursor(page, toggle, 450);
-    await emphasizeTutorialTarget(page, row, 850);
-  }
-  if (await toggle.getAttribute("aria-checked") !== "true") {
-    if (tutorial) await tutorialClick(page, toggle, 900, row);
-    else await row.click({ timeout: 3000 });
-  } else if (tutorial) {
-    await page.waitForTimeout(900);
-  }
-  await page.keyboard.press("Escape");
-  if (tutorial) await hideTutorialCursor(page);
-  return menuSelector;
 }
 
 async function scrollChatToBottom(page) {
