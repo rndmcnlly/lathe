@@ -405,7 +405,7 @@ def cleanup_demo(directory):
             errors.append(monitor.sanitize(result.stderr or "Could not remove demo network"))
     except Exception as exc:
         errors.append(monitor.sanitize(str(exc)))
-    (directory / "demo-cleanup.json").write_text(json.dumps({"success": not errors, "errors": errors}, indent=2))
+    monitor.record_cleanup(directory, "demo-cleanup.json", errors)
     return bool(errors)
 
 

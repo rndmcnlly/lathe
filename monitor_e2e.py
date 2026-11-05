@@ -300,9 +300,19 @@ async def cleanup_sandboxes():
     await suite.cleanup_test_sandboxes()
 
 
+def record_cleanup(directory, filename, errors):
+    """Keep each attempt: a successful last-resort cleanup must not erase failure evidence."""
+    path = directory / filename
+    previous = json.loads(path.read_text()) if path.exists() else None
+    attempts = previous.get("attempts", [previous]) if previous else []
+    result = {"success": not errors, "errors": [sanitize(error) for error in errors]}
+    attempts.append(result)
+    path.write_text(json.dumps({**result, "attempts": attempts}, indent=2) + "\n")
+
+
 def cleanup(directory):
     """Stop tool execution before external cleanup, including after cancellation."""
-    failed = False
+    errors = []
     state = directory / "environment.json"
     if state.exists():
         os.environ["LATHE_TEST_DEPLOYMENT_LABEL"] = json.loads(state.read_text())["deployment_label"]
@@ -317,14 +327,15 @@ def cleanup(directory):
     finally:
         removal = docker("rm", "--force", "--volumes", CONTAINER, check=False, timeout=60)
         if removal.returncode and "No such container" not in removal.stderr:
-            failed = True
+            errors.append(removal.stderr or f"Could not remove {CONTAINER}")
         try:
             asyncio.run(cleanup_sandboxes())
         except Exception as exc:
-            failed = True
-            (directory / "cleanup-error.log").write_text(sanitize(str(exc)))
-    (directory / "cleanup.json").write_text(json.dumps({"success": not failed}) + "\n")
-    return failed
+            errors.append(str(exc))
+            with (directory / "cleanup-error.log").open("a") as out:
+                out.write(sanitize(str(exc)) + "\n")
+    record_cleanup(directory, "cleanup.json", errors)
+    return bool(errors)
 
 
 def launch(directory, *, docker_args=(), tool_call_iterations=12):

@@ -290,6 +290,9 @@ the infrastructure directory's `independent-files.json`.
 The small infrastructure artifact also contains that qualification manifest,
 so requested/served-model and checkout evidence do not require downloading the
 large video/Playwright archive. Repeated cleanup preserves original startup logs.
+Both cleanup JSON reports retain an `attempts` history with sanitized errors;
+their top-level result describes the latest attempt. A successful last-resort
+cleanup does not erase the original failure or qualify a failed capture command.
 
 Local live runs shared with other review sessions must hold the review lock for
 the full subprocess lifetime. After explicitly supplying both provider keys,

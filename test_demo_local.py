@@ -65,6 +65,24 @@ def test_demo_cleanup_attempts_every_resource_and_fails_closed(tmp_path, monkeyp
     assert (tmp_path / f"{demo.WORKER}.log").read_text() == "original startup evidence"
 
 
+def test_repeated_cleanup_preserves_first_failure_and_latest_result(tmp_path, monkeypatch):
+    (tmp_path / "environment.json").write_text(json.dumps({"deployment_label": "lathe-ci-demo-fixture"}))
+    failure = [True]
+    def docker(*args, **kwargs):
+        error = "network has active endpoints https://private.example/secret" if failure[0] and args[0] == "network" else ""
+        return subprocess.CompletedProcess(args, int(bool(error)), "", error)
+    monkeypatch.setattr(demo.monitor, "docker", docker)
+    monkeypatch.setattr(demo.monitor, "cleanup", lambda directory: False)
+    assert demo.cleanup_demo(tmp_path)
+    failure[0] = False
+    assert not demo.cleanup_demo(tmp_path)
+    report = json.loads((tmp_path / "demo-cleanup.json").read_text())
+    assert report["success"] is True
+    assert [attempt["success"] for attempt in report["attempts"]] == [False, True]
+    assert "active endpoints" in report["attempts"][0]["errors"][0]
+    assert "https://private.example/secret" not in json.dumps(report)
+
+
 @pytest.mark.parametrize("fault", [None, "capture", "cleanup", "model", "models", "requests", "evidence", "files", "egress"])
 def test_publication_qualification_requires_independent_evidence(tmp_path, monkeypatch, fault):
     monkeypatch.setattr(demo, "ROOT", tmp_path)

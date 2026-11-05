@@ -524,6 +524,27 @@ def test_host_stops_tool_execution_before_sandbox_cleanup(tmp_path, monkeypatch,
     assert json.loads((tmp_path / "cleanup.json").read_text())["success"] is not cleanup_fails
 
 
+def test_cleanup_preserves_removal_failure_after_successful_retry(tmp_path, monkeypatch):
+    import subprocess
+    (tmp_path / "environment.json").write_text(json.dumps({"deployment_label": "lathe-ci-owned"}))
+    failure = [True]
+    def docker(*args, **kwargs):
+        error = "removal denied https://private.example/secret" if failure[0] and args[0] == "rm" else ""
+        return subprocess.CompletedProcess(args, int(bool(error)), "", error)
+    async def sandboxes():
+        pass
+    monkeypatch.setattr(monitor, "docker", docker)
+    monkeypatch.setattr(monitor, "cleanup_sandboxes", sandboxes)
+    assert monitor.cleanup(tmp_path)
+    failure[0] = False
+    assert not monitor.cleanup(tmp_path)
+    report = json.loads((tmp_path / "cleanup.json").read_text())
+    assert report["success"] is True
+    assert [attempt["success"] for attempt in report["attempts"]] == [False, True]
+    assert "removal denied" in report["attempts"][0]["errors"][0]
+    assert "https://private.example/secret" not in json.dumps(report)
+
+
 def socket_event(payload, kind="chat:completion", detail=None, **overrides):
     return {"chat_id": payload["chat_id"], "message_id": payload["id"],
             "data": {"type": kind, "data": detail or {}}, **overrides}
