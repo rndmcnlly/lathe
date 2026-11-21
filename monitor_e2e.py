@@ -272,7 +272,8 @@ async def inside(directory):
         import test_deployment as suite
         suite.TRACE = trace
         result = await suite.main()
-        relay.verify_evidence()
+        if result == 0:
+            relay.verify_evidence()
     except Exception as exc:
         result = 1
         trace("fatal", error=f"{type(exc).__name__}: {exc}")

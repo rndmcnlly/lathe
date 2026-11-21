@@ -22,7 +22,7 @@ jobs:
   capture:
     if: github.repository == 'rndmcnlly/lathe' && github.event_name != 'pull_request'
     environment: lathe-demo
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     env:
       LATHE_MONITOR_MODEL: z-ai/glm-5.3-flash
@@ -37,17 +37,13 @@ jobs:
         with:
           node-version: 22
       - name: Install capture prerequisites
+        id: prerequisites
+        working-directory: demo-video
         run: |
-          npm ci --prefix demo-video
-          cd demo-video
-          npx playwright install --with-deps chromium
-      - name: Offline contracts
-        run: |
-          uv run --locked pytest
-          npm test --prefix demo-video
+          npm ci
+          npx playwright install --with-deps --only-shell chromium
       - name: Disposable OWUI, private Worker, and live model capture
         id: capture
-        continue-on-error: true
         timeout-minutes: 35
         env:
           # Existing repository keys, or same-name overrides in lathe-demo.
@@ -80,6 +76,7 @@ jobs:
         if: always()
         env:
           CAPTURE_OUTCOME: ${{ steps.capture.outcome }}
+          PREREQUISITES_OUTCOME: ${{ steps.prerequisites.outcome }}
         run: |
           python - <<'PY'
           import json, os
@@ -95,14 +92,12 @@ jobs:
               out.write(f"- Requested model: {qualified.get('requested_model', os.environ['LATHE_MONITOR_MODEL'])}\n")
               out.write(f"- Serving models: {qualified.get('serving_models', [])}\n")
               out.write(f"- Failure domain: {data.get('failure_domain', 'infrastructure')}\n")
-              out.write(f"- First failing step: {data.get('failed_step', 'none')}\n")
+              fallback = ('Install capture prerequisites'
+                          if os.environ['PREREQUISITES_OUTCOME'] == 'failure' else 'none recorded')
+              out.write(f"- First failing step: {data.get('failed_step', fallback)}\n")
           PY
       - name: Enforce qualification
-        if: always()
-        env:
-          CAPTURE_OUTCOME: ${{ steps.capture.outcome }}
         run: |
-          test "$CAPTURE_OUTCOME" = success
           test "$(jq -r '.accepted' demo-video/out/qualification.json)" = true
           test "$(jq -r '.git_sha' demo-video/out/qualification.json)" = "$GITHUB_SHA"
 

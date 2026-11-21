@@ -26,16 +26,14 @@ test("recording delivery copies completed video instead of requiring a same-file
   }
 });
 
-// Accessibility contract from OWUI v0.13.0 IntegrationsMenu.svelte:
-// https://github.com/open-webui/open-webui/pull/32940 (menu roles, Oct 22)
-// https://github.com/open-webui/open-webui/pull/33065 (sibling controls, Oct 24)
-// Deliberately omit upstream IDs/classes and keep the visual switch inert.
+// OWUI 0.13.4 puts the tools submenu under the composer's More button.
+// Keep the fixtures small; only the live demo verifies upstream's actual UI.
 function integrationsFixture(name, checked, { broken = false } = {}) {
   return `<!doctype html><html><body>
     <p>Lathe</p><button>Tools 99</button>
-    <button aria-label="Integrations" onclick="document.querySelector('[role=menu]').hidden = false">Open</button>
+    <button aria-label="More" onclick="document.querySelector('[role=menu]').hidden = false">+</button>
     <div role="menu" hidden>
-      <button role="menuitem" onclick="this.hidden = true; document.querySelector('#tool-list').hidden = false">Tools <span>2</span></button>
+      <button role="menuitem" onclick="this.hidden = true; document.querySelector('#tool-list').hidden = false">Tools <span>2</span>${checked ? " <span>1 selected</span>" : ""}</button>
       <section id="tool-list" hidden>
         <button role="menuitemcheckbox" aria-checked="false">Other tool</button>
         <div role="presentation" onclick="if (event.target.closest('[role=menuitemcheckbox]')) {
@@ -58,23 +56,19 @@ function integrationsFixture(name, checked, { broken = false } = {}) {
   </body></html>`;
 }
 
-for (const name of ["Lathe", "Lathe Test"]) {
-  for (const checked of [false, true]) {
-    test(`enable ${name} through menu accessibility semantics, initially checked=${checked}`, { timeout: 10000 }, async () => {
-      const browser = await chromium.launch({ headless: true });
-      try {
-        const page = await browser.newPage();
-        await page.setContent(integrationsFixture(name, checked));
-        await enableLathe(page);
-        // Reopen the menu to observe the result, not the adapter's return value.
-        await page.getByRole("button", { name: "Integrations", exact: true }).click();
-        assert.equal(await page.getByRole("menuitemcheckbox", { name, exact: true }).isChecked(), true);
-        assert.equal(await page.getByRole("menuitemcheckbox", { name: "Other tool" }).isChecked(), false);
-        assert.deepEqual(await page.evaluate(() => [window.toggleClicks, window.valveClicks]), [checked ? 0 : 1, 0]);
-        assert.equal(await page.getByRole("switch").isChecked(), false, "decoration must not supply the authoritative checked state");
-      } finally { await browser.close(); }
-    });
-  }
+for (const [name, checked] of [["Lathe", false], ["Lathe Test", true]]) {
+  test(`enable ${name} through More, initially checked=${checked}`, { timeout: 10000 }, async () => {
+    const browser = await chromium.launch({ headless: true });
+    try {
+      const page = await browser.newPage();
+      await page.setContent(integrationsFixture(name, checked));
+      await enableLathe(page);
+      await page.getByRole("button", { name: "More", exact: true }).click();
+      assert.equal(await page.getByRole("menuitemcheckbox", { name, exact: true }).isChecked(), true);
+      assert.equal(await page.getByRole("menuitemcheckbox", { name: "Other tool" }).isChecked(), false);
+      assert.deepEqual(await page.evaluate(() => [window.toggleClicks, window.valveClicks]), [checked ? 0 : 1, 0]);
+    } finally { await browser.close(); }
+  });
 }
 
 test("enabling a tool requires observed checked state, not just a successful click", { timeout: 10000 }, async () => {

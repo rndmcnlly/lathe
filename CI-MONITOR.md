@@ -120,7 +120,9 @@ The monitor reuses `test_deployment.py`: byte-identical source, the complete
 independent schema contract, bash, write/read, interpreter, and image middleware.
 Its fresh loopback-only OWUI uses separate synthetic admin and non-admin completion
 accounts, exercising the same identity checks as existing-host tests. Both paths filter socket
-events by active chat/message IDs before recording them. Request-end evidence
+events by active chat/message IDs before recording them. The client creates
+each temporary chat ID from the authenticated Socket.IO namespace ID and a
+fresh conversation UUID. Request-end evidence
 includes elapsed time, HTTP acceptance/task ID, completed-call count, and the last
 matching status; unrelated account traffic never enters diagnostics.
 It then runs a first-time journey with a separate read-back check:
@@ -204,7 +206,7 @@ With the same two provider keys exported and Docker running:
 
 ```sh
 npm ci --prefix demo-video
-npm exec --prefix demo-video -- playwright install chromium
+npm exec --prefix demo-video -- playwright install --only-shell chromium
 uv run python demo_local.py
 ```
 
@@ -327,7 +329,9 @@ desired trusted-ref restrictions or approvals without blocking scheduled runs.
 Provider secrets remain `OPENROUTER_API_KEY` and `DAYTONA_API_KEY`, already
 present at repository level. No `DEMO_OWUI_URL`, `DEMO_PASSKEY`, or cloud token
 is required. Runs serialize without cancellation and always repeat cleanup and
-upload sanitized infrastructure/capture evidence.
+upload sanitized infrastructure/capture evidence. The demo uses Ubuntu 24.04
+and Playwright's Chromium headless shell. The full offline suite runs in
+**Offline CI**, not again before each scheduled capture.
 
 Manual dispatch defaults to capture/check only. `publish=true` enables
 publication **only on the default branch**, after accepted capture, routing,

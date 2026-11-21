@@ -3,7 +3,7 @@
 A real GLM 5.3 Flash conversation in Open WebUI: raw repair-café data and three
 short requests, not a scripted coding-agent capabilities showcase.
 
-1. Enable Lathe visibly through **Integrations → Tools → Lathe**.
+1. Enable Lathe visibly through **More → Tools → Lathe**.
 2. Ask for a quick analysis: repairs, volunteer time, and average item time
    by session, plus what blocked unsuccessful repairs. Include `repair-log.csv` as pasted individual records, keeping advice
    separate from repairs. The take must show a real `interpret` result without
@@ -29,7 +29,7 @@ With Docker, OpenSSL, Node/npm, and exported `DAYTONA_API_KEY` and
 
 ```sh
 npm ci --prefix demo-video
-npm exec --prefix demo-video -- playwright install chromium
+npm exec --prefix demo-video -- playwright install --only-shell chromium
 uv run python demo_local.py
 ```
 

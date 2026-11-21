@@ -337,7 +337,6 @@ class OWUIClient:
     def __init__(self, tool_id=TOOL_ID):
         self.tool_id = tool_id
         self.sio = socketio.AsyncClient()
-        self.session_id = None
         self.events = []
         self.done = asyncio.Event()
         self.max_calls = None
@@ -345,10 +344,6 @@ class OWUIClient:
         self.last_output = []
         self.traced_results = 0
         self.active_request = None
-
-        @self.sio.event
-        async def connect():
-            self.session_id = self.sio.sid
 
         @self.sio.on("*")
         async def catch_all(event, *args):
@@ -392,8 +387,6 @@ class OWUIClient:
             auth={"token": OWUI_TEST_TOKEN},
             wait_timeout=15,
         )
-        await self.sio.emit("user-join", {"auth": {"token": OWUI_TEST_TOKEN}})
-        await asyncio.sleep(0.5)
 
     async def close(self):
         if self.sio.connected:
@@ -401,6 +394,10 @@ class OWUIClient:
 
     async def send(self, prompt, *, timeout=180, max_calls=None):
         require(self.active_request is None, "OWUIClient supports only one active request")
+        # OWUI binds a new temporary chat to the authenticated Socket.IO
+        # namespace ID, not the underlying Engine.IO connection ID.
+        session_id = self.sio.get_sid()
+        require(session_id, "Connect to OWUI before sending a completion")
         self.events.clear()
         self.done.clear()
         self.max_calls = max_calls
@@ -412,9 +409,9 @@ class OWUIClient:
             "model": MODEL,
             "messages": [{"role": "user", "content": prompt}],
             "stream": True,
-            "chat_id": f"local:{uuid.uuid4()}",
+            "chat_id": f"temporary:{session_id}:{uuid.uuid4()}",
             "id": str(uuid.uuid4()),
-            "session_id": self.session_id,
+            "session_id": session_id,
             "tool_ids": [self.tool_id],
         }
         self.active_request = (payload["chat_id"], payload["id"])

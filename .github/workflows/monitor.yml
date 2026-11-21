@@ -43,16 +43,17 @@ jobs:
       - uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff # v6
         with:
           enable-cache: true
-      - name: Offline contracts
-        run: uv run --locked pytest test_unit.py test_monitor.py
+      - name: Monitor contracts
+        run: uv run --locked pytest test_monitor.py
       - name: Disposable Open WebUI, real inference, real Daytona
         timeout-minutes: 35
         env:
           DAYTONA_API_KEY: ${{ secrets.DAYTONA_API_KEY }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
         run: uv run --locked python monitor_e2e.py
+      # Guard against root-owned artifacts from the container. A failed
+      # monitor need not have a summary, so probe only after success.
       - name: Verify host-writable evidence
-        if: always()
         run: |
           python - <<'PY'
           from pathlib import Path

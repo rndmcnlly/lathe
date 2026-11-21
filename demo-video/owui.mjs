@@ -10,9 +10,10 @@ export async function enableLathe(page, {
   click = async (target) => target.click(),
   emphasize = async () => {},
 } = {}) {
-  const integrations = page.getByRole("button", { name: "Integrations", exact: true });
-  await click(integrations, 650);
-  const tools = page.getByRole("menuitem", { name: /^Tools\s+\d+$/ });
+  const more = page.getByRole("button", { name: "More", exact: true });
+  await more.waitFor({ state: "visible", timeout: 5000 });
+  await click(more, 650);
+  const tools = page.getByRole("menuitem", { name: /^Tools\s+\d+(?:\s+\d+ selected)?$/ });
   await tools.waitFor({ state: "visible", timeout: 5000 });
   await click(tools, 650);
 
@@ -26,7 +27,6 @@ export async function enableLathe(page, {
     name: /^Lathe(?: Test)?$/, checked: true,
   }).waitFor({ state: "visible", timeout: 5000 });
   await page.keyboard.press("Escape");
-  return "Integrations";
 }
 
 export async function typeMessage(page, text) {

@@ -261,10 +261,12 @@ async def serve():
             await configure_demo(api)
         # Private pipe to the parent, never written to an artifact or console.
         print(json.dumps({"ready": True, "token": token}), flush=True)
-        await asyncio.to_thread(sys.stdin.readline)
-        relay.verify_evidence()
-        async with httpx.AsyncClient(headers={"Authorization": f"Bearer {os.environ['DAYTONA_API_KEY']}"}, timeout=30) as http:
-            await verify_demo_files(http, directory)
+        # A rejected/interrupted capture still needs teardown, not evidence of
+        # steps it never reached. EOF is also an abandoned capture.
+        if await asyncio.to_thread(sys.stdin.readline) == "accepted\n":
+            relay.verify_evidence()
+            async with httpx.AsyncClient(headers={"Authorization": f"Bearer {os.environ['DAYTONA_API_KEY']}"}, timeout=30) as http:
+                await verify_demo_files(http, directory)
     finally:
         try:
             if suite and admin:
@@ -473,6 +475,7 @@ def main():
     (directory / "environment.json").write_text(json.dumps({
         "deployment_label": os.environ["LATHE_TEST_DEPLOYMENT_LABEL"]}))
     process = None
+    captured = False
     with tempfile.TemporaryDirectory(prefix="lathe-demo-") as temporary:
         try:
             path = Path(temporary)
@@ -507,11 +510,12 @@ def main():
             print(f"Recording local demo at http://127.0.0.1:{port}", flush=True)
             subprocess.run(["npm", "run", "capture"], cwd=ROOT / "demo-video", env=env,
                            check=True, timeout=1200)
+            captured = True
         finally:
             inner_failed = False
             if process:
                 try:
-                    stdout, stderr = process.communicate("done\n", timeout=45)
+                    stdout, stderr = process.communicate("accepted\n" if captured else "", timeout=45)
                     (directory / "demo-host.log").write_text(monitor.sanitize(stdout + stderr))
                     inner_failed = process.returncode != 0
                 except subprocess.TimeoutExpired:

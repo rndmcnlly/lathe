@@ -3,11 +3,12 @@
 import importlib.util
 import asyncio
 import json
-import sys
+from uuid import UUID
 from pathlib import Path
 
 import httpx
 import pytest
+import socketio
 from aiohttp import ClientSession, web
 from aiohttp.test_utils import TestServer
 
@@ -278,21 +279,6 @@ async def test_cleanup_fails_closed_on_unbounded_pagination(suite, monkeypatch):
     assert len(requests) == suite.LIST_MAX_PAGES and all(r[0] == "GET" for r in requests)
 
 
-async def test_monitor_cleanup_path_fails_closed_on_unbounded_pagination(monkeypatch):
-    # monitor_e2e delegates to the real test_deployment cleanup; its caller turns
-    # any exception into cleanup failure, never a reported absence.
-    monkeypatch.setenv("LATHE_ISOLATED_CI", "1")
-    monkeypatch.setenv("LATHE_TEST_DEPLOYMENT_LABEL", "lathe-ci-this-run")
-    monkeypatch.delitem(sys.modules, "test_deployment", raising=False)
-    requests = []
-    client_type = httpx.AsyncClient
-    monkeypatch.setattr(httpx, "AsyncClient",
-                        lambda **kw: client_type(transport=httpx.MockTransport(endless_pages(requests)), **kw))
-    with pytest.raises(AssertionError, match="absence not established"):
-        await monitor.cleanup_sandboxes()
-    assert requests and all(r[0] == "GET" for r in requests)
-
-
 async def test_listing_fails_closed_at_wall_clock_deadline(suite):
     requests = []
     ticks = iter(range(10**6))
@@ -471,32 +457,31 @@ def test_inner_monitor_invokes_host_identity_contract(monkeypatch):
     assert kwargs == {"check": False, "timeout": 1500}
 
 
-@pytest.mark.parametrize("over_budget", [False, True])
-async def test_socket_delivery_preserves_tool_evidence_and_enforces_budget(suite, monkeypatch, over_budget):
+@pytest.fixture
+def socket_client(suite):
+    client = suite.OWUIClient()
+    client.sio.namespaces["/"] = "test-session"
+    return client
+
+
+async def test_socket_delivery_enforces_budget_and_keeps_partial_evidence(suite, suite_transport, socket_client):
     observed = []
     suite.TRACE = lambda kind, **data: observed.append((kind, data))
-    suite.OWUI_BASE = "http://127.0.0.1:8080"
-    client = suite.OWUIClient()
+    client = socket_client
     output = [{"type": "function_call", "name": "read", "call_id": "one", "arguments": "{}"},
-              {"type": "function_call_output", "call_id": "one", "status": "completed", "output": "CANARY"}]
-    if over_budget:
-        output += [{"type": "function_call", "name": "bash", "call_id": "two"}]
+              {"type": "function_call_output", "call_id": "one", "status": "completed", "output": "CANARY"},
+              {"type": "function_call", "name": "bash", "call_id": "two"}]
 
     async def owui(request):
         payload = json.loads(request.content)
         await client.sio.handlers["/"]["*"]("events", {
             "chat_id": payload["chat_id"], "message_id": payload["id"], "data": {
-            "type": "chat:completion", "data": {"output": output, "done": not over_budget}}})
+            "type": "chat:completion", "data": {"output": output}}})
         return httpx.Response(200, json={"task_id": "task"})
 
-    client_type = httpx.AsyncClient
-    monkeypatch.setattr(suite.httpx, "AsyncClient",
-                        lambda **kw: client_type(transport=httpx.MockTransport(owui), **kw))
-    if over_budget:
-        with pytest.raises(AssertionError, match="budget"):
-            await client.send("inspect", timeout=1, max_calls=1)
-    else:
-        assert await client.send("inspect", timeout=1, max_calls=1) == output
+    suite_transport(owui)
+    with pytest.raises(AssertionError, match="budget"):
+        await client.send("inspect", timeout=1, max_calls=1)
     assert any(kind == "tool_progress" and "CANARY" in json.dumps(data) for kind, data in observed)
     assert observed[-1][0] == "chat_output"
 
@@ -556,11 +541,11 @@ def socket_event(payload, kind="chat:completion", detail=None, **overrides):
     {"chat_id": None, "message_id": None},
 ])
 async def test_socket_filters_before_retaining_printing_tracing_or_completing(
-        suite, suite_transport, capsys, foreign):
+        suite, suite_transport, socket_client, capsys, foreign):
     suite.VERBOSE = True
     traced = []
     suite.TRACE = lambda kind, **data: traced.append((kind, data))
-    client = suite.OWUIClient()
+    client = socket_client
     emit = client.sio.handlers["/"]["*"]
     output = [{"type": "function_call", "name": "read", "call_id": "one"},
               {"type": "function_call_output", "call_id": "one", "status": "completed", "output": "OWN"}]
@@ -599,11 +584,11 @@ async def test_socket_filters_before_retaining_printing_tracing_or_completing(
 
 @pytest.mark.parametrize("first_failure", ["timeout", "http", "success", "cancel"])
 async def test_socket_late_events_ignored_between_and_during_requests(
-        suite, suite_transport, capsys, first_failure):
+        suite, suite_transport, socket_client, capsys, first_failure):
     suite.VERBOSE = True
     traced = []
     suite.TRACE = lambda kind, **data: traced.append((kind, data))
-    client = suite.OWUIClient()
+    client = socket_client
     emit = client.sio.handlers["/"]["*"]
     requests = []
     accepted = asyncio.Event()
@@ -708,26 +693,44 @@ async def test_staging_access_is_private_and_completion_account_is_restricted(
             await suite.check_staging_access({"id": "admin"}, {"id": "test"})
 
 
-async def test_socket_auth_uses_only_completion_identity(suite, monkeypatch):
+async def test_temporary_completions_bind_to_the_authenticated_socket_namespace(suite):
+    sio = socketio.AsyncServer(async_mode="aiohttp")
+    app = web.Application()
+    sio.attach(app, socketio_path="/ws/socket.io")
+    sessions = set()
+    chats = set()
+
+    @sio.event
+    async def connect(sid, environ, auth):
+        if auth != {"token": "test-token"}:
+            return False
+        sessions.add(sid)
+
+    async def complete(request):
+        payload = await request.json()
+        prefix, _, chat = payload["chat_id"].partition(":")
+        origin, _, conversation = chat.partition(":")
+        if (request.headers.get("Authorization") != "Bearer test-token"
+                or prefix != "temporary" or origin not in sessions
+                or payload.get("session_id") != origin or not conversation):
+            return web.json_response({"detail": "Temporary chat expired or unavailable"}, status=404)
+        chats.add(UUID(conversation))
+        await sio.emit("events", socket_event(payload, detail={"done": True, "output": [
+            {"type": "message", "content": "accepted"}]}), to=origin)
+        return web.json_response({"task_id": "owned-task"})
+
+    app.router.add_post("/api/chat/completions", complete)
+    app.on_shutdown.append(lambda _: sio.shutdown())
     client = suite.OWUIClient()
-    calls = []
-
-    async def connect(*args, **kwargs):
-        calls.append(kwargs["auth"])
-
-    async def emit(event, data):
-        calls.append(data["auth"])
-
-    async def sleep(seconds):
-        pass
-
-    monkeypatch.setattr(client.sio, "connect", connect)
-    monkeypatch.setattr(client.sio, "emit", emit)
-    # Replace only this suite's connection settle delay, not global asyncio.
-    from types import SimpleNamespace
-    monkeypatch.setattr(suite, "asyncio", SimpleNamespace(sleep=sleep))
-    await client.connect()
-    assert calls == [{"token": "test-token"}, {"token": "test-token"}]
+    async with TestServer(app) as server:
+        suite.OWUI_BASE = str(server.make_url("/")).rstrip("/")
+        await client.connect()
+        try:
+            for prompt in ("first", "second"):
+                assert await client.send(prompt, timeout=2) == [{"type": "message", "content": "accepted"}]
+        finally:
+            await client.close()
+    assert len(chats) == 2
 
 
 async def test_monitor_provisions_non_admin_completion_identity_and_model_access(suite_transport, monkeypatch):

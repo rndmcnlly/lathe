@@ -214,7 +214,7 @@ async function waitForResponse(page, timeoutMs) {
 async function enableLathe(page, { tutorial = false } = {}) {
   if (tutorial) await installTutorialCursor(page);
   try {
-    return await enableOwuiLathe(page, tutorial ? {
+    await enableOwuiLathe(page, tutorial ? {
       click: (target, settleMs) => tutorialClick(page, target, settleMs),
       emphasize: async (target) => {
         await moveTutorialCursor(page, target, 450);
@@ -458,9 +458,10 @@ const adapter = {
     return { observations: ["chat.state=fresh"] };
   },
 
-  "owui.enable-tool": async () => ({
-    observations: [`owui.integration-menu=${await enableLathe(state.page, { tutorial: true })}`, "owui.tool.Lathe=enabled"],
-  }),
+  "owui.enable-tool": async () => {
+    await enableLathe(state.page, { tutorial: true });
+    return { observations: ["owui.tool.Lathe=enabled"] };
+  },
 
   "chat.send": async ({ prompt, dataFile, timeoutMs }) => {
     state.toolBaseline = normalizedToolEvents(await fetchChat(state).catch(() => null)).length;
