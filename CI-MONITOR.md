@@ -234,7 +234,7 @@ The Worker also drops to host UID/GID after its root-only CA installation,
 before npm/Wrangler creates files beside the bind-mounted configuration. This
 keeps temporary-directory removal host-owned, including `.wrangler/tmp`.
 
-The staging sandbox has `networkBlockAll=true`: no clone, installer, external
+The staging sandbox has `network_policy.block_all=true` on Daytona v2: no clone, installer, external
 asset, or ripgrep bootstrap is needed. OWUI still reaches OpenRouter and the
 Daytona control plane. The user gives raw individual repair records and first asks
 for quick analytics: repairs, time logged, average item time by session,

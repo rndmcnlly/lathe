@@ -43,7 +43,7 @@ The runner creates disposable OWUI, local Wrangler running the actual preview
 Worker, and loopback HTTPS infrastructure. A fixed synthetic identity exercises
 the Worker's PKCE/session flow, not Pocket ID or real passkeys. OWUI still reaches
 the model provider and Daytona control plane; the sandbox has actual
-`networkBlockAll=true` and no extra volumes. No production OWUI configuration,
+`network_policy.block_all=true` and no extra volumes. No production OWUI configuration,
 hosted login, or `.env` is imported by the runner. The upstream relay enforces ZDR,
 data-collection denial, price ceilings, a conservative $4.50 reservation cap, and
 request/output-token limits. See [CI-MONITOR.md](../CI-MONITOR.md).
