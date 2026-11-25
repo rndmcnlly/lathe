@@ -1806,6 +1806,45 @@ async def _ensure_desktop(valves, sandbox_id, client) -> str:
     return "Desktop was down; started it.\n"
 
 
+# The preview proxy enters through the sandbox's network interface, so it reaches
+# neither loopback listeners nor missing ones, and reports both as a bare 502.
+_LISTENER_SCRIPT = textwrap.dedent("""\
+    import os
+    found = set()
+    for table in ("/proc/net/tcp", "/proc/net/tcp6"):
+        if not os.path.exists(table):
+            continue
+        with open(table) as f:
+            for fields in map(str.split, list(f)[1:]):
+                address, port = fields[1].split(":")
+                if fields[3] == "0A" and int(port, 16) == PORT:
+                    # Words are little-endian: 127.0.0.0/8 (plain or v4-mapped) and ::1.
+                    v4 = len(address) == 8 or address.startswith("0" * 16 + "FFFF0000")
+                    loopback = address.endswith("7F") if v4 else address == "0" * 24 + "01000000"
+                    found.add("loopback" if loopback else "reachable")
+    print("reachable" if "reachable" in found else "loopback" if found else "absent")
+    """)
+
+
+async def _unreachable_reason(valves, sandbox_id, client, port: int) -> str | None:
+    """Explain why a preview of this port cannot work, or None if it can."""
+    try:
+        state = (await _run_sandbox_script(
+            valves, sandbox_id, client, f"PORT = {port}\n" + _LISTENER_SCRIPT,
+            error_prefix="listener check failed")).strip()
+    except Exception as exc:
+        logger.debug("expose: %s", exc)
+        return None  # Advisory: never block exposure because the check broke.
+    if state == "loopback":
+        return (f"port {port} listens only on loopback (127.0.0.1/localhost), which the preview "
+                "proxy cannot reach. Restart the service bound to 0.0.0.0, then call expose again. "
+                "Binding to 0.0.0.0 does not make it public: access still follows the expose policy.")
+    if state == "absent":
+        return (f"nothing is listening on port {port}. Start the service with bash bound to "
+                "0.0.0.0, check that it is ready, then call expose again.")
+    return None
+
+
 # v2 serves RFB on loopback 5900 without a web page. Runs only for expose.
 _VNC_PORT = 6080
 _VNC_BRIDGE_SCRIPT = textwrap.dedent(f"""\
@@ -4626,7 +4665,8 @@ class Tools:
             token/secret/key values and login-token URLs from screen-facing
             inspection unless the user asked for those values; this is a display
             habit, not automatic secret detection.
-            Use the least reachable bind address the proxy can actually access.
+            Bind services you will expose to 0.0.0.0: the preview proxy cannot reach
+            loopback. Keep everything else on 127.0.0.1.
             Disable app authentication only behind a verified private authenticated
             proxy with no unauthenticated direct path; otherwise retain app auth.
             Private registration does not secure other routes to the same app.
@@ -4672,7 +4712,7 @@ class Tools:
 
             Check port 8000 using the identity/reuse procedure above, then start:
 
-            bash(command="python3 -m http.server 8000 --bind 127.0.0.1 --directory /home/daytona/workspace/site",
+            bash(command="python3 -m http.server 8000 --bind 0.0.0.0 --directory /home/daytona/workspace/site",
                  foreground_seconds=0)
 
             Keep the returned background descriptor. In a subsequent bash call,
@@ -4682,8 +4722,7 @@ class Tools:
 
             expose(target="http:8000", access="private")
 
-            Verify that the preview reaches this server. If the proxy cannot reach
-            loopback, diagnose its routing before changing the bind address; do not
+            Verify that the preview reaches this server. If it does not, do not
             silently switch to public access. Public exposure requires the user's
             explicit request. Editing files under the served root needs only a
             browser refresh, not a server restart.
@@ -5293,6 +5332,10 @@ class Tools:
                                        'then peek(command="status") before exposing VNC.')
                 await _run_sandbox_script(self.valves, sandbox_id, client, _VNC_BRIDGE_SCRIPT,
                                           error_prefix="VNC unavailable")
+            else:
+                reason = await _unreachable_reason(self.valves, sandbox_id, client, port)
+                if reason:
+                    raise _ToolFailure(reason)
             await _emit(__event_emitter__, f"Generating URL for port {port}...")
             url, access_note = await _http_preview(
                 self.valves, sandbox_id, port, __user__, access, tag, client,

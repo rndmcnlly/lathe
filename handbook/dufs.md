@@ -40,7 +40,7 @@ help and the user's requested operations:
 
 ```sh
 /absolute/installation/dufs /home/daytona/workspace/share \
-  --bind 127.0.0.1 --port 5000 \
+  --bind 0.0.0.0 --port 5000 \
   --allow-upload --allow-search --allow-archive --allow-hash
 ```
 

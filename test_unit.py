@@ -2780,6 +2780,11 @@ async def test_vnc_does_not_start_desktop_or_downgrade_private(tools, sandbox, h
     assert result.startswith("Error:") and "no noVNC bridge" in result and "https://" not in result
 
 
+def only_checked_listener(calls):
+    """No URL was minted or registered: nothing beyond the in-sandbox check."""
+    return [(r.url.host, r.url.path) for r in calls] == [("proxy.test", "/sb/processes")]
+
+
 @pytest.fixture
 def preview(tools, sandbox, http):
     upstream, protected, secret = "https://secret.preview.test/", "https://owner.preview.test/", "installation-secret"
@@ -2812,13 +2817,59 @@ def preview(tools, sandbox, http):
             assert (request.method, request.url.path) == ("POST", "/sb/processes")
             if setup_failure:
                 return httpx.Response(200, json=process("checksum mismatch", 1))
-            return httpx.Response(200, json=process("READY PID=123"))
+            assert "PORT = " in argv_of(request)[2]
+            return httpx.Response(201, json=process("reachable"))
         http(handler)
         result = await tools.expose(target, access, tag, upstream_headers=upstream_headers or {},
                                     public_headers_acknowledged=acknowledged,
                                     __user__=user, __event_emitter__=emit)
         return result, calls, json.dumps(events)
     return SimpleNamespace(invoke=invoke, upstream=upstream, protected=protected, secret=secret, good=good)
+
+
+@pytest.mark.parametrize("access", ["public", "private"])
+@pytest.mark.parametrize("state,message", [("loopback", "bound to 0.0.0.0"), ("absent", "nothing is listening on port 5000")])
+async def test_unreachable_service_never_mints_a_preview(tools, sandbox, http, access, state, message):
+    tools.valves.preview_wrapper_url, tools.valves.preview_wrapper_key = "https://wrapper.test/register", "key"
+    calls = []
+    def handler(request):
+        calls.append(request.url.path)
+        return httpx.Response(201, json=process(state + "\n"))
+    http(handler)
+    result = await tools.expose("http:5000", access, __user__=USER)
+    assert result.startswith("Error:") and message in result and "https://" not in result
+    assert calls == ["/sb/processes"]
+
+
+@pytest.mark.parametrize("failure", [httpx.Response(503), httpx.Response(201, json=process("boom", 1))])
+async def test_broken_listener_check_does_not_block_exposure(tools, sandbox, http, failure):
+    def handler(request):
+        if request.url.host == "api.test":
+            return httpx.Response(201, json={"url": "https://signed.test/"})
+        return failure
+    http(handler)
+    assert "https://signed.test/" in await tools.expose("http:5000", "public", __user__=USER)
+
+
+HEADER = "  sl  local_address rem_address   st\n"
+@pytest.mark.parametrize("tcp,tcp6,expected", [
+    ("0: 0100007F:1F40 00000000:0000 0A", None, "loopback"),
+    ("0: 0200FF0A:1F40 00000000:0000 0A", None, "reachable"),
+    ("0: 00000000:1F40 00000000:0000 0A", None, "reachable"),
+    ("0: 0100007F:1F40 00000000:0000 0A\n1: 00000000:1F40 00000000:0000 0A", None, "reachable"),
+    ("0: 00000000:1F41 00000000:0000 0A", None, "absent"),
+    ("0: 00000000:1F40 00000000:0000 01", None, "absent"),  # established, not listening
+    ("", "0: 00000000000000000000000000000000:1F40 0:0 0A", "reachable"),
+    ("", "0: 00000000000000000000000001000000:1F40 0:0 0A", "loopback"),
+    ("", "0: 0000000000000000FFFF00000100007F:1F40 0:0 0A", "loopback"),
+    ("", "0: 0000000000000000FFFF00000200FF0A:1F40 0:0 0A", "reachable"),
+])
+def test_listener_classification(tmp_path, tcp, tcp6, expected):
+    (tmp_path / "tcp").write_text(HEADER + tcp + "\n" if tcp else HEADER)
+    if tcp6 is not None:
+        (tmp_path / "tcp6").write_text(HEADER + tcp6 + "\n")
+    script = lathe._LISTENER_SCRIPT.replace("/proc/net", str(tmp_path))
+    assert run_script("PORT = 8000\n" + script).strip() == expected
 
 
 @pytest.mark.parametrize("target", ["http:1024", "http:5000", "http:65535"])
@@ -2918,7 +2969,7 @@ async def test_header_requests_require_wrapper_before_signing(preview, tools, ac
     result, calls, events = await preview.invoke(
         access=access, acknowledged=access == "public",
         upstream_headers={"Authorization": "secret-app-credential"})
-    assert result.startswith("Error:") and not calls
+    assert result.startswith("Error:") and only_checked_listener(calls)
     assert "secret-app-credential" not in result + events
 
 
@@ -3001,10 +3052,10 @@ async def test_preview_configuration_and_direct_mode(preview, tools):
     result, calls, _ = await preview.invoke(access="secret")
     assert result.startswith("Error:") and not calls
     result, calls, _ = await preview.invoke(user={"email": USER["email"]})
-    assert result.startswith("Error:") and not calls
+    assert result.startswith("Error:") and only_checked_listener(calls)
     tools.valves.preview_wrapper_key = ""
     result, calls, _ = await preview.invoke()
-    assert result.startswith("Error:") and not calls
+    assert result.startswith("Error:") and only_checked_listener(calls)
     tools.valves.preview_wrapper_url = ""
     result, calls, _ = await preview.invoke()
     assert result.startswith("Error:") and preview.upstream not in result

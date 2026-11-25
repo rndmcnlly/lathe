@@ -84,7 +84,7 @@ workspace paths with the inspected absolute paths:
 
 ```sh
 /absolute/installation/bin/code-server \
-  --bind-addr 127.0.0.1:8080 --auth none \
+  --bind-addr 0.0.0.0:8080 --auth none \
   --disable-telemetry /home/daytona/workspace
 ```
 
@@ -93,8 +93,8 @@ no unauthenticated direct route exists. Otherwise retain code-server's password
 authentication (inspect `~/.config/code-server/config.yaml`, or use a dedicated
 `--config` file). Do not print its password into chat or a skill. Verify the
 effective bind/auth settings in logs: environment variables and existing config
-can affect behavior. If loopback cannot be proxied, do not blindly widen binding
-with authentication disabled. Keep the IDE private even with app authentication.
+can affect behavior. The `0.0.0.0` bind is what Daytona's preview proxy needs;
+where a proxy can reach loopback, use that instead. Keep the IDE private even with app authentication.
 
 Use background execution with logs and recorded process identity as described
 in the index. Wait with a bounded retry loop for an HTTP response from the

@@ -14,7 +14,7 @@ Reuse a healthy matching server instead of creating a duplicate. Ask about a
 different root or occupied port rather than stopping somebody else's work.
 
 ```sh
-python3 -m http.server 8000 --bind 127.0.0.1 \
+python3 -m http.server 8000 --bind 0.0.0.0 \
   --directory /home/daytona/workspace/my-site
 ```
 
@@ -27,8 +27,8 @@ without an index, and **follows symlinks**, potentially serving files outside
 the chosen directory. Audit the tree including symlinked directories. Do not
 claim root confinement or use it for hostile concurrent filesystem activity.
 For untrusted content or a less controlled environment, choose a server with
-the required controls instead. Loopback works only if the intended proxy can
-reach it; do not broaden binding without evaluating direct routes and auth.
+the required controls instead. Daytona's preview proxy cannot reach loopback;
+where another proxy can, prefer `127.0.0.1`.
 
 ## Lathe-only preview step
 
