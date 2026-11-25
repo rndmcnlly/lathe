@@ -651,13 +651,18 @@ async def test_completed_bash_retention_is_bounded(tools, monkeypatch, tmp_path,
         assert not list(command_root.iterdir())
 
 
-async def test_bash_launch_failure_discards_wrapper(tools, sandbox, http):
+@pytest.mark.parametrize("failure", [400, 503, "timeout", "missing-id"])
+async def test_bash_launch_failure_preserves_evidence_unless_rejected(tools, sandbox, http, failure):
     requests = []
 
     def handler(request):
         requests.append((request.method, request.url.path))
         if launches_bash(request):
-            return httpx.Response(500, text="launch failed")
+            if failure == "timeout":
+                raise httpx.ReadTimeout("response lost", request=request)
+            if failure == "missing-id":
+                return httpx.Response(201, json={})
+            return httpx.Response(failure, text="launch failed")
         if (request.method, request.url.path) == ("POST", "/sb/processes"):
             return httpx.Response(201, json=process())
         if (request.method, request.url.path) == ("POST", "/sb/files/upload"):
@@ -668,8 +673,32 @@ async def test_bash_launch_failure_discards_wrapper(tools, sandbox, http):
 
     http(handler)
     result = await tools.bash("true", __user__=USER)
-    assert result.startswith("API error: HTTP 500")
-    assert ("DELETE", "/sb/files") in requests
+    if failure == 400:
+        assert result.startswith("API error: HTTP 400")
+        assert ("DELETE", "/sb/files") in requests
+    else:
+        assert "outcome is unknown" in result and "Do not automatically rerun" in result
+        assert "CMD=" in result and "/log" in result and "/exit" in result
+        assert ("DELETE", "/sb/files") not in requests
+    assert requests.count(("POST", "/sb/processes")) == 2
+
+
+async def test_signaled_bash_reports_failure_even_with_output(tools, sandbox, http, clock):
+    def handler(request):
+        if launches_bash(request):
+            return httpx.Response(201, json={"id": "p1", "state": "running"})
+        if request.url.path == "/sb/files/upload":
+            return httpx.Response(200)
+        if request.url.path == "/sb/processes/p1":
+            return httpx.Response(200, json={"state": "terminal", "signal": "SIGKILL"})
+        assert request.url.path == "/sb/processes"
+        script = json.loads(request.content)["argv"][-1]
+        data = json.dumps({"text": "partial output\n", "size": 15}) if "f.seek" in script and "lease" not in script else ""
+        return httpx.Response(201, json=process(data))
+
+    http(handler)
+    result = await tools.bash("true", __user__=USER)
+    assert result.startswith("Error:") and "SIGKILL" in result and "partial output" in result
 
 
 @pytest.mark.parametrize("command,log_size", [
@@ -1788,12 +1817,19 @@ async def test_stuck_boot_is_bounded_and_reports_daytona_reason(lifecycle, clock
     assert 120 <= clock() < 130
 
 
-async def test_duplicate_sandbox_association_refuses_use_and_destroy(tools, http):
+@pytest.mark.parametrize("paginated", [False, True])
+async def test_duplicate_sandbox_association_refuses_use_and_destroy(tools, http, paginated):
     calls = []
 
     def handler(request):
         calls.append((request.method, request.url.path))
         if calls[-1] == SEARCH:
+            if paginated and "cursor" not in request.url.params:
+                return httpx.Response(200, json={"sandboxes": [record(sandbox_id="a")], "next_cursor": "second"})
+            if paginated:
+                assert request.url.params["cursor"] == "second"
+                assert json.loads(request.url.params["labels"]) == {"test": USER["email"]}
+                return listing(record(sandbox_id="b"))
             return listing(record(sandbox_id="a"), record(sandbox_id="b"))
         assert request.method == "GET"
         return httpx.Response(200, json=record(sandbox_id=request.url.path.rsplit("/", 1)[1]))
@@ -1804,6 +1840,28 @@ async def test_duplicate_sandbox_association_refuses_use_and_destroy(tools, http
             await lathe._ensure_sandbox(tools.valves, USER["email"], client)
     assert "Multiple sandboxes" in await tools.destroy(__user__=USER, __event_call__=AsyncMock(return_value=True))
     assert {method for method, _ in calls} == {"GET"}
+
+
+async def test_resume_that_stops_fails_without_polling_until_timeout(lifecycle, clock):
+    _, ensure = lifecycle
+    with pytest.raises(RuntimeError, match="Sandbox stopped after"):
+        await ensure(record("paused"), record("assigned"), record("stopped"))
+    assert clock() < 10
+
+
+@pytest.mark.parametrize("late", [False, True])
+async def test_truncated_tool_output_fails_closed(tools, transport, late):
+    def handler(request):
+        if request.method == "POST":
+            data = process("partial information")
+            data["logs"].update(truncatedHead=not late, eof=not late, nextCursor="c1")
+            return httpx.Response(201, json=data)
+        assert request.url.params["cursor"] == "c1"
+        return httpx.Response(200, json={"truncatedHead": True, "eof": True})
+
+    async with httpx.AsyncClient(transport=transport(handler)) as client:
+        with pytest.raises(lathe._ToolFailure, match="incomplete tool output"):
+            await lathe._run_sandbox_script(tools.valves, "sb", client, "pass", error_prefix="script failed")
 
 
 async def test_destroy_requires_consent_and_authoritative_completion(tools, http, clock):
@@ -2857,7 +2915,8 @@ async def test_broken_listener_check_does_not_block_exposure(tools, sandbox, htt
             return httpx.Response(201, json={"url": "https://signed.test/"})
         return failure
     http(handler)
-    assert "https://signed.test/" in await tools.expose("http:5000", "public", __user__=USER)
+    result = await tools.expose("http:5000", "public", __user__=USER)
+    assert result.splitlines()[0] == "Service URL: https://signed.test/"
 
 
 HEADER = "  sl  local_address rem_address   st\n"

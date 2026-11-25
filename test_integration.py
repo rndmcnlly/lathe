@@ -24,6 +24,7 @@ import httpx
 from dotenv import load_dotenv
 
 from lathe import Tools, _api, _execute, _find_sandbox, _headers
+from test_deployment import labelled_sandboxes
 
 
 load_dotenv()
@@ -76,22 +77,19 @@ async def confirmed(_event):
 
 
 async def _delete_test_sandboxes(tools: Tools):
-    """Best-effort cleanup for the fixed, isolated test identity."""
-    async with httpx.AsyncClient() as client:
-        response = await client.get(
-            _api(tools.valves, "/sandboxes/search"),
-            params={"labels": json.dumps({DEPLOYMENT_LABEL: TEST_EMAIL})},
-            headers=_headers(tools.valves),
-            timeout=30,
-        )
-        response.raise_for_status()
-        matches = [
-            sandbox
-            for sandbox in response.json()["sandboxes"]
-            if (sandbox.get("labels") or {}).get(DEPLOYMENT_LABEL) == TEST_EMAIL
-        ]
+    """Clean up every sandbox for the isolated test identity."""
+    async with httpx.AsyncClient(headers=_headers(tools.valves)) as client:
+        matches = await labelled_sandboxes(client, DEPLOYMENT_LABEL, [TEST_EMAIL],
+                                          api_url=tools.valves.daytona_api_url)
         for sandbox in matches:
             url = _api(tools.valves, f"/sandboxes/{sandbox['id']}")
+            current = await client.get(url, timeout=30)
+            if current.status_code == 404:
+                continue
+            current.raise_for_status()
+            item = current.json()
+            if item.get("status") == "deleted" or (item.get("labels") or {}).get(DEPLOYMENT_LABEL) != TEST_EMAIL:
+                continue
             response = await client.delete(url, headers=_headers(tools.valves), timeout=30)
             if response.status_code not in (404, 409):
                 response.raise_for_status()
@@ -423,6 +421,20 @@ asyncio.run(main())
 
         output = await tools.peek("accessibility.tree", {"maxDepth": 1}, **ctx)
         require(not output.startswith("Error:"), output)
+
+        # An unrelated loopback listener must not be exposed or stopped.
+        output = await tools.bash(
+            "nohup python3 -m http.server 6080 --bind 127.0.0.1 >/tmp/lathe-vnc-conflict.log 2>&1 & "
+            "echo $! > /tmp/lathe-vnc-conflict.pid; "
+            "for i in $(seq 1 20); do curl -fsS -o /dev/null http://127.0.0.1:6080 && exit 0; sleep .25; done; exit 1",
+            **ctx)
+        require("Exit code:" not in output, output)
+        output = await tools.expose("vnc", "private", **ctx)
+        require("port 6080 does not serve the noVNC bridge" in output and "Service URL:" not in output, output)
+        output = await tools.bash(
+            "curl -fsS -o /dev/null http://127.0.0.1:6080 && kill \"$(cat /tmp/lathe-vnc-conflict.pid)\"",
+            **ctx)
+        require("Exit code:" not in output, output)
 
         # Explicitly public only on this disposable test desktop, with no login.
         output = await tools.expose("vnc", "public", **ctx)

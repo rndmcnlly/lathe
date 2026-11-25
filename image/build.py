@@ -38,7 +38,7 @@ def main() -> None:
 
     dockerfile = (HERE / "Dockerfile").read_text()
     digest = hashlib.sha256(dockerfile.encode()).hexdigest()[:8]
-    name = f"lathe-{datetime.date.today():%Y%m%d}-{digest}"
+    name = f"lathe-{args.region}-{datetime.date.today():%Y%m%d}-{digest}"
 
     with httpx.Client(base_url="https://api.daytona.com", timeout=90,
                       headers={"Authorization": f"Bearer {api_key()}"}) as client:

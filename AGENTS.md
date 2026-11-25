@@ -136,6 +136,10 @@ edits need offline tests, not paid model qualification solely for wording.
   no volumes, and no Lathe-initiated deletion. Names are not unique: idempotency
   keys decide create races, and replay deleted sandboxes, so creation walks a
   numbered key sequence. Search lags; only per-ID records are authoritative.
+  Daytona rejects a key reused with a different create body, without returning
+  the sandbox ID. Keep creation valves consistent across workers; quiesce
+  provisioning when changing them. The key is derived from the create body
+  so settings can change after a sandbox has been deleted.
   Toolbox URLs come from the sandbox record, per region.
 - **Cold start**: bootstrap from a blank x86_64 Linux Daytona sandbox. Egress
   allowlist only; resolve versions via GitHub API rather than hardcoded URLs;

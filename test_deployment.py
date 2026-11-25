@@ -263,7 +263,8 @@ DELETE_DEADLINE_SECONDS = 60.0
 
 
 async def labelled_sandboxes(http, label, emails=None, *, max_pages=LIST_MAX_PAGES,
-                             deadline=LIST_DEADLINE_SECONDS, clock=time.monotonic):
+                             deadline=LIST_DEADLINE_SECONDS, clock=time.monotonic,
+                             api_url="https://api.daytona.com"):
     """IDs/labels of sandboxes carrying `label`, following every `next_cursor` page.
 
     GET /sandboxes/search is eventually consistent and cursor-paginated
@@ -283,7 +284,7 @@ async def labelled_sandboxes(http, label, emails=None, *, max_pages=LIST_MAX_PAG
             require(pages < max_pages, f"Daytona listing exceeded {max_pages} pages; absence not established")
             require(clock() < stop, f"Daytona listing exceeded {deadline}s; absence not established")
             pages += 1
-            response = await http.get("https://api.daytona.com/sandboxes/search", timeout=30,
+            response = await http.get(f"{api_url.rstrip('/')}/sandboxes/search", timeout=30,
                                       params={**params, **({"cursor": cursor} if cursor else {})})
             response.raise_for_status()
             payload = response.json()
@@ -326,8 +327,17 @@ async def cleanup_test_sandboxes():
     }
     async with httpx.AsyncClient(headers=headers) as client:
         for sandbox in await labelled_sandboxes(client, DEPLOYMENT_LABEL):
+            url = f"https://api.daytona.com/sandboxes/{sandbox['id']}"
+            current = await client.get(url, timeout=30)
+            if current.status_code == 404:
+                continue
+            current.raise_for_status()
+            item = current.json()
+            if (item.get("status") == "deleted" or
+                    (item.get("labels") or {}).get(DEPLOYMENT_LABEL) != sandbox["labels"][DEPLOYMENT_LABEL]):
+                continue
             response = await client.delete(
-                f"https://api.daytona.com/sandboxes/{sandbox['id']}",
+                url,
                 headers=headers,
                 timeout=30,
             )

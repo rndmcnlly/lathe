@@ -227,8 +227,14 @@ async def test_cleanup_owns_only_exact_run_and_follows_pages(suite, monkeypatch)
             return httpx.Response(200, json={"sandboxes": [
                 {"id": "prod", "labels": {"production": "user"}},
                 {"id": "other-ci", "labels": {"lathe-ci-other-run": "monitor@lathe.invalid"}},
+                {"id": "stale", "labels": {"lathe-ci-this-run": "monitor@lathe.invalid"}},
             ], "next_cursor": "page2"})
+        if request.url.path == "/sandboxes/stale":
+            assert request.method == "GET"
+            return httpx.Response(200, json={"labels": {"production": "user"}})
         assert request.url.path == "/sandboxes/owned"
+        if request.method == "GET" and ("DELETE", "/sandboxes/owned", None) not in requests:
+            return httpx.Response(200, json={"labels": {"lathe-ci-this-run": "monitor@lathe.invalid"}})
         return httpx.Response(200 if request.method == "DELETE" else 404)
 
     client_type = httpx.AsyncClient
@@ -236,6 +242,7 @@ async def test_cleanup_owns_only_exact_run_and_follows_pages(suite, monkeypatch)
                         lambda **kw: client_type(transport=httpx.MockTransport(daytona), **kw))
     await suite.cleanup_test_sandboxes()
     assert requests == [("GET", "/sandboxes/search", None), ("GET", "/sandboxes/search", "page2"),
+                        ("GET", "/sandboxes/stale", None), ("GET", "/sandboxes/owned", None),
                         ("DELETE", "/sandboxes/owned", None), ("GET", "/sandboxes/owned", None)]
 
 
@@ -825,6 +832,8 @@ async def test_no_deploy_cleans_owned_staging_after_access_failure_but_not_forei
             return httpx.Response(200, json={"sandboxes": [{"id": "owned-sandbox",
                 "labels": {suite.DEPLOYMENT_LABEL: "test@lathe.invalid"}}]})
         assert request.url.path == "/sandboxes/owned-sandbox"
+        if request.url.path not in deletions:
+            return httpx.Response(200, json={"labels": {suite.DEPLOYMENT_LABEL: "test@lathe.invalid"}})
         return httpx.Response(404)
 
     suite_transport(owui)

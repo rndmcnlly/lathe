@@ -10,7 +10,9 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/*
 
 # Daytona builds accept one base image, so node and uv come from their releases.
-RUN curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin UV_NO_MODIFY_PATH=1 sh \
+RUN curl -LsSf https://astral.sh/uv/install.sh -o /tmp/install-uv.sh \
+ && UV_INSTALL_DIR=/usr/local/bin UV_NO_MODIFY_PATH=1 sh /tmp/install-uv.sh \
+ && rm /tmp/install-uv.sh \
  && cd /tmp \
  && curl -fsSLO https://nodejs.org/dist/latest-v22.x/SHASUMS256.txt \
  && node=$(grep -o 'node-v[0-9.]*-linux-x64.tar.xz' SHASUMS256.txt) \

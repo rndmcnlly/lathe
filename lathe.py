@@ -125,25 +125,36 @@ async def _find_sandbox(valves, email: str, client: httpx.AsyncClient) -> dict |
     live, so every candidate is resolved by ID before cardinality is judged.
     """
     label_key = valves.deployment_label
-    resp = await client.get(
-        _api(valves, "/sandboxes/search"),
-        params={"labels": json.dumps({label_key: email}), "limit": 100},
-        headers=_headers(valves),
-        timeout=30.0,
-    )
-    resp.raise_for_status()
-    live = []
-    for match in resp.json().get("sandboxes") or []:
-        if (match.get("labels") or {}).get(label_key, email) != email or match.get("status") == "deleted":
-            continue
-        sandbox = await _get_live_sandbox(valves, match["id"], client)
-        if sandbox and (sandbox.get("labels") or {}).get(label_key) == email:
-            live.append(sandbox)
-    # A deleting sandbox must not shadow its replacement.
-    current = [s for s in live if s.get("status") != "deleting"] or live[:1]
-    if len(current) > 1:
-        raise RuntimeError(_multiple_sandboxes_error(label_key, email, current))
-    return current[0] if current else None
+    params = {"labels": json.dumps({label_key: email}), "limit": 100}
+    seen_ids, seen_cursors = set(), set()
+    current, deleting = None, None
+    for _ in range(20):
+        resp = await client.get(_api(valves, "/sandboxes/search"), params=params,
+                                headers=_headers(valves), timeout=30.0)
+        resp.raise_for_status()
+        page = resp.json()
+        for match in page["sandboxes"]:
+            if ((match.get("labels") or {}).get(label_key, email) != email
+                    or match.get("status") == "deleted" or match["id"] in seen_ids):
+                continue
+            seen_ids.add(match["id"])
+            sandbox = await _get_live_sandbox(valves, match["id"], client)
+            if not sandbox or (sandbox.get("labels") or {}).get(label_key) != email:
+                continue
+            if sandbox.get("status") == "deleting":
+                deleting = sandbox
+            elif current:
+                raise RuntimeError(_multiple_sandboxes_error(label_key, email, [current, sandbox]))
+            else:
+                current = sandbox
+        cursor = page.get("next_cursor")
+        if not cursor:
+            return current or deleting
+        if cursor in seen_cursors:
+            break
+        seen_cursors.add(cursor)
+        params["cursor"] = cursor
+    raise RuntimeError("Daytona sandbox search did not finish pagination; ownership could not be resolved.")
 
 
 async def _emit(emitter, description: str, done: bool = False):
@@ -957,18 +968,26 @@ async def _execute(valves, sandbox_id: str, client: httpx.AsyncClient,
     process = resp.json()
     page = process.get("logs") or {}
     frames = list(page.get("frames") or [])
+    incomplete = process.get("truncatedHead") or page.get("truncatedHead")
+    cursors = set()
     # Log pages are bounded; a finished process has a finite number of them.
-    while process.get("state") == "terminal" and not page.get("eof", True):
+    while not incomplete and process.get("state") == "terminal" and not page.get("eof", True):
+        cursor = page.get("nextCursor")
+        if not cursor or cursor in cursors:
+            incomplete = True
+            break
+        cursors.add(cursor)
         resp = await client.get(
             _toolbox(valves, sandbox_id, f"/processes/{process['id']}/logs"),
-            params={"cursor": page["nextCursor"], "encoding": "text"},
+            params={"cursor": cursor, "encoding": "text"},
             headers=_headers(valves), timeout=http_timeout,
         )
         resp.raise_for_status()
         page = resp.json()
-        if not page.get("frames"):
-            break
-        frames.extend(page["frames"])
+        incomplete = page.get("truncatedHead")
+        frames.extend(page.get("frames") or [])
+    if incomplete:
+        return -1, "", "Daytona returned incomplete tool output. Narrow the command or context and try again."
     out, err = ("".join(f.get("data", "") for f in frames if (f.get("channel") == "stderr") is stderr)
                 for stderr in (False, True))
     exit_code = process.get("exitCode")
@@ -1848,22 +1867,38 @@ async def _unreachable_reason(valves, sandbox_id, client, port: int) -> str | No
 # v2 serves RFB on loopback 5900 without a web page. Runs only for expose.
 _VNC_PORT = 6080
 _VNC_BRIDGE_SCRIPT = textwrap.dedent(f"""\
-    import os, shutil, socket, subprocess, time
-    def up(port):
+    import http.client, pathlib, shutil, socket, subprocess, time
+    page = pathlib.Path("/opt/novnc/vnc.html")
+    if not shutil.which("websockify") or not page.is_file():
+        raise SystemExit("this sandbox image has no noVNC bridge (websockify and /opt/novnc)")
+    expected = page.read_bytes()
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+        s.connect(("192.0.2.1", 9))  # Select the interface address without sending a packet.
+        interface = s.getsockname()[0]
+    def up(host):
         with socket.socket() as s:
             s.settimeout(1)
-            return s.connect_ex(("127.0.0.1", port)) == 0
-    if not up({_VNC_PORT}):
-        if not shutil.which("websockify") or not os.path.isfile("/opt/novnc/vnc.html"):
-            raise SystemExit("this sandbox image has no noVNC bridge (websockify and /opt/novnc)")
+            return s.connect_ex((host, {_VNC_PORT})) == 0
+    if not up(interface) and not up("127.0.0.1"):
         subprocess.Popen(["websockify", "--web", "/opt/novnc", "{_VNC_PORT}", "127.0.0.1:5900"],
                          stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                          stderr=subprocess.DEVNULL, start_new_session=True)
         deadline = time.monotonic() + 10
-        while not up({_VNC_PORT}):
+        while not up(interface):
             if time.monotonic() > deadline:
                 raise SystemExit("the noVNC bridge did not start within 10 s")
             time.sleep(0.2)
+    connection = http.client.HTTPConnection(interface, {_VNC_PORT}, timeout=2)
+    try:
+        connection.request("GET", "/vnc.html")
+        response = connection.getresponse()
+        if response.status != 200 or response.read(len(expected) + 1) != expected:
+            raise ValueError("unexpected noVNC page")
+    except (OSError, ValueError, http.client.HTTPException):
+        raise SystemExit("port {_VNC_PORT} does not serve the noVNC bridge on the sandbox interface. "
+                         "Check for an existing service or a loopback-only listener; nothing was stopped.")
+    finally:
+        connection.close()
     """)
 
 
@@ -3001,23 +3036,32 @@ async def _core_bash(valves, sandbox_id: str, client: httpx.AsyncClient, *,
             timeout=60.0,
         )
         resp.raise_for_status()
-        # The shell changes directory, so a missing workdir is a command failure.
-        exec_command = (
-            f"cd {_shell_quote(workdir)} && "
-            f"bash {script_path}; EC=$?; "
-            f"echo $EC > {_shell_quote(exit_path)}; "
-            f"(exit $EC)"
-        )
+    except BaseException:
+        await _discard_bash_setup(valves, sandbox_id, client, cmd_id)
+        raise
+    # The shell changes directory, so a missing workdir is a command failure.
+    exec_command = (
+        f"cd {_shell_quote(workdir)} && bash {script_path}; EC=$?; "
+        f"echo $EC > {_shell_quote(exit_path)}; (exit $EC)"
+    )
+    try:
         resp = await client.post(
             _toolbox(valves, sandbox_id, "/processes"),
             headers=_headers(valves),
             json={"argv": ["bash", "-c", exec_command], "tag": f"lathe-cmd-{cmd_id}"}, timeout=30.0,
         )
         resp.raise_for_status()
-    except BaseException:
-        await _discard_bash_setup(valves, sandbox_id, client, cmd_id)
-        raise
-    process_id = resp.json()["id"]
+        process_id = resp.json()["id"]
+        if not isinstance(process_id, str) or not process_id:
+            raise ValueError("missing process ID")
+    except (httpx.HTTPError, ValueError, KeyError, TypeError) as exc:
+        if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code in (400, 401, 403, 404, 405, 422):
+            await _discard_bash_setup(valves, sandbox_id, client, cmd_id)
+            raise
+        raise _ToolFailure(
+            f"Bash launch outcome is unknown. Do not automatically rerun it. "
+            f"CMD={cmd_id}; check {log_path} and {exit_path} for evidence."
+        ) from None
 
     # ── Foreground polling window ────────────────────────────────
     # 0 = immediate background (fire-and-forget).  Positive values
@@ -3031,6 +3075,7 @@ async def _core_bash(valves, sandbox_id: str, client: httpx.AsyncClient, *,
     last_status_at = time.time()
     finished = False
     exit_code = None
+    termination = None
 
     while time.time() < deadline:
         await asyncio.sleep(poll_interval)
@@ -3046,6 +3091,8 @@ async def _core_bash(valves, sandbox_id: str, client: httpx.AsyncClient, *,
         process = resp.json()
         if process.get("state") == "terminal":
             exit_code = process.get("exitCode")
+            if type(exit_code) is not int:
+                termination = process.get("signal") or process.get("reason") or "no exit code"
             finished = True
 
         if finished:
@@ -3090,6 +3137,8 @@ async def _core_bash(valves, sandbox_id: str, client: httpx.AsyncClient, *,
         release_lease_for=cmd_id,
         discard_notice_for=cmd_id,
     )
+    if termination:
+        raise _ToolFailure(f"Bash terminated without an exit code ({str(termination)[:120]}).\n{formatted}")
     return formatted
 
 
@@ -4029,7 +4078,8 @@ async def _ensure_sandbox(valves, email: str, client: httpx.AsyncClient, emitter
     deadline = time.time() + 120
     poll_interval = 1.0
     info = sandbox
-    start_requested = False
+    start_requested_from = None
+    start_transition_seen = False
     preparing_emitted = False
     while time.time() < deadline:
         status = info.get("status", "unknown")
@@ -4047,7 +4097,10 @@ async def _ensure_sandbox(valves, email: str, client: httpx.AsyncClient, emitter
             preparing_emitted = True
 
         if status in ("paused", "stopped"):
-            if not start_requested:
+            if status == "stopped" and start_requested_from and (
+                    start_requested_from == "paused" or start_transition_seen):
+                raise RuntimeError("Sandbox stopped after the resume or start request. Ask the Daytona administrator to inspect it.")
+            if start_requested_from is None:
                 action = "resume" if status == "paused" else "start"
                 resp = await client.post(
                     _api(valves, f"/sandboxes/{sandbox_id}/{action}"),
@@ -4057,7 +4110,7 @@ async def _ensure_sandbox(valves, email: str, client: httpx.AsyncClient, emitter
                 # 409: another worker already moved it on; polling observes that.
                 if resp.status_code != 409:
                     resp.raise_for_status()
-                    start_requested = True
+                    start_requested_from = status
                     warning = warning or (
                         "[Sandbox was resumed from pause: files, processes and interpreter state were "
                         "kept, but network connections may have dropped]" if status == "paused" else
@@ -4081,6 +4134,8 @@ async def _ensure_sandbox(valves, email: str, client: httpx.AsyncClient, emitter
                 "Ask the administrator to inspect the sandbox and update Lathe if this status is expected."
             )
 
+        if start_requested_from and status in ("assigned", "booting", "pending"):
+            start_transition_seen = True
         await asyncio.sleep(poll_interval)
         resp = await client.get(
             _api(valves, f"/sandboxes/{sandbox_id}"),
@@ -4537,9 +4592,8 @@ class Tools:
             first: expose never starts it). Give them that link, then stop all
             input AND screenshots and wait for their explicit ready message. Then
             observe afresh (page.text or a screenshot). No busy polling.
-            When handing off, mention the idle window from expose's result: the
-            sandbox may pause after that many minutes without tool calls, even
-            while the human works over VNC. If they need longer, a short reply
+            When handing off, mention that the sandbox may pause while the
+            human works over VNC. If that happens, a short reply
             from them lets you refresh it with peek(command="status"). Logins
             whose cookies have an expiry persist in the browser profile;
             session-only cookies survive a pause but not a sandbox restart.
@@ -5360,10 +5414,9 @@ class Tools:
             await _emit(__event_emitter__, f"URL ready (port {port})", done=True)
             return (
                 f"Service URL: {url}\n\n{access_note}\n\n"
-                f"The sandbox pauses after ~{self.valves.idle_pause_minutes} min of inactivity, "
-                "even with background processes; the next tool call resumes them. If the service "
-                "does not answer then, restart it with bash and call expose again. Registration "
-                "does not keep the service alive."
+                "If the sandbox pauses, the next Lathe tool call resumes it. "
+                "If the service still does not answer, restart it and call expose again. "
+                "Preview registration does not keep the sandbox awake."
             )
 
         return await _tool_context(__event_emitter__, _run, harness)
