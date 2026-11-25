@@ -5,12 +5,13 @@ author_url: https://adamsmith.as
 description: Coding agent tools (lathe, bash, read, write, edit, glob, grep, view, show, peek, poke, interpret, onboard, expose, destroy) backed by per-user sandbox VMs with transparent lifecycle management.
 required_open_webui_version: 0.12.0
 requirements: httpx, pydantic>=2, cachetools, PyYAML
-version: 1.3.3
+version: 2.0.0
 licence: MIT
 """
 
 import asyncio
 import base64
+import hashlib
 import html
 import inspect
 import io
@@ -77,28 +78,16 @@ def _api(valves, path: str) -> str:
     return f"{valves.daytona_api_url.rstrip('/')}{path}"
 
 
+# Each region serves its own toolbox proxy, named by the sandbox record. A
+# disposable per-worker cache: _ensure_sandbox refills it on every tool call.
+_TOOLBOX_URLS: LRUCache = LRUCache(maxsize=4096)
+
+
 def _toolbox(valves, sandbox_id: str, path: str) -> str:
-    return f"{valves.daytona_proxy_url.rstrip('/')}/{sandbox_id}{path}"
-
-
-def _extract_sandbox_list(payload) -> list:
-    """Tolerate both legacy and post-2026-05-24 shapes for GET /api/sandbox.
-
-    Legacy (≤ May 24, 2026): a flat JSON array of sandbox objects.
-    New (cursor pagination): {"items": [...], "cursor": "..."} (or similar).
-    Lathe filters by label client-side and expects 0–1 matches per user, so
-    the default page size is plenty; we don't paginate further. If a future
-    deployment ever has >page_size sandboxes sharing the label prefix, this
-    would silently return only the first page — acceptable given the design
-    invariant of one sandbox per user.
-    """
-    if payload is None:
-        return []
-    if isinstance(payload, list):
-        return payload
-    if isinstance(payload, dict):
-        return payload.get("items") or []
-    return []
+    base = valves.daytona_proxy_url or _TOOLBOX_URLS.get(sandbox_id)
+    if not base:
+        raise RuntimeError("Daytona reported no toolbox URL for this sandbox. Retry this tool call.")
+    return f"{base.rstrip('/')}/{sandbox_id}{path}"
 
 
 def _multiple_sandboxes_error(label_key: str, email: str, sandboxes: list[dict]) -> str:
@@ -114,13 +103,9 @@ def _multiple_sandboxes_error(label_key: str, email: str, sandboxes: list[dict])
 
 
 async def _get_live_sandbox(valves, sandbox_id: str, client: httpx.AsyncClient) -> dict | None:
-    """Return authoritative sandbox data, or None for a deleted/deleting ghost.
-
-    GET /sandbox?labels=... is an eventually consistent discovery index. Once its
-    cardinality gate admits one candidate, this per-ID endpoint is authoritative.
-    """
+    """Return authoritative sandbox data, or None once it is deleted."""
     resp = await client.get(
-        _api(valves, f"/sandbox/{sandbox_id}"),
+        _api(valves, f"/sandboxes/{sandbox_id}"),
         headers=_headers(valves),
         timeout=30.0,
     )
@@ -128,9 +113,48 @@ async def _get_live_sandbox(valves, sandbox_id: str, client: httpx.AsyncClient) 
         return None
     resp.raise_for_status()
     sandbox = resp.json()
-    if sandbox.get("state") in ("deleted", "destroyed"):
+    if sandbox.get("status") == "deleted":
         return None
     return sandbox
+
+
+async def _find_sandbox(valves, email: str, client: httpx.AsyncClient) -> dict | None:
+    """Find this user's sandbox, or None. Refuses an ambiguous association.
+
+    Search is an eventually consistent index that can list deleted sandboxes as
+    live, so every candidate is resolved by ID before cardinality is judged.
+    """
+    label_key = valves.deployment_label
+    params = {"labels": json.dumps({label_key: email}), "limit": 100}
+    seen_ids, seen_cursors = set(), set()
+    current, deleting = None, None
+    for _ in range(20):
+        resp = await client.get(_api(valves, "/sandboxes/search"), params=params,
+                                headers=_headers(valves), timeout=30.0)
+        resp.raise_for_status()
+        page = resp.json()
+        for match in page["sandboxes"]:
+            if ((match.get("labels") or {}).get(label_key, email) != email
+                    or match.get("status") == "deleted" or match["id"] in seen_ids):
+                continue
+            seen_ids.add(match["id"])
+            sandbox = await _get_live_sandbox(valves, match["id"], client)
+            if not sandbox or (sandbox.get("labels") or {}).get(label_key) != email:
+                continue
+            if sandbox.get("status") == "deleting":
+                deleting = sandbox
+            elif current:
+                raise RuntimeError(_multiple_sandboxes_error(label_key, email, [current, sandbox]))
+            else:
+                current = sandbox
+        cursor = page.get("next_cursor")
+        if not cursor:
+            return current or deleting
+        if cursor in seen_cursors:
+            break
+        seen_cursors.add(cursor)
+        params["cursor"] = cursor
+    raise RuntimeError("Daytona sandbox search did not finish pagination; ownership could not be resolved.")
 
 
 async def _emit(emitter, description: str, done: bool = False):
@@ -264,7 +288,7 @@ def _format_bg_bash_notice(cmd_id: str, exit_code: int | None,
     else:
         lines.append("(no output)")
     lines.append(f"Full output: {_bash_sidecar_dir(cmd_id)}/log; exit: {_bash_sidecar_dir(cmd_id)}/exit")
-    lines.append("Retained for 24 hours after completion (sandbox stop/restart clears it).")
+    lines.append("Retained for 24 hours after completion (a sandbox restart clears it).")
     return "\n".join(lines)
 
 
@@ -331,7 +355,7 @@ def _parse_env_vars(env_vars: str) -> list[tuple[str, str]]:
 # Keys lathe manages itself; admin create-overrides may not clobber them.
 # - name/labels: the per-user lookup invariant (one sandbox per email).
 # - volumes: forbidden; Lathe never provisions or mounts volumes.
-_PROTECTED_CREATE_KEYS = frozenset({"name", "labels", "volumes"})
+_PROTECTED_CREATE_KEYS = frozenset({"name", "labels", "volumes", "persistent", "idempotency_key"})
 
 
 def _parse_create_overrides(raw: str) -> dict:
@@ -364,7 +388,7 @@ def _parse_create_overrides(raw: str) -> dict:
         raise ValueError(
             f"Valves sandbox_create_overrides may not set lathe-managed keys: "
             f"{', '.join(sorted(clobbered))}. These are derived per user "
-            f"(name/labels) or forbidden (volumes)."
+            f"(name/labels/persistent/idempotency_key) or forbidden (volumes)."
         )
     return overrides
 
@@ -445,9 +469,9 @@ async def _http_preview(valves, sandbox_id: str, port: int, user: dict,
             )
 
     try:
-        response = await client.get(
-            _api(valves, f"/sandbox/{sandbox_id}/ports/{port}/signed-preview-url"),
-            params={"expiresInSeconds": valves.preview_expiry_seconds},
+        response = await client.post(
+            _api(valves, f"/sandboxes/{sandbox_id}/ports/{port}/signed-preview-urls"),
+            json={"expires_in_seconds": valves.preview_expiry_seconds},
             headers=_headers(valves), timeout=30.0, follow_redirects=False,
         )
         response.raise_for_status()
@@ -904,7 +928,7 @@ async def _upload_file(valves, sandbox_id: str, client: httpx.AsyncClient,
         await client.post(
             _toolbox(valves, sandbox_id, "/files/folder"),
             headers=_headers(valves),
-            json={"path": parent, "mode": "755"},
+            params={"path": parent, "mode": "755"},
             timeout=30.0,
         )
     resp = await client.post(
@@ -929,6 +953,50 @@ def _checked_result(result: str) -> str:
     return result
 
 
+async def _execute(valves, sandbox_id: str, client: httpx.AsyncClient,
+                   argv: list[str], *, timeout_ms: int = 30000,
+                   http_timeout: float = 60.0) -> tuple[int, str, str]:
+    """Run a program to completion. Returns (exit code, stdout, stderr)."""
+    resp = await client.post(
+        _toolbox(valves, sandbox_id, "/processes"),
+        params={"waitMs": timeout_ms + 1000, "logs": "text"},
+        headers=_headers(valves),
+        json={"argv": argv, "timeoutMs": timeout_ms},
+        timeout=max(http_timeout, timeout_ms / 1000 + 15),
+    )
+    resp.raise_for_status()
+    process = resp.json()
+    page = process.get("logs") or {}
+    frames = list(page.get("frames") or [])
+    incomplete = process.get("truncatedHead") or page.get("truncatedHead")
+    cursors = set()
+    # Log pages are bounded; a finished process has a finite number of them.
+    while not incomplete and process.get("state") == "terminal" and not page.get("eof", True):
+        cursor = page.get("nextCursor")
+        if not cursor or cursor in cursors:
+            incomplete = True
+            break
+        cursors.add(cursor)
+        resp = await client.get(
+            _toolbox(valves, sandbox_id, f"/processes/{process['id']}/logs"),
+            params={"cursor": cursor, "encoding": "text"},
+            headers=_headers(valves), timeout=http_timeout,
+        )
+        resp.raise_for_status()
+        page = resp.json()
+        incomplete = page.get("truncatedHead")
+        frames.extend(page.get("frames") or [])
+    if incomplete:
+        return -1, "", "Daytona returned incomplete tool output. Narrow the command or context and try again."
+    out, err = ("".join(f.get("data", "") for f in frames if (f.get("channel") == "stderr") is stderr)
+                for stderr in (False, True))
+    exit_code = process.get("exitCode")
+    if exit_code is None:
+        exit_code = -1
+        err += f"\n[{process.get('reason') or process.get('state') or 'no exit status'}]"
+    return exit_code, out, err
+
+
 async def _run_sandbox_script(valves, sandbox_id: str, client: httpx.AsyncClient,
                               script: str, *, error_prefix: str,
                               timeout_ms: int = 30000,
@@ -939,21 +1007,12 @@ async def _run_sandbox_script(valves, sandbox_id: str, client: httpx.AsyncClient
     Returns the script's stdout on success. Non-zero exit and the reserved
     script error prefix raise _ToolFailure, rendered only at user boundaries.
     """
-    resp = await client.post(
-        _toolbox(valves, sandbox_id, "/process/execute"),
-        headers=_headers(valves),
-        json={
-            "command": f"python3 -c {_shell_quote(script)}",
-            "timeout": timeout_ms,
-        },
-        timeout=http_timeout,
+    exit_code, result, stderr = await _execute(
+        valves, sandbox_id, client, ["python3", "-c", script],
+        timeout_ms=timeout_ms, http_timeout=http_timeout,
     )
-    resp.raise_for_status()
-    data = resp.json()
-    result = data.get("result", "")
-    exit_code = data.get("exitCode", -1)
     if exit_code != 0:
-        raise _ToolFailure(f"{error_prefix} (exit {exit_code}).\n{result[:500]}")
+        raise _ToolFailure(f"{error_prefix} (exit {exit_code}).\n{(result + stderr)[:500]}")
     return _checked_result(result)
 
 
@@ -1476,8 +1535,8 @@ async def _core_show(valves, sandbox_id: str, client: httpx.AsyncClient, *,
 _Pixel = typing.Annotated[int, Field(ge=0, le=32767)]
 _Positive = typing.Annotated[int, Field(ge=1, le=32768)]
 _Button = typing.Literal["left", "right", "middle"]
-_DESKTOP_PROCESSES = ("xvfb", "xfce4", "x11vnc", "novnc", "pulseaudio", "atspi")
-_Process = typing.Literal["xvfb", "xfce4", "x11vnc", "novnc", "pulseaudio", "atspi"]
+_DESKTOP_PROCESSES = ("xvfb", "wm", "x11vnc", "dbus")
+_Process = typing.Literal["xvfb", "wm", "x11vnc", "dbus"]
 _Text = typing.Annotated[str, Field(max_length=16384)]
 _Name = typing.Annotated[str, Field(min_length=1, max_length=256)]
 _Scope = typing.Literal["focused", "pid", "all"]
@@ -1489,7 +1548,7 @@ _A11Y = {"scope": (_Scope, "focused"),
          "pid": (typing.Annotated[int, Field(ge=1, le=2147483647)], None)}
 _Shot = {"showCursor": (bool, False), "region": (_Region, None)}
 # No scale: downscaled images invite clicks at image rather than native pixels.
-_Compression = {"format": (typing.Literal["png", "jpeg", "webp"], "jpeg"),
+_Compression = {"format": (typing.Literal["png", "jpeg"], "jpeg"),
                 "quality": (typing.Annotated[int, Field(ge=1, le=100)], 80)}
 # Browser tabs are DevTools page targets, named by a hex id prefix from page.list.
 _Tab = {"tab": (typing.Annotated[str, Field(pattern=r"^[0-9A-Fa-f]{4,64}$")], None)}
@@ -1537,17 +1596,11 @@ _POKE_COMMANDS = {
     "mouse.scroll": ("POST", "mouse/scroll", {
         **_XY, "direction": (typing.Literal["up", "down"], ...),
         "amount": (typing.Annotated[int, Field(ge=1, le=100)], 1)}),
-    "mouse.down": ("POST", "mouse/down", {
-        "x": (_Pixel, None), "y": (_Pixel, None), "button": (_Button, "left")}),
-    "mouse.up": ("POST", "mouse/up", {
-        "x": (_Pixel, None), "y": (_Pixel, None), "button": (_Button, "left")}),
     "keyboard.type": ("POST", "keyboard/type", {
         "text": (_Text, ...), "delay": (typing.Annotated[int, Field(ge=0, le=100)], 0)}),
     "keyboard.press": ("POST", "keyboard/key", {
         "key": (_Name, ...), "modifiers": (typing.Annotated[list[_Name], Field(max_length=8)], [])}),
     "keyboard.hotkey": ("POST", "keyboard/hotkey", {"keys": (_Name, ...)}),
-    "keyboard.down": ("POST", "keyboard/down", {"key": (_Name, ...)}),
-    "keyboard.up": ("POST", "keyboard/up", {"key": (_Name, ...)}),
     "accessibility.focus": ("POST", "a11y/node/focus", {"id": (_Name, ...)}),
     "accessibility.invoke": ("POST", "a11y/node/invoke", {
         "id": (_Name, ...), "action": (_Name, None)}),
@@ -1695,13 +1748,15 @@ def _computer_failure(status_code: int, body: bytes, args: dict) -> _ToolFailure
     return _ToolFailure(
         f"computer command failed (HTTP {status_code})" + (f": {detail}" if detail else "")
         + ". No input was retried. Check peek(command=\"status\") before proceeding; for "
-        "lower-level control use bash with DISPLAY=:0 (see lathe(manpage=\"computer\")).")
+        "lower-level control use bash with DISPLAY=:99 (see lathe(manpage=\"computer\")).")
 
 
-async def _computer_json(valves, sandbox_id, client, suffix: str) -> dict:
+async def _computer_json(valves, sandbox_id, client, suffix: str, *, missing=None) -> dict:
     """GET a small JSON computer-use resource, passing provider errors through."""
     resp = await client.get(_toolbox(valves, sandbox_id, "/computeruse/" + suffix),
                             headers=_headers(valves), timeout=30.0, follow_redirects=False)
+    if resp.status_code == 404 and missing is not None:
+        return missing
     if not resp.is_success:
         raise _computer_failure(resp.status_code, resp.content[:8192], {})
     try:
@@ -1714,9 +1769,9 @@ async def _computer_json(valves, sandbox_id, client, suffix: str) -> dict:
 
 
 async def _desktop_processes(valves, sandbox_id, client, names) -> dict:
-    """Per-process running state. Daytona's aggregate status says "partial"
-    even when every display process is down, so Lathe decides from these."""
-    states = await asyncio.gather(*(_computer_json(valves, sandbox_id, client, f"process/{name}/status")
+    """Per-process running state. Daytona lists no process (404) before the
+    desktop's first start, which reads as not running."""
+    states = await asyncio.gather(*(_computer_json(valves, sandbox_id, client, f"process/{name}/status", missing={})
                                     for name in names))
     return {name: state.get("running") is True for name, state in zip(names, states)}
 
@@ -1728,7 +1783,7 @@ _DESKTOP_DOWN = ("desktop is down (no display process). peek never starts it; an
 async def _desktop_status(valves, sandbox_id, client) -> str:
     status = await _computer_json(valves, sandbox_id, client, "status")
     reported = next((v for k, v in status.items() if k.lower() == "status"), "unknown")
-    states = await asyncio.gather(*(_computer_json(valves, sandbox_id, client, f"process/{name}/status")
+    states = await asyncio.gather(*(_computer_json(valves, sandbox_id, client, f"process/{name}/status", missing={})
                                     for name in _DESKTOP_PROCESSES), return_exceptions=True)
     running = {name: None if isinstance(state, BaseException) else state.get("running") is True
                for name, state in zip(_DESKTOP_PROCESSES, states)}
@@ -1739,11 +1794,11 @@ async def _desktop_status(valves, sandbox_id, client) -> str:
         head = "Desktop state is unknown: the display process status could not be read."
     elif not running["xvfb"]:
         head = "Desktop is down: no display process. " + _DESKTOP_DOWN.split(". ", 1)[1]
-    elif all(running[n] for n in ("xvfb", "xfce4", "x11vnc", "novnc")):
+    elif all(running[n] for n in ("xvfb", "wm", "x11vnc")):
         head = "Desktop is active."
     else:
-        head = ("Desktop is partially running: input works while xvfb runs; VNC needs x11vnc "
-                "and novnc. Restarting a live desktop can close windows: ask first.")
+        head = ("Desktop is partially running: input works while xvfb runs; VNC needs "
+                "x11vnc. Restarting a live desktop can close windows: ask first.")
     lines = [head, f"Running: {', '.join(up) or 'none'}. Stopped: {', '.join(down) or 'none'}."]
     if unknown:
         lines.append(f"Unknown: {', '.join(unknown)}.")
@@ -1762,12 +1817,89 @@ async def _ensure_desktop(valves, sandbox_id, client) -> str:
         return ""
     await _computer_request(valves, sandbox_id, client, "start", {}, mutate=True)
     deadline = time.monotonic() + 30
-    while not all((await _desktop_processes(valves, sandbox_id, client, ("xvfb", "xfce4"))).values()):
+    while not all((await _desktop_processes(valves, sandbox_id, client, ("xvfb", "wm"))).values()):
         if time.monotonic() > deadline:
             raise _ToolFailure("the desktop was down and did not come up within 30 s after start. "
                                "Check peek(command=\"status\") and process logs.")
         await asyncio.sleep(0.5)
     return "Desktop was down; started it.\n"
+
+
+# The preview proxy enters through the sandbox's network interface, so it reaches
+# neither loopback listeners nor missing ones, and reports both as a bare 502.
+_LISTENER_SCRIPT = textwrap.dedent("""\
+    import os
+    found = set()
+    for table in ("/proc/net/tcp", "/proc/net/tcp6"):
+        if not os.path.exists(table):
+            continue
+        with open(table) as f:
+            for fields in map(str.split, list(f)[1:]):
+                address, port = fields[1].split(":")
+                if fields[3] == "0A" and int(port, 16) == PORT:
+                    # Words are little-endian: 127.0.0.0/8 (plain or v4-mapped) and ::1.
+                    v4 = len(address) == 8 or address.startswith("0" * 16 + "FFFF0000")
+                    loopback = address.endswith("7F") if v4 else address == "0" * 24 + "01000000"
+                    found.add("loopback" if loopback else "reachable")
+    print("reachable" if "reachable" in found else "loopback" if found else "absent")
+    """)
+
+
+async def _unreachable_reason(valves, sandbox_id, client, port: int) -> str | None:
+    """Explain why a preview of this port cannot work, or None if it can."""
+    try:
+        state = (await _run_sandbox_script(
+            valves, sandbox_id, client, f"PORT = {port}\n" + _LISTENER_SCRIPT,
+            error_prefix="listener check failed")).strip()
+    except Exception as exc:
+        logger.debug("expose: %s", exc)
+        return None  # Advisory: never block exposure because the check broke.
+    if state == "loopback":
+        return (f"port {port} listens only on loopback (127.0.0.1/localhost), which the preview "
+                "proxy cannot reach. Restart the service bound to 0.0.0.0, then call expose again. "
+                "Binding to 0.0.0.0 does not make it public: access still follows the expose policy.")
+    if state == "absent":
+        return (f"nothing is listening on port {port}. Start the service with bash bound to "
+                "0.0.0.0, check that it is ready, then call expose again.")
+    return None
+
+
+# v2 serves RFB on loopback 5900 without a web page. Runs only for expose.
+_VNC_PORT = 6080
+_VNC_BRIDGE_SCRIPT = textwrap.dedent(f"""\
+    import http.client, pathlib, shutil, socket, subprocess, time
+    page = pathlib.Path("/opt/novnc/vnc.html")
+    if not shutil.which("websockify") or not page.is_file():
+        raise SystemExit("this sandbox image has no noVNC bridge (websockify and /opt/novnc)")
+    expected = page.read_bytes()
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+        s.connect(("192.0.2.1", 9))  # Select the interface address without sending a packet.
+        interface = s.getsockname()[0]
+    def up(host):
+        with socket.socket() as s:
+            s.settimeout(1)
+            return s.connect_ex((host, {_VNC_PORT})) == 0
+    if not up(interface) and not up("127.0.0.1"):
+        subprocess.Popen(["websockify", "--web", "/opt/novnc", "{_VNC_PORT}", "127.0.0.1:5900"],
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, start_new_session=True)
+        deadline = time.monotonic() + 10
+        while not up(interface):
+            if time.monotonic() > deadline:
+                raise SystemExit("the noVNC bridge did not start within 10 s")
+            time.sleep(0.2)
+    connection = http.client.HTTPConnection(interface, {_VNC_PORT}, timeout=2)
+    try:
+        connection.request("GET", "/vnc.html")
+        response = connection.getresponse()
+        if response.status != 200 or response.read(len(expected) + 1) != expected:
+            raise ValueError("unexpected noVNC page")
+    except (OSError, ValueError, http.client.HTTPException):
+        raise SystemExit("port {_VNC_PORT} does not serve the noVNC bridge on the sandbox interface. "
+                         "Check for an existing service or a loopback-only listener; nothing was stopped.")
+    finally:
+        connection.close()
+    """)
 
 
 async def _computer_request(valves, sandbox_id, client, command, args, *, mutate):
@@ -1856,15 +1988,19 @@ def pages():
 
 def desktop_env():
     # Toolbox shells lack the session bus; without it apps never reach AT-SPI.
-    env = dict(os.environ, DISPLAY=":0")
-    found = subprocess.run(["pgrep", "-xo", "xfce4-session"], capture_output=True, text=True).stdout.split()
-    if found:
+    sockets = sorted(os.listdir("/tmp/.X11-unix")) if os.path.isdir("/tmp/.X11-unix") else []
+    env = dict(os.environ, DISPLAY=":" + (sockets[0][1:] if sockets else "99"))
+    for pid in filter(str.isdigit, os.listdir("/proc")):
         try:
-            with open(f"/proc/{found[0]}/environ", "rb") as f:
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                if not any(os.path.basename(arg) == b"xfce4-session" for arg in f.read().split(b"\0")):
+                    continue
+            with open(f"/proc/{pid}/environ", "rb") as f:
                 for item in f.read().split(b"\0"):
                     key, _, value = item.decode(errors="replace").partition("=")
                     if key in ("DISPLAY", "DBUS_SESSION_BUS_ADDRESS", "GTK_MODULES", "XAUTHORITY"):
                         env[key] = value
+            break
         except OSError:
             pass
     return env
@@ -1879,9 +2015,11 @@ def launch():
     os.makedirs(PROFILE, exist_ok=True)
     log = open(os.path.join(PROFILE, "lathe-launch.log"), "ab")
     # Visible on the shared desktop, DevTools on loopback only, Chromium sandbox intact.
+    # AT-SPI needs both: the variable joins the bus, the flag exposes page contents.
     subprocess.Popen([binary, "--remote-debugging-port=9222", "--user-data-dir=" + PROFILE,
                       "--no-first-run", "--no-default-browser-check", "--hide-crash-restore-bubble",
-                      "about:blank"], env=desktop_env(), cwd=os.path.expanduser("~"),
+                      "--force-renderer-accessibility", "about:blank"],
+                     env=dict(desktop_env(), ACCESSIBILITY_ENABLED="1"), cwd=os.path.expanduser("~"),
                      stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True)
     deadline = time.monotonic() + 30
     while time.monotonic() < deadline:
@@ -2423,7 +2561,7 @@ async def _core_poke(valves, sandbox_id: str, client: httpx.AsyncClient, *,
     page.open launches it (starting the desktop if down); then page.click, page.type, page.save (url: fetch bytes with browser cookies; no url: save the tab as pdf/html/mhtml), page.eval (awaits promises).
     Read lathe(manpage="computer") before first use. Pause all input and screenshots during human login; resume only after the user says ready.
     Ask before first browser use unless requested, and before desktop input beyond it; once allowed, offer expose(target="vnc", access="private") as a live view.
-    :param command: Browser, with args: {browser_commands}. Desktop (args in lathe(manpage="computer")): mouse.click/move/drag/scroll/down/up, keyboard.type/press/hotkey/down/up, accessibility.focus/invoke/set_value. Lifecycle: start, stop, process.restart.
+    :param command: Browser, with args: {browser_commands}. Desktop (args in lathe(manpage="computer")): mouse.click/move/drag/scroll, keyboard.type/press/hotkey, accessibility.focus/invoke/set_value. Lifecycle: start, stop, process.restart.
     :param args: Command-specific JSON object. Strict types; unknown fields are rejected. Never put passwords in tool arguments.
     """
     args = _computer_args(command, args, mutate=True)
@@ -2679,8 +2817,6 @@ def _build_bash_reap_script(preserve_log_for: str | None = None,
                     except OSError:
                         pass
                     open(os.path.join(command_dir, "reap"), "a").close()
-                    if not os.path.isfile(os.path.join(command_dir, "session_done")):
-                        print("delete " + command_id)
                     try:
                         evidence = os.path.join(command_dir, "exit")
                         if not os.path.exists(evidence):
@@ -2699,7 +2835,7 @@ async def _reap_bash_commands(valves, sandbox_id: str, client: httpx.AsyncClient
                               claim_chat: str | None = None,
                               claim_command: str | None = None,
                               discard_notice_for: str | None = None) -> list[str]:
-    """Delete completed sessions; expire result files only after their lease.
+    """Release finished commands; expire result files only after their lease.
 
     Returns completion notices claimed for claim_chat (see the reap script).
     """
@@ -2715,8 +2851,6 @@ async def _reap_bash_commands(valves, sandbox_id: str, client: httpx.AsyncClient
         if result.startswith("Error:"):
             logger.warning("%s", result)
             return notices
-        cleaned = []
-        failed_cleanup = set()
         for line in result.splitlines():
             action, _, command_id = line.partition(" ")
             if action == "notice":
@@ -2727,59 +2861,31 @@ async def _reap_bash_commands(valves, sandbox_id: str, client: httpx.AsyncClient
                 except (ValueError, KeyError, TypeError) as exc:
                     logger.warning("bash cleanup: malformed completion notice: %s", exc)
                 continue
-            if action not in ("delete", "expire") or not command_id:
+            # Daytona expires finished process records itself.
+            if action != "expire" or not command_id:
                 continue
-            if action == "delete":
-                response = await client.delete(
-                    _toolbox(valves, sandbox_id, f"/process/session/lathe-cmd-{command_id}"),
-                    headers=_headers(valves), timeout=30.0,
-                )
-                if response.status_code not in (204, 404):
-                    logger.warning("bash cleanup: session %s returned HTTP %s",
-                                   command_id, response.status_code)
-                    failed_cleanup.add(command_id)
-                else:
-                    cleaned.append(command_id)
-            else:
-                if command_id in failed_cleanup:
-                    # Keep the retry record until session release succeeds.
-                    continue
-                response = await client.delete(
-                    _toolbox(valves, sandbox_id, "/files/"),
-                    params={"path": _bash_sidecar_dir(command_id), "recursive": "true"},
-                    headers=_headers(valves), timeout=30.0,
-                )
-                if response.status_code not in (204, 404):
-                    logger.warning("bash cleanup: sidecar %s returned HTTP %s",
-                                   command_id, response.status_code)
-        if cleaned:
-            # A successful session release is recorded separately from evidence
-            # expiry, avoiding repeated HTTP deletes for every retained result.
-            script = f"import os\nroot={_EPHEMERAL_ROOT + '/cmd'!r}\n"
-            script += f"for command_id in {cleaned!r}:\n"
-            script += "    path = os.path.join(root, command_id, 'session_done')\n"
-            script += "    if os.path.isdir(os.path.dirname(path)):\n        open(path, 'a').close()\n"
-            await _run_sandbox_script(valves, sandbox_id, client, script,
-                                      error_prefix="bash session cleanup marker failed")
+            response = await client.delete(
+                _toolbox(valves, sandbox_id, "/files"),
+                params={"path": _bash_sidecar_dir(command_id), "recursive": "true"},
+                headers=_headers(valves), timeout=30.0,
+            )
+            if response.status_code not in (204, 404):
+                logger.warning("bash cleanup: sidecar %s returned HTTP %s",
+                               command_id, response.status_code)
     except Exception as exc:
         logger.warning("bash cleanup failed: %s", exc)
     return notices
 
 
 async def _discard_bash_setup(valves, sandbox_id: str, client: httpx.AsyncClient,
-                              command_id: str, session_created: bool) -> None:
+                              command_id: str) -> None:
     """Best-effort cleanup when a command could not be launched."""
     try:
         await client.delete(
-            _toolbox(valves, sandbox_id, "/files/"),
+            _toolbox(valves, sandbox_id, "/files"),
             params={"path": _bash_sidecar_dir(command_id), "recursive": "true"},
             headers=_headers(valves), timeout=30.0,
         )
-        if session_created:
-            await client.delete(
-                _toolbox(valves, sandbox_id, f"/process/session/lathe-cmd-{command_id}"),
-                headers=_headers(valves), timeout=30.0,
-            )
     except Exception as exc:
         logger.warning("bash setup cleanup failed: %s", exc)
 
@@ -2894,7 +3000,7 @@ async def _core_bash(valves, sandbox_id: str, client: httpx.AsyncClient, *,
     Long-running commands auto-background and return a descriptor with log
     file paths for monitoring. Text previews are capped at 50 KiB. Full logs and
     exit status remain readable for 24 hours after completion, until a later
-    bash call reaps expired evidence. Sandbox stop/restart clears these files.
+    bash call reaps expired evidence. A sandbox restart clears these files.
 
     For first-time application setup, read lathe(manpage="services") before
     installing or launching; it routes to relevant skills and the configured
@@ -2921,10 +3027,7 @@ async def _core_bash(valves, sandbox_id: str, client: httpx.AsyncClient, *,
         notify_path=f"{cmd_dir}/notify", notify_chat=claim_chat,
     )
 
-    session_id = f"lathe-cmd-{cmd_id}"
-    session_created = False
     try:
-        # Each command gets a session so concurrent calls never queue.
         resp = await client.post(
             _toolbox(valves, sandbox_id, "/files/upload"),
             params={"path": script_path},
@@ -2933,33 +3036,32 @@ async def _core_bash(valves, sandbox_id: str, client: httpx.AsyncClient, *,
             timeout=60.0,
         )
         resp.raise_for_status()
+    except BaseException:
+        await _discard_bash_setup(valves, sandbox_id, client, cmd_id)
+        raise
+    # The shell changes directory, so a missing workdir is a command failure.
+    exec_command = (
+        f"cd {_shell_quote(workdir)} && bash {script_path}; EC=$?; "
+        f"echo $EC > {_shell_quote(exit_path)}; (exit $EC)"
+    )
+    try:
         resp = await client.post(
-            _toolbox(valves, sandbox_id, "/process/session"),
-            headers=_headers(valves), json={"sessionId": session_id}, timeout=30.0,
-        )
-        if resp.status_code not in (200, 201, 409):
-            resp.raise_for_status()
-        session_created = True
-
-        # Session exec has no cwd parameter, so change directory explicitly.
-        exec_command = (
-            f"cd {_shell_quote(workdir)} && "
-            f"bash {script_path}; EC=$?; "
-            f"echo $EC > {_shell_quote(exit_path)}; "
-            f"(exit $EC)"
-        )
-        resp = await client.post(
-            _toolbox(valves, sandbox_id, f"/process/session/{session_id}/exec"),
+            _toolbox(valves, sandbox_id, "/processes"),
             headers=_headers(valves),
-            json={"command": exec_command, "runAsync": True}, timeout=30.0,
+            json={"argv": ["bash", "-c", exec_command], "tag": f"lathe-cmd-{cmd_id}"}, timeout=30.0,
         )
         resp.raise_for_status()
-    except BaseException:
-        await _discard_bash_setup(
-            valves, sandbox_id, client, cmd_id, session_created,
-        )
-        raise
-    session_cmd_id = resp.json().get("cmdId", "")
+        process_id = resp.json()["id"]
+        if not isinstance(process_id, str) or not process_id:
+            raise ValueError("missing process ID")
+    except (httpx.HTTPError, ValueError, KeyError, TypeError) as exc:
+        if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code in (400, 401, 403, 404, 405, 422):
+            await _discard_bash_setup(valves, sandbox_id, client, cmd_id)
+            raise
+        raise _ToolFailure(
+            f"Bash launch outcome is unknown. Do not automatically rerun it. "
+            f"CMD={cmd_id}; check {log_path} and {exit_path} for evidence."
+        ) from None
 
     # ── Foreground polling window ────────────────────────────────
     # 0 = immediate background (fire-and-forget).  Positive values
@@ -2973,30 +3075,25 @@ async def _core_bash(valves, sandbox_id: str, client: httpx.AsyncClient, *,
     last_status_at = time.time()
     finished = False
     exit_code = None
+    termination = None
 
     while time.time() < deadline:
         await asyncio.sleep(poll_interval)
         poll_interval = min(poll_interval * 1.5, 2.0)
 
-        # Check command status via session info
         resp = await client.get(
-            _toolbox(valves, sandbox_id, f"/process/session/{session_id}"),
+            _toolbox(valves, sandbox_id, f"/processes/{process_id}"),
             headers=_headers(valves),
             timeout=15.0,
         )
         if resp.status_code != 200:
             continue
-        session_info = resp.json()
-        commands = session_info.get("commands", [])
-
-        # Find our command by id
-        for cmd in commands:
-            if cmd.get("id") == session_cmd_id:
-                ec = cmd.get("exitCode")
-                if ec is not None:
-                    exit_code = ec
-                    finished = True
-                break
+        process = resp.json()
+        if process.get("state") == "terminal":
+            exit_code = process.get("exitCode")
+            if type(exit_code) is not int:
+                termination = process.get("signal") or process.get("reason") or "no exit code"
+            finished = True
 
         if finished:
             break
@@ -3021,8 +3118,7 @@ async def _core_bash(valves, sandbox_id: str, client: httpx.AsyncClient, *,
     if not finished:
         elapsed = int(time.time() - (deadline - fg_timeout))
         if on_background:
-            on_background(sandbox_id=sandbox_id, session_id=session_id,
-                          session_cmd_id=session_cmd_id, cmd_id=cmd_id,
+            on_background(sandbox_id=sandbox_id, process_id=process_id, cmd_id=cmd_id,
                           start_time=deadline - fg_timeout)
         return _format_bash_result(
             output, exit_code, was_truncated, meta,
@@ -3041,6 +3137,8 @@ async def _core_bash(valves, sandbox_id: str, client: httpx.AsyncClient, *,
         release_lease_for=cmd_id,
         discard_notice_for=cmd_id,
     )
+    if termination:
+        raise _ToolFailure(f"Bash terminated without an exit code ({str(termination)[:120]}).\n{formatted}")
     return formatted
 
 
@@ -3050,7 +3148,7 @@ async def _core_bash(valves, sandbox_id: str, client: httpx.AsyncClient, *,
 # hear about it) before the command runs; a foreground result marks it
 # delivered. When a command auto-backgrounds, the outer bash() Tool method
 # spawns this worker-local coroutine as a fast path: on completion it releases the
-# session and marks the job ready, so this worker's next tool call in the
+# result lease and marks the job ready, so this worker's next tool call in the
 # chat claims the notice while it can return it.
 #
 # The sandbox owns delivery. Claiming only when a result can carry the notice
@@ -3060,13 +3158,11 @@ async def _core_bash(valves, sandbox_id: str, client: httpx.AsyncClient, *,
 
 _BG_BASH_POLL_MAX_SECONDS = 600
 
-async def _poll_bg_bash(valves, sandbox_id: str, session_id: str,
-                        session_cmd_id: str, cmd_id: str,
+async def _poll_bg_bash(valves, sandbox_id: str, process_id: str, cmd_id: str,
                         chat_state: LRUCache, chat_id: str):
     """Poll a backgrounded bash command and mark its notice ready to claim."""
     poll_interval = 2.0
     deadline = time.time() + _BG_BASH_POLL_MAX_SECONDS
-    exit_code = None
 
     async with httpx.AsyncClient() as poll_client:
         try:
@@ -3075,22 +3171,13 @@ async def _poll_bg_bash(valves, sandbox_id: str, session_id: str,
                 poll_interval = min(poll_interval * 1.5, 10.0)
                 try:
                     resp = await poll_client.get(
-                        _toolbox(valves, sandbox_id, f"/process/session/{session_id}"),
+                        _toolbox(valves, sandbox_id, f"/processes/{process_id}"),
                         headers=_headers(valves),
                         timeout=15.0,
                     )
-                    if resp.status_code != 200:
-                        continue
-                    commands = resp.json().get("commands", [])
-                    for cmd in commands:
-                        if cmd.get("id") == session_cmd_id:
-                            ec = cmd.get("exitCode")
-                            if ec is not None:
-                                exit_code = ec
-                            break
-                    else:
-                        continue
-                    if exit_code is not None:
+                    # An expired record also means the process has finished.
+                    if resp.status_code == 404 or (
+                            resp.status_code == 200 and resp.json().get("state") == "terminal"):
                         break
                 except Exception:
                     continue  # transient network error, keep polling
@@ -3771,39 +3858,35 @@ async def _chat_auto_init(
 
     # ── Sandbox-side snapshot (workspace listing + versions) ─────
     try:
-        resp = await client.post(
-            _toolbox(valves, sandbox_id, "/process/execute"),
-            headers=_headers(valves),
-            json={"command": f"python3 -c {_shell_quote(_SNAPSHOT_SCRIPT)}", "timeout": 10000},
-            timeout=15.0,
+        exit_code, snapshot, _ = await _execute(
+            valves, sandbox_id, client, ["python3", "-c", _SNAPSHOT_SCRIPT],
+            timeout_ms=10000, http_timeout=15.0,
         )
-        if resp.status_code == 200:
-            data = resp.json()
-            if data.get("exitCode") == 0 and data.get("result", "").strip():
-                parts.append(_render_context(data["result"]))
+        if exit_code == 0 and snapshot.strip():
+            parts.append(_render_context(snapshot))
     except Exception as e:
         logger.debug("auto-init: snapshot failed: %s", e)
 
     # ── Sandbox metadata from Daytona API ────────────────────────
     try:
         resp = await client.get(
-            _api(valves, f"/sandbox/{sandbox_id}"),
+            _api(valves, f"/sandboxes/{sandbox_id}"),
             headers=_headers(valves),
             timeout=15.0,
         )
         if resp.status_code == 200:
             sb = resp.json()
             cpu = sb.get("cpu")
-            mem = sb.get("memory")
-            disk = sb.get("disk")
-            region = sb.get("region")
+            mem = sb.get("memory_mib")
+            disk = sb.get("disk_max_mib")
+            region = sb.get("region_id")
             meta_parts = []
             if cpu is not None:
-                meta_parts.append(f"{cpu} vCPU")
+                meta_parts.append(f"{cpu:g} reserved CPU cores")
             if mem is not None:
-                meta_parts.append(f"{mem} GB RAM")
+                meta_parts.append(f"{mem / 1024:g} GiB reserved RAM")
             if disk is not None:
-                meta_parts.append(f"{disk} GB disk")
+                meta_parts.append(f"{disk / 1024:g} GiB disk limit")
             if region:
                 meta_parts.append(f"region: {region}")
             if meta_parts:
@@ -3852,16 +3935,12 @@ async def _wait_for_toolbox(valves, sandbox_id: str, client: httpx.AsyncClient, 
     attempts = 30 if wait else 1
     for attempt in range(attempts):
         try:
-            resp = await client.post(
-                _toolbox(valves, sandbox_id, "/process/execute"),
-                headers=_headers(valves),
-                json={"command": "bash -c 'mkdir -p /home/daytona/workspace'", "timeout": 5000},
-                timeout=10.0,
+            exit_code, _, _ = await _execute(
+                valves, sandbox_id, client, ["mkdir", "-p", "/home/daytona/workspace"],
+                timeout_ms=5000, http_timeout=10.0,
             )
-            if resp.status_code == 200:
-                data = resp.json()
-                if data.get("exitCode") == 0:
-                    return
+            if exit_code == 0:
+                return
         except (httpx.HTTPError, httpx.TimeoutException) as e:
             logger.debug("wait-for-toolbox: attempt %d failed: %s", attempt, e)
         if not wait:
@@ -3875,24 +3954,91 @@ async def _wait_for_toolbox(valves, sandbox_id: str, client: httpx.AsyncClient, 
     raise RuntimeError("Sandbox started but toolbox could not prepare the workspace (30 attempts)")
 
 
-_SANDBOX_START_STATES = frozenset({"stopped", "paused", "archived"})
 _SANDBOX_WAIT_STATES = frozenset({
-    # Provisioning: never interrupt creation with a start request.
-    "unknown", "pending_build", "pulling_snapshot", "building_snapshot", "creating",
-    # Start/resume and lifecycle operations converge without intervention.
-    "starting", "resuming", "restoring", "stopping", "pausing", "archiving",
-    "resizing", "snapshotting", "forking",
+    "queued", "pending", "assigned", "booting", "stopping", "pausing",
 })
-_SANDBOX_DELETION_STATES = frozenset({
-    "deleting", "deleted", "destroying", "destroyed",
-})
+_SANDBOX_DELETION_STATES = frozenset({"deleting", "deleted"})
+
+
+def _sandbox_name(valves, email: str) -> str:
+    # Names are for the Daytona console; only the exact labels identify owners.
+    def slug(value: str, fallback: str) -> str:
+        return re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")[:40].rstrip("-") or fallback
+
+    deployment = slug(valves.deployment_label, "deployment")
+    username = slug(email.split("@", 1)[0], "user")
+    digest = hashlib.sha256(f"{valves.deployment_label}\0{email}".encode()).hexdigest()
+    return f"lathe-{deployment}-{username}-{digest[:8]}"
+
+
+def _create_request(valves, email: str) -> dict:
+    """Build the create body. Identity and persistence are forced over overrides."""
+    body: dict = {
+        "cpu": valves.cpu_cores,
+        "memory_mib": round(valves.memory_gib * 1024),
+        "disk_max_mib": round(valves.disk_max_gib * 1024),
+        # Pausing keeps memory and disk. Nothing here deletes: an external
+        # reaper owns the retention decision.
+        "lifecycle_policy": {
+            "idle_expiry_seconds": valves.idle_pause_minutes * 60, "on_idle_timeout": "pause",
+            "timeout_seconds": valves.max_run_minutes * 60, "on_timeout": "pause",
+        },
+    }
+    if valves.sandbox_image.strip():
+        body["image"] = valves.sandbox_image.strip()
+    if valves.sandbox_region.strip():
+        body["region_id"] = valves.sandbox_region.strip()
+    return {
+        **body,
+        **_parse_create_overrides(valves.sandbox_create_overrides),
+        "name": _sandbox_name(valves, email),
+        "labels": {valves.deployment_label: email},
+        "persistent": True,
+    }
+
+
+async def _create_sandbox(valves, email: str, client: httpx.AsyncClient) -> dict:
+    """Create this user's sandbox, or join a concurrent create of it.
+
+    Names are not unique, so an idempotency key decides races between workers.
+    A used key replays its sandbox even after deletion; walking a numbered
+    sequence past deleted replays gives every worker the same next key.
+    """
+    body = _create_request(valves, email)
+    digest = hashlib.sha256(json.dumps(body, sort_keys=True).encode()).hexdigest()[:32]
+    for generation in range(64):
+        resp = await client.post(
+            _api(valves, "/sandboxes"),
+            headers=_headers(valves),
+            json={**body, "idempotency_key": f"lathe-{digest}-{generation}"},
+            timeout=30.0,
+        )
+        if resp.status_code == 400:
+            raise RuntimeError(
+                f"Daytona refused the sandbox settings: {resp.text[:300]} "
+                "Ask the administrator to check the Lathe sandbox valves."
+            )
+        resp.raise_for_status()
+        sandbox = await _get_live_sandbox(valves, resp.json()["id"], client)
+        if sandbox is None or sandbox.get("status") in _SANDBOX_DELETION_STATES:
+            continue
+        if (sandbox.get("labels") or {}).get(valves.deployment_label) != email:
+            raise RuntimeError(
+                "Daytona returned a sandbox without the expected owner association. Lathe will "
+                f"not select it. Ask the administrator to inspect sandbox {sandbox['id']}."
+            )
+        return sandbox
+    raise RuntimeError(
+        "Daytona kept returning deleted sandboxes for this account. "
+        "Ask the administrator to inspect it."
+    )
 
 
 async def _ensure_sandbox(valves, email: str, client: httpx.AsyncClient, emitter=None) -> tuple[str, str | None]:
     """Find or create a running sandbox for this user.
 
     Returns (sandbox_id, warning) where warning is None if the sandbox was
-    already running, or a short message describing what recovery was needed.
+    already running, or a short message describing what was needed.
     """
     if not valves.daytona_api_key:
         raise RuntimeError(
@@ -3904,36 +4050,12 @@ async def _ensure_sandbox(valves, email: str, client: httpx.AsyncClient, emitter
             "Deployment label not configured. Ask an admin to set it in Tool settings."
         )
 
-    label_key = valves.deployment_label
-    labels_filter = json.dumps({label_key: email})
-
-    # 1. Look up existing sandbox by label
-    resp = await client.get(
-        _api(valves, "/sandbox"),
-        params={"labels": labels_filter},
-        headers=_headers(valves),
-        timeout=30.0,
-    )
-    resp.raise_for_status()
-    sandboxes = _extract_sandbox_list(resp.json())
-
-    matches = [s for s in sandboxes if s.get("labels", {}).get(label_key) == email]
-
-    if len(matches) > 1:
-        raise RuntimeError(_multiple_sandboxes_error(label_key, email, matches))
-
-    # The label list is an eventually consistent discovery index. Its only
-    # permitted live cardinality is zero or one, so this adds at most one
-    # authoritative per-ID request per tool call.
-    sandbox = (
-        await _get_live_sandbox(valves, matches[0]["id"], client)
-        if matches else None
-    )
+    sandbox = await _find_sandbox(valves, email, client)
     warning: str | None = None
-    # No readiness cache: only a sandbox found started by the authoritative
-    # per-ID lookup takes the steady-state path. Creation (including a losing
-    # concurrent create) and any observed transition still wait for toolbox.
-    wait_for_startup = sandbox is None or sandbox.get("state") != "started"
+    # No readiness cache: only a sandbox found running by the authoritative
+    # per-ID lookup takes the steady-state path. Creation and any observed
+    # transition still wait for the toolbox.
+    wait_for_startup = sandbox is None or sandbox.get("status") != "running"
 
     if sandbox is None:
         if not valves.auto_create_sandbox:
@@ -3945,81 +4067,27 @@ async def _ensure_sandbox(valves, email: str, client: httpx.AsyncClient, emitter
                     f"separately before lathe's tools can be used."
                 )
             )
-
-        # 2. Build the create request. Admin overrides layer over lathe's
-        # tunable defaults (language, autoStop/Archive/Delete).
-        # Identity keys are forced last; volume overrides are forbidden so a
-        # misconfigured override can never break the per-user lookup
-        # invariant. _parse_create_overrides already rejects those keys,
-        # but forcing them here is belt-and-suspenders.
-        overrides = _parse_create_overrides(valves.sandbox_create_overrides)
-        sandbox_name = f"{label_key}/{email}"
-        create_json: dict = {
-            "autoStopInterval": valves.auto_stop_minutes,
-            "autoArchiveInterval": valves.auto_archive_minutes,
-            "autoDeleteInterval": valves.auto_delete_minutes,
-            **overrides,
-            "name": sandbox_name,
-            "labels": {label_key: email},
-        }
-        # 3. Create new sandbox (workspace persists across stop/archive)
         await _emit(emitter, "Preparing sandbox...")
-        resp = await client.post(
-            _api(valves, "/sandbox"),
-            headers=_headers(valves),
-            json=create_json,
-            timeout=30.0,
-        )
-        if resp.status_code == 409:
-            # Daytona's control-plane source makes (organizationId, name) unique
-            # and translates duplicate inserts to 409; labels only have a
-            # non-unique GIN index.
-            # Evidence: https://github.com/daytonaio/daytona/blob/b5a5d9e78d76c8bcf351f2049620250e0f34eea4/apps/api/src/sandbox/entities/sandbox.entity.ts#L31-L55
-            # and https://github.com/daytonaio/daytona/blob/b5a5d9e78d76c8bcf351f2049620250e0f34eea4/apps/api/src/sandbox/services/sandbox.service.ts#L711-L713
-            # Resolve the winning cross-process create by that unique name, not
-            # the eventually consistent label index that allowed the race.
-            lookup = await client.get(
-                _api(valves, f"/sandbox/{urllib.parse.quote(sandbox_name, safe='')}"),
-                headers=_headers(valves),
-                timeout=30.0,
-            )
-            if lookup.status_code == 404:
-                raise RuntimeError(
-                    "Sandbox creation conflicted, but Daytona did not return the "
-                    "winning sandbox by its unique name. Retry this tool call; if "
-                    "the conflict persists, ask the Daytona administrator to inspect "
-                    f"sandbox name {sandbox_name}."
-                )
-            lookup.raise_for_status()
-            sandbox = lookup.json()
-            if (sandbox.get("name") != sandbox_name
-                    or sandbox.get("labels", {}).get(label_key) != email):
-                raise RuntimeError(
-                    f"Daytona sandbox name {sandbox_name} is already in use without "
-                    f"the expected {label_key}={email} association. Lathe will not "
-                    "select it. Ask the Daytona administrator to reconcile that name."
-                )
-        else:
-            resp.raise_for_status()
-            sandbox = resp.json()
-            warning = "[Sandbox was created — this is a fresh environment with no prior files]"
+        sandbox = await _create_sandbox(valves, email, client)
+        warning = "[Sandbox was created — this is a fresh environment with no prior files]"
 
     sandbox_id = sandbox["id"]
-    state = sandbox.get("state", "unknown")
 
-    # 4. Drive every observed lifecycle state toward started. The same policy
-    # runs before and during polling so stopping -> stopped and archiving ->
-    # archived issue the start request that their terminal states require.
+    # Drive every observed state toward running. The same policy runs before
+    # and during polling so pausing -> paused issues its resume.
     deadline = time.time() + 120
     poll_interval = 1.0
     info = sandbox
-    recovery_attempted = False
-    start_requested = False
+    start_requested_from = None
+    start_transition_seen = False
     preparing_emitted = False
     while time.time() < deadline:
-        state = info.get("state", "unknown")
+        status = info.get("status", "unknown")
 
-        if state == "started":
+        if status == "running":
+            proxy = info.get("toolbox_proxy_url") or ""
+            if proxy.startswith("https://"):
+                _TOOLBOX_URLS[sandbox_id] = proxy
             await _wait_for_toolbox(valves, sandbox_id, client, emitter, wait=wait_for_startup)
             await _emit(emitter, "Sandbox ready", done=True)
             return sandbox_id, warning
@@ -4028,69 +4096,49 @@ async def _ensure_sandbox(valves, email: str, client: httpx.AsyncClient, emitter
             await _emit(emitter, "Preparing sandbox...")
             preparing_emitted = True
 
-        if state in _SANDBOX_START_STATES and not start_requested:
-            resp = await client.post(
-                _api(valves, f"/sandbox/{sandbox_id}/start"),
-                headers=_headers(valves),
-                timeout=30.0,
-            )
-            resp.raise_for_status()
-            start_requested = True
-            if not warning:
-                if state == "archived":
-                    warning = "[Sandbox was restarted from archived state — running processes were lost]"
-                elif state == "paused":
-                    warning = "[Sandbox was resumed from paused state]"
-                else:
-                    warning = "[Sandbox was restarted — running processes were lost]"
-
-        if state == "error":
-            if info.get("recoverable") and not recovery_attempted:
-                recovery_attempted = True
+        if status in ("paused", "stopped"):
+            if status == "stopped" and start_requested_from and (
+                    start_requested_from == "paused" or start_transition_seen):
+                raise RuntimeError("Sandbox stopped after the resume or start request. Ask the Daytona administrator to inspect it.")
+            if start_requested_from is None:
+                action = "resume" if status == "paused" else "start"
                 resp = await client.post(
-                    _api(valves, f"/sandbox/{sandbox_id}/recover"),
+                    _api(valves, f"/sandboxes/{sandbox_id}/{action}"),
                     headers=_headers(valves),
                     timeout=30.0,
                 )
-                resp.raise_for_status()
-                resp = await client.post(
-                    _api(valves, f"/sandbox/{sandbox_id}/start"),
-                    headers=_headers(valves),
-                    timeout=30.0,
-                )
-                resp.raise_for_status()
-                start_requested = True
-                if not warning:
-                    warning = "[Sandbox was recovered from error — check that expected files and processes still exist]"
-            else:
-                reason = info.get("errorReason", "unknown")
-                detail = " after recovery was attempted" if recovery_attempted else ""
-                raise RuntimeError(
-                    f"Sandbox is in a non-recoverable error state{detail}: {reason}. "
-                    "Ask the Daytona administrator to inspect or replace this sandbox."
-                )
+                # 409: another worker already moved it on; polling observes that.
+                if resp.status_code != 409:
+                    resp.raise_for_status()
+                    start_requested_from = status
+                    warning = warning or (
+                        "[Sandbox was resumed from pause: files, processes and interpreter state were "
+                        "kept, but network connections may have dropped]" if status == "paused" else
+                        "[Sandbox was restarted — running processes were lost]")
 
-        elif state == "build_failed":
+        elif status in ("failed", "lost"):
             raise RuntimeError(
-                "Sandbox snapshot build failed. Ask the Daytona administrator to "
-                "inspect the failed build and replace or retry this sandbox."
+                f"Sandbox is {status}: {info.get('error') or 'no reason given'}. "
+                "Ask the Daytona administrator to inspect or replace this sandbox."
             )
 
-        elif state in _SANDBOX_DELETION_STATES:
+        elif status in _SANDBOX_DELETION_STATES:
             raise RuntimeError(
-                f"Sandbox is being deleted (state: {state}). Retry after deletion completes "
+                f"Sandbox is being deleted (status: {status}). Retry after deletion completes "
                 "so Lathe can provision a replacement."
             )
 
-        elif state not in _SANDBOX_START_STATES and state not in _SANDBOX_WAIT_STATES:
+        elif status not in _SANDBOX_WAIT_STATES:
             raise RuntimeError(
-                f"Sandbox has unsupported Daytona lifecycle state '{state}'. "
-                "Ask the administrator to inspect the sandbox and update Lathe if this state is expected."
+                f"Sandbox has unsupported Daytona status '{status}'. "
+                "Ask the administrator to inspect the sandbox and update Lathe if this status is expected."
             )
 
+        if start_requested_from and status in ("assigned", "booting", "pending"):
+            start_transition_seen = True
         await asyncio.sleep(poll_interval)
         resp = await client.get(
-            _api(valves, f"/sandbox/{sandbox_id}"),
+            _api(valves, f"/sandboxes/{sandbox_id}"),
             headers=_headers(valves),
             timeout=30.0,
         )
@@ -4099,7 +4147,11 @@ async def _ensure_sandbox(valves, email: str, client: httpx.AsyncClient, emitter
 
         poll_interval = min(poll_interval * 1.2, 5.0)
 
-    raise RuntimeError("Timed out waiting for sandbox to start (120s)")
+    reason = f": {info['error']}" if info.get("error") else ""
+    raise RuntimeError(
+        f"Timed out waiting for sandbox to start (120s, status {info.get('status')}){reason}. "
+        "If this repeats, ask the Daytona administrator to inspect it."
+    )
 
 
 # ── Tools class (only public methods are visible to OWUI) ───────────
@@ -4121,12 +4173,12 @@ class Tools:
             json_schema_extra={"input": {"type": "password"}},
         )
         daytona_api_url: str = Field(
-            "https://app.daytona.io/api",
+            "https://api.daytona.com",
             description="Daytona control plane API URL",
         )
         daytona_proxy_url: str = Field(
-            "https://proxy.app.daytona.io/toolbox",
-            description="Daytona toolbox proxy URL",
+            "",
+            description="Optional toolbox proxy URL override. Empty uses the URL Daytona reports for each sandbox's region.",
         )
         preview_wrapper_url: str = Field(
             "", description="Optional HTTPS registration endpoint for public or owner-authenticated HTTP previews. Headerless public requests fall back to the direct signed URL; private or header-bearing requests fail closed.",
@@ -4143,17 +4195,33 @@ class Tools:
             "",
             description="Label key used to tag sandboxes for this OWUI deployment (e.g. 'chat.example.com')",
         )
-        auto_stop_minutes: int = Field(
-            15,
-            description="Minutes of idle before sandbox stops (0 = never)",
+        idle_pause_minutes: int = Field(
+            15, ge=1,
+            description="Minutes of idle before the sandbox pauses. Pausing keeps files and running processes.",
         )
-        auto_archive_minutes: int = Field(
-            60,
-            description="Minutes after stop before sandbox archives",
+        max_run_minutes: int = Field(
+            1440, ge=1,
+            description="Minutes a sandbox may run before it pauses regardless of activity; restarts on each resume. Daytona's plan sets the maximum (24 hours on Starter).",
         )
-        auto_delete_minutes: int = Field(
-            -1,
-            description="Minutes after archive before sandbox is permanently deleted (-1 = never). Example: 129600 = 90 days.",
+        cpu_cores: float = Field(
+            0.5, ge=0.125,
+            description="CPU cores reserved for a new sandbox. Work may use more when the host has it.",
+        )
+        memory_gib: float = Field(
+            2.0, ge=0.5,
+            description="Memory (GiB) reserved for a new sandbox. Work may use more when the host has it.",
+        )
+        disk_max_gib: float = Field(
+            20.0, ge=10,
+            description="Disk limit (GiB) for a new sandbox. Fixed at creation.",
+        )
+        sandbox_image: str = Field(
+            "",
+            description="Daytona image name or ID for new sandboxes (see image/build.py). Empty uses Daytona's default image.",
+        )
+        sandbox_region: str = Field(
+            "",
+            description="Daytona region for new sandboxes, e.g. us-east-ash-1. Must hold sandbox_image. Empty uses the project default.",
         )
         auto_create_sandbox: bool = Field(
             True,
@@ -4177,10 +4245,8 @@ class Tools:
             description=(
                 "JSON object of extra arguments merged into the Daytona sandbox "
                 "create request, e.g. "
-                '{"snapshot":"daytona-medium","target":"us"}. '
-                "Size comes from the snapshot (daytona-small/medium/large); "
-                "cpu/memory/disk apply only with an image, not a snapshot. "
-                "Cannot override name or labels, or attach volumes."
+                '{"memory_max_mib":8192,"cores_max":4}. Replaces values from other valves. '
+                "Cannot override name, labels, persistent or idempotency_key, or attach volumes."
             ),
         )
         foreground_timeout_seconds: int = Field(
@@ -4260,7 +4326,7 @@ class Tools:
             **Administrator network policy:**
             Ask the administrator about account-tier restrictions, approved
             mirrors, or allowlist changes. Check the current policy at
-            https://app.daytona.io rather than assuming a tier guarantees access.
+            https://app.daytona.com rather than assuming a tier guarantees access.
 
             ## What does NOT work
 
@@ -4295,14 +4361,13 @@ class Tools:
             sandbox was restarted (in which case the PID is stale). To
             distinguish the two, check whether the PID is still alive.
             While a command runs, its sidecar remains available for monitoring.
-            Completion releases the Daytona session unless a live shell-backgrounded
-            job still depends on it. Cleanup removes the wrapper and PID, but keeps
+            Cleanup removes the wrapper and PID, but keeps
             the full log and exit status for 24 hours after completion. Unrelated
             bash calls, including calls from other chats, do not shorten this lease.
             A later bash call removes expired evidence once no retained job is live.
             Previews are bounded to 50 KiB, and may begin mid-line. Use read() for
             numbered previews, bash byte ranges, or expose() for full file access.
-            Sandbox stop or restart clears all sidecars and sessions.
+            A sandbox restart clears all sidecars; an idle pause does not.
 
             ## Completion notices
 
@@ -4380,9 +4445,8 @@ class Tools:
               return busy without executing their code. Other chats can run
               independently. This is organizational separation, not isolation
               against agents with shell access to the same sandbox.
-            - State is lost when the sandbox stops or restarts (idle timeout,
-              destroy, etc.). The tool detects this and warns you to re-run
-               setup code.
+            - State survives an idle pause, but not a sandbox restart or destroy.
+              The tool detects this and warns you to re-run setup code.
             - A timeout kills the Python process and discards its memory.
               Partial filesystem/network effects may remain. Never automatically
               replay Python after a timeout or ambiguous submission.
@@ -4528,13 +4592,11 @@ class Tools:
             first: expose never starts it). Give them that link, then stop all
             input AND screenshots and wait for their explicit ready message. Then
             observe afresh (page.text or a screenshot). No busy polling.
-            When handing off, mention the idle window from expose's result: the
-            sandbox may stop after that many minutes without tool calls, even
-            while the human works over VNC. If they need longer, a short reply
+            When handing off, mention that the sandbox may pause while the
+            human works over VNC. If that happens, a short reply
             from them lets you refresh it with peek(command="status"). Logins
-            whose cookies have an expiry persist in the browser profile across
-            sleep; session-only cookies do not, so a stopped sandbox may mean
-            logging in again.
+            whose cookies have an expiry persist in the browser profile;
+            session-only cookies survive a pause but not a sandbox restart.
 
             Private access is strongly advised, as for shells and IDEs. Public
             access requires the user's explicit informed approval: anyone with the
@@ -4560,24 +4622,24 @@ class Tools:
             In native dialogs, click the button (Save, Open) rather than pressing
             Enter, which may do nothing. Named keys include enter, tab, escape,
             arrows, ctrl, alt, shift, cmd; hotkey takes strings like ctrl+l.
-            accessibility.tree/find and focus/invoke/set_value use AT-SPI, whose
-            coverage is sparse; read browser content with page commands instead.
+            accessibility.tree/find and focus/invoke/set_value use AT-SPI. Prefer
+            page commands for the browser: pass scope "all", since "focused" may
+            name another application, and type with page.type, since browser
+            fields refuse set_value.
             Input acknowledgement is not proof of outcome: observe again. No input
-            is retried: an ambiguous failure may already have acted. Held
-            keys/buttons need matching up calls, even after failures.
+            is retried: an ambiguous failure may already have acted.
 
             ## Escape hatch: bash
 
             Bash shells lack the desktop session environment. Import it so GUI apps
             appear on the shared screen and register with accessibility:
 
-            eval "$(tr '\\0' '\\n' < /proc/$(pgrep -xo xfce4-session)/environ | grep -E '^(DBUS_SESSION_BUS_ADDRESS|DISPLAY|GTK_MODULES)=' | sed 's/^/export /')"
+            eval "$(tr '\\0' '\\n' < /proc/$(pgrep -fo xfce4-session)/environ | grep -E '^(DBUS_SESSION_BUS_ADDRESS|DISPLAY|GTK_MODULES)=' | sed 's/^/export /')"
 
             For multi-step scripts, waits and downloads, attach Playwright to the
             shared browser after any page poke has launched it:
             chromium.connect_over_cdp("http://127.0.0.1:9222"). The browser page of
-            the agent handbook has details. Raw X access: xwd, Pillow and ffmpeg
-            are installed; pip install --user mss python-xlib; XTEST is available.
+            the agent handbook has details.
 
             ## Errors and diagnostics
 
@@ -4594,7 +4656,7 @@ class Tools:
             peek(command="status") summarizes which processes run. Rarely needed,
             and usually better done with bash (ps, logs): display.windows (sizes
             are often 0), process.status/logs/errors and poke process.restart.
-            Processes: xvfb, xfce4, x11vnc, novnc, pulseaudio, atspi.
+            Processes: xvfb, wm, x11vnc, dbus.
 
             ## Shared ownership
 
@@ -4662,7 +4724,8 @@ class Tools:
             token/secret/key values and login-token URLs from screen-facing
             inspection unless the user asked for those values; this is a display
             habit, not automatic secret detection.
-            Use the least reachable bind address the proxy can actually access.
+            Bind services you will expose to 0.0.0.0: the preview proxy cannot reach
+            loopback. Keep everything else on 127.0.0.1.
             Disable app authentication only behind a verified private authenticated
             proxy with no unauthenticated direct path; otherwise retain app auth.
             Private registration does not secure other routes to the same app.
@@ -4672,7 +4735,7 @@ class Tools:
             Wait and check port release. Do not escalate to KILL or stop unrelated
             processes without permission. After sandbox sleep, verify or restart
             the intended application before renewing exposure.
-            The ordinary sandbox filesystem survives stop/archive, not destroy.
+            The sandbox filesystem survives pause and restart, not destroy.
             Preview registration neither keeps a sandbox awake nor restarts a process.
 
             {preview_access_note}
@@ -4708,7 +4771,7 @@ class Tools:
 
             Check port 8000 using the identity/reuse procedure above, then start:
 
-            bash(command="python3 -m http.server 8000 --bind 127.0.0.1 --directory /home/daytona/workspace/site",
+            bash(command="python3 -m http.server 8000 --bind 0.0.0.0 --directory /home/daytona/workspace/site",
                  foreground_seconds=0)
 
             Keep the returned background descriptor. In a subsequent bash call,
@@ -4718,8 +4781,7 @@ class Tools:
 
             expose(target="http:8000", access="private")
 
-            Verify that the preview reaches this server. If the proxy cannot reach
-            loopback, diagnose its routing before changing the bind address; do not
+            Verify that the preview reaches this server. If it does not, do not
             silently switch to public access. Public exposure requires the user's
             explicit request. Editing files under the served root needs only a
             browser refresh, not a server restart.
@@ -4783,8 +4845,10 @@ class Tools:
             Work in a per-user Linux sandbox, shared across conversations.
             Tools create/start/recover it automatically. Default working directory:
             /home/daytona/workspace. Use absolute sandbox paths for file tools.
-            Files survive stop/archive; running processes and interpreter state do
-            not. Idle stop defaults to 15 minutes. Previews do not keep it awake.
+            An idle sandbox pauses (15 minutes by default): files, processes and
+            interpreter state are kept and resume with the next tool call. Work does
+            not progress while paused, and background jobs do not keep it awake.
+            A sandbox unused for weeks may be deleted; export important results.
 
             ## Start with project context
 
@@ -4802,7 +4866,7 @@ class Tools:
             - bash auto-backgrounds after its foreground window.
               Use the returned sidecar paths to inspect progress/results. Bash
               logs and exit status remain readable for 24 hours after completion;
-              later bash calls reap expired results. Sandbox stop/restart clears them.
+              later bash calls reap expired results. A sandbox restart clears them.
             - {preview_access_note}
             - Start services with bash, check readiness, then expose http:<port>.
               Never expose shells or IDEs publicly.
@@ -4946,32 +5010,10 @@ class Tools:
             if not valves.deployment_label:
                 return "Error: Deployment label not configured."
 
-            label_key = valves.deployment_label
-            labels_filter = json.dumps({label_key: email})
-
             await _emit(__event_emitter__, "Looking up sandbox...")
 
             async with httpx.AsyncClient() as client:
-                resp = await client.get(
-                    _api(valves, "/sandbox"),
-                    params={"labels": labels_filter},
-                    headers=_headers(valves),
-                    timeout=30.0,
-                )
-                resp.raise_for_status()
-                sandboxes = _extract_sandbox_list(resp.json())
-                matches = [
-                    s for s in sandboxes
-                    if s.get("labels", {}).get(label_key) == email
-                ]
-
-                if len(matches) > 1:
-                    return f"Error: {_multiple_sandboxes_error(label_key, email, matches)}"
-
-                sandbox = (
-                    await _get_live_sandbox(valves, matches[0]["id"], client)
-                    if matches else None
-                )
+                sandbox = await _find_sandbox(valves, email, client)
 
                 if sandbox is None:
                     await _emit(__event_emitter__, "No sandbox found", done=True)
@@ -4980,25 +5022,17 @@ class Tools:
                 sid = sandbox["id"]
                 await _emit(__event_emitter__, f"Destroying sandbox {sid[:12]}...")
                 resp = await client.delete(
-                    _api(valves, f"/sandbox/{sid}"),
+                    _api(valves, f"/sandboxes/{sid}"),
                     headers=_headers(valves),
-                    params={"force": "true"},
                     timeout=30.0,
                 )
                 resp.raise_for_status()
 
-                # The label list may transiently disappear then reappear with a
-                # stale pre-delete state. Only the per-ID 404 is completion.
+                # Search may keep listing it; only the per-ID record is authoritative.
                 for _ in range(30):
                     await asyncio.sleep(1)
-                    resp = await client.get(
-                        _api(valves, f"/sandbox/{sid}"),
-                        headers=_headers(valves),
-                        timeout=30.0,
-                    )
-                    if resp.status_code == 404:
+                    if await _get_live_sandbox(valves, sid, client) is None:
                         break
-                    resp.raise_for_status()
                 else:
                     raise RuntimeError(
                         f"Sandbox {sid[:12]} did not finish deletion within 30 seconds."
@@ -5059,24 +5093,13 @@ class Tools:
                 script_path, script.encode("utf-8"),
             )
 
-            resp = await client.post(
-                _toolbox(self.valves, sandbox_id, "/process/execute"),
-                headers=_headers(self.valves),
-                json={
-                    "command": f"python3 {script_path}",
-                    "timeout": 30000,
-                },
-                timeout=60.0,
+            exit_code, result, stderr = await _execute(
+                self.valves, sandbox_id, client, ["python3", script_path],
             )
-            resp.raise_for_status()
-            data = resp.json()
-
-            result = data.get("result", "")
-            exit_code = data.get("exitCode", -1)
 
             if exit_code != 0:
                 await _emit(__event_emitter__, "Error loading context", done=True)
-                return f"Error: onboard script failed (exit {exit_code}): {result[:500]}"
+                return f"Error: onboard script failed (exit {exit_code}): {(result + stderr)[:500]}"
 
             rendered = _render_context(result)
             await _emit(__event_emitter__, "Project context loaded", done=True)
@@ -5153,8 +5176,7 @@ class Tools:
                 # CMD/notify was written at launch; the poller is a fast path
                 # that also releases the session promptly, chat or not.
                 asyncio.ensure_future(_poll_bg_bash(
-                    self.valves, sandbox_id, background["session_id"],
-                    background["session_cmd_id"], background["cmd_id"],
+                    self.valves, sandbox_id, background["process_id"], background["cmd_id"],
                     self._chat_state, __chat_id__,
                 ))
 
@@ -5350,7 +5372,7 @@ class Tools:
         match = re.fullmatch(r"http:([0-9]{1,5})", target.strip().lower())
         if not vnc and not match:
             return 'Error: target must be "http:<port>" or "vnc". See the services/computer manuals for lifecycle and access safeguards.'
-        port = 6080 if vnc else int(match[1])
+        port = _VNC_PORT if vnc else int(match[1])
         if not 1024 <= port <= 65535:
             return "Error: port must be between 1024 and 65535."
         harness = _HarnessDelivery(self._chat_state, __chat_id__)
@@ -5364,10 +5386,15 @@ class Tools:
             )
             if vnc:
                 obj = await _computer_json(self.valves, sandbox_id, client, "status")
-                active = next((v for k, v in obj.items() if k.lower() == "status"), None)
-                if active != "active":
+                if obj.get("status") != "active":
                     raise _ToolFailure('desktop is not active. Use poke(command="start"), '
                                        'then peek(command="status") before exposing VNC.')
+                await _run_sandbox_script(self.valves, sandbox_id, client, _VNC_BRIDGE_SCRIPT,
+                                          error_prefix="VNC unavailable")
+            else:
+                reason = await _unreachable_reason(self.valves, sandbox_id, client, port)
+                if reason:
+                    raise _ToolFailure(reason)
             await _emit(__event_emitter__, f"Generating URL for port {port}...")
             url, access_note = await _http_preview(
                 self.valves, sandbox_id, port, __user__, access, tag, client,
@@ -5387,10 +5414,9 @@ class Tools:
             await _emit(__event_emitter__, f"URL ready (port {port})", done=True)
             return (
                 f"Service URL: {url}\n\n{access_note}\n\n"
-                f"The sandbox auto-stops after ~{self.valves.auto_stop_minutes} min of inactivity, "
-                "even with background processes. Restart the service with "
-                + ('poke(command="start")' if vnc else "bash") + " after sleep, "
-                "then call expose again. Registration does not keep the service alive."
+                "If the sandbox pauses, the next Lathe tool call resumes it. "
+                "If the service still does not answer, restart it and call expose again. "
+                "Preview registration does not keep the sandbox awake."
             )
 
         return await _tool_context(__event_emitter__, _run, harness)

@@ -261,8 +261,10 @@ async def test_setup_preserves_provider_and_lifecycle_policy(stale_cache):
              "params": {"function_calling": "native", "max_tokens": 4096,
                         "custom_params": {"provider": {"data_collection": "deny"}}},
              "meta": {"capabilities": {"builtin_tools": False, "vision": True}}}
-    valves = {"sandbox_create_overrides": '{"ttlMinutes":30}', "auto_stop_minutes": 5,
-              "auto_delete_minutes": 0, "deployment_label": "lathe-ci-demo-fixture",
+    lifecycle = {"idle_expiry_seconds": 300, "on_idle_timeout": "delete",
+                 "timeout_seconds": 1800, "on_timeout": "delete"}
+    valves = {"sandbox_create_overrides": json.dumps({"lifecycle_policy": lifecycle}),
+              "idle_pause_minutes": 5, "deployment_label": "lathe-ci-demo-fixture",
               "preview_wrapper_key": "fixture-secret"}
     seen = []
     def respond(request):
@@ -294,8 +296,9 @@ async def test_setup_preserves_provider_and_lifecycle_policy(stale_cache):
     assert model["params"]["function_calling"] == "native"
     assert model["meta"]["capabilities"]["vision"] is True
     assert model["meta"]["capabilities"]["builtin_tools"] is False
-    assert json.loads(valves["sandbox_create_overrides"]) == {"ttlMinutes": 30, "networkBlockAll": True}
-    assert valves["auto_stop_minutes"] == 5 and valves["auto_delete_minutes"] == 0
+    assert json.loads(valves["sandbox_create_overrides"]) == {
+        "lifecycle_policy": lifecycle, "network_policy": {"block_all": True}}
+    assert valves["idle_pause_minutes"] == 5
     assert valves["preview_wrapper_key"] == "fixture-secret"
     assert any(params.get("refresh") == "true" for _, _, params, _ in seen)
 
@@ -308,11 +311,12 @@ async def test_independent_downloads_verify_policy_and_final_artifacts(tmp_path,
     (tmp_path / "demo-video/out/artifact.json").write_text('{"path":"/workspace/impact.html"}')
     monkeypatch.setattr(demo, "ROOT", tmp_path)
     monkeypatch.setenv("LATHE_TEST_DEPLOYMENT_LABEL", "lathe-ci-demo-fixture")
-    sandbox = {"id": "sandbox-1", "labels": {"lathe-ci-demo-fixture": "monitor@lathe.invalid"},
-               "networkBlockAll": True, "volumes": []}
+    sandbox = {"id": "sandbox-1", "status": "running", "toolbox_proxy_url": "https://region.test/toolbox",
+               "labels": {"lathe-ci-demo-fixture": "monitor@lathe.invalid"}, "volumes": []}
+    policy = {"desired": {"block_all": True}, "applied": {"block_all": True}}
     files = {"/workspace/impact.html": '<h1>Repair café</h1><p>12 items, 7 repaired</p>' + '<p>Volunteer impact</p>' * 30}
     if fault == "egress":
-        sandbox["networkBlockAll"] = False
+        policy["applied"]["block_all"] = False
     if fault == "volume":
         sandbox["volumes"] = [{"id": "other"}]
     if fault == "identity":
@@ -323,9 +327,14 @@ async def test_independent_downloads_verify_policy_and_final_artifacts(tmp_path,
         files["/workspace/impact.html"] += '<script src="https://external.invalid/chart.js"></script>'
     downloads = []
     def respond(request):
-        if request.url.path == "/api/sandbox":
+        if request.url.path == "/sandboxes/search":
             assert json.loads(request.url.params["labels"]) == {"lathe-ci-demo-fixture": "monitor@lathe.invalid"}
-            return demo.httpx.Response(200, json={"items": [sandbox]})
+            return demo.httpx.Response(200, json={"sandboxes": [sandbox], "next_cursor": None})
+        if request.url.path == "/sandboxes/sandbox-1":
+            return demo.httpx.Response(200, json=sandbox)
+        if request.url.path == "/sandboxes/sandbox-1/network-policy":
+            return demo.httpx.Response(200, json=policy)
+        assert request.url.host == "region.test"
         assert request.url.path == "/toolbox/sandbox-1/files/download"
         path = request.url.params["path"]
         downloads.append(path)

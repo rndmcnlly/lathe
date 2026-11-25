@@ -97,9 +97,9 @@ the port afterward: identify it before any restart.
 
 The app commands on these pages do not depend on Open WebUI. An IDE or terminal
 can execute arbitrary code and read the entire sandbox; a root argument selects
-a working directory, **not confinement**. Bind to loopback when the reverse proxy
-can reach it. If the proxy requires a different bind address, understand direct
-access routes before changing it. An app without authentication is acceptable
+a working directory, **not confinement**. Daytona's preview proxy cannot reach
+loopback, so bind exposed services to `0.0.0.0`; elsewhere, prefer loopback when
+the reverse proxy can reach it and understand direct access routes. An app without authentication is acceptable
 only behind a verified private authenticated proxy with no unauthenticated
 direct path. Otherwise keep app authentication and transport security enabled.
 

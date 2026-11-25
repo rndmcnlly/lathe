@@ -50,15 +50,15 @@ lathe._ensure_sandbox = sandbox
 lathe._ensure_chat_init = orientation
 violations = []
 async def execute(request):
-    if request.method != "POST" or request.url.path != "/" + options["sandbox"] + "/process/execute":
+    if request.method != "POST" or request.url.path != "/" + options["sandbox"] + "/processes":
         violations.append(str(request.url))
         raise AssertionError("unexpected HTTP")
-    args = shlex.split(json.loads(request.content)["command"])
+    args = json.loads(request.content)["argv"]
     assert args[:2] == ["python3", "-c"]
     assert "never-in-sandbox" not in args[2]
     child = await asyncio.create_subprocess_exec(sys.executable, "-c", args[2], stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
     stdout, stderr = await child.communicate()
-    return httpx.Response(200, json={"exitCode": child.returncode, "result": stdout.decode() + stderr.decode()})
+    return httpx.Response(200, json={"id": "p1", "state": "terminal", "exitCode": child.returncode, "logs": {"eof": True, "frames": [{"channel": c, "data": d.decode()} for c, d in (("stdout", stdout), ("stderr", stderr)) if d]}})
 constructor = httpx.AsyncClient
 lathe.httpx.AsyncClient = lambda *args, **kw: constructor(*args, **kw, transport=httpx.MockTransport(execute))
 async def main():

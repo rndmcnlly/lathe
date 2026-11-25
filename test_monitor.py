@@ -214,29 +214,36 @@ def suite_transport(suite, monkeypatch):
 
 
 async def test_cleanup_owns_only_exact_run_and_follows_pages(suite, monkeypatch):
-    # Daytona's ListSandboxesResponseDto pages with `nextCursor`; the owned
+    # Daytona's sandbox search pages with `next_cursor`; the owned
     # sandbox is a straggler on page 2, behind other runs and production.
     requests = []
 
     def daytona(request):
         requests.append((request.method, request.url.path, request.url.params.get("cursor")))
-        if request.url.path == "/api/sandbox":
+        if request.url.path == "/sandboxes/search":
             if request.url.params.get("cursor") == "page2":
-                return httpx.Response(200, json={"items": [
-                    {"id": "owned", "labels": {"lathe-ci-this-run": "monitor@lathe.invalid"}}], "nextCursor": None})
-            return httpx.Response(200, json={"items": [
+                return httpx.Response(200, json={"sandboxes": [
+                    {"id": "owned", "labels": {"lathe-ci-this-run": "monitor@lathe.invalid"}}], "next_cursor": None})
+            return httpx.Response(200, json={"sandboxes": [
                 {"id": "prod", "labels": {"production": "user"}},
                 {"id": "other-ci", "labels": {"lathe-ci-other-run": "monitor@lathe.invalid"}},
-            ], "nextCursor": "page2"})
-        assert request.url.path == "/api/sandbox/owned"
+                {"id": "stale", "labels": {"lathe-ci-this-run": "monitor@lathe.invalid"}},
+            ], "next_cursor": "page2"})
+        if request.url.path == "/sandboxes/stale":
+            assert request.method == "GET"
+            return httpx.Response(200, json={"labels": {"production": "user"}})
+        assert request.url.path == "/sandboxes/owned"
+        if request.method == "GET" and ("DELETE", "/sandboxes/owned", None) not in requests:
+            return httpx.Response(200, json={"labels": {"lathe-ci-this-run": "monitor@lathe.invalid"}})
         return httpx.Response(200 if request.method == "DELETE" else 404)
 
     client_type = httpx.AsyncClient
     monkeypatch.setattr(suite.httpx, "AsyncClient",
                         lambda **kw: client_type(transport=httpx.MockTransport(daytona), **kw))
     await suite.cleanup_test_sandboxes()
-    assert requests == [("GET", "/api/sandbox", None), ("GET", "/api/sandbox", "page2"),
-                        ("DELETE", "/api/sandbox/owned", None), ("GET", "/api/sandbox/owned", None)]
+    assert requests == [("GET", "/sandboxes/search", None), ("GET", "/sandboxes/search", "page2"),
+                        ("GET", "/sandboxes/stale", None), ("GET", "/sandboxes/owned", None),
+                        ("DELETE", "/sandboxes/owned", None), ("GET", "/sandboxes/owned", None)]
 
 
 async def test_known_owner_lookup_uses_exact_server_filter_across_pages(suite):
@@ -244,13 +251,12 @@ async def test_known_owner_lookup_uses_exact_server_filter_across_pages(suite):
     def daytona(request):
         requests.append(dict(request.url.params))
         assert json.loads(request.url.params["labels"]) == {"lathe-ci-this-run": "test@lathe.invalid"}
-        assert request.url.params["includeErroredDeleted"] == "true"
         if request.url.params.get("cursor") == "p2":
-            return httpx.Response(200, json={"items": [
-                {"id": "owned", "labels": {"lathe-ci-this-run": "test@lathe.invalid", "secret": "x"}}], "nextCursor": None})
+            return httpx.Response(200, json={"sandboxes": [
+                {"id": "owned", "labels": {"lathe-ci-this-run": "test@lathe.invalid", "secret": "x"}}], "next_cursor": None})
         # A server that under-filters: same key, other owner, must be re-checked away.
-        return httpx.Response(200, json={"items": [
-            {"id": "other-owner", "labels": {"lathe-ci-this-run": "someone@lathe.invalid"}}], "nextCursor": "p2"})
+        return httpx.Response(200, json={"sandboxes": [
+            {"id": "other-owner", "labels": {"lathe-ci-this-run": "someone@lathe.invalid"}}], "next_cursor": "p2"})
     async with httpx.AsyncClient(transport=httpx.MockTransport(daytona)) as http:
         found = await suite.labelled_sandboxes(http, "lathe-ci-this-run", ["test@lathe.invalid"])
     # IDs and the owning label only; other labels never leave the helper.
@@ -262,10 +268,10 @@ def endless_pages(requests):
     """Distinct cursors forever: a misbehaving or adversarial listing."""
     def respond(request):
         requests.append((request.method, request.url.path))
-        assert request.method == "GET" and request.url.path == "/api/sandbox", "no deletion while listing is unproven"
+        assert request.method == "GET" and request.url.path == "/sandboxes/search", "no deletion while listing is unproven"
         n = int(request.url.params.get("cursor", "0"))
-        return httpx.Response(200, json={"items": [{"id": f"noise-{n}", "labels": {"other": "x"}}],
-                                         "nextCursor": str(n + 1)})
+        return httpx.Response(200, json={"sandboxes": [{"id": f"noise-{n}", "labels": {"other": "x"}}],
+                                         "next_cursor": str(n + 1)})
     return respond
 
 
@@ -293,17 +299,16 @@ async def test_deletion_proof_is_per_id_and_deadline_bounded(suite):
     requests = []
     def respond(request):
         requests.append(request.url.path)
-        return httpx.Response(200, json={"id": "owned", "state": "started"})
+        return httpx.Response(200, json={"id": "owned", "status": "running"})
     ticks = iter(range(10**6))
     async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as http:
         with pytest.raises(RuntimeError, match="owned did not finish deletion within 60"):
             await suite.await_deleted(http, "owned", interval=0, clock=lambda: next(ticks))
-    assert set(requests) == {"/api/sandbox/owned"}
+    assert set(requests) == {"/sandboxes/owned"}
 
 
 @pytest.mark.parametrize("states,polls", [
-    (["deleted"], 1), (["destroyed"], 1),
-    (["deleting", "destroying", "destroyed"], 3), (["destroying", "deleted"], 2),
+    (["deleted"], 1), (["deleting", "deleted"], 2), (["running", "deleting", "deleted"], 3),
 ])
 async def test_deletion_proof_waits_out_transitional_states(suite, states, polls):
     # Only a finished state proves deletion; transitional states keep polling.
@@ -311,7 +316,7 @@ async def test_deletion_proof_waits_out_transitional_states(suite, states, polls
     requests = []
     def respond(request):
         requests.append(request.url.path)
-        return httpx.Response(200, json={"id": "owned", "state": next(replies)})
+        return httpx.Response(200, json={"id": "owned", "status": next(replies)})
     async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as http:
         await suite.await_deleted(http, "owned", interval=0)
     assert len(requests) == polls
@@ -342,9 +347,10 @@ async def test_staging_deployment_accepts_current_valves_and_sets_expiry(suite, 
     from lathe import Tools
     Tools.Valves(**valves)
     assert set(valves) <= set(Tools.Valves.model_fields)
-    assert valves["auto_stop_minutes"] == 5
-    assert valves["auto_delete_minutes"] == 0
-    assert json.loads(valves["sandbox_create_overrides"])["ttlMinutes"] == 30
+    assert valves["idle_pause_minutes"] == 5
+    policy = json.loads(valves["sandbox_create_overrides"])["lifecycle_policy"]
+    assert policy == {"idle_expiry_seconds": 300, "on_idle_timeout": "delete",
+                      "timeout_seconds": 1800, "on_timeout": "delete"}
     assert seen[0]["access_grants"] == []
     assert seen[2] == {"access_grants": [
         {"principal_type": "user", "principal_id": "test-user", "permission": "read"}]}
@@ -822,17 +828,19 @@ async def test_no_deploy_cleans_owned_staging_after_access_failure_but_not_forei
                 {"principal_type": "user", "principal_id": "*", "permission": "read"}]})
         if request.url.path == "/api/v1/tools/":
             return httpx.Response(200, json=[{"id": "lathe_test"}])
-        if request.url.path == "/api/sandbox":
-            return httpx.Response(200, json=[{"id": "owned-sandbox",
-                "labels": {suite.DEPLOYMENT_LABEL: "test@lathe.invalid"}}])
-        assert request.url.path == "/api/sandbox/owned-sandbox"
+        if request.url.path == "/sandboxes/search":
+            return httpx.Response(200, json={"sandboxes": [{"id": "owned-sandbox",
+                "labels": {suite.DEPLOYMENT_LABEL: "test@lathe.invalid"}}]})
+        assert request.url.path == "/sandboxes/owned-sandbox"
+        if request.url.path not in deletions:
+            return httpx.Response(200, json={"labels": {suite.DEPLOYMENT_LABEL: "test@lathe.invalid"}})
         return httpx.Response(404)
 
     suite_transport(owui)
     if owner == "admin":
         with pytest.raises(AssertionError, match="grant read access only"):
             await suite.main()
-        assert deletions == ["/api/sandbox/owned-sandbox", "/api/v1/tools/id/lathe_test/delete"]
+        assert deletions == ["/sandboxes/owned-sandbox", "/api/v1/tools/id/lathe_test/delete"]
     else:
         assert await suite.main() == 2
         assert not deletions

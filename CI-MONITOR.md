@@ -164,8 +164,8 @@ Three teardown layers serve different failure modes:
 2. The host stops OWUI before a second exact-label cleanup, so an interrupted
    tool loop cannot create another VM after cleanup. Docker removal includes
    anonymous volumes. An `always()` Actions step repeats this after interruption.
-3. Daytona gets `autoStopInterval=5`, `autoDeleteInterval=0` (delete on stop),
-   and `ttlMinutes=30`. The hard wall-clock deadline applies even to an active
+3. A `lifecycle_policy` override deletes the sandbox after 5 idle minutes and
+   after 30 minutes of wall clock. The hard wall-clock deadline applies even to an active
    sandbox if the runner disappears. Provider cleanup scheduling is not an
    exact-second guarantee.
 
@@ -234,7 +234,7 @@ The Worker also drops to host UID/GID after its root-only CA installation,
 before npm/Wrangler creates files beside the bind-mounted configuration. This
 keeps temporary-directory removal host-owned, including `.wrangler/tmp`.
 
-The staging sandbox has `networkBlockAll=true`: no clone, installer, external
+The staging sandbox has `network_policy.block_all=true` on Daytona v2: no clone, installer, external
 asset, or ripgrep bootstrap is needed. OWUI still reaches OpenRouter and the
 Daytona control plane. The user gives raw individual repair records and first asks
 for quick analytics: repairs, time logged, average item time by session,

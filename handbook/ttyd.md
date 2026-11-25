@@ -39,7 +39,7 @@ After verifying the installed help, example behind a verified private
 authenticated proxy with no unauthenticated direct path:
 
 ```sh
-/absolute/installation/ttyd --interface 127.0.0.1 --port 7681 \
+/absolute/installation/ttyd --interface 0.0.0.0 --port 7681 \
   --writable --cwd /home/daytona/workspace /bin/bash -l
 ```
 
@@ -47,8 +47,8 @@ Current ttyd defaults to read-only: `--writable` enables user input. Enable it
 only for the requested interactive terminal. Do not enable URL-supplied command
 arguments. If proxy-only authentication is not secure on this deployment, use
 ttyd's supported app authentication and secure transport, protecting credentials
-from chat/logs/process listings, or do not offer the terminal. Do not blindly
-widen the bind address to fix a failed proxy connection.
+from chat/logs/process listings, or do not offer the terminal. Daytona's preview
+proxy cannot reach loopback, hence `0.0.0.0` here.
 
 Launch using the background/log procedure in the index, with bounded HTTP
 readiness checks. Then verify an actual terminal WebSocket session in the

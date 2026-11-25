@@ -37,6 +37,24 @@ USER = {"email": "owner@example.test", "id": "trusted-user"}
 PNG = b"\x89PNG\r\n\x1a\n" + b"\0" * 8
 
 
+def process(result="", exit_code=0):
+    """A finished Daytona process with its first (complete) log page."""
+    frames = [{"channel": "stdout", "data": result}] if result else []
+    return {"id": "p1", "state": "terminal", "exitCode": exit_code, "logs": {"frames": frames, "eof": True}}
+
+
+def argv_of(request):
+    return json.loads(request.content)["argv"]
+
+
+def launches_bash(request):
+    return (request.method, request.url.path) == ("POST", "/sb/processes") and argv_of(request)[0] == "bash"
+
+
+def run_launch(request, **kwargs):
+    return subprocess.run(argv_of(request), stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, **kwargs)
+
+
 @pytest.fixture(autouse=True)
 def no_network(monkeypatch):
     attempts = []
@@ -471,10 +489,9 @@ async def test_relative_file_path_never_reaches_http(tools, name, kwargs):
 async def test_search_core_executes_quoted_arguments_and_clamps(tools, tmp_path, transport, kind, budget, expected):
     (tmp_path / "a'quoted.txt").write_text("needle's marker\n" * 600)
     def handler(request):
-        assert (request.method, request.url.path) == ("POST", "/sb/process/execute")
-        command = json.loads(request.content)["command"]
-        source = shlex.split(command)[2].replace("/home/daytona/workspace", str(tmp_path))
-        return httpx.Response(200, json={"exitCode": 0, "result": run_script(source)})
+        assert (request.method, request.url.path) == ("POST", "/sb/processes")
+        source = argv_of(request)[2].replace("/home/daytona/workspace", str(tmp_path))
+        return httpx.Response(200, json=process(run_script(source)))
     async with httpx.AsyncClient(transport=transport(handler)) as client:
         kwargs = {"pattern": "**/*.txt"} if kind == "glob" else {"pattern": "needle's marker", "files": "**/*.txt"}
         result = await getattr(lathe, "_core_" + kind)(tools.valves, "sb", client, max_lines=budget, **kwargs)
@@ -486,12 +503,12 @@ async def test_file_core_http_roundtrip(tools, tmp_path, transport):
     # Execute the actual HTTP command locally: covers quoting and argument
     # assembly as well as real disk effects, rather than echoing canned text.
     def handler(request):
-        assert (request.method, request.url.path) == ("POST", "/sb/process/execute")
+        assert (request.method, request.url.path) == ("POST", "/sb/processes")
         assert request.headers["authorization"] == "Bearer test-key"
-        command = shlex.split(json.loads(request.content)["command"])
+        command = argv_of(request)
         assert command[:2] == ["python3", "-c"]
         result = run_script(command[2])
-        return httpx.Response(200, json={"exitCode": 0, "result": result})
+        return httpx.Response(200, json=process(result))
     path = str(tmp_path / "it's a file.txt")
     async with httpx.AsyncClient(transport=transport(handler)) as client:
         await lathe._core_write(tools.valves, "sb", client, path=path, content="alpha\ncafé\n")
@@ -577,22 +594,18 @@ async def test_completed_bash_retention_is_bounded(tools, monkeypatch, tmp_path,
     expired_failure = sidecar("expired-failure")
     expired = time.time() - 24 * 60 * 60 - 1
     os.utime(expired_failure / "exit", (expired, expired))
-    deleted_sessions = []
     delete_attempts = {}
 
     def handler(request):
-        if (request.method, request.url.path) == ("POST", "/sb/process/execute"):
-            command = shlex.split(json.loads(request.content)["command"])
-            return httpx.Response(200, json={"exitCode": 0, "result": run_script(command[2])})
-        if request.method == "DELETE" and "/process/session/" in request.url.path:
-            session = request.url.path.rsplit("/", 1)[-1]
-            delete_attempts[session] = delete_attempts.get(session, 0) + 1
-            if session in ("lathe-cmd-ordinary", "lathe-cmd-expired-failure") and delete_attempts[session] == 1:
-                return httpx.Response(503)
-            deleted_sessions.append(session)
-            return httpx.Response(204)
-        assert (request.method, request.url.path) == ("DELETE", "/sb/files/")
-        shutil.rmtree(request.url.params["path"])
+        if (request.method, request.url.path) == ("POST", "/sb/processes"):
+            command = argv_of(request)
+            return httpx.Response(200, json=process(run_script(command[2])))
+        assert (request.method, request.url.path) == ("DELETE", "/sb/files")
+        path = Path(request.url.params["path"])
+        delete_attempts[path.name] = delete_attempts.get(path.name, 0) + 1
+        if delete_attempts[path.name] == 1 and path.name == "expired-failure":
+            return httpx.Response(503)
+        shutil.rmtree(path)
         return httpx.Response(204)
 
     async with httpx.AsyncClient(transport=transport(handler)) as client:
@@ -601,21 +614,18 @@ async def test_completed_bash_retention_is_bounded(tools, monkeypatch, tmp_path,
         assert old_spill.exists()
         assert leased.exists()
         assert {p.name for p in retained.iterdir()} == {"keep", "log", "exit"}
-        assert "lathe-cmd-retained" not in deleted_sessions
-        assert "lathe-cmd-old-spill" in deleted_sessions
-        assert expired_failure.exists(), "failed session cleanup must retain its retry record"
+        assert expired_failure.exists(), "failed cleanup must be retried"
 
         await lathe._reap_bash_commands(tools.valves, "sb", client)
         assert (ordinary / "log").read_text() == "command output\n"
-        assert delete_attempts["lathe-cmd-ordinary"] == 2
-        assert delete_attempts["lathe-cmd-expired-failure"] == 2
+        assert delete_attempts["expired-failure"] == 2
         assert not expired_failure.exists()
 
         current = sidecar("current")
         await lathe._reap_bash_commands(
             tools.valves, "sb", client, preserve_log_for="current",
         )
-        assert {p.name for p in current.iterdir()} == {"log", "exit", "reap", "session_done"}
+        assert {p.name for p in current.iterdir()} == {"log", "exit", "reap"}
         assert "plaintext" not in "".join(p.read_text() for p in current.iterdir())
 
         await lathe._reap_bash_commands(
@@ -630,12 +640,10 @@ async def test_completed_bash_retention_is_bounded(tools, monkeypatch, tmp_path,
             )
         )
         await lathe._reap_bash_commands(tools.valves, "sb", client)
-        assert "lathe-cmd-retained" in deleted_sessions
         assert (retained / "log").read_text() == "command output\n"
 
         await lathe._reap_bash_commands(tools.valves, "sb", client)
         assert (current / "log").read_text() == "command output\n"
-        assert delete_attempts["lathe-cmd-current"] == 1, "retained evidence must not repeat session cleanup"
         expired = time.time() - 24 * 60 * 60 - 1
         for directory in (current, ordinary, retained, old_spill, leased):
             os.utime(directory / "exit", (expired, expired))
@@ -643,29 +651,54 @@ async def test_completed_bash_retention_is_bounded(tools, monkeypatch, tmp_path,
         assert not list(command_root.iterdir())
 
 
-async def test_bash_launch_failure_discards_session_and_wrapper(tools, sandbox, http):
+@pytest.mark.parametrize("failure", [400, 503, "timeout", "missing-id"])
+async def test_bash_launch_failure_preserves_evidence_unless_rejected(tools, sandbox, http, failure):
     requests = []
 
     def handler(request):
         requests.append((request.method, request.url.path))
-        if (request.method, request.url.path) == ("POST", "/sb/process/execute"):
-            return httpx.Response(200, json={"exitCode": 0, "result": ""})
+        if launches_bash(request):
+            if failure == "timeout":
+                raise httpx.ReadTimeout("response lost", request=request)
+            if failure == "missing-id":
+                return httpx.Response(201, json={})
+            return httpx.Response(failure, text="launch failed")
+        if (request.method, request.url.path) == ("POST", "/sb/processes"):
+            return httpx.Response(201, json=process())
         if (request.method, request.url.path) == ("POST", "/sb/files/upload"):
             return httpx.Response(200)
-        if (request.method, request.url.path) == ("POST", "/sb/process/session"):
-            return httpx.Response(201)
-        if request.method == "POST" and request.url.path.endswith("/exec"):
-            return httpx.Response(500, text="launch failed")
         if request.method == "DELETE":
             return httpx.Response(204)
         pytest.fail(f"unexpected request: {request.method} {request.url.path}")
 
     http(handler)
     result = await tools.bash("true", __user__=USER)
-    assert result.startswith("API error: HTTP 500")
-    assert any(method == "DELETE" and path == "/sb/files/" for method, path in requests)
-    assert any(method == "DELETE" and "/process/session/lathe-cmd-" in path
-               for method, path in requests)
+    if failure == 400:
+        assert result.startswith("API error: HTTP 400")
+        assert ("DELETE", "/sb/files") in requests
+    else:
+        assert "outcome is unknown" in result and "Do not automatically rerun" in result
+        assert "CMD=" in result and "/log" in result and "/exit" in result
+        assert ("DELETE", "/sb/files") not in requests
+    assert requests.count(("POST", "/sb/processes")) == 2
+
+
+async def test_signaled_bash_reports_failure_even_with_output(tools, sandbox, http, clock):
+    def handler(request):
+        if launches_bash(request):
+            return httpx.Response(201, json={"id": "p1", "state": "running"})
+        if request.url.path == "/sb/files/upload":
+            return httpx.Response(200)
+        if request.url.path == "/sb/processes/p1":
+            return httpx.Response(200, json={"state": "terminal", "signal": "SIGKILL"})
+        assert request.url.path == "/sb/processes"
+        script = json.loads(request.content)["argv"][-1]
+        data = json.dumps({"text": "partial output\n", "size": 15}) if "f.seek" in script and "lease" not in script else ""
+        return httpx.Response(201, json=process(data))
+
+    http(handler)
+    result = await tools.bash("true", __user__=USER)
+    assert result.startswith("Error:") and "SIGKILL" in result and "partial output" in result
 
 
 @pytest.mark.parametrize("command,log_size", [
@@ -677,7 +710,6 @@ async def test_bash_large_log_survives_unrelated_chat(tools, sandbox, http, monk
     monkeypatch.setattr(lathe, "_EPHEMERAL_ROOT", str(tmp_path / "lathe"))
     for chat in ("a", "b"):
         tools._chat_state[chat] = {"init": True, "pending": []}
-    deleted = []
     exits = {}
 
     def handler(request):
@@ -686,22 +718,14 @@ async def test_bash_large_log_survives_unrelated_chat(tools, sandbox, http, monk
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(request.content.split(b"\r\n\r\n", 1)[1].rsplit(b"\r\n--", 1)[0])
             return httpx.Response(200)
-        if request.method == "POST" and request.url.path == "/sb/process/session":
-            return httpx.Response(201)
-        if request.method == "POST" and request.url.path.endswith("/exec"):
-            command = json.loads(request.content)["command"]
-            process = subprocess.run(command, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=10)
-            exits[request.url.path.removesuffix("/exec")] = process.returncode
-            return httpx.Response(200, json={"cmdId": "cmd"})
-        if request.method == "POST" and request.url.path == "/sb/process/execute":
-            script = shlex.split(json.loads(request.content)["command"])[2]
-            return httpx.Response(200, json={"exitCode": 0, "result": run_script(script)})
-        if request.method == "GET" and "/process/session/" in request.url.path:
-            assert not request.url.path.endswith("/logs"), "unbounded log download"
-            return httpx.Response(200, json={"commands": [{"id": "cmd", "exitCode": exits[request.url.path]}]})
-        assert request.method == "DELETE" and "/process/session/" in request.url.path
-        deleted.append(request.url.path)
-        return httpx.Response(204)
+        if launches_bash(request):
+            exits[f"p{len(exits)}"] = run_launch(request, timeout=10).returncode
+            return httpx.Response(201, json={"id": f"p{len(exits) - 1}", "state": "running"})
+        if request.method == "POST" and request.url.path == "/sb/processes":
+            return httpx.Response(201, json=process(run_script(argv_of(request)[2])))
+        assert request.method == "GET", "unexpected cleanup"
+        assert not request.url.path.endswith("/logs"), "unbounded log download"
+        return httpx.Response(200, json={"state": "terminal", "exitCode": exits[request.url.path.rsplit("/", 1)[1]]})
 
     http(handler)
     events = []
@@ -718,7 +742,6 @@ async def test_bash_large_log_survives_unrelated_chat(tools, sandbox, http, monk
     assert "Text preview truncated" in preview and len(preview.encode()) < 53 * 1024
     assert log.stat().st_size == log_size
     assert (log.parent / "exit").read_text().strip() == "0"
-    assert deleted, "sessions should be cleaned independently of result files"
     emissions = []
     async def emit(event):
         emissions.append(event)
@@ -776,7 +799,6 @@ async def test_bash_preview_failure_preserves_lifecycle(
     tools._chat_state["chat"] = {"init": True, "pending": []}
     polls = 0
     previews = 0
-    deleted = []
     def handler(request):
         nonlocal polls, previews
         if request.method == "POST" and request.url.path == "/sb/files/upload":
@@ -784,30 +806,23 @@ async def test_bash_preview_failure_preserves_lifecycle(
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(request.content.split(b"\r\n\r\n", 1)[1].rsplit(b"\r\n--", 1)[0])
             return httpx.Response(200)
-        if request.method == "POST" and request.url.path == "/sb/process/session":
-            return httpx.Response(201)
-        if request.method == "POST" and request.url.path.endswith("/exec"):
-            subprocess.run(json.loads(request.content)["command"], shell=True, check=True,
-                           stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-            return httpx.Response(200, json={"cmdId": "cmd"})
-        if request.method == "GET" and "/process/session/" in request.url.path:
+        if launches_bash(request):
+            run_launch(request, check=True)
+            return httpx.Response(201, json={"id": "p1", "state": "running"})
+        if request.method == "GET" and request.url.path == "/sb/processes/p1":
             polls += 1
-            command = {"id": "cmd"}
-            if not background or polls > 1:
-                command["exitCode"] = 0
-            return httpx.Response(200, json={"commands": [command]})
-        if request.method == "POST" and request.url.path == "/sb/process/execute":
-            script = shlex.split(json.loads(request.content)["command"])[2]
+            done = not background or polls > 1
+            return httpx.Response(200, json={"state": "terminal", "exitCode": 0} if done else {"state": "running"})
+        if request.method == "POST" and request.url.path == "/sb/processes":
+            script = argv_of(request)[2]
             if "f.seek" in script and "lease" not in script:  # preview, not the reaper
                 previews += 1
                 if previews == 1:
                     if failure == "http": return httpx.Response(503)
-                    if failure == "script": return httpx.Response(200, json={"exitCode": 1, "result": "preview failed"})
-                    return httpx.Response(200, json={"exitCode": 0, "result": "not-json"})
-            return httpx.Response(200, json={"exitCode": 0, "result": run_script(script)})
-        assert request.method == "DELETE" and "/process/session/" in request.url.path
-        deleted.append(request.url.path)
-        return httpx.Response(204)
+                    if failure == "script": return httpx.Response(200, json=process("preview failed", 1))
+                    return httpx.Response(200, json=process("not-json"))
+            return httpx.Response(200, json=process(run_script(script)))
+        pytest.fail(f"unexpected request: {request.method} {request.url.path}")
     http(handler)
     result = await tools.bash("echo lifecycle-output", workdir=str(tmp_path),
         foreground_seconds=0 if background else 30, __user__=USER, __chat_id__="chat")
@@ -821,9 +836,9 @@ async def test_bash_preview_failure_preserves_lifecycle(
                 if "Background job completed" in result: break
                 await asyncio.sleep(0)
         assert "lifecycle-output" in result
-    assert deleted, "finished session cleanup must survive a preview failure"
     log = next((tmp_path / "lathe" / "cmd").glob("*/log"))
     assert log.read_text() == "lifecycle-output\n"
+    assert not (log.parent / "lease").exists(), "lease release must survive a preview failure"
 
 
 async def test_failed_write_does_not_emit_success(tools, sandbox, http, tmp_path):
@@ -832,9 +847,9 @@ async def test_failed_write_does_not_emit_success(tools, sandbox, http, tmp_path
     parent_file.write_text("occupied")
     emissions = []
     def handler(request):
-        assert request.url.path == "/sb/process/execute"
-        script = shlex.split(json.loads(request.content)["command"])[2]
-        return httpx.Response(200, json={"exitCode": 0, "result": run_script(script)})
+        assert request.url.path == "/sb/processes"
+        script = argv_of(request)[2]
+        return httpx.Response(200, json=process(run_script(script)))
     http(handler)
     async def emit(event):
         emissions.append(event)
@@ -1036,13 +1051,13 @@ async def test_onboard_and_first_snapshot_render_yaml_on_host(tools, sandbox, mo
     monkeypatch.setattr(lathe, "_upload_file", upload)
     monkeypatch.setattr(lathe, "_SNAPSHOT_SCRIPT", lathe._build_snapshot_script(str(tmp_path)))
     def handler(request):
-        if request.url.path == "/sandbox/sb":
+        if request.url.path == "/sandboxes/sb":
             return httpx.Response(200, json={"cpu": 2})
-        assert request.url.path == "/sb/process/execute"
-        command = shlex.split(json.loads(request.content)["command"])
+        assert request.url.path == "/sb/processes"
+        command = argv_of(request)
         script = command[2] if command[1] == "-c" else uploaded[command[1]]
         raw = run_script(script, env={**os.environ, "HOME": str(tmp_path / "home")})
-        return httpx.Response(200, json={"exitCode": 0, "result": raw})
+        return httpx.Response(200, json=process(raw))
     http(handler)
     onboard = await tools.onboard(str(tmp_path), __user__=USER)
     tools._chat_state["yaml"] = {"init": True, "pending": []}
@@ -1076,9 +1091,9 @@ async def test_chat_init_and_notice_delivery(tools, transport, configured):
     calls = []
     def handler(request):
         calls.append(request)
-        if (request.method, request.url.path) == ("POST", "/sb/process/execute"):
-            return httpx.Response(200, json={"exitCode": 0, "result": json.dumps({"sections": ["workspace snapshot"], "skills": []})})
-        assert (request.method, request.url.path) == ("GET", "/sandbox/sb")
+        if (request.method, request.url.path) == ("POST", "/sb/processes"):
+            return httpx.Response(200, json=process(json.dumps({"sections": ["workspace snapshot"], "skills": []})))
+        assert (request.method, request.url.path) == ("GET", "/sandboxes/sb")
         return httpx.Response(200, json={"cpu": 2})
     user = {**USER, "valves": tools.UserValves(env_vars='{"TOKEN":"hidden-value"}')}
     async with httpx.AsyncClient(transport=transport(handler)) as client:
@@ -1119,12 +1134,12 @@ async def test_first_image_queues_admin_guidance(tools, monkeypatch, http):
     tools.valves.handbook_url = "https://handbook.test/current.md"
 
     def handler(request):
-        if request.url.path == "/sandbox/sb":
+        if request.url.path == "/sandboxes/sb":
             return httpx.Response(503)
         if request.url.path == "/sb/files/download":
             return httpx.Response(200, content=PNG)
-        assert (request.method, request.url.path) == ("POST", "/sb/process/execute")
-        return httpx.Response(200, json={"exitCode": 0, "result": "sandbox text"})
+        assert (request.method, request.url.path) == ("POST", "/sb/processes")
+        return httpx.Response(200, json=process("sandbox text"))
 
     http(handler)
     image = await tools.view("/image", __user__=USER, __chat_id__="admin-guidance")
@@ -1147,16 +1162,16 @@ async def test_first_failure_delivers_context_once(tools, monkeypatch, http, tmp
 
     def handler(request):
         nonlocal snapshot_done
-        if request.url.path == "/sandbox/sb":
+        if request.url.path == "/sandboxes/sb":
             return httpx.Response(200, json={"cpu": 2})
-        if request.url.path == "/sb/process/execute":
-            script = shlex.split(json.loads(request.content)["command"])[2]
+        if request.url.path == "/sb/processes":
+            script = argv_of(request)[2]
             if not snapshot_done:
                 snapshot_done = True
-                return httpx.Response(200, json={"exitCode": 0, "result": json.dumps({"sections": ["workspace snapshot"], "skills": []})})
+                return httpx.Response(200, json=process(json.dumps({"sections": ["workspace snapshot"], "skills": []})))
             if failing and failure == "http":
                 return httpx.Response(503, text="temporarily unavailable")
-            return httpx.Response(200, json={"exitCode": 0, "result": run_script(script)})
+            return httpx.Response(200, json=process(run_script(script)))
         assert request.url.path == "/sb/files/download"
         assert tool == "view" and failing
         return httpx.Response(503 if failure == "http" else 404)
@@ -1185,20 +1200,20 @@ async def test_background_bash_poll_delivers_once(tools, sandbox, http, clock, t
     (log.parent / "exit").write_text("7\n")
     (log.parent / "notify").write_text(json.dumps({"chat": "chat"}))
     tools._chat_state["chat"] = {"init": True, "pending": []}
-    statuses = iter([httpx.Response(503), httpx.Response(200, json={"commands": [{"id": "cmd"}]}),
-                     httpx.Response(200, json={"commands": [{"id": "cmd", "exitCode": 7}]})])
+    statuses = iter([httpx.Response(503), httpx.Response(200, json={"state": "running"}),
+                     httpx.Response(200, json={"state": "terminal", "exitCode": 7})])
     def handler(request):
-        if (request.method, request.url.path) == ("POST", "/sb/process/execute"):
-            script = shlex.split(json.loads(request.content)["command"])[2]
+        if (request.method, request.url.path) == ("POST", "/sb/processes"):
+            script = argv_of(request)[2]
             if "lease" in script:  # the reaper, which claims the notice
-                return httpx.Response(200, json={"exitCode": 0, "result": run_script(script)})
-            return httpx.Response(200, json={"exitCode": 0, "result": "caller output"})
+                return httpx.Response(200, json=process(run_script(script)))
+            return httpx.Response(200, json=process("caller output"))
         if request.method == "DELETE":
             return httpx.Response(204)
-        assert (request.method, request.url.path) == ("GET", "/sb/process/session/session")
+        assert (request.method, request.url.path) == ("GET", "/sb/processes/p1")
         return next(statuses)
     http(handler)
-    await lathe._poll_bg_bash(tools.valves, "sb", "session", "cmd", "job", tools._chat_state, "chat")
+    await lathe._poll_bg_bash(tools.valves, "sb", "p1", "job", tools._chat_state, "chat")
     # Observe delivery through an ordinary wrapper, not by draining its queue.
     assert await tools.read("/file", __user__=USER, __chat_id__="other") == "caller output"
     result = await tools.read("/file", __user__=USER, __chat_id__="chat")
@@ -1222,14 +1237,14 @@ def shared_sandbox(*, lose_first_poller=False, die_watching=False):
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(request.content.split(b"\r\n\r\n", 1)[1].rsplit(b"\r\n--", 1)[0])
             return httpx.Response(200)
-        if request.method == "POST" and request.url.path in ("/sb/process/session", "/sb/files/folder"):
+        if (request.method, request.url.path) == ("POST", "/sb/files/folder"):
             return httpx.Response(201)
-        if request.method == "POST" and request.url.path.endswith("/exec"):
+        if launches_bash(request):
             # The job finishes before the launching worker registers its notice.
-            subprocess.run(json.loads(request.content)["command"], shell=True, check=True,
-                           stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-            return httpx.Response(200, json={"cmdId": "cmd"})
-        if request.method == "GET" and "/process/session/" in request.url.path:
+            run_launch(request, check=True)
+            sessions["count"] = sessions.get("count", 0) + 1
+            return httpx.Response(201, json={"id": f"p{sessions['count']}", "state": "running"})
+        if request.method == "GET" and request.url.path.startswith("/sb/processes/"):
             # Running at the foreground check, finished for the poller after;
             # with lose_first_poller, the first job's poller never sees it end.
             sessions.setdefault("first", request.url.path)
@@ -1237,13 +1252,11 @@ def shared_sandbox(*, lose_first_poller=False, die_watching=False):
                 sessions["died"] = True
                 raise httpx.ConnectError("worker died mid-command")
             reads = sessions[request.url.path] = sessions.get(request.url.path, 0) + 1
-            command = {"id": "cmd"}
-            if reads > 1 and not (lose_first_poller and request.url.path == sessions["first"]):
-                command["exitCode"] = 0
-            return httpx.Response(200, json={"commands": [command]})
-        if request.method == "POST" and request.url.path == "/sb/process/execute":
-            script = shlex.split(json.loads(request.content)["command"])[2]
-            return httpx.Response(200, json={"exitCode": 0, "result": run_script(script)})
+            done = reads > 1 and not (lose_first_poller and request.url.path == sessions["first"])
+            return httpx.Response(200, json={"state": "terminal", "exitCode": 0} if done else {"state": "running"})
+        if request.method == "POST" and request.url.path == "/sb/processes":
+            script = argv_of(request)[2]
+            return httpx.Response(200, json=process(run_script(script)))
         assert request.method == "DELETE"
         return httpx.Response(204)
     return handler
@@ -1348,8 +1361,8 @@ async def test_notice_duration_uses_sandbox_start_and_end(tools, sandbox, http, 
     def handler(request):
         if request.method == "DELETE":
             return httpx.Response(204)
-        script = shlex.split(json.loads(request.content)["command"])[2]
-        return httpx.Response(200, json={"exitCode": 0, "result": run_script(script)})
+        script = argv_of(request)[2]
+        return httpx.Response(200, json=process(run_script(script)))
     http(handler)
     async with lathe.httpx.AsyncClient() as client:
         notices = await lathe._reap_bash_commands(tools.valves, "sb", client, claim_chat="chat")
@@ -1385,20 +1398,79 @@ async def test_background_notice_survives_lost_poller_on_another_worker(
             "true", workdir=str(tmp_path), __user__=USER, __chat_id__="chat")
 
 
+async def test_poller_treats_expired_process_record_as_finished(tools, http, clock, tmp_path, monkeypatch):
+    # Daytona drops finished process records on its own schedule.
+    monkeypatch.setattr(lathe, "_EPHEMERAL_ROOT", str(tmp_path))
+    job = tmp_path / "cmd" / "job"
+    job.mkdir(parents=True)
+    for name, content in (("log", "late output\n"), ("exit", "0\n"), ("notify", json.dumps({"chat": "chat"}))):
+        (job / name).write_text(content)
+    tools._chat_state["chat"] = {"init": True, "pending": []}
+
+    def handler(request):
+        if request.method == "GET":
+            return httpx.Response(404, json={"code": "PROCESS_NOT_FOUND"})
+        return httpx.Response(201, json=process(run_script(argv_of(request)[2])))
+
+    http(handler)
+    await lathe._poll_bg_bash(tools.valves, "sb", "p1", "job", tools._chat_state, "chat")
+    assert clock() < 5 and not (job / "lease").exists()
+    assert (job / "reap").exists(), "the finished job was not released"
+
+
 async def test_background_bash_poll_deadline(tools, http, clock, monkeypatch):
     tools._chat_state["chat"] = {"init": True, "pending": []}
     requests = []
     def handler(request):
         requests.append(request)
-        assert (request.method, request.url.path) == ("GET", "/sb/process/session/session")
-        return httpx.Response(200, json={"commands": [{"id": "cmd"}]})
+        assert (request.method, request.url.path) == ("GET", "/sb/processes/p1")
+        return httpx.Response(200, json={"state": "running"})
     http(handler)
     monkeypatch.setattr(lathe, "_BG_BASH_POLL_MAX_SECONDS", 5)
     await asyncio.wait_for(lathe._poll_bg_bash(
-        tools.valves, "sb", "session", "cmd", "job", tools._chat_state, "chat"), 1)
+        tools.valves, "sb", "p1", "job", tools._chat_state, "chat"), 1)
     assert clock() >= 5
     assert requests and len(requests) < 10
     assert tools._chat_state["chat"]["pending"] == []
+
+
+def record(status="running", sandbox_id="sb", **details):
+    return {"id": sandbox_id, "status": status, "labels": {"test": USER["email"]}, **details}
+
+
+def listing(*records):
+    return httpx.Response(200, json={"sandboxes": list(records), "next_cursor": None})
+
+
+SEARCH, GET = ("GET", "/sandboxes/search"), ("GET", "/sandboxes/sb")
+RESUME, START = ("POST", "/sandboxes/sb/resume"), ("POST", "/sandboxes/sb/start")
+EXECUTE = ("POST", "/sb/processes")
+
+
+@pytest.fixture
+def lifecycle(tools, transport):
+    """Drive _ensure_sandbox through authoritative records; returns (call log, invoke)."""
+    calls = []
+
+    async def ensure(*records, action=202):
+        observations = iter(records)
+
+        def handler(request):
+            call = (request.method, request.url.path)
+            calls.append(call)
+            if call == SEARCH:
+                return listing(record("stale-index-status"))
+            if call == GET:
+                return httpx.Response(200, json=next(observations))
+            if call in (RESUME, START):
+                return httpx.Response(action, json={"id": "sb", "status": "assigned"})
+            assert call == EXECUTE
+            return httpx.Response(201, json=process("ready"))
+
+        async with httpx.AsyncClient(transport=transport(handler)) as client:
+            return await lathe._ensure_sandbox(tools.valves, USER["email"], client)
+
+    return calls, ensure
 
 
 async def test_started_tool_request_budget(tools, http):
@@ -1407,71 +1479,72 @@ async def test_started_tool_request_budget(tools, http):
 
     def handler(request):
         calls.append((request.method, request.url.path))
-        if request.url.path == "/sandbox":
-            return httpx.Response(200, json=[{
-                "id": "sb", "state": "started", "labels": {"test": USER["email"]},
-            }])
-        if request.url.path == "/sandbox/sb":
-            return httpx.Response(200, json={"id": "sb", "state": "started"})
-        assert (request.method, request.url.path) == ("POST", "/sb/process/execute")
-        command = json.loads(request.content)["command"]
-        result = "" if command == "bash -c 'mkdir -p /home/daytona/workspace'" else "file contents"
-        return httpx.Response(200, json={"exitCode": 0, "result": result})
+        if calls[-1] == SEARCH:
+            assert json.loads(request.url.params["labels"]) == {"test": USER["email"]}
+            return listing(record())
+        if calls[-1] == GET:
+            return httpx.Response(200, json=record())
+        assert calls[-1] == EXECUTE
+        return httpx.Response(201, json=process("" if argv_of(request)[0] == "mkdir" else "file contents"))
 
     http(handler)
     for _ in range(2):
         before = len(calls)
         assert await tools.read("/file", __user__=USER, __chat_id__="chat") == "file contents"
-        assert len(calls) - before == 4
-        assert calls[before:before + 2] == [("GET", "/sandbox"), ("GET", "/sandbox/sb")]
+        assert calls[before:] == [SEARCH, GET, EXECUTE, EXECUTE]
 
 
-@pytest.mark.parametrize("initial", ["created", "conflicted", "stopped", "starting", "error"])
+async def test_toolbox_url_comes_from_the_sandbox_region(tools, http):
+    tools.valves.daytona_proxy_url = ""
+    tools._chat_state["chat"] = {"init": True, "pending": []}
+    hosts = []
+
+    def handler(request):
+        if request.url.path == "/sandboxes/search":
+            return listing(record(sandbox_id="regional"))
+        if request.url.host == "api.test":
+            return httpx.Response(200, json=record(sandbox_id="regional",
+                                                   toolbox_proxy_url="https://region.test/toolbox"))
+        hosts.append(str(request.url.copy_with(query=None)))
+        return httpx.Response(201, json=process("contents"))
+
+    http(handler)
+    assert await tools.read("/file", __user__=USER, __chat_id__="chat") == "contents"
+    assert set(hosts) == {"https://region.test/toolbox/regional/processes"}
+
+
+@pytest.mark.parametrize("initial", ["created", "stopped", "paused", "booting"])
 @pytest.mark.parametrize("failure", ["http", "timeout", "mkdir"])
 async def test_startup_readiness_retries_and_creates_workspace(
     tools, transport, clock, tmp_path, initial, failure,
 ):
-    observations = iter([initial, "started"])
+    observations = iter(["running"] if initial == "created" else [initial, "running"])
     workspace = tmp_path / "workspace with spaces"
     attempts = []
 
     def handler(request):
-        if request.url.path == "/sandbox" and request.method == "GET":
-            return httpx.Response(200, json=[] if initial in ("created", "conflicted") else [{
-                "id": "sb", "state": "started", "labels": {"test": USER["email"]},
-            }])
-        if request.url.path == "/sandbox" and request.method == "POST":
-            assert "volumes" not in json.loads(request.content)
-            if initial == "conflicted":
-                return httpx.Response(409)
-            return httpx.Response(200, json={"id": "sb", "state": "started"})
-        if request.url.path == "/sandbox/test/owner@example.test":
-            return httpx.Response(200, json={
-                "id": "sb", "state": "started", "name": "test/owner@example.test",
-                "labels": {"test": USER["email"]},
-            })
-        if request.url.path == "/sandbox/sb" and request.method == "GET":
-            return httpx.Response(200, json={
-                "id": "sb", "state": next(observations), "recoverable": True,
-            })
-        if request.url.path in ("/sandbox/sb/start", "/sandbox/sb/recover"):
-            assert request.method == "POST"
-            return httpx.Response(200, json={})
-        assert (request.method, request.url.path) == ("POST", "/sb/process/execute")
-        command = json.loads(request.content)["command"]
-        attempts.append(command)
+        call = (request.method, request.url.path)
+        if call == SEARCH:
+            return listing() if initial == "created" else listing(record())
+        if call == ("POST", "/sandboxes"):
+            return httpx.Response(202, json={"id": "sb", "status": "pending"})
+        if call == GET:
+            return httpx.Response(200, json=record(next(observations)))
+        if call in (START, RESUME):
+            return httpx.Response(202, json={})
+        assert call == EXECUTE
+        attempts.append(argv_of(request))
         if len(attempts) == 1:
             if failure == "timeout":
                 raise httpx.ReadTimeout("toolbox starting", request=request)
             if failure == "http":
                 return httpx.Response(503)
-            return httpx.Response(200, json={"exitCode": 1, "result": "mkdir failed"})
+            return httpx.Response(201, json=process("mkdir failed", 1))
         # Execute the shipped readiness command, with only its absolute root
         # redirected to a real temporary directory.
-        argv = shlex.split(command)
-        argv[2] = argv[2].replace("/home/daytona/workspace", shlex.quote(str(workspace)))
+        argv = [arg.replace("/home/daytona/workspace", str(workspace)) for arg in attempts[-1]]
         result = subprocess.run(argv, capture_output=True, text=True)
-        return httpx.Response(200, json={"exitCode": result.returncode, "result": result.stdout})
+        return httpx.Response(201, json=process(result.stdout, result.returncode))
 
     async with httpx.AsyncClient(transport=transport(handler)) as client:
         sandbox_id, _ = await lathe._ensure_sandbox(tools.valves, USER["email"], client)
@@ -1486,19 +1559,17 @@ async def test_started_workspace_failure_never_runs_tool(tools, http, clock, fai
 
     def handler(request):
         calls.append((request.method, request.url.path))
-        if request.url.path == "/sandbox":
-            return httpx.Response(200, json=[{
-                "id": "sb", "labels": {"test": USER["email"]},
-            }])
-        if request.url.path == "/sandbox/sb":
-            return httpx.Response(200, json={"id": "sb", "state": "started"})
-        assert (request.method, request.url.path) == ("POST", "/sb/process/execute")
-        assert json.loads(request.content)["command"] == "bash -c 'mkdir -p /home/daytona/workspace'"
+        if calls[-1] == SEARCH:
+            return listing(record())
+        if calls[-1] == GET:
+            return httpx.Response(200, json=record())
+        assert calls[-1] == EXECUTE
+        assert argv_of(request) == ["mkdir", "-p", "/home/daytona/workspace"]
         if failure == "timeout":
-            raise httpx.ReadTimeout("sandbox stopped after lookup", request=request)
+            raise httpx.ReadTimeout("sandbox paused after lookup", request=request)
         if failure == "http":
             return httpx.Response(503)
-        return httpx.Response(200, json={"exitCode": 1, "result": "workspace path is a file"})
+        return httpx.Response(201, json=process("workspace path is a file", 1))
 
     http(handler)
     result = await tools.read("/file", __user__=USER, __chat_id__="chat")
@@ -1510,13 +1581,16 @@ async def test_startup_workspace_failure_is_bounded(tools, transport, clock):
     attempts = []
 
     def handler(request):
-        if (request.method, request.url.path) == ("GET", "/sandbox"):
-            return httpx.Response(200, json=[])
-        if (request.method, request.url.path) == ("POST", "/sandbox"):
-            return httpx.Response(200, json={"id": "sb", "state": "started"})
-        assert (request.method, request.url.path) == ("POST", "/sb/process/execute")
+        call = (request.method, request.url.path)
+        if call == SEARCH:
+            return listing()
+        if call == ("POST", "/sandboxes"):
+            return httpx.Response(202, json={"id": "sb"})
+        if call == GET:
+            return httpx.Response(200, json=record())
+        assert call == EXECUTE
         attempts.append(request)
-        return httpx.Response(200, json={"exitCode": 1, "result": "mkdir failed"})
+        return httpx.Response(201, json=process("mkdir failed", 1))
 
     async with httpx.AsyncClient(transport=transport(handler)) as client:
         with pytest.raises(RuntimeError, match="could not prepare the workspace"):
@@ -1524,57 +1598,81 @@ async def test_startup_workspace_failure_is_bounded(tools, transport, clock):
     assert len(attempts) == 30 and clock() == 30
 
 
-@pytest.mark.parametrize("state,status", [
-    ("deleted", 200), ("destroyed", 200), ("started", 404),
+@pytest.mark.parametrize("status,code,labels", [
+    ("deleted", 200, {"test": USER["email"]}), ("running", 404, {}),
+    ("running", 200, {"test": "someone-else@example.test"}), ("running", 200, {}),
 ])
-async def test_stale_discovery_never_resurrects_sandbox(tools, transport, state, status):
+async def test_stale_discovery_never_selects_sandbox(tools, transport, status, code, labels):
     tools.valves.auto_create_sandbox = False
     tools.valves.sandbox_missing_message = "provision externally"
-    candidate = {"id": "sb", "labels": {"test": USER["email"]}, "state": "started"}
     calls = []
+
     def handler(request):
-        calls.append(request.url.path)
-        assert request.method == "GET"
-        if request.url.path == "/sandbox":
-            return httpx.Response(200, json={"items": [candidate]})
-        assert request.url.path == "/sandbox/sb"
-        return httpx.Response(status, json={**candidate, "state": state})
+        calls.append((request.method, request.url.path))
+        if calls[-1] == SEARCH:
+            return listing(record())
+        assert calls[-1] == GET
+        return httpx.Response(code, json={**record(status), "labels": labels})
+
     async with httpx.AsyncClient(transport=transport(handler)) as client:
         with pytest.raises(RuntimeError, match="provision externally"):
             await lathe._ensure_sandbox(tools.valves, USER["email"], client)
-    assert calls == ["/sandbox", "/sandbox/sb"]
+    assert calls == [SEARCH, GET]
 
 
-async def test_concurrent_first_calls_converge_by_unique_name(tools, transport):
-    label_lookups = 0
-    create_calls = 0
+async def test_deleted_ghosts_in_search_do_not_make_association_ambiguous(tools, transport):
+    states = {"ghost": "deleted", "leaving": "deleting", "sb": "running"}
+
+    def handler(request):
+        if request.url.path == "/sandboxes/search":
+            return listing(*(record(sandbox_id=sid) for sid in states))
+        if request.url.path.startswith("/sandboxes/"):
+            sid = request.url.path.rsplit("/", 1)[1]
+            return httpx.Response(200, json=record(states[sid], sid))
+        assert request.url.path == "/sb/processes"
+        return httpx.Response(201, json=process())
+
+    async with httpx.AsyncClient(transport=transport(handler)) as client:
+        assert await lathe._ensure_sandbox(tools.valves, USER["email"], client) == ("sb", None)
+
+
+def fake_creation(deleted=()):
+    """Daytona create semantics: a key replays its sandbox, even a deleted one."""
+    state = SimpleNamespace(by_key={}, bodies=[], deleted=set(deleted))
+
+    def create(request):
+        body = json.loads(request.content)
+        state.bodies.append(body)
+        sid = state.by_key.setdefault(body["idempotency_key"], f"sb{len(state.by_key)}")
+        return httpx.Response(202, json={"id": sid, "status": "pending"})
+
+    def get(request):
+        sid = request.url.path.rsplit("/", 1)[1]
+        return httpx.Response(200, json=record("deleted" if sid in state.deleted else "running", sid))
+
+    state.create, state.get = create, get
+    return state
+
+
+async def test_concurrent_first_calls_converge_by_idempotency_key(tools, transport):
+    cloud = fake_creation()
+    lookups = 0
     both_looked_up = asyncio.Event()
-    calls = []
-    winner = {
-        "id": "winner", "name": "test/owner@example.test", "state": "started",
-        "labels": {"test": USER["email"]},
-    }
 
     async def handler(request):
-        nonlocal label_lookups, create_calls
-        calls.append((request.method, request.url.path))
-        if (request.method, request.url.path) == ("GET", "/sandbox"):
-            label_lookups += 1
-            if label_lookups == 2:
+        nonlocal lookups
+        if request.url.path == "/sandboxes/search":
+            lookups += 1
+            if lookups == 2:
                 both_looked_up.set()
             await both_looked_up.wait()
-            return httpx.Response(200, json=[])
-        if (request.method, request.url.path) == ("POST", "/sandbox"):
-            create_calls += 1
-            if create_calls == 1:
-                return httpx.Response(200, json=winner)
-            return httpx.Response(409, text="Sandbox with name already exists")
-        if (request.method, request.url.path) == (
-            "GET", "/sandbox/test/owner@example.test",
-        ):
-            return httpx.Response(200, json=winner)
-        assert (request.method, request.url.path) == ("POST", "/winner/process/execute")
-        return httpx.Response(200, json={"exitCode": 0, "result": "ready"})
+            return listing()
+        if (request.method, request.url.path) == ("POST", "/sandboxes"):
+            return cloud.create(request)
+        if request.url.path.startswith("/sandboxes/"):
+            return cloud.get(request)
+        assert request.url.path == "/sb0/processes"
+        return httpx.Response(201, json=process("ready"))
 
     async with (
         httpx.AsyncClient(transport=transport(handler)) as first,
@@ -1584,287 +1682,227 @@ async def test_concurrent_first_calls_converge_by_unique_name(tools, transport):
             lathe._ensure_sandbox(tools.valves, USER["email"], first),
             lathe._ensure_sandbox(tools.valves, USER["email"], second),
         )
-
-    assert sorted(results, key=lambda result: result[1] or "") == [
-        ("winner", None),
-        ("winner", "[Sandbox was created — this is a fresh environment with no prior files]"),
-    ]
-    assert label_lookups == 2 and create_calls == 2
-    assert calls.count(("GET", "/sandbox/test/owner@example.test")) == 1
-    assert calls.count(("POST", "/winner/process/execute")) == 2
+    assert {sid for sid, _ in results} == {"sb0"}
+    assert len(cloud.bodies) == 2 and len(cloud.by_key) == 1
 
 
-async def test_create_conflict_without_authoritative_winner_is_retryable(tools, transport):
-    calls = []
+async def test_creation_walks_past_deleted_replays(tools, transport):
+    cloud = fake_creation(deleted={"sb0", "sb1"})
 
     def handler(request):
-        calls.append((request.method, request.url.path))
-        if (request.method, request.url.path) == ("GET", "/sandbox"):
-            return httpx.Response(200, json=[])
-        if (request.method, request.url.path) == ("POST", "/sandbox"):
-            return httpx.Response(409, text="Sandbox with name already exists")
-        assert (request.method, request.url.path) == (
-            "GET", "/sandbox/test/owner@example.test",
-        )
-        return httpx.Response(404)
+        if request.url.path == "/sandboxes/search":
+            return listing()
+        return cloud.create(request) if request.method == "POST" else cloud.get(request)
 
     async with httpx.AsyncClient(transport=transport(handler)) as client:
-        with pytest.raises(RuntimeError, match="Retry this tool call"):
-            await lathe._ensure_sandbox(tools.valves, USER["email"], client)
-
-    assert calls == [
-        ("GET", "/sandbox"),
-        ("POST", "/sandbox"),
-        ("GET", "/sandbox/test/owner@example.test"),
-    ]
+        assert (await lathe._create_sandbox(tools.valves, USER["email"], client))["id"] == "sb2"
+        # Another worker walks the same sequence to the same sandbox.
+        assert (await lathe._create_sandbox(tools.valves, USER["email"], client))["id"] == "sb2"
+    assert len(cloud.by_key) == 3
 
 
-@pytest.mark.parametrize("state", ["deleting", "destroying"])
-async def test_deletion_in_progress_never_creates_replacement(tools, transport, clock, state):
-    calls = []
+def test_create_request_uses_readable_display_name_without_changing_owner(tools):
+    tools.valves.deployment_label = "chat.adamsmith.as/v2"
+    request = lathe._create_request(tools.valves, "ada+lab@example.test")
+    assert re.fullmatch(r"lathe-chat-adamsmith-as-v2-ada-lab-[a-f0-9]{8}", request["name"])
+    assert request["labels"] == {"chat.adamsmith.as/v2": "ada+lab@example.test"}
+    other = lathe._create_request(tools.valves, "ada+lab@other.test")
+    assert request["name"] != other["name"]
 
+
+async def test_create_request_carries_valves_and_protects_identity(tools, transport):
+    cloud = fake_creation()
+    v = tools.valves
+    v.idle_pause_minutes, v.max_run_minutes, v.cpu_cores, v.memory_gib, v.disk_max_gib = 7, 90, 1.5, 3, 40
+    v.sandbox_image, v.sandbox_region = "lathe-image", "us-east-ash-1"
+    v.sandbox_create_overrides = '{"memory_max_mib": 8192}'
+    transport_handler = transport(lambda r: cloud.create(r) if r.method == "POST" else cloud.get(r))
+    async with httpx.AsyncClient(transport=transport_handler) as client:
+        await lathe._create_sandbox(v, USER["email"], client)
+    body = cloud.bodies[0]
+    assert body["lifecycle_policy"] == {"idle_expiry_seconds": 420, "on_idle_timeout": "pause",
+                                        "timeout_seconds": 5400, "on_timeout": "pause"}
+    assert (body["cpu"], body["memory_mib"], body["disk_max_mib"], body["memory_max_mib"]) == (1.5, 3072, 40960, 8192)
+    assert (body["image"], body["region_id"], body["persistent"]) == ("lathe-image", "us-east-ash-1", True)
+    assert body["labels"] == {"test": USER["email"]}
+    assert re.fullmatch(r"[A-Za-z0-9._-]{1,128}", body["name"]) and "volumes" not in body
+    assert not {"delete", "stop"} & set(body["lifecycle_policy"].values())
+    for key in ("name", "labels", "volumes", "persistent", "idempotency_key"):
+        v.sandbox_create_overrides = json.dumps({key: "x"})
+        with pytest.raises(ValueError, match=key):
+            lathe._create_request(v, USER["email"])
+
+
+async def test_creation_rejects_foreign_replay(tools, transport):
     def handler(request):
-        calls.append((request.method, request.url.path))
-        assert request.method == "GET"
-        if request.url.path == "/sandbox":
-            return httpx.Response(200, json=[{
-                "id": "sb", "labels": {"test": USER["email"]},
-            }])
-        assert request.url.path == "/sandbox/sb"
-        return httpx.Response(200, json={"id": "sb", "state": state})
+        if request.method == "POST":
+            return httpx.Response(202, json={"id": "sb"})
+        return httpx.Response(200, json={**record(), "labels": {"test": "someone-else@example.test"}})
 
     async with httpx.AsyncClient(transport=transport(handler)) as client:
-        with pytest.raises(RuntimeError, match="Retry after deletion completes"):
-            await lathe._ensure_sandbox(tools.valves, USER["email"], client)
-
-    assert calls == [("GET", "/sandbox"), ("GET", "/sandbox/sb")]
-    assert clock() == 0
+        with pytest.raises(RuntimeError, match="will not select it"):
+            await lathe._create_sandbox(tools.valves, USER["email"], client)
 
 
-@pytest.mark.parametrize("state,expected_warning,start_calls", [
-    ("started", None, 0),
-    ("stopped", "running processes were lost", 1),
-    ("archived", "running processes were lost", 1),
-    ("paused", "resumed from paused state", 1),
+async def test_refused_settings_reach_the_administrator(tools, transport):
+    handler = transport(lambda r: httpx.Response(400, json={"message": "exceeds the plan maximum"}))
+    async with httpx.AsyncClient(transport=handler) as client:
+        with pytest.raises(RuntimeError, match="exceeds the plan maximum.*valves"):
+            await lathe._create_sandbox(tools.valves, USER["email"], client)
+
+
+async def test_deletion_in_progress_never_creates_replacement(lifecycle, clock):
+    calls, ensure = lifecycle
+    with pytest.raises(RuntimeError, match="Retry after deletion completes"):
+        await ensure(record("deleting"))
+    assert calls == [SEARCH, GET] and clock() == 0
+
+
+@pytest.mark.parametrize("status,warning,action", [
+    ("running", None, None),
+    ("stopped", "running processes were lost", START),
+    ("paused", "processes and interpreter state were kept", RESUME),
 ])
-async def test_lifecycle_ready_and_restartable_states(
-    tools, transport, clock, state, expected_warning, start_calls,
-):
-    observations = iter([state, "started"] if start_calls else [state])
-    calls = []
-
-    def handler(request):
-        calls.append((request.method, request.url.path))
-        if request.url.path == "/sandbox":
-            return httpx.Response(200, json=[{
-                "id": "sb", "labels": {"test": USER["email"]},
-            }])
-        if request.url.path == "/sandbox/sb" and request.method == "GET":
-            return httpx.Response(200, json={"id": "sb", "state": next(observations)})
-        if request.url.path == "/sandbox/sb/start":
-            return httpx.Response(200, json={"id": "sb", "state": "starting"})
-        assert request.url.path == "/sb/process/execute"
-        return httpx.Response(200, json={"exitCode": 0, "result": "ready"})
-
-    async with httpx.AsyncClient(transport=transport(handler)) as client:
-        sandbox_id, warning = await lathe._ensure_sandbox(
-            tools.valves, USER["email"], client,
-        )
-
+async def test_lifecycle_ready_and_restartable_states(lifecycle, clock, status, warning, action):
+    calls, ensure = lifecycle
+    sandbox_id, message = await ensure(record(status), *([record()] if action else []))
     assert sandbox_id == "sb"
-    assert (expected_warning is None and warning is None) or expected_warning in warning
-    assert calls.count(("POST", "/sandbox/sb/start")) == start_calls
-    assert calls.count(("POST", "/sb/process/execute")) == 1
-    assert (clock() > 0) == bool(start_calls)
+    assert (message is None) if warning is None else warning in message
+    assert [c for c in calls if c in (START, RESUME)] == ([action] if action else [])
+    assert calls.count(EXECUTE) == 1
+    assert (clock() > 0) == bool(action)
 
 
-@pytest.mark.parametrize("initial,terminal", [
-    ("stopping", "stopped"),
-    ("archiving", "archived"),
+@pytest.mark.parametrize("initial,terminal,action", [
+    ("stopping", "stopped", START), ("pausing", "paused", RESUME),
 ])
-async def test_lifecycle_transition_restarts_after_terminal_state(
-    tools, transport, clock, initial, terminal,
-):
+async def test_lifecycle_transition_restarts_once_after_terminal_state(lifecycle, clock, initial, terminal, action):
     # Daytona's read model may briefly remain at the terminal state after the
-    # start request. That must not cause duplicate start requests.
-    states = iter([initial, terminal, terminal, "starting", "started"])
-    calls = []
-
-    def handler(request):
-        calls.append((request.method, request.url.path))
-        if request.url.path == "/sandbox":
-            return httpx.Response(200, json=[{
-                "id": "sb", "labels": {"test": USER["email"]},
-            }])
-        if request.url.path == "/sandbox/sb" and request.method == "GET":
-            return httpx.Response(200, json={"id": "sb", "state": next(states)})
-        if request.url.path == "/sandbox/sb/start":
-            return httpx.Response(200, json={"id": "sb", "state": "starting"})
-        assert request.url.path == "/sb/process/execute"
-        return httpx.Response(200, json={"exitCode": 0, "result": "ready"})
-
-    async with httpx.AsyncClient(transport=transport(handler)) as client:
-        sandbox_id, warning = await lathe._ensure_sandbox(
-            tools.valves, USER["email"], client,
-        )
-
-    assert sandbox_id == "sb"
-    assert "running processes were lost" in warning
-    assert calls[:7] == [
-        ("GET", "/sandbox"),
-        ("GET", "/sandbox/sb"),
-        ("GET", "/sandbox/sb"),
-        ("POST", "/sandbox/sb/start"),
-        ("GET", "/sandbox/sb"),
-        ("GET", "/sandbox/sb"),
-        ("GET", "/sandbox/sb"),
-    ]
-    assert calls.count(("POST", "/sandbox/sb/start")) == 1
+    # request. That must not cause duplicate requests.
+    calls, ensure = lifecycle
+    await ensure(*(record(s) for s in (initial, terminal, terminal, "assigned", "booting", "running")))
+    assert calls[:4] == [SEARCH, GET, GET, action]
+    assert sum(c in (START, RESUME) for c in calls) == 1
     assert clock() > 0
 
 
-@pytest.mark.parametrize("state", [
-    "unknown", "pending_build", "pulling_snapshot", "building_snapshot", "creating",
-    "starting", "resuming", "restoring", "resizing", "snapshotting", "forking",
+async def test_lifecycle_resume_lost_to_another_worker_is_not_an_error(lifecycle, clock):
+    _, ensure = lifecycle
+    assert (await ensure(record("paused"), record("assigned"), record(), action=409))[0] == "sb"
+
+
+@pytest.mark.parametrize("status", ["queued", "pending", "assigned", "booting"])
+async def test_lifecycle_in_flight_states_wait_without_starting(lifecycle, clock, status):
+    calls, ensure = lifecycle
+    assert await ensure(record(status), record()) == ("sb", None)
+    assert not {START, RESUME} & set(calls) and clock() > 0
+
+
+@pytest.mark.parametrize("status,details,message", [
+    ("failed", {"error": "broken host"}, "broken host"),
+    ("lost", {}, "Sandbox is lost"),
+    ("new_daytona_state", {}, "unsupported Daytona status"),
 ])
-async def test_lifecycle_in_flight_states_wait_without_starting(
-    tools, transport, clock, state,
-):
-    observations = iter([state, "started"])
-    calls = []
-
-    def handler(request):
-        calls.append((request.method, request.url.path))
-        if request.url.path == "/sandbox":
-            return httpx.Response(200, json=[{
-                "id": "sb", "labels": {"test": USER["email"]},
-            }])
-        if request.url.path == "/sandbox/sb":
-            return httpx.Response(200, json={"id": "sb", "state": next(observations)})
-        assert request.url.path == "/sb/process/execute"
-        return httpx.Response(200, json={"exitCode": 0, "result": "ready"})
-
-    async with httpx.AsyncClient(transport=transport(handler)) as client:
-        assert await lathe._ensure_sandbox(
-            tools.valves, USER["email"], client,
-        ) == ("sb", None)
-
-    assert ("POST", "/sandbox/sb/start") not in calls
-    assert clock() > 0
-
-
-async def test_lifecycle_pausing_waits_then_resumes(tools, transport, clock):
-    observations = iter(["pausing", "paused", "resuming", "started"])
-    calls = []
-
-    def handler(request):
-        calls.append((request.method, request.url.path))
-        if request.url.path == "/sandbox":
-            return httpx.Response(200, json=[{
-                "id": "sb", "labels": {"test": USER["email"]},
-            }])
-        if request.url.path == "/sandbox/sb" and request.method == "GET":
-            return httpx.Response(200, json={"id": "sb", "state": next(observations)})
-        if request.url.path == "/sandbox/sb/start":
-            return httpx.Response(200, json={"id": "sb", "state": "resuming"})
-        assert request.url.path == "/sb/process/execute"
-        return httpx.Response(200, json={"exitCode": 0, "result": "ready"})
-
-    async with httpx.AsyncClient(transport=transport(handler)) as client:
-        assert await lathe._ensure_sandbox(
-            tools.valves, USER["email"], client,
-        ) == ("sb", "[Sandbox was resumed from paused state]")
-
-    assert calls.count(("POST", "/sandbox/sb/start")) == 1
-    assert clock() > 0
-
-
-@pytest.mark.parametrize("state,details,message", [
-    ("build_failed", {}, "snapshot build failed"),
-    ("error", {"recoverable": False, "errorReason": "broken host"}, "broken host"),
-    ("new_daytona_state", {}, "unsupported Daytona lifecycle state"),
-])
-async def test_lifecycle_terminal_failures_are_immediate(
-    tools, transport, clock, state, details, message,
-):
-    def handler(request):
-        if request.url.path == "/sandbox":
-            return httpx.Response(200, json=[{
-                "id": "sb", "labels": {"test": USER["email"]},
-            }])
-        assert (request.method, request.url.path) == ("GET", "/sandbox/sb")
-        return httpx.Response(200, json={"id": "sb", "state": state, **details})
-
-    async with httpx.AsyncClient(transport=transport(handler)) as client:
-        with pytest.raises(RuntimeError, match=message):
-            await lathe._ensure_sandbox(tools.valves, USER["email"], client)
+async def test_lifecycle_terminal_failures_are_immediate(lifecycle, clock, status, details, message):
+    _, ensure = lifecycle
+    with pytest.raises(RuntimeError, match=message):
+        await ensure(record(status, **details))
     assert clock() == 0
 
 
-async def test_lifecycle_recoverable_error_recovers_once(tools, transport, clock):
-    observations = iter([
-        {"state": "error", "recoverable": True, "errorReason": "runner lost"},
-        {"state": "restoring"},
-        {"state": "started"},
-    ])
+async def test_stuck_boot_is_bounded_and_reports_daytona_reason(lifecycle, clock):
+    _, ensure = lifecycle
+    with pytest.raises(RuntimeError, match="Timed out.*booting.*could not start"):
+        await ensure(*[record("booting", error="the sandbox could not start")] * 200)
+    assert 120 <= clock() < 130
+
+
+@pytest.mark.parametrize("paginated", [False, True])
+async def test_duplicate_sandbox_association_refuses_use_and_destroy(tools, http, paginated):
     calls = []
 
     def handler(request):
         calls.append((request.method, request.url.path))
-        if request.url.path == "/sandbox":
-            return httpx.Response(200, json=[{
-                "id": "sb", "labels": {"test": USER["email"]},
-            }])
-        if request.url.path == "/sandbox/sb" and request.method == "GET":
-            return httpx.Response(200, json={"id": "sb", **next(observations)})
-        if request.url.path in ("/sandbox/sb/recover", "/sandbox/sb/start"):
-            return httpx.Response(200, json={"id": "sb"})
-        assert request.url.path == "/sb/process/execute"
-        return httpx.Response(200, json={"exitCode": 0, "result": "ready"})
+        if calls[-1] == SEARCH:
+            if paginated and "cursor" not in request.url.params:
+                return httpx.Response(200, json={"sandboxes": [record(sandbox_id="a")], "next_cursor": "second"})
+            if paginated:
+                assert request.url.params["cursor"] == "second"
+                assert json.loads(request.url.params["labels"]) == {"test": USER["email"]}
+                return listing(record(sandbox_id="b"))
+            return listing(record(sandbox_id="a"), record(sandbox_id="b"))
+        assert request.method == "GET"
+        return httpx.Response(200, json=record(sandbox_id=request.url.path.rsplit("/", 1)[1]))
 
-    async with httpx.AsyncClient(transport=transport(handler)) as client:
-        sandbox_id, warning = await lathe._ensure_sandbox(
-            tools.valves, USER["email"], client,
-        )
-
-    assert sandbox_id == "sb" and "recovered from error" in warning
-    assert calls.count(("POST", "/sandbox/sb/recover")) == 1
-    assert calls.count(("POST", "/sandbox/sb/start")) == 1
-    assert clock() > 0
-
-
-async def test_duplicate_sandbox_association_refuses_use_and_destroy(tools, http):
-    calls = []
-    def handler(request):
-        calls.append((request.method, request.url.path))
-        assert (request.method, request.url.path) == ("GET", "/sandbox")
-        return httpx.Response(200, json=[{"id": sid, "labels": {"test": USER["email"]}} for sid in ("a", "b")])
     http(handler)
     async with lathe.httpx.AsyncClient() as client:
         with pytest.raises(RuntimeError, match="Multiple sandboxes"):
             await lathe._ensure_sandbox(tools.valves, USER["email"], client)
     assert "Multiple sandboxes" in await tools.destroy(__user__=USER, __event_call__=AsyncMock(return_value=True))
-    assert calls == [("GET", "/sandbox")] * 2
+    assert {method for method, _ in calls} == {"GET"}
+
+
+async def test_resume_that_stops_fails_without_polling_until_timeout(lifecycle, clock):
+    _, ensure = lifecycle
+    with pytest.raises(RuntimeError, match="Sandbox stopped after"):
+        await ensure(record("paused"), record("assigned"), record("stopped"))
+    assert clock() < 10
+
+
+@pytest.mark.parametrize("late", [False, True])
+async def test_truncated_tool_output_fails_closed(tools, transport, late):
+    def handler(request):
+        if request.method == "POST":
+            data = process("partial information")
+            data["logs"].update(truncatedHead=not late, eof=not late, nextCursor="c1")
+            return httpx.Response(201, json=data)
+        assert request.url.params["cursor"] == "c1"
+        return httpx.Response(200, json={"truncatedHead": True, "eof": True})
+
+    async with httpx.AsyncClient(transport=transport(handler)) as client:
+        with pytest.raises(lathe._ToolFailure, match="incomplete tool output"):
+            await lathe._run_sandbox_script(tools.valves, "sb", client, "pass", error_prefix="script failed")
 
 
 async def test_destroy_requires_consent_and_authoritative_completion(tools, http, clock):
     calls = []
     responses = iter([
-        httpx.Response(200, json=[{"id": "sb", "labels": {"test": USER["email"]}}]),
-        httpx.Response(200, json={"id": "sb", "state": "started"}),
-        httpx.Response(204), httpx.Response(200, json={"state": "destroying"}), httpx.Response(404),
+        listing(record()), httpx.Response(200, json=record()), httpx.Response(202),
+        httpx.Response(200, json=record("deleting")), httpx.Response(200, json=record("deleted")),
     ])
+
     def handler(request):
         calls.append((request.method, request.url.path))
         return next(responses)
+
     http(handler)
     assert "cannot confirm" in await tools.destroy(__user__=USER)
     assert "cancelled" in await tools.destroy(__user__=USER, __event_call__=AsyncMock(return_value=False))
     assert calls == []
     result = await tools.destroy(__user__=USER, __event_call__=AsyncMock(return_value=True))
     assert result.startswith("Destroyed 1 sandbox")
-    assert calls == [("GET", "/sandbox"), ("GET", "/sandbox/sb"), ("DELETE", "/sandbox/sb"),
-                     ("GET", "/sandbox/sb"), ("GET", "/sandbox/sb")]
+    assert calls == [SEARCH, GET, ("DELETE", "/sandboxes/sb"), GET, GET]
+
+
+async def test_execute_follows_log_pages_and_separates_channels(tools, transport):
+    def handler(request):
+        if request.method == "POST":
+            return httpx.Response(201, json={"id": "p1", "state": "terminal", "exitCode": 0, "logs": {
+                "frames": [{"channel": "stdout", "data": "one "}, {"channel": "stderr", "data": "warning"}],
+                "nextCursor": "c1", "eof": False}})
+        assert (request.url.path, request.url.params["cursor"]) == ("/sb/processes/p1/logs", "c1")
+        return httpx.Response(200, json={"frames": [{"channel": "stdout", "data": "two"}], "eof": True})
+
+    async with httpx.AsyncClient(transport=transport(handler)) as client:
+        assert await lathe._execute(tools.valves, "sb", client, ["true"]) == (0, "one two", "warning")
+
+
+async def test_killed_script_is_a_failure_not_empty_success(tools, transport):
+    handler = transport(lambda r: httpx.Response(201, json={
+        "id": "p1", "state": "terminal", "signal": "SIGKILL", "reason": "timed_out", "logs": {"frames": [], "eof": True}}))
+    async with httpx.AsyncClient(transport=handler) as client:
+        with pytest.raises(lathe._ToolFailure, match="timed_out"):
+            await lathe._run_sandbox_script(tools.valves, "sb", client, "pass", error_prefix="script failed")
 
 
 @pytest.mark.parametrize("payload,mime", [
@@ -1993,8 +2031,8 @@ async def test_image_return_defers_notices_until_text_call(tools, sandbox, http)
         if request.url.path == "/sb/files/download":
             assert request.method == "GET" and request.url.params["path"] == "/image"
             return httpx.Response(200, content=PNG)
-        assert (request.method, request.url.path) == ("POST", "/sb/process/execute")
-        return httpx.Response(200, json={"exitCode": 0, "result": "text result"})
+        assert (request.method, request.url.path) == ("POST", "/sb/processes")
+        return httpx.Response(200, json=process("text result"))
     http(handler)
     tools._chat_state["a"] = {"init": True, "pending": ["pending notice"]}
     result = await tools.view("/image", __user__=USER, __chat_id__="a")
@@ -2016,8 +2054,8 @@ async def test_text_model_view_refused_before_io(tools, monkeypatch, model):
 
 
 @pytest.mark.parametrize("tool,command,args,method,path,payload", [
-    ("peek", "process.status", {"process": "atspi"}, "GET", "process/atspi/status", {}),
-    ("peek", "process.logs", {"process": "novnc"}, "GET", "process/novnc/logs", {}),
+    ("peek", "process.status", {"process": "dbus"}, "GET", "process/dbus/status", {}),
+    ("peek", "process.logs", {"process": "x11vnc"}, "GET", "process/x11vnc/logs", {}),
     ("peek", "display.info", {}, "GET", "display/info", {}),
     ("peek", "display.windows", {}, "GET", "display/windows", {}),
     ("peek", "mouse.position", {}, "GET", "mouse/position", {}),
@@ -2027,7 +2065,7 @@ async def test_text_model_view_refused_before_io(tools, monkeypatch, model):
      {"scope": "focused", "name": "Submit", "states": ["visible"], "nameMatch": "substring", "limit": 20}),
     ("poke", "start", {}, "POST", "start", {}),
     ("poke", "stop", {}, "POST", "stop", {}),
-    ("poke", "process.restart", {"process": "xfce4"}, "POST", "process/xfce4/restart", {}),
+    ("poke", "process.restart", {"process": "wm"}, "POST", "process/wm/restart", {}),
     ("poke", "mouse.move", {"x": 5, "y": 6}, "POST", "mouse/move", {"x": 5, "y": 6}),
     ("poke", "mouse.click", {"x": 5, "y": 6}, "POST", "mouse/click",
      {"x": 5, "y": 6, "button": "left", "double": False}),
@@ -2035,14 +2073,10 @@ async def test_text_model_view_refused_before_io(tools, monkeypatch, model):
      {"startX": 1, "startY": 2, "endX": 3, "endY": 4, "button": "left"}),
     ("poke", "mouse.scroll", {"x": 5, "y": 6, "direction": "up"}, "POST", "mouse/scroll",
      {"x": 5, "y": 6, "direction": "up", "amount": 1}),
-    ("poke", "mouse.down", {}, "POST", "mouse/down", {"button": "left"}),
-    ("poke", "mouse.up", {"x": 7, "y": 8}, "POST", "mouse/up", {"x": 7, "y": 8, "button": "left"}),
     ("poke", "keyboard.type", {"text": "α\nHello"}, "POST", "keyboard/type", {"text": "α\nHello", "delay": 0}),
     ("poke", "keyboard.press", {"key": "c", "modifiers": ["ctrl"]}, "POST", "keyboard/key",
      {"key": "c", "modifiers": ["ctrl"]}),
     ("poke", "keyboard.hotkey", {"keys": "ctrl+l"}, "POST", "keyboard/hotkey", {"keys": "ctrl+l"}),
-    ("poke", "keyboard.down", {"key": "shift"}, "POST", "keyboard/down", {"key": "shift"}),
-    ("poke", "keyboard.up", {"key": "shift"}, "POST", "keyboard/up", {"key": "shift"}),
     ("poke", "accessibility.focus", {"id": "node"}, "POST", "a11y/node/focus", {"id": "node"}),
     ("poke", "accessibility.invoke", {"id": "node"}, "POST", "a11y/node/invoke", {"id": "node"}),
     ("poke", "accessibility.set_value", {"id": "node", "value": "abc"}, "POST", "a11y/node/value",
@@ -2074,18 +2108,21 @@ def fake_desktop(running, *, page_result=None, polls_down=0):
     def handler(request):
         path = request.url.path.removeprefix("/sb")
         state["log"].append(f"{request.method} {path}")
-        if path == "/process/execute":
-            state["scripts"].append(json.loads(request.content)["command"])
-            return httpx.Response(200, json={"exitCode": 0, "result": json.dumps(page_result) + "\n"})
+        if path == "/processes":
+            state["scripts"].append(argv_of(request)[2])
+            return httpx.Response(200, json=process(json.dumps(page_result) + "\n"))
         name = re.fullmatch(r"/computeruse/process/(\w+)/status", path)
         if name:
-            up = state["running"] or name[1] == "atspi"
-            if state["running"] and state["polls_down"]:
+            # v2 lists no process at all before the desktop's first start.
+            if not state["running"]:
+                return httpx.Response(404, json={"message": "no such process"})
+            up = True
+            if state["polls_down"]:
                 state["polls_down"] -= 1
                 up = False
             return httpx.Response(200, json={"processName": name[1], "running": up})
         if path == "/computeruse/status":
-            return httpx.Response(200, json={"status": "active" if state["running"] else "partial"})
+            return httpx.Response(200, json={"status": "active" if state["running"] else "inactive"})
         if path == "/computeruse/start":
             state["running"] = True
             return httpx.Response(200, json={"message": "started"})
@@ -2110,11 +2147,11 @@ async def test_poke_starts_down_desktop_before_acting(tools, sandbox, http, cloc
     result = await tools.poke(command, args, __user__=USER)
     assert "Error:" not in result and "started" in result
     log = desktop["log"]
-    acted = log.index("POST /process/execute" if command.startswith("page.") else
+    acted = log.index("POST /processes" if command.startswith("page.") else
                       "POST /computeruse/" + command.replace(".", "/"))
     assert log.index("POST /computeruse/start") < acted
     # The action waited for both the display and the session after start.
-    assert "GET /computeruse/process/xfce4/status" in log[log.index("POST /computeruse/start"):acted]
+    assert "GET /computeruse/process/wm/status" in log[log.index("POST /computeruse/start"):acted]
     if command.startswith("page."):
         assert '"launch": true' in desktop["scripts"][0]
 
@@ -2141,13 +2178,12 @@ async def test_peek_never_starts_or_touches_a_down_display(tools, sandbox, http,
     http(desktop["handler"])
     result = await tools.peek(command, args, __user__=USER)
     assert not any(entry.startswith("POST /computeruse") for entry in desktop["log"])
-    assert all("/process/" in e or e.endswith("/computeruse/status") for e in desktop["log"])
+    assert all("/process" in e or e.endswith("/computeruse/status") for e in desktop["log"])
     if command.startswith("page."):
         assert '"launch": false' in desktop["scripts"][0]
     elif command == "status":
-        # Truthful summary, not Daytona's misleading aggregate "partial".
         assert "Desktop is down" in result and "poke starts it" in result
-        assert "Running: atspi." in result
+        assert "Running: none." in result
     else:
         assert result.startswith("Error:") and "desktop is down" in result
 
@@ -2553,8 +2589,8 @@ async def test_page_poke_survives_dead_computer_use_service(tools, sandbox, http
     log = []
     def handler(request):
         log.append(request.url.path)
-        if request.url.path == "/sb/process/execute":
-            return httpx.Response(200, json={"exitCode": 0, "result": json.dumps({"ok": True, "text": "Opened."})})
+        if request.url.path == "/sb/processes":
+            return httpx.Response(200, json=process(json.dumps({"ok": True, "text": "Opened."})))
         return httpx.Response(500, json={"message": "internal server error: connection is shut down"})
     http(handler)
     result = await tools.poke("page.open", {"url": "https://example.org/"}, __user__=USER)
@@ -2588,7 +2624,7 @@ async def test_stop_warns_about_input_after_restart(tools, sandbox, http):
 async def test_status_reports_running_processes(tools, sandbox, http):
     http(fake_desktop(True)["handler"])
     result = await tools.peek("status", __user__=USER)
-    assert result.startswith("Desktop is active.") and "xvfb, xfce4, x11vnc, novnc" in result
+    assert result.startswith("Desktop is active.") and "xvfb, wm, x11vnc, dbus" in result
 
 
 @pytest.mark.parametrize("command,args,message,shown", [
@@ -2607,7 +2643,7 @@ async def test_computer_errors_pass_provider_message_bounded_and_redacted(tools,
         return httpx.Response(500, json={"statusCode": 500, "message": message, "source": "DAYTONA_DAEMON"})
     http(handler)
     result = await tools.poke(command, args, __user__=USER)
-    assert result.startswith("Error: computer command failed (HTTP 500)") and "bash with DISPLAY=:0" in result
+    assert result.startswith("Error: computer command failed (HTTP 500)") and "bash with DISPLAY=:99" in result
     for field in ("text", "value"):
         if field in args:
             assert args[field][:8] not in result
@@ -2772,9 +2808,12 @@ async def test_vnc_preview_uses_existing_policy_and_landing_path(tools, sandbox,
         calls.append(request)
         if request.url.path == "/sb/computeruse/status":
             assert request.method == "GET"
-            return httpx.Response(200, json={"Status": "active"})
+            return httpx.Response(200, json={"status": "active"})
+        if request.url.path == "/sb/processes":
+            assert "websockify" in argv_of(request)[2]
+            return httpx.Response(201, json=process())
         if request.url.host == "api.test":
-            assert request.url.path == "/sandbox/sb/ports/6080/signed-preview-url"
+            assert (request.method, request.url.path) == ("POST", "/sandboxes/sb/ports/6080/signed-preview-urls")
             return httpx.Response(200, json={"url": "https://signed.test/?token=secret-token"})
         assert (request.method, request.url.host, request.url.path) == ("POST", "wrapper.test", "/register")
         registration = json.loads(request.content)
@@ -2785,7 +2824,7 @@ async def test_vnc_preview_uses_existing_policy_and_landing_path(tools, sandbox,
     assert "/vnc.html?" in result and "path=websockify" in result
     assert "logged-in accounts" in result
     assert ("secret-token" in result) is not wrapped
-    assert len(calls) == (3 if wrapped else 2)
+    assert len(calls) == (4 if wrapped else 3)
 
 
 async def test_vnc_does_not_start_desktop_or_downgrade_private(tools, sandbox, http):
@@ -2799,9 +2838,18 @@ async def test_vnc_does_not_start_desktop_or_downgrade_private(tools, sandbox, h
     assert result.startswith("Error:") and "not active" in result
     assert len(calls) == 1
     calls.clear()
-    http(lambda r: httpx.Response(200, json={"status": "active"}))
+    bridge = process()
+    http(lambda r: httpx.Response(200, json=bridge if r.method == "POST" else {"status": "active"}))
     result = await tools.expose("vnc", "private", __user__=USER)
     assert result.startswith("Error:") and "no direct URL" in result
+    bridge = process("this sandbox image has no noVNC bridge", 1)
+    result = await tools.expose("vnc", "public", __user__=USER)
+    assert result.startswith("Error:") and "no noVNC bridge" in result and "https://" not in result
+
+
+def only_checked_listener(calls):
+    """No URL was minted or registered: nothing beyond the in-sandbox check."""
+    return [(r.url.host, r.url.path) for r in calls] == [("proxy.test", "/sb/processes")]
 
 
 @pytest.fixture
@@ -2826,23 +2874,70 @@ def preview(tools, sandbox, http):
                 if payload == "malformed":
                     return httpx.Response(200, text=upstream + secret)
                 return httpx.Response(status, json=good if payload is None else payload)
-            if request.url.path.endswith("/signed-preview-url"):
-                assert request.method == "GET" and request.url.host == "api.test"
+            if request.url.path.endswith("/signed-preview-urls"):
+                assert request.method == "POST" and request.url.host == "api.test"
                 port = int(request.url.path.split("/")[-2])
                 assert 1024 <= port <= 65535
-                assert request.url.params["expiresInSeconds"] == "86400"
+                assert json.loads(request.content) == {"expires_in_seconds": 86400}
                 return httpx.Response(200, json={"url": upstream})
             assert request.url.host == "proxy.test"
-            assert (request.method, request.url.path) == ("POST", "/sb/process/execute")
+            assert (request.method, request.url.path) == ("POST", "/sb/processes")
             if setup_failure:
-                return httpx.Response(200, json={"exitCode": 1, "result": "checksum mismatch"})
-            return httpx.Response(200, json={"exitCode": 0, "result": "READY PID=123"})
+                return httpx.Response(200, json=process("checksum mismatch", 1))
+            assert "PORT = " in argv_of(request)[2]
+            return httpx.Response(201, json=process("reachable"))
         http(handler)
         result = await tools.expose(target, access, tag, upstream_headers=upstream_headers or {},
                                     public_headers_acknowledged=acknowledged,
                                     __user__=user, __event_emitter__=emit)
         return result, calls, json.dumps(events)
     return SimpleNamespace(invoke=invoke, upstream=upstream, protected=protected, secret=secret, good=good)
+
+
+@pytest.mark.parametrize("access", ["public", "private"])
+@pytest.mark.parametrize("state,message", [("loopback", "bound to 0.0.0.0"), ("absent", "nothing is listening on port 5000")])
+async def test_unreachable_service_never_mints_a_preview(tools, sandbox, http, access, state, message):
+    tools.valves.preview_wrapper_url, tools.valves.preview_wrapper_key = "https://wrapper.test/register", "key"
+    calls = []
+    def handler(request):
+        calls.append(request.url.path)
+        return httpx.Response(201, json=process(state + "\n"))
+    http(handler)
+    result = await tools.expose("http:5000", access, __user__=USER)
+    assert result.startswith("Error:") and message in result and "https://" not in result
+    assert calls == ["/sb/processes"]
+
+
+@pytest.mark.parametrize("failure", [httpx.Response(503), httpx.Response(201, json=process("boom", 1))])
+async def test_broken_listener_check_does_not_block_exposure(tools, sandbox, http, failure):
+    def handler(request):
+        if request.url.host == "api.test":
+            return httpx.Response(201, json={"url": "https://signed.test/"})
+        return failure
+    http(handler)
+    result = await tools.expose("http:5000", "public", __user__=USER)
+    assert result.splitlines()[0] == "Service URL: https://signed.test/"
+
+
+HEADER = "  sl  local_address rem_address   st\n"
+@pytest.mark.parametrize("tcp,tcp6,expected", [
+    ("0: 0100007F:1F40 00000000:0000 0A", None, "loopback"),
+    ("0: 0200FF0A:1F40 00000000:0000 0A", None, "reachable"),
+    ("0: 00000000:1F40 00000000:0000 0A", None, "reachable"),
+    ("0: 0100007F:1F40 00000000:0000 0A\n1: 00000000:1F40 00000000:0000 0A", None, "reachable"),
+    ("0: 00000000:1F41 00000000:0000 0A", None, "absent"),
+    ("0: 00000000:1F40 00000000:0000 01", None, "absent"),  # established, not listening
+    ("", "0: 00000000000000000000000000000000:1F40 0:0 0A", "reachable"),
+    ("", "0: 00000000000000000000000001000000:1F40 0:0 0A", "loopback"),
+    ("", "0: 0000000000000000FFFF00000100007F:1F40 0:0 0A", "loopback"),
+    ("", "0: 0000000000000000FFFF00000200FF0A:1F40 0:0 0A", "reachable"),
+])
+def test_listener_classification(tmp_path, tcp, tcp6, expected):
+    (tmp_path / "tcp").write_text(HEADER + tcp + "\n" if tcp else HEADER)
+    if tcp6 is not None:
+        (tmp_path / "tcp6").write_text(HEADER + tcp6 + "\n")
+    script = lathe._LISTENER_SCRIPT.replace("/proc/net", str(tmp_path))
+    assert run_script("PORT = 8000\n" + script).strip() == expected
 
 
 @pytest.mark.parametrize("target", ["http:1024", "http:5000", "http:65535"])
@@ -2942,7 +3037,7 @@ async def test_header_requests_require_wrapper_before_signing(preview, tools, ac
     result, calls, events = await preview.invoke(
         access=access, acknowledged=access == "public",
         upstream_headers={"Authorization": "secret-app-credential"})
-    assert result.startswith("Error:") and not calls
+    assert result.startswith("Error:") and only_checked_listener(calls)
     assert "secret-app-credential" not in result + events
 
 
@@ -3025,10 +3120,10 @@ async def test_preview_configuration_and_direct_mode(preview, tools):
     result, calls, _ = await preview.invoke(access="secret")
     assert result.startswith("Error:") and not calls
     result, calls, _ = await preview.invoke(user={"email": USER["email"]})
-    assert result.startswith("Error:") and not calls
+    assert result.startswith("Error:") and only_checked_listener(calls)
     tools.valves.preview_wrapper_key = ""
     result, calls, _ = await preview.invoke()
-    assert result.startswith("Error:") and not calls
+    assert result.startswith("Error:") and only_checked_listener(calls)
     tools.valves.preview_wrapper_url = ""
     result, calls, _ = await preview.invoke()
     assert result.startswith("Error:") and preview.upstream not in result
@@ -3044,12 +3139,12 @@ async def test_interpret_ambiguous_response_never_replays(tools, sandbox, http, 
     calls = []
     def handler(request):
         calls.append(request)
-        assert request.url.path == "/sb/process/execute"
+        assert request.url.path == "/sb/processes"
         if failure == "transport":
             raise httpx.ReadError("lost response", request=request)
         if failure == 503:
             return httpx.Response(503)
-        return httpx.Response(200, json={"exitCode": 0, "result": "not json" if failure == "json" else "{}"})
+        return httpx.Response(200, json=process("not json" if failure == "json" else "{}"))
     http(handler)
     result = await tools.interpret("x = 1", __user__=USER, __chat_id__="chat")
     assert "outcome may be unknown" in result and "Do not automatically replay" in result

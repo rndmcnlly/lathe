@@ -115,9 +115,14 @@ URLs do not belong in saved procedures.
 
 ## State
 
-Files in an ordinary sandbox survive stop/archive. Destroying the sandbox
-destroys that workspace; Lathe does not provision an additional persistent
-volume. Important results can be exported or committed to a remote repository.
+Each user has one persistent sandbox: one thing to explain, and one thing to
+reap. Idle pauses it, keeping files, processes and memory together, so there is
+no second storage tier with its own rules. Destroying it destroys everything;
+Lathe provisions no volume. Important results can be exported or committed to a
+remote repository.
+
+Lathe never deletes on its own. Retention is a policy decision about other
+people's forgotten data, owned by an administrator's job outside Lathe.
 
 `interpret` deliberately retains conversation-scoped Python state. Native
 subagents share the user's filesystem but have their own chat identities and

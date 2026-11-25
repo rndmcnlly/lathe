@@ -3,7 +3,7 @@
 Single-file Open WebUI toolkit (`lathe.py`). Keep the OWUI runtime implementation
 in that file. Optional applications are installed by the agent via `bash`, guided
 by `handbook/`, not imported runtime modules; the optional `preview-wrapper/` Cloudflare Worker
-is separate infrastructure. Read [DESIGN.md](DESIGN.md) for the human-facing tool
+and `image/` sandbox image are separate infrastructure. Read [DESIGN.md](DESIGN.md) for the human-facing tool
 story and responsibility boundaries before changing the tool surface.
 
 ## Documentation routing
@@ -29,7 +29,7 @@ Credentials: gitignored `.env`, documented in `.env.example`. Use `uv run`.
 ```sh
 uv run pytest                                  # offline, no credentials
 uv run pytest -k interpreter                    # focused selection
-uv run python test_integration.py               # DAYTONA_API_KEY
+uv run python test_integration.py               # DAYTONA_API_KEY, LATHE_TEST_IMAGE, LATHE_TEST_REGION
 uv run python test_deployment.py [--verbose]     # also OWUI credentials/model: .env.example
 ```
 
@@ -86,8 +86,8 @@ Neither live suite belongs in default pytest collection.
   Filter account-wide socket events by chat and message IDs before any retention.
 - `monitor_e2e.py` uses fresh Docker OWUI, real OpenRouter/Daytona, environment
   keys only (ignores `.env`), never an existing OWUI host. Cleanup must match the
-  exact run's `lathe-ci-*` label. No volumes; delete on idle stop after five
-  minutes; 30-minute wall-clock TTL. `test_monitor.py` protects isolation and
+  exact run's `lathe-ci-*` label. No volumes; delete after five idle
+  minutes; 30-minute wall-clock deletion. `test_monitor.py` protects isolation and
   sanitized evidence. Operation: `CI-MONITOR.md`.
 
 For closing issues: offline tests pass; run integration for Daytona-facing
@@ -132,6 +132,15 @@ edits need offline tests, not paid model qualification solely for wording.
 - **OWUI floor**: 0.12.0 is the supported minimum. Raise the
   frontmatter floor only for concrete required behavior/verified incompatibility,
   backed by upstream evidence, not a speculative version matrix.
+- **Daytona v2 lifecycle**: one `persistent` sandbox per user, paused when idle,
+  no volumes, and no Lathe-initiated deletion. Names are not unique: idempotency
+  keys decide create races, and replay deleted sandboxes, so creation walks a
+  numbered key sequence. Search lags; only per-ID records are authoritative.
+  Daytona rejects a key reused with a different create body, without returning
+  the sandbox ID. Keep creation valves consistent across workers; quiesce
+  provisioning when changing them. The key is derived from the create body
+  so settings can change after a sandbox has been deleted.
+  Toolbox URLs come from the sandbox record, per region.
 - **Cold start**: bootstrap from a blank x86_64 Linux Daytona sandbox. Egress
   allowlist only; resolve versions via GitHub API rather than hardcoded URLs;
   install to `/tmp`, prefer static `*-musl` builds. Details: services manpage.
@@ -145,8 +154,8 @@ signatures rather than maintaining a parallel signature catalog here.
 
 `_tool_context` owns HTTP client/error handling for sandbox operations except
 destroy. Manual calls need no sandbox. Sandbox-backed wrappers call `_ensure_sandbox` for
-create/start/recover/poll and `_ensure_chat_init` for chat context. Destroy manages
-its own client without creating/recovering a sandbox.
+create/resume/poll and `_ensure_chat_init` for chat context. Destroy manages
+its own client without creating/resuming a sandbox.
 
 View must return the core `data:image/...;base64,` result byte-identically: OWUI
 uses startswith detection, so prepended text breaks image lifting. Keep harness

@@ -7,7 +7,8 @@ Daytona, but deliberately do not claim to cover Open WebUI loading or dispatch.
 Usage:
     uv run python test_integration.py
 
-Requires ``DAYTONA_API_KEY`` in the environment or ``.env``.
+Requires ``DAYTONA_API_KEY`` in the environment or ``.env``, and the image from
+``image/build.py`` named by ``LATHE_TEST_IMAGE`` (with ``LATHE_TEST_REGION``).
 """
 
 import asyncio
@@ -22,7 +23,8 @@ import uuid
 import httpx
 from dotenv import load_dotenv
 
-from lathe import Tools, _api, _extract_sandbox_list, _headers, _toolbox
+from lathe import Tools, _api, _execute, _find_sandbox, _headers
+from test_deployment import labelled_sandboxes
 
 
 load_dotenv()
@@ -75,51 +77,32 @@ async def confirmed(_event):
 
 
 async def _delete_test_sandboxes(tools: Tools):
-    """Best-effort cleanup for the fixed, isolated test identity."""
-    async with httpx.AsyncClient() as client:
-        response = await client.get(
-            f"{tools.valves.daytona_api_url}/sandbox",
-            params={"labels": json.dumps({DEPLOYMENT_LABEL: TEST_EMAIL})},
-            headers=_headers(tools.valves),
-            timeout=30,
-        )
-        response.raise_for_status()
-        matches = [
-            sandbox
-            for sandbox in _extract_sandbox_list(response.json())
-            if sandbox.get("labels", {}).get(DEPLOYMENT_LABEL) == TEST_EMAIL
-        ]
+    """Clean up every sandbox for the isolated test identity."""
+    async with httpx.AsyncClient(headers=_headers(tools.valves)) as client:
+        matches = await labelled_sandboxes(client, DEPLOYMENT_LABEL, [TEST_EMAIL],
+                                          api_url=tools.valves.daytona_api_url)
         for sandbox in matches:
-            sid = sandbox["id"]
-            response = await client.delete(
-                f"{tools.valves.daytona_api_url}/sandbox/{sid}",
-                params={"force": "true"},
-                headers=_headers(tools.valves),
-                timeout=30,
-            )
-            if response.status_code == 409:
-                # Only a deletion already in progress may be treated as success.
-                current = await client.get(
-                    f"{tools.valves.daytona_api_url}/sandbox/{sid}",
-                    headers=_headers(tools.valves), timeout=30,
-                )
-                if current.status_code != 404:
-                    current.raise_for_status()
-                    require(current.json().get("state") in ("deleting", "destroying"),
-                            f"Sandbox {sid} delete conflicted outside deletion")
-            elif response.status_code != 404:
+            url = _api(tools.valves, f"/sandboxes/{sandbox['id']}")
+            current = await client.get(url, timeout=30)
+            if current.status_code == 404:
+                continue
+            current.raise_for_status()
+            item = current.json()
+            if item.get("status") == "deleted" or (item.get("labels") or {}).get(DEPLOYMENT_LABEL) != TEST_EMAIL:
+                continue
+            response = await client.delete(url, headers=_headers(tools.valves), timeout=30)
+            if response.status_code not in (404, 409):
                 response.raise_for_status()
             for _ in range(60):
-                current = await client.get(
-                    f"{tools.valves.daytona_api_url}/sandbox/{sid}",
-                    headers=_headers(tools.valves), timeout=30,
-                )
+                current = await client.get(url, headers=_headers(tools.valves), timeout=30)
                 if current.status_code == 404:
                     break
                 current.raise_for_status()
+                if current.json().get("status") == "deleted":
+                    break
                 await asyncio.sleep(1)
             else:
-                raise AssertionError(f"Sandbox {sid} did not finish deletion")
+                raise AssertionError(f"Sandbox {sandbox['id']} did not finish deletion")
 
 
 async def main():
@@ -130,9 +113,12 @@ async def main():
     tools = Tools()
     tools.valves.daytona_api_key = API_KEY
     tools.valves.deployment_label = DEPLOYMENT_LABEL
-    tools.valves.auto_stop_minutes = 15
-    tools.valves.auto_archive_minutes = 60
-    tools.valves.auto_delete_minutes = -1
+    tools.valves.sandbox_image = os.environ.get("LATHE_TEST_IMAGE", "")
+    tools.valves.sandbox_region = os.environ.get("LATHE_TEST_REGION", "")
+    # Lathe never deletes; a test sandbox deletes itself even if cleanup dies.
+    tools.valves.sandbox_create_overrides = json.dumps({"lifecycle_policy": {
+        "idle_expiry_seconds": 900, "on_idle_timeout": "delete",
+        "timeout_seconds": 1800, "on_timeout": "delete"}})
 
     user = {"email": TEST_EMAIL, "id": "lathe-integration", "name": "Lathe Integration"}
     chat_id = f"integration-{uuid.uuid4()}"
@@ -322,84 +308,36 @@ asyncio.run(main())
             require(f"retention-{index}" in output, output)
 
         async with httpx.AsyncClient() as client:
-            response = await client.get(
-                _api(tools.valves, "/sandbox"),
-                params={"labels": json.dumps({DEPLOYMENT_LABEL: TEST_EMAIL})},
-                headers=_headers(tools.valves), timeout=30,
-            )
-            response.raise_for_status()
-            sandbox = next(
-                item for item in _extract_sandbox_list(response.json())
-                if item.get("labels", {}).get(DEPLOYMENT_LABEL) == TEST_EMAIL
-            )
-            sandbox_id = sandbox["id"]
+            sandbox_id = (await _find_sandbox(tools.valves, TEST_EMAIL, client))["id"]
 
-            response = await client.get(
-                _toolbox(tools.valves, sandbox_id, "/process/session"),
-                headers=_headers(tools.valves), timeout=30,
-            )
-            response.raise_for_status()
-            sessions = [
-                session for session in response.json()
-                if str(session.get("sessionId", session.get("id", ""))).startswith("lathe-cmd-")
-            ]
-            inspect_script = (
-                "import json,os; root='/dev/shm/lathe/cmd'; "
-                "print(json.dumps({d: sorted(os.listdir(root+'/'+d)) for d in os.listdir(root)} "
-                "if os.path.isdir(root) else {}))"
-            )
-            response = await client.post(
-                _toolbox(tools.valves, sandbox_id, "/process/execute"),
-                headers=_headers(tools.valves),
-                json={"command": f"python3 -c {json.dumps(inspect_script)}", "timeout": 5000},
-                timeout=15,
-            )
-            response.raise_for_status()
-            sidecars = json.loads(response.json()["result"].strip())
-            require(len(sessions) == 1, f"expected one service session, got {len(sessions)}")
-            require(len(sidecars) >= 21, sidecars)
-            require(all("log" in names and "exit" in names for names in sidecars.values()), sidecars)
-            require(sum("keep" in names for names in sidecars.values()) == 1, sidecars)
-            print(f"  measured: {len(sessions)} service session, {len(sidecars)} retained results")
+            async def run(*argv):
+                return await _execute(tools.valves, sandbox_id, client, list(argv), timeout_ms=10000)
 
-            response = await client.post(
-                _toolbox(tools.valves, sandbox_id, "/process/execute"),
-                headers=_headers(tools.valves),
-                json={"command": "curl -fsS http://127.0.0.1:8766 >/dev/null", "timeout": 5000},
-                timeout=15,
-            )
-            response.raise_for_status()
-            require(response.json().get("exitCode") == 0, "retained HTTP service was killed")
-            await client.post(
-                _toolbox(tools.valves, sandbox_id, "/process/execute"),
-                headers=_headers(tools.valves),
-                json={"command": "pkill -f '[h]ttp.server 8766'; sleep 1", "timeout": 5000},
-                timeout=15,
-            )
+            async def sidecars():
+                code, out, err = await run("python3", "-c", (
+                    "import json,os; root='/dev/shm/lathe/cmd'; "
+                    "print(json.dumps({d: sorted(os.listdir(root+'/'+d)) for d in os.listdir(root)}))"))
+                require(code == 0, err)
+                return json.loads(out)
 
-        await tools.bash("true", **ctx)
-        async with httpx.AsyncClient() as client:
-            response = await client.get(
-                _toolbox(tools.valves, sandbox_id, "/process/session"),
-                headers=_headers(tools.valves), timeout=30,
-            )
-            response.raise_for_status()
-            sessions = [
-                session for session in response.json()
-                if session.get("sessionId", "").startswith("lathe-cmd-")
-            ]
-            require(not sessions, f"exited service session was not reaped: {sessions}")
-            expire_script = (
+            retained = await sidecars()
+            require(len(retained) >= 21, retained)
+            require(all("log" in names and "exit" in names for names in retained.values()), retained)
+            require(sum("keep" in names for names in retained.values()) == 1, retained)
+            print(f"  measured: {len(retained)} retained results")
+
+            code, _, err = await run("curl", "-fsS", "-o", "/dev/null", "http://127.0.0.1:8766")
+            require(code == 0, f"retained HTTP service was killed: {err}")
+            await run("bash", "-c", "pkill -f '[h]ttp.server 8766'; sleep 1")
+            await tools.bash("true", **ctx)
+            retained = await sidecars()
+            require(not any("keep" in names for names in retained.values()),
+                    f"exited service was not released: {retained}")
+            code, _, err = await run("python3", "-c", (
                 "import os,time; root='/dev/shm/lathe/cmd'; "
                 "[(os.utime(root+'/'+d+'/exit', (time.time()-86401, time.time()-86401))) "
-                "for d in os.listdir(root) if os.path.isfile(root+'/'+d+'/exit')]"
-            )
-            response = await client.post(
-                _toolbox(tools.valves, sandbox_id, "/process/execute"),
-                headers=_headers(tools.valves),
-                json={"command": f"python3 -c {json.dumps(expire_script)}", "timeout": 5000}, timeout=15,
-            )
-            response.raise_for_status()
+                "for d in os.listdir(root) if os.path.isfile(root+'/'+d+'/exit')]"))
+            require(code == 0, err)
         await tools.bash("echo expire-old-results", **ctx)
         output = await tools.read(full_log, **ctx)
         require(output.startswith("Error:") and "File not found" in output, output)
@@ -423,8 +361,6 @@ asyncio.run(main())
 
     async def computer_roundtrip():
         import base64
-        import re
-        import shlex
 
         output = await tools.poke("start", **ctx)
         require(not output.startswith("Error:"), output)
@@ -449,38 +385,56 @@ asyncio.run(main())
             require(output.startswith("data:image/"), output[:200])
             require(len(base64.b64decode(output.split(",", 1)[1], validate=True)) > 100, "Empty screenshot")
 
-        # A real terminal consumes keyboard events; verify its file separately,
-        # not the input acknowledgement or a canary echoed in a tool argument.
-        script = f"{WORKSPACE}/desktop-input.py"
-        saved = f"{WORKSPACE}/desktop-input.txt"
-        await tools.write(script, f"from pathlib import Path\nPath({saved!r}).write_text(input())\n", **ctx)
-        child = shlex.quote(f"python3 {script}")
-        output = await tools.bash(
-            f"export DISPLAY=:0; if command -v xfce4-terminal >/dev/null; then "
-            f"exec xfce4-terminal --disable-server --title=LatheInput --command={child}; "
-            f"else exec xterm -title LatheInput -e python3 {script}; fi",
-            foreground_seconds=0, **ctx)
-        require("Error:" not in output, output)
+        # A real page consumes keyboard events; read its state separately, not
+        # the input acknowledgement or a canary echoed in a tool argument.
+        page = f"{WORKSPACE}/desktop-input.html"
+        await tools.write(page, "<!doctype html><title>LatheInput</title><input id=i autofocus>"
+                          "<button onclick=\"document.title='invoked'\">Greet</button>", **ctx)
+        output = await tools.poke("page.open", {"url": f"file://{page}"}, **ctx)
+        require("LatheInput" in output, output)
+        windows = await tools.peek("display.windows", **ctx)
+        require("LatheInput" in windows, windows)
+        output = await tools.poke("page.click", {"selector": "#i"}, **ctx)
+        require(not output.startswith("Error:"), output)
+        output = await tools.poke("keyboard.type", {"text": canary}, **ctx)
+        require("Input delivered" in output, output)
         for _ in range(20):
-            windows = await tools.peek("display.windows", **ctx)
-            if "LatheInput" in windows:
+            output = await tools.poke("page.eval", {"js": "document.getElementById('i').value.length"}, **ctx)
+            if str(len(canary)) in output:
                 break
             await asyncio.sleep(0.5)
         else:
-            raise AssertionError(f"Test terminal did not open: {windows}")
-        output = await tools.poke("keyboard.type", {"text": canary}, **ctx)
-        require("Input delivered" in output, output)
-        output = await tools.poke("keyboard.press", {"key": "enter"}, **ctx)
-        require("Input delivered" in output, output)
+            raise AssertionError(f"keyboard input did not reach the page: {output}")
+
+        # Page contents reach AT-SPI only with Lathe's browser launch settings.
         for _ in range(20):
-            output = await tools.read(saved, **ctx)
-            if canary in output:
+            output = await tools.peek("accessibility.find", {"scope": "all", "name": "Greet", "role": "button"}, **ctx)
+            node = re.search(r'"id":"([^"]+)"', output)
+            if node:
                 break
             await asyncio.sleep(0.5)
-        require(canary in output, output)
+        else:
+            raise AssertionError(f"browser is missing from the accessibility tree: {output}")
+        await tools.poke("accessibility.invoke", {"id": node[1]}, **ctx)
+        output = await tools.peek("page.wait", {"text": "unused", "timeout": 1}, **ctx)
+        require("invoked" in output, output)
 
         output = await tools.peek("accessibility.tree", {"maxDepth": 1}, **ctx)
         require(not output.startswith("Error:"), output)
+
+        # An unrelated loopback listener must not be exposed or stopped.
+        output = await tools.bash(
+            "nohup python3 -m http.server 6080 --bind 127.0.0.1 >/tmp/lathe-vnc-conflict.log 2>&1 & "
+            "echo $! > /tmp/lathe-vnc-conflict.pid; "
+            "for i in $(seq 1 20); do curl -fsS -o /dev/null http://127.0.0.1:6080 && exit 0; sleep .25; done; exit 1",
+            **ctx)
+        require("Exit code:" not in output, output)
+        output = await tools.expose("vnc", "private", **ctx)
+        require("port 6080 does not serve the noVNC bridge" in output and "Service URL:" not in output, output)
+        output = await tools.bash(
+            "curl -fsS -o /dev/null http://127.0.0.1:6080 && kill \"$(cat /tmp/lathe-vnc-conflict.pid)\"",
+            **ctx)
+        require("Exit code:" not in output, output)
 
         # Explicitly public only on this disposable test desktop, with no login.
         output = await tools.expose("vnc", "public", **ctx)
@@ -509,7 +463,7 @@ asyncio.run(main())
         from urllib.parse import urlsplit
 
         # After the sandbox restart above every display process is down (Daytona
-        # still reports "partial"). Input after an in-plugin stop/start cycle
+        # lists no processes). Input after an in-plugin stop/start cycle
         # crashes Daytona's computer-use service, so this follows a sandbox wake.
         # peek must not start the desktop; poke must.
         output = await tools.peek("status", **ctx)
@@ -650,31 +604,35 @@ asyncio.run(main())
         require("Condition met" in output, output)
         await tools.bash("pkill -f '[h]ttp.server 8767'", **ctx)
 
-    async def workspace_survives_stop():
-        # No extra volume: restart the same VM and independently read its file.
+    async def change_state(action, target):
         async with httpx.AsyncClient() as client:
-            response = await client.get(
-                _api(tools.valves, "/sandbox"),
-                params={"labels": json.dumps({DEPLOYMENT_LABEL: TEST_EMAIL})},
-                headers=_headers(tools.valves), timeout=30,
-            )
-            response.raise_for_status()
-            sandbox, = [s for s in _extract_sandbox_list(response.json())
-                        if s.get("labels", {}).get(DEPLOYMENT_LABEL) == TEST_EMAIL]
-            require(not sandbox.get("volumes"), "Test sandbox unexpectedly has an extra volume")
-            sid = sandbox["id"]
-            response = await client.post(_api(tools.valves, f"/sandbox/{sid}/stop"),
-                                         headers=_headers(tools.valves), timeout=30)
+            sandbox = await _find_sandbox(tools.valves, TEST_EMAIL, client)
+            require(sandbox["persistent"] is True, "Test sandbox is not persistent")
+            url = _api(tools.valves, f"/sandboxes/{sandbox['id']}")
+            response = await client.post(f"{url}/{action}", headers=_headers(tools.valves), timeout=30)
             response.raise_for_status()
             for _ in range(60):
-                response = await client.get(_api(tools.valves, f"/sandbox/{sid}"),
-                                            headers=_headers(tools.valves), timeout=30)
+                response = await client.get(url, headers=_headers(tools.valves), timeout=30)
                 response.raise_for_status()
-                if response.json().get("state") == "stopped":
-                    break
+                if response.json().get("status") == target:
+                    return
                 await asyncio.sleep(1)
-            else:
-                raise AssertionError("Test sandbox did not stop")
+            raise AssertionError(f"Test sandbox did not reach {target}")
+
+    async def everything_survives_pause():
+        output = await tools.bash(
+            "nohup sh -c 'while :; do date +%s > /tmp/tick; sleep 1; done' >/dev/null 2>&1 & echo $! > /tmp/ticker", **ctx)
+        require("Exit code:" not in output, output)
+        await change_state("pause", "paused")
+        output = await tools.bash("sleep 3; kill -0 $(cat /tmp/ticker) && echo ticking; cat /tmp/tick; date +%s", **ctx)
+        require("resumed from pause" in output and "ticking" in output, output)
+        tick, now = map(int, output.split()[-2:])
+        require(now - tick <= 2, f"process did not continue after resume: {tick} {now}")
+        output = await tools.interpret("print(contract_value + 2)", **ctx)
+        require(output.rstrip().endswith("42"), output)
+
+    async def workspace_survives_stop():
+        await change_state("stop", "stopped")
         output = await tools.read(test_file, **ctx)
         require(canary in output and "OMEGA" in output, output)
         # Files and durable session history survive, but Python memory does not.
@@ -712,6 +670,7 @@ asyncio.run(main())
             ("background notice claimed once across workers", background_notice_claimed_once_across_workers),
             ("signed preview URL", expose_contract),
             ("desktop input, screenshots and VNC transport", computer_roundtrip),
+            ("processes and interpreter survive sandbox pause", everything_survives_pause),
             ("ordinary workspace survives sandbox stop", workspace_survives_stop),
             ("browser page commands with desktop auto-start", browser_roundtrip),
             ("disabled auto-create policy", disabled_auto_create_is_respected),

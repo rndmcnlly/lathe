@@ -118,7 +118,7 @@ async def configure_demo(api):
     response.raise_for_status()
     valves = response.json()
     overrides = json.loads(valves["sandbox_create_overrides"])
-    overrides["networkBlockAll"] = True
+    overrides["network_policy"] = {"block_all": True}
     valves["sandbox_create_overrides"] = json.dumps(overrides)
     response = await api.post(path + "/update", json=valves)
     response.raise_for_status()
@@ -126,20 +126,28 @@ async def configure_demo(api):
 
 async def verify_demo_files(http, directory):
     """Read actual sandbox policy and artifacts without the model or toolkit."""
-    response = await http.get("https://app.daytona.io/api/sandbox", params={
-        "labels": json.dumps({os.environ["LATHE_TEST_DEPLOYMENT_LABEL"]: "monitor@lathe.invalid"})})
-    response.raise_for_status()
-    data = response.json()
-    matches = [s for s in (data if isinstance(data, list) else data.get("items", []))
-               if s.get("labels", {}).get(os.environ["LATHE_TEST_DEPLOYMENT_LABEL"]) == "monitor@lathe.invalid"]
-    if len(matches) != 1 or matches[0].get("networkBlockAll") is not True or matches[0].get("volumes"):
+    from test_deployment import labelled_sandboxes
+
+    label, owner = os.environ["LATHE_TEST_DEPLOYMENT_LABEL"], "monitor@lathe.invalid"
+    matches = await labelled_sandboxes(http, label, [owner])
+    if len(matches) != 1:
         raise RuntimeError("Expected one egress-blocked, volume-free demo sandbox")
-    sandbox = matches[0]
+    sandbox_url = f"https://api.daytona.com/sandboxes/{matches[0]['id']}"
+    response = await http.get(sandbox_url)
+    response.raise_for_status()
+    sandbox = response.json()
+    response = await http.get(f"{sandbox_url}/network-policy")
+    response.raise_for_status()
+    applied = response.json().get("applied") or {}
+    if (sandbox.get("status") != "running" or (sandbox.get("labels") or {}).get(label) != owner
+            or sandbox.get("volumes") or applied.get("block_all") is not True
+            or applied.get("allow_cidrs") or applied.get("allow_domains")):
+        raise RuntimeError("Expected one egress-blocked, volume-free demo sandbox")
     artifact = json.loads((ROOT / "demo-video/out/artifact.json").read_text())
     path = artifact["path"]
     if not path.startswith("/") or not path.lower().endswith(".html"):
         raise RuntimeError("Expected an absolute HTML artifact path")
-    response = await http.get(f"https://proxy.app.daytona.io/toolbox/{sandbox['id']}/files/download", params={"path": path})
+    response = await http.get(f"{sandbox['toolbox_proxy_url']}/{sandbox['id']}/files/download", params={"path": path})
     response.raise_for_status()
     html = response.text
     rows = list(csv.DictReader(io.StringIO((ROOT / "demo-video/repair-log.csv").read_text())))
