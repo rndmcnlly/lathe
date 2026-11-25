@@ -3912,9 +3912,14 @@ _SANDBOX_DELETION_STATES = frozenset({"deleting", "deleted"})
 
 
 def _sandbox_name(valves, email: str) -> str:
-    # Names admit neither "@" nor "/", and are display-only in Daytona.
+    # Names are for the Daytona console; only the exact labels identify owners.
+    def slug(value: str, fallback: str) -> str:
+        return re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")[:40].rstrip("-") or fallback
+
+    deployment = slug(valves.deployment_label, "deployment")
+    username = slug(email.split("@", 1)[0], "user")
     digest = hashlib.sha256(f"{valves.deployment_label}\0{email}".encode()).hexdigest()
-    return f"lathe-{digest[:24]}"
+    return f"lathe-{deployment}-{username}-{digest[:8]}"
 
 
 def _create_request(valves, email: str) -> dict:

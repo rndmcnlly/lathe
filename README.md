@@ -101,6 +101,9 @@ is useful for substantial guidance. Neither valve causes automatic fetching.
 Each user has one persistent sandbox. When idle it pauses, and the next tool call
 resumes it with files, processes and interpreter state intact. Work does not
 progress while paused, and background processes do not keep a sandbox awake.
+New Lathe-created sandboxes show the deployment and email username in their
+Daytona display names, with a short hash to distinguish similar names. Lathe
+still finds sandboxes by their exact owner label, not by display name.
 
 > [!IMPORTANT]
 > **Lathe never deletes a sandbox on its own.** Pausing has no deletion deadline,

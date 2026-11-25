@@ -1672,6 +1672,15 @@ async def test_creation_walks_past_deleted_replays(tools, transport):
     assert len(cloud.by_key) == 3
 
 
+def test_create_request_uses_readable_display_name_without_changing_owner(tools):
+    tools.valves.deployment_label = "chat.adamsmith.as/v2"
+    request = lathe._create_request(tools.valves, "ada+lab@example.test")
+    assert re.fullmatch(r"lathe-chat-adamsmith-as-v2-ada-lab-[a-f0-9]{8}", request["name"])
+    assert request["labels"] == {"chat.adamsmith.as/v2": "ada+lab@example.test"}
+    other = lathe._create_request(tools.valves, "ada+lab@other.test")
+    assert request["name"] != other["name"]
+
+
 async def test_create_request_carries_valves_and_protects_identity(tools, transport):
     cloud = fake_creation()
     v = tools.valves
