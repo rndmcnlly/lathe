@@ -164,8 +164,8 @@ Three teardown layers serve different failure modes:
 2. The host stops OWUI before a second exact-label cleanup, so an interrupted
    tool loop cannot create another VM after cleanup. Docker removal includes
    anonymous volumes. An `always()` Actions step repeats this after interruption.
-3. Daytona gets `autoStopInterval=5`, `autoDeleteInterval=0` (delete on stop),
-   and `ttlMinutes=30`. The hard wall-clock deadline applies even to an active
+3. A `lifecycle_policy` override deletes the sandbox after 5 idle minutes and
+   after 30 minutes of wall clock. The hard wall-clock deadline applies even to an active
    sandbox if the runner disappears. Provider cleanup scheduling is not an
    exact-second guarantee.
 

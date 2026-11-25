@@ -47,7 +47,7 @@ programs should live in a file and be executed from a short snippet.
 
 A durable generation marker distinguishes first use from replacement of Python
 memory. A subsequent run in a replacement process reports a reset, including
-after sandbox stop/restart or archive/resume. Ordinary workspace files survive
+after a sandbox stop/restart. An idle pause preserves the process. Ordinary workspace files survive
 those lifecycle changes separately. Sandbox deletion destroys both files and
 session history; a newly provisioned sandbox starts fresh, with advisory lifecycle
 warnings. Existing Daytona interpreter contexts are not adopted: upgrading this

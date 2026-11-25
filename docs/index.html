@@ -102,17 +102,16 @@
 <!-- Working model -->
 <section class="section">
     <div class="section-label">Working model</div>
-    <h2 class="section-title">Files persist; processes do not</h2>
+    <h2 class="section-title">An idle sandbox pauses</h2>
     <p>
-        A user returns to the same sandbox across conversations. Files, repositories,
-        and installed packages on its filesystem survive ordinary stops and archives.
-        A new tool call starts the sandbox again when needed.
+        A user returns to the same sandbox across conversations. When idle, it pauses
+        with its files, running programs, and in-memory Python state, and the next tool
+        call resumes it.
     </p>
     <p>
-        Running servers, shell processes, and in-memory Python state are lost when the
-        sandbox stops or archives. The default configuration stops an idle sandbox after
-        about 15 minutes and archives it 60 minutes later. Administrators can change
-        these intervals.
+        Work does not progress while a sandbox is paused. The default configuration
+        pauses an idle sandbox after about 15 minutes. Administrators can change this
+        interval, and may delete sandboxes unused for a long time.
     </p>
     <p>
         Conversation context is separate from sandbox state. Open WebUI handles
@@ -256,7 +255,7 @@
     <div class="section-label">Trust and retention</div>
     <h2 class="section-title">Know where the work goes</h2>
     <ul class="limit-list trust-list">
-        <li><strong>Sandbox data lives in Daytona.</strong> Lathe labels each sandbox with the Open WebUI user's email. Files survive normal stops and archives without an additional persistent volume.</li>
+        <li><strong>Sandbox data lives in Daytona.</strong> Lathe labels each sandbox with the Open WebUI user's email. Files survive idle pauses until the sandbox is destroyed or an administrator removes it.</li>
         <li><strong>User environment variables are credentials entrusted to the agent.</strong> Lathe injects them into model-directed shell commands. The model can print them, inspect process environments, or read generated command wrappers. Use scoped, revocable credentials.</li>
         <li><strong>Choose the preview's access mode.</strong> Every HTTP exposure is explicitly public or private. Private previews require the deployment's authentication wrapper and never downgrade to public. Public previews may use a direct signed bearer URL when wrapping is unavailable, where the request permits it. Upstream access defaults to 24 hours; the tool reports wrapper expiry separately. Sharing access does not keep a stopped service or sandbox running.</li>
         <li><strong>Shown images and reports stay in the chat.</strong> Open WebUI saves them with the conversation, and an HTML report runs again each time you open it, isolated from your account and the network.</li>

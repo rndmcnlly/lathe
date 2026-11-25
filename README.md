@@ -1,6 +1,6 @@
 # Lathe
 
-A single-file Open WebUI toolkit that gives any model a coding agent's tool surface: `bash`, `read`, `write`, `edit`, `glob`, `grep`, `interpret`, `view`, `show`, `peek`, `poke`, `onboard`, `lathe`, `expose`, `destroy`, executing against per-user cloud sandboxes via [Daytona](https://www.daytona.io/).
+A single-file Open WebUI toolkit that gives any model a coding agent's tool surface: `bash`, `read`, `write`, `edit`, `glob`, `grep`, `interpret`, `view`, `show`, `peek`, `poke`, `onboard`, `lathe`, `expose`, `destroy`, executing against per-user cloud sandboxes via [Daytona](https://www.daytona.com/).
 
 **For users**: See [lathe.tools](https://lathe.tools) for what Lathe can do, how to use it, and example workflows.
 
@@ -8,7 +8,7 @@ A single-file Open WebUI toolkit that gives any model a coding agent's tool surf
 
 ## What it does to your instance
 
-Lathe registers fourteen tools that models can call in [Native function calling mode](https://docs.openwebui.com/features/extensibility/plugin/tools/). When a user's model calls a tool, Lathe creates, starts, or resumes a cloud sandbox VM via the Daytona control plane and toolbox APIs. All sandbox operations go outbound from your OWUI server.
+Lathe registers fourteen tools that models can call in [Native function calling mode](https://docs.openwebui.com/features/extensibility/plugin/tools/). When a user's model calls a tool, Lathe creates or resumes a cloud sandbox VM via the Daytona control plane and toolbox APIs. All sandbox operations go outbound from your OWUI server.
 
 Lathe does not import `open_webui.*`, use OWUI file storage, or change stored model, prompt, user, or instance configuration. Its tool descriptions and results include operational instructions, project context, and background notices that influence the calling model.
 
@@ -22,7 +22,7 @@ Lathe does not import `open_webui.*`, use OWUI file storage, or change stored mo
 
 ## Requirements
 
-1. **Daytona account** with an API key ([daytona.io](https://www.daytona.io/))
+1. **Daytona account** with an API key for the v2 platform ([daytona.com](https://www.daytona.com/))
 2. **Open WebUI ≥ 0.12.0** with Native function calling mode enabled
 3. Models that support tool/function calling (`view()` and `peek` screenshots additionally need a vision-capable model)
 
@@ -78,40 +78,66 @@ is useful for substantial guidance. Neither valve causes automatic fetching.
 | Valve | Default | Purpose |
 |-------|---------|---------|
 | `daytona_api_key` | *(empty, password field)* | Daytona API key |
-| `daytona_api_url` | `https://app.daytona.io/api` | Control plane URL |
-| `daytona_proxy_url` | `https://proxy.app.daytona.io/toolbox` | Toolbox proxy URL |
+| `daytona_api_url` | `https://api.daytona.com` | Control plane URL |
+| `daytona_proxy_url` | *(empty)* | Toolbox proxy override; empty uses the URL Daytona reports for each sandbox |
 | `preview_wrapper_url` | *(empty)* | HTTPS registration endpoint for a public or owner-authenticated preview wrapper |
 | `preview_wrapper_key` | *(empty, password field)* | Installation bearer credential for that wrapper |
 | `preview_expiry_seconds` | `86400` | Upstream HTTP signed-URL lifetime (60–86400 seconds); independent of wrapper registration expiry |
 | `deployment_label` | *(empty, must configure)* | Label key for sandbox tagging (e.g. `chat.example.com`) |
-| `auto_stop_minutes` | `15` | Idle timeout before sandbox stops |
-| `auto_archive_minutes` | `60` | Minutes after stop before sandbox archives |
-| `auto_delete_minutes` | `-1` | Minutes after archive before permanent deletion (`-1` = never) |
+| `idle_pause_minutes` | `15` | Idle minutes before the sandbox pauses, keeping files, processes and memory |
+| `max_run_minutes` | `1440` | Minutes a sandbox may run before pausing regardless of activity; restarts on each resume. The Daytona plan sets the maximum |
+| `cpu_cores` | `0.5` | CPU cores reserved for a new sandbox |
+| `memory_gib` | `2` | Memory (GiB) reserved for a new sandbox |
+| `disk_max_gib` | `20` | Disk limit (GiB) for a new sandbox; fixed at creation |
+| `sandbox_image` | *(empty)* | Daytona image for new sandboxes; empty uses Daytona's default |
+| `sandbox_region` | *(empty)* | Daytona region for new sandboxes; must hold `sandbox_image` |
 | `auto_create_sandbox` | `true` | Auto-create a sandbox when none exists. Disable when sandboxes are provisioned externally |
 | `sandbox_missing_message` | *(empty)* | Message shown to the agent when no sandbox exists and `auto_create_sandbox` is off |
 | `sandbox_create_overrides` | `{}` | JSON of extra Daytona create args (see below) |
 | `foreground_timeout_seconds` | `30` | Seconds to wait for a bash command before auto-backgrounding (1–300) |
 
-### Sandbox shape (`sandbox_create_overrides`)
+### Lifecycle and retention
 
-`sandbox_create_overrides` is a JSON object merged into the Daytona sandbox
-create request, letting you control sandbox shape without a valve per field:
+Each user has one persistent sandbox. When idle it pauses, and the next tool call
+resumes it with files, processes and interpreter state intact. Work does not
+progress while paused, and background processes do not keep a sandbox awake.
 
-```json
-{"snapshot": "daytona-medium", "target": "us"}
+> [!IMPORTANT]
+> **Lathe never deletes a sandbox on its own.** Pausing has no deletion deadline,
+> so data from absent users stays until you remove it. Run a scheduled job outside
+> Lathe that deletes sandboxes carrying your `deployment_label` whose
+> `last_activity_at` is older than your retention policy, and alert when a
+> deletion fails.
+
+`persistent` sandboxes are accepted by Daytona's Linux API but absent from its
+published create schema. Treat that, and paused retention, as provider behavior
+that could change. Sandbox destruction loses everything: export important work or
+commit it to a remote repository.
+
+### Sandbox image
+
+Daytona's default image is minimal. `image/Dockerfile` adds Python, uv, Node, git,
+ripgrep, jq, tmux, build tools, Chromium, and desktop support, running as an
+ordinary `daytona` user with sudo. Build it and set the two valves:
+
+```bash
+uv run --script image/build.py --region us-east-ash-1   # prints the image name
 ```
 
-`snapshot` selects the base environment and, for Daytona's default snapshots,
-the size: `daytona-small` (1 vCPU, 1 GiB, 3 GiB disk), `daytona-medium`
-(2, 4, 8) or `daytona-large` (4, 8, 10). The desktop and browser tools want at
-least `daytona-medium`. `target` picks a region. Resource fields (`cpu`,
-`memory`, `disk`, `gpu`) apply only when creating from an `image`; Daytona
-rejects them alongside a snapshot, and Lathe's default create uses one. Any field
-the Daytona [`POST /sandbox`](https://www.daytona.io/docs/en/tools/api/) body
-accepts works here except reserved identity/storage fields. The keys `name`,
-`labels`, and `volumes` are rejected: Lathe owns per-user lookup and does not
-provision extra volumes. Ordinary workspace files survive stop/archive, but not
-sandbox destruction. Export important work or commit it to a remote repository.
+Named images are immutable, so each build gets a new name; rolling back is a valve
+change. Existing sandboxes keep the image they were created from.
+
+### Sandbox shape (`sandbox_create_overrides`)
+
+`sandbox_create_overrides` is a JSON object merged over the create request built
+from the valves above, for any other field Daytona's v2 `POST /sandboxes` accepts:
+
+```json
+{"memory_max_mib": 8192, "cores_max": 4}
+```
+
+The keys `name`, `labels`, `persistent`, `idempotency_key` and `volumes` are
+rejected: Lathe owns per-user lookup and lifecycle, and provisions no volumes.
 
 ### HTTP preview access and wrapping
 
@@ -240,8 +266,9 @@ even when the owner is already signed into Open WebUI.
 
 ### Shared desktop (computer use)
 
-Daytona sandboxes include an Xfce desktop on a virtual display, with a noVNC
-viewer on port 6080. Lathe gives the model and the user two ways into that one
+Daytona's runtime supplies an Xfce desktop on a virtual display, on any Linux
+image. The [Lathe image](image/) adds Chromium, the accessibility registry, and
+the noVNC page that `expose` serves on port 6080. Lathe gives the model and the user two ways into that one
 screen:
 
 - The model calls `peek` to read it (screenshots, window lists, pointer position,
@@ -281,11 +308,9 @@ What administrators should know:
   or a subagent from sending input while the user is working. Lathe also does
   not retry input, and a successful `poke` means the input was delivered, not
   that the application did what was intended.
-- **Snapshots and resources.** Daytona's default snapshot provides the desktop
-  packages; a custom `sandbox_create_overrides` snapshot must include them.
-  BayLeaf measured the desktop stack idling near 450 MB of memory, so very
-  small sandboxes may struggle. Browsers are ordinary sandbox software the
-  model installs or launches with `bash`.
+- **Image and resources.** Browser commands and VNC need the Lathe image or an
+  equivalent; without its noVNC bridge, `expose("vnc")` returns an error. BayLeaf
+  measured the v0 desktop stack idling near 450 MB of memory.
 
 The model-facing command reference is `lathe(manpage="computer")`.
 [COMPUTER-USE.md](COMPUTER-USE.md) records the design and live qualification.
@@ -381,6 +406,7 @@ including dependency requirements. The focused run does not qualify the other to
 | File | Purpose |
 |------|---------|
 | `lathe.py` | The OWUI toolkit (single file, deployed via OWUI admin API) |
+| `image/` | Dockerfile and builder for the sandbox image |
 | `handbook/` | Mutable agent reference guides for optional applications |
 | `DESIGN.md` | Human-facing tool story and responsibility boundaries |
 | `preview-wrapper/` | Optional Cloudflare Worker for branded, cookie-isolated preview origins |
